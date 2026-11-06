@@ -38,6 +38,14 @@ here.
 
 ---
 
+## PLaMo reference test artifacts — source checkout only
+
+This section is hand-maintained and must be preserved when regenerating this file.
+
+Built with PLaMo. The random PLaMo 3 fixture in `testdata/plamo3-tiny` and the associated PLaMo reference goldens were generated using Preferred Networks' model code and tokenizer. They are covered separately by the [PLaMo Community License Agreement](testdata/plamo3-LICENSE.txt); the complete agreement travels with the test artifacts. Recipients must comply with its terms. These artifacts contain no trained parameters from the released checkpoint and are not embedded in runtime or release binaries. GoInfer's independently implemented Go runtime remains MIT licensed.
+
+---
+
 ## Core (default build)
 
 ### golang.org/x/text — BSD-3-Clause
@@ -583,7 +591,8 @@ go-licenses report -tags metal ./metal/...   # + cgo-free Metal backend (darwin)
 # full texts above are the modules' own LICENSE files from $(go env GOMODCACHE).
 ```
 
-**`go-licenses` does not know about the embedded model weights.** The "Embedded model weights"
+**`go-licenses` does not know about model weights or reference artifacts.** Preserve both the
+"PLaMo reference test artifacts" section and its linked license when regenerating. The "Embedded model weights"
 section at the top is hand-maintained: model weights are not a Go module, so a regeneration that
 simply overwrites this file DELETES the only in-repo record of an Apache-2.0 obligation the
 release assets carry. Re-add it, or regenerate into a scratch file and merge. (The release

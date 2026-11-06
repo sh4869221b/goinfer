@@ -100,7 +100,7 @@ const (
 	modeByteLevel
 )
 
-// Tokenizer is a loaded BPE tokenizer. It serves two families behind one merge core (see
+// Tokenizer is a loaded decoder tokenizer. Its BPE path serves two families behind one merge core (see
 // tokMode): Gemma 3's byte-fallback SentencePiece-style model and the byte-level
 // GPT-2/Llama-3/Qwen model. Load reads the HF tokenizer.json and resolves the mode and special
 // tokens from it.
@@ -108,6 +108,7 @@ const (
 // The pipeline mirrors HF `tokenizers` exactly so ids match the per-family
 // golden: split out added/special tokens (longest match on the raw text),
 // normalize the gaps, pretokenize (byte-level only), then BPE each piece.
+// PLaMo uses the separate unigram path in plamo.go.
 type Tokenizer struct {
 	plamo *plamoTokenizer
 	// preDecline is non-empty when the pre-tokenizer this tokenizer declares is one this build
@@ -279,11 +280,10 @@ func parseMerges(raw json.RawMessage) ([][2]string, error) {
 	return out, nil
 }
 
-// Load reads a SentencePiece/BPE model. path may point directly at a
-// tokenizer.json or at a directory containing one (e.g. the HF checkpoint
-// dir). The legacy tokenizer.model (SP protobuf) is not supported — the HF
-// tokenizer.json carries the same vocab plus the explicit merge table and
-// pipeline, which is what we match for parity.
+// Load reads tokenizer.json, PLaMo's tokenizer.jsonl, or a checkpoint directory.
+// PLaMo also requires its neighboring tokenizer_config.json. Directories may
+// instead supply vocab.json with merges.txt, or tekken.json. The legacy
+// tokenizer.model (SP protobuf) is not supported.
 func Load(path string) (*Tokenizer, error) {
 	if strings.HasSuffix(path, "tokenizer.jsonl") {
 		return loadPlamo(path)

@@ -1,5 +1,5 @@
-// Package tokenizer implements the BPE tokenizers the decoder LLMs ship,
-// loaded from the HF tokenizer.json. One ordered-merge core serves two
+// Package tokenizer loads decoder tokenizers from Hugging Face and GGUF checkpoints.
+// BPE models loaded from tokenizer.json share an ordered-merge core serving two
 // families behind a mode flag (see tokMode):
 //
 //   - modeGemma: Gemma 3's byte-fallback SentencePiece-style BPE —
@@ -8,6 +8,9 @@
 //   - modeByteLevel: the GPT-2 / Llama-3 / Qwen byte-level BPE — NFC
 //     normalize, a GPT-2 split-regex pretokenizer, and a byte→printable-rune
 //     map (space → Ġ) so every symbol is in-vocab (no byte-fallback).
+//
+// PLaMo's tokenizer.jsonl uses unigram dynamic programming with raw whitespace and byte fallback;
+// its neighboring tokenizer_config.json supplies special tokens and boundary rules.
 //
 // Load auto-detects the family from tokenizer.json (the decoder type) and
 // resolves special tokens (Gemma's are required; the byte-level families read

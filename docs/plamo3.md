@@ -1,5 +1,7 @@
 # Experimental PLaMo 3 Translate support
 
+Built with PLaMo.
+
 This branch adds the PLaMo 3 translation decoder and tokenizer. It does not add PLaMo 2 support: PLaMo 2 Translate uses a different Mamba hybrid architecture.
 
 The implementation follows the official [pfnet/plamo-3-translate-0.8b](https://huggingface.co/pfnet/plamo-3-translate-0.8b/tree/cc8e88169807d5a272e8ff06db12eb0129b67f81) source, pinned at `cc8e88169807d5a272e8ff06db12eb0129b67f81`.
@@ -43,7 +45,7 @@ Use an absolute path for `PLAMO3_TOKENIZER_DIR`, since Go tests run in the packa
 
 The real 0.8B checkpoint was also checked on Linux amd64 CPU: two 26-token English/Japanese prompts matched the reference at all 16 layers (cosine at least 0.99999), with matching next-token argmax and final-logit cosine reported as 1.000000000. Go used BF16 weights widened for FP32 arithmetic; the reference explicitly widened the released weights to FP32. This checks the original weights and both input languages, not broad translation quality or long context. Runtime int4 generation produced these smoke-test translations:
 
-| Source | Output |
+| Source | PLaMo 3 output |
 | --- | --- |
 | The meeting has been moved to next Monday. | 会議は来週の月曜日に変更になりました。 |
 | 会議は来週の月曜日に変更されました。 | The meeting has been moved to next Monday. |
@@ -65,4 +67,4 @@ Supported input is the original unquantized safetensors layout. Pre-quantized FP
 
 The shared descriptor can express the other PLaMo 3 sizes, but 2B, 8B and 31B have not been run here. CUDA, Metal, the user's RTX 4070, long-context limits and translation quality benchmarks have not been validated. No performance or VRAM-fit claim is made. The capability matrix's parity status remains pending until full model oracle validation.
 
-GoInfer is MIT licensed. Model weights and PFN source use the [PLaMo Community License](https://huggingface.co/pfnet/plamo-3-translate-0.8b/blob/cc8e88169807d5a272e8ff06db12eb0129b67f81/LICENSE/en), with separate terms for commercial use; the Go implementation does not redistribute model weights or PFN source. Follow those terms when downloading or deploying the model.
+GoInfer's runtime code is MIT licensed. Released weights and PFN source use the [PLaMo Community License](https://huggingface.co/pfnet/plamo-3-translate-0.8b/blob/cc8e88169807d5a272e8ff06db12eb0129b67f81/LICENSE/en). This change does not redistribute the released weights or PFN source. The randomly initialized fixture and PFN-generated reference goldens carry that agreement separately; its full text is included in [the test-data license](../testdata/plamo3-LICENSE.txt). Follow its redistribution, attribution and commercial-use conditions when using or sharing those materials.
