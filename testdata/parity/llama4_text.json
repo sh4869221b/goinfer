@@ -12,7 +12,7 @@
   "programs": [
     "testdata/llama4-tiny"
   ],
-  "deps_hash": "sha256:ac5fb05c633a05df525b87dcd8f0633ea57e6e95d2ef285196dd13900f1aacb8",
+  "deps_hash": "sha256:8db1cb3f87264509b24f46a86f4e22a6305317f39f0bb37adb30da182fbc5e41",
   "status": "experimental",
   "validated_at": "3f23c96",
   "date": "2026-06-16",
