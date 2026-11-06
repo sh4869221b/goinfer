@@ -1,0 +1,13 @@
+{
+  "uses": ["core", "loaders", "quant"],
+  "own": ["decoder/arch_plamo3.go", "decoder/weights_plamo3.go"],
+  "programs": ["testdata/plamo3-tiny"],
+  "deps_hash": "",
+  "status": "pending",
+  "validated_at": null,
+  "date": "2026-11-06",
+  "reference": "PFN plamo-3-translate-0.8b modeling_plamo.py at cc8e88169807d5a272e8ff06db12eb0129b67f81; tiny fp32 per-layer and token-logit parity",
+  "machine": "linux-amd64 CPU",
+  "method": "tiny-golden",
+  "metrics": null
+}

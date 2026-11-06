@@ -715,6 +715,30 @@
     "parity": "full-oracle 100.0%/1.00000"
   },
   {
+    "name": "plamo3",
+    "model_types": [
+      "plamo3"
+    ],
+    "display_name": "PLaMo 3 Translate",
+    "description": "PFN PLaMo 3 translation decoder (experimental; CPU parity, safetensors)",
+    "summary": "PFN's translation model; experimental safetensors support, with a dedicated PFML3 translation example.",
+    "tasks": [
+      "chat"
+    ],
+    "coverage_axis": "softmax-GQA",
+    "moe": "dense",
+    "sliding_window": "interleave",
+    "qk_norm": true,
+    "rope_style": "dual-base",
+    "norm": "RMSNorm, sandwich",
+    "activation": "SwiGLU",
+    "tied_lm_head": false,
+    "loaders": "safetensors",
+    "modality": "text",
+    "gpu_residency_eligible": true,
+    "parity": "pending"
+  },
+  {
     "name": "phi3",
     "model_types": [
       "phi3"

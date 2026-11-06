@@ -15,6 +15,7 @@ demo/chat/dist/
 # Model weights — large, supplied per-machine, never committed.
 # Tests skip cleanly when these aren't present.
 *.safetensors
+!testdata/plamo3-tiny/model.safetensors
 *.gguf
 *.bin
 # EXCEPTION: mixtral-tiny is a 3.6 MB deterministic random-weight MoE checkpoint

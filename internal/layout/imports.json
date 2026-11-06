@@ -301,6 +301,10 @@
     "demo/chat": [
       "internal/app/chatapp"
     ],
+    "demo/plamo-translate": [
+      "decoder",
+      "tokenizer"
+    ],
     "embeddinggemma2": [
       "internal/audio",
       "internal/vision",

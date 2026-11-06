@@ -1115,6 +1115,7 @@ Every import from one goinfer package to another, by repository-relative directo
 | `demo/agent/cmd/agent-web` | `backend/webgpu`, `demo/agent/agent`, `demo/agent/internal/embedmodel` |  |
 | `demo/agent/cmd/stdlib-agent` | `demo/agent/agent`, `demo/agent/internal/embedmodel` |  |
 | `demo/chat` | `internal/app/chatapp` |  |
+| `demo/plamo-translate` | `decoder`, `tokenizer` |  |
 | `embeddinggemma2` | `internal/audio`, `internal/vision`, `multimodal`, `tokenizer` |  |
 | `engine` | `constrain`, `decoder`, `internal/cost` |  |
 | `engine/enginetest` | `engine` |  |

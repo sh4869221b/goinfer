@@ -38,6 +38,7 @@ Regenerate with `go test ./decoder -run HardwareMatrix -update`.
 | Nemotron-H | ✅ | ✅ resident | ✅ resident | ✅ resident |
 | Olmo 3 | ✅ | ✅ resident | ✅ resident | ✅ resident |
 | Olmo Hybrid | ✅ | ✅ resident | ✅ resident | ✅ resident |
+| PLaMo 3 Translate | ✅ | ✅ resident | ✅ resident | ✅ resident |
 | Phi-3 / Phi-4 | ✅ | CPU | CPU | CPU |
 | Qwen2 / Qwen2.5 | ✅ | ✅ resident | ✅ resident | ✅ resident |
 | Qwen2-MoE | ✅ | ✅ resident | ✅ resident | ✅ resident |

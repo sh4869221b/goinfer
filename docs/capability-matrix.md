@@ -88,6 +88,8 @@ with `go test ./decoder -run CapabilityMatrix -update`.
 
 > **Olmo 3** — Ai2 Olmo 3 (7B/32B): no pre-norm at all (post-only), whole-vector QK-norm, sliding/full 3:1 + YaRN on full layers only
 
+> **PLaMo 3 Translate** — PFN PLaMo 3 translation decoder (experimental; CPU parity, safetensors)
+
 > **Phi-3 / Phi-4** — Microsoft Phi-3/Phi-4 dense (fused qkv/gate-up, partial rotary)
 
 > **Qwen2 / Qwen2.5** — Alibaba Qwen2/2.5 dense (q/k/v bias)
@@ -136,6 +138,7 @@ with `go test ./decoder -run CapabilityMatrix -update`.
 | Mistral | `mistral` | dense | all-layer | no | full | RMSNorm, pre-norm | SwiGLU | no | safetensors, GGUF | text | yes | full-oracle 100.0%/1.00000 |
 | Mixtral | `mixtral` | sparse, no-shared | none | no | full | RMSNorm, pre-norm | SwiGLU | no | safetensors, GGUF | text | yes | experimental: tiny-oracle 100.0%/1.00000 |
 | Olmo 3 | `olmo3` | dense | interleave | yes | full | RMSNorm, post-only | SwiGLU | no | safetensors | text | yes | full-oracle 100.0%/1.00000 |
+| PLaMo 3 Translate | `plamo3` | dense | interleave | yes | dual-base | RMSNorm, sandwich | SwiGLU | no | safetensors | text | yes | pending |
 | Phi-3 / Phi-4 | `phi3` | dense | none | no | full | RMSNorm, pre-norm | SwiGLU | no | safetensors, GGUF | text | no | full-oracle 100.0%/1.00000 |
 | Qwen2 / Qwen2.5 | `qwen2` | dense | none | no | full | RMSNorm, pre-norm | SwiGLU | no | safetensors, GGUF | text | yes | full-oracle 100.0%/1.00000 |
 | Qwen2-MoE | `qwen2_moe` | sparse +shared | none | no | full | RMSNorm, pre-norm | SwiGLU | no | safetensors, GGUF | text | yes | real-oracle 100.0%/0.99954 |

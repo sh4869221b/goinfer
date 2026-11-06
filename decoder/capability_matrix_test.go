@@ -41,6 +41,10 @@ var updateMatrix = flag.Bool("update", false, "rewrite the generated capability-
 // deepseek_v2 vs deepseek_v3 routing flavor). Returns nil for an unknown key.
 func representativeConfig(modelType string) *Config {
 	switch modelType {
+	case "plamo3":
+		return &Config{ModelType: "plamo3", VocabSize: 64, HiddenDim: 64, NumLayers: 2, NumHeads: 2, NumKVHeads: 1, HeadDim: 128,
+			IntermediateDim: 128, RMSNormEps: 1e-6, PlamoWindowSize: 4, SlidingWindowPattern: 2,
+			RopeParameters: json.RawMessage(`{"full_attention":{"rope_type":"yarn","rope_theta":1000000,"factor":256,"original_max_position_embeddings":4096,"truncate":false},"sliding_attention":{"rope_type":"default","rope_theta":10000}}`)}
 	case "gemma":
 		return &Config{
 			ModelType: "gemma", VocabSize: 100, HiddenDim: 8, NumLayers: 2, NumHeads: 2, NumKVHeads: 1, HeadDim: 4,
@@ -534,6 +538,7 @@ type familyDoc struct {
 }
 
 var familyDocs = map[string]familyDoc{
+	"plamo3":              {"PLaMo 3 Translate", "PFN PLaMo 3 translation decoder (experimental; CPU parity, safetensors)", "safetensors", "text"},
 	"gemma":               {"Gemma", "Google Gemma 1 (2B/7B) and CodeGemma: pre-norm, (1+w) RMSNorm, GeGLU, tied head", "safetensors, GGUF", "text"},
 	"gemma2":              {"Gemma 2", "Google Gemma 2 (2B/9B/27B): sandwich norms, sliding/full alternating, attention + final-logit softcaps", "safetensors, GGUF", "text"},
 	"gemma3":              {"Gemma 3", "Google Gemma 3 dense (270M/1B/4B/12B/27B)", "safetensors, GGUF", "text (+ vision via VL text_config)"},
@@ -607,6 +612,7 @@ type siteDoc struct {
 var siteTasks = map[string]bool{"chat": true, "code": true, "vision": true, "audio": true}
 
 var siteDocs = map[string]siteDoc{
+	"plamo3":           {"PFN's translation model; experimental safetensors support, with a dedicated PFML3 translation example.", []string{"chat"}},
 	"olmo_hybrid":      {"Ai2's 7B hybrid: mostly linear-attention layers, a few full-attention ones, no position encoding at all.", []string{"chat"}},
 	"qwen3_next":       {"Qwen's 80B mixture-of-experts with about 3B active per token, on hybrid attention.", []string{"chat"}},
 	"qwen3_5_moe":      {"Qwen3.5 and 3.6 mixture-of-experts on hybrid attention.", []string{"chat"}},

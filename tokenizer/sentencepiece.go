@@ -109,6 +109,7 @@ const (
 // golden: split out added/special tokens (longest match on the raw text),
 // normalize the gaps, pretokenize (byte-level only), then BPE each piece.
 type Tokenizer struct {
+	plamo *plamoTokenizer
 	// preDecline is non-empty when the pre-tokenizer this tokenizer declares is one this build
 	// does not walk. See PreTokenizerDecline.
 	preDecline string
@@ -284,9 +285,15 @@ func parseMerges(raw json.RawMessage) ([][2]string, error) {
 // tokenizer.json carries the same vocab plus the explicit merge table and
 // pipeline, which is what we match for parity.
 func Load(path string) (*Tokenizer, error) {
+	if strings.HasSuffix(path, "tokenizer.jsonl") {
+		return loadPlamo(path)
+	}
 	jsonPath := path
 	if fi, err := os.Stat(path); err == nil && fi.IsDir() {
 		jsonPath = filepath.Join(path, "tokenizer.json")
+		if _, err := os.Stat(filepath.Join(path, "tokenizer.jsonl")); err == nil {
+			return loadPlamo(filepath.Join(path, "tokenizer.jsonl"))
+		}
 	}
 	raw, err := os.ReadFile(jsonPath)
 	if err != nil {
@@ -535,6 +542,9 @@ func (t *Tokenizer) Encode(text string, addBOS bool) ([]int, error) {
 // trusted gap text never contains a special form, so on legitimate input the two
 // modes agree (the byte-identity property EncodeSegments relies on).
 func (t *Tokenizer) encode(text string, addBOS, parseSpecial bool) ([]int, error) {
+	if t.plamo != nil {
+		return t.encodePlamo(text, addBOS, parseSpecial), nil
+	}
 	// A vocab loaded without merges AND without scores can DECODE but not encode — refuse rather than
 	// return a silently unmerged (wrong) tokenization. A SentencePiece vocab with scores but no merge
 	// list (gemma-3 GGUFs) encodes via the score-rank path (mergeRank), so it is allowed. See gguf.go.
@@ -945,6 +955,9 @@ func (t *Tokenizer) Decode(ids []int) (string, error) {
 // (the space belongs to the first token of the whole sequence), so per-piece callers
 // pass false — see DecodePiece.
 func (t *Tokenizer) decode(ids []int, stripLeading bool) (string, error) {
+	if t.plamo != nil {
+		return t.decodePlamo(ids)
+	}
 	if t.mode == modeByteLevel {
 		return t.decodeByteLevel(ids)
 	}
@@ -1012,6 +1025,12 @@ func (t *Tokenizer) DecodePiece(id int) (string, error) {
 func (t *Tokenizer) TokenText(id int) []byte {
 	if id < 0 || id >= len(t.idToPiece) {
 		return nil
+	}
+	if t.plamo != nil {
+		if b, ok := t.byteToVal[int32(id)]; ok {
+			return []byte{b}
+		}
+		return []byte(t.idToPiece[id])
 	}
 	if t.mode == modeByteLevel {
 		// An ADDED token's surface is stored verbatim, not byte-level-encoded (see Tokenizer.isAdded). This

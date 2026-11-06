@@ -49,6 +49,7 @@ func populated(v reflect.Value) (bool, int) {
 
 // censusList is the fixture set this census round-trips. See the completeness gate below.
 var censusList = []string{
+	"../testdata/plamo3-tiny",
 	"testdata/laguna-xs2-tiny", "testdata/qwen3_5-tiny", "testdata/internlm2-tiny",
 	"testdata/internlm3-tiny", "testdata/laguna-m1-tiny", "testdata/laguna-xs21-tiny",
 	"testdata/gptoss_tiny.gguf",

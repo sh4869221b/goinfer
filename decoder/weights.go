@@ -666,6 +666,12 @@ func buildWeightsFromSafetensorsTo(cfg *Config, arch *Architecture, s *tensorSch
 		}
 		return buildNemotronWeights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id) // per-layer mamba | attention | mlp
 	}
+	if arch.Name == "plamo3" {
+		if lora != nil {
+			return nil, fmt.Errorf("decoder: LoRA merge unsupported for plamo3")
+		}
+		return buildPlamo3Weights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id)
+	}
 	if arch.Name == "phi3" {
 		if lora != nil {
 			return nil, fmt.Errorf("decoder: LoRA merge unsupported for the phi3 (fused qkv/gate_up) layout")

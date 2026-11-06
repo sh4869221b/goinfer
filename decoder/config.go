@@ -30,6 +30,11 @@ func (b *gemma4BidirectionalAttention) UnmarshalJSON(data []byte) error {
 // per-family groups below). The per-layer local:global attention pattern is derived at load time (LayerTypes, else
 // SlidingWindowPattern), not stored per layer. The example values in the trailing comments are Gemma 3 270M.
 type Config struct {
+	PlamoWindowSize     int    `json:"window_size"`
+	PlamoScaleEmbedding bool   `json:"scale_embedding"`
+	PlamoLinearType     string `json:"linear_type"`
+	TieWordEmbeddings   bool   `json:"tie_word_embeddings"`
+
 	ModelType       string  `json:"model_type"`              // "gemma3_text" — selects the arch adapter
 	VocabSize       int     `json:"vocab_size"`              // 262144
 	HiddenDim       int     `json:"hidden_size"`             // 640 (270M)
