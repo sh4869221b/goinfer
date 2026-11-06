@@ -1,7 +1,16 @@
 {
-  "uses": ["core", "loaders", "quant"],
-  "own": ["decoder/arch_plamo3.go", "decoder/weights_plamo3.go"],
-  "programs": ["testdata/plamo3-tiny"],
+  "uses": [
+    "core",
+    "loaders",
+    "quant"
+  ],
+  "own": [
+    "decoder/arch_plamo3.go",
+    "decoder/weights_plamo3.go"
+  ],
+  "programs": [
+    "testdata/plamo3-tiny"
+  ],
   "deps_hash": "",
   "status": "pending",
   "validated_at": null,
