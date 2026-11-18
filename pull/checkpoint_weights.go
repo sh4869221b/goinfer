@@ -3,6 +3,7 @@ package pull
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -59,18 +60,28 @@ func verifyOpenCheckpointDigest(root *os.Root, name string, file File, f *os.Fil
 	if cached := readCheckpointDigest(root, name, info); id != "" && cached.FileID == id && cached.SHA256 == file.SHA256 {
 		return nil
 	}
+	if err := checkOpenCheckpointDigest(root, name, file, f, info); err != nil {
+		return err
+	}
+	if id != "" {
+		writeRootDigest(root, name, info, id, file.SHA256)
+	}
+	return nil
+}
+
+var errCheckpointDigestMismatch = errors.New("file does not match the checkpoint digest")
+
+// Check the opened bytes directly when publishing or discarding staging data.
+func checkOpenCheckpointDigest(root *os.Root, name string, file File, f *os.File, info os.FileInfo) error {
 	digest, err := hashCheckpointFile(file, f)
 	if err != nil {
 		return err
 	}
 	if digest != file.SHA256 {
-		return fmt.Errorf("%s does not match the checkpoint digest", file.Path)
+		return fmt.Errorf("%s: %w", file.Path, errCheckpointDigestMismatch)
 	}
 	if err := confirmCheckpointFile(root, name, f, info); err != nil {
 		return fmt.Errorf("checking %s: %w", file.Path, err)
-	}
-	if id != "" {
-		writeRootDigest(root, name, info, id, digest)
 	}
 	return nil
 }

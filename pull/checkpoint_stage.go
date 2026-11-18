@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -147,7 +148,7 @@ func (w *checkpointWorkspace) reclaimCompletedStage(parent *os.Root, dest string
 	}
 	defer stage.Close()
 	if w.matchesPublication(stage, complete.publication) {
-		if cleanup, err := readCheckpointCleanup(stage); err == nil && cleanup.Owner == w.owner && cleanup.Token == complete.publication {
+		if cleanup, err := readCheckpointCleanup(stage); err == nil && cleanup.Owner == w.owner && cleanup.Token == complete.publication && w.canResumeCleanup(stage, cleanup.Transfers) {
 			w.reclaimTransfers(stage, cleanup.Transfers)
 		}
 	}
@@ -446,11 +447,6 @@ func preparePublishedFile(work, stage, publish *os.Root, publishName string, f F
 	if source.Size() != f.Size {
 		return nil, fmt.Errorf("staged file has size %d, want %d", source.Size(), f.Size)
 	}
-	if f.SHA256 != "" {
-		if err := verifyOpenCheckpointDigest(stage, name, f, in, source); err != nil {
-			return nil, err
-		}
-	}
 	if err := publish.MkdirAll(filepath.Dir(name), 0o755); err != nil {
 		return nil, err
 	}
@@ -463,15 +459,18 @@ func preparePublishedFile(work, stage, publish *os.Root, publishName string, f F
 			return nil, fmt.Errorf("staged file changed while linking")
 		}
 		if f.SHA256 != "" {
+			if err := checkOpenCheckpointDigest(publish, name, f, in, source); err != nil {
+				if errors.Is(err, errCheckpointDigestMismatch) {
+					discardStagedDigest(stage, name, in, source, f.SHA256)
+				}
+				return nil, err
+			}
 			writeRootDigest(publish, name, linked, checkpointFileID(in, source), f.SHA256)
 		}
 		return source, nil
 	}
 	// Filesystems without hard links can publish via a copy on the same disk.
 	if err := checkDiskSpace(f.Path, f.Size, publish.Name()); err != nil {
-		return nil, err
-	}
-	if _, err := in.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
 	out, err := openRegularDownloadFile(publish, name, os.O_CREATE|os.O_EXCL|os.O_WRONLY)
@@ -483,7 +482,8 @@ func preparePublishedFile(work, stage, publish *os.Root, publishName string, f F
 		digest, err := hashCheckpointFile(f, io.TeeReader(in, out))
 		copyErr = err
 		if err == nil && digest != f.SHA256 {
-			copyErr = fmt.Errorf("copied file does not match the checkpoint digest")
+			discardStagedDigest(stage, name, in, source, f.SHA256)
+			copyErr = errCheckpointDigestMismatch
 		}
 		if copyErr == nil {
 			info, err := out.Stat()
@@ -507,4 +507,15 @@ func preparePublishedFile(work, stage, publish *os.Root, publishName string, f F
 		return nil, closeErr
 	}
 	return source, nil
+}
+
+// A retry can refetch the shard once the contradicted sidecar is gone.
+func discardStagedDigest(stage *os.Root, name string, file *os.File, source os.FileInfo, digest string) {
+	info, err := stage.Lstat(name)
+	if err != nil || !sameCheckpointFileState(source, info) {
+		return
+	}
+	if cached := readCheckpointDigest(stage, name, info); cached.SHA256 == digest && cached.FileID == checkpointFileID(file, source) {
+		_ = stage.Remove(sidecarPath(name))
+	}
 }

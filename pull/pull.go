@@ -799,8 +799,9 @@ func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File
 		}
 	}
 	finish := func(transferRoot *os.Root, src, target string, verified os.FileInfo, id string) error {
+		digest := hex.EncodeToString(h.Sum(nil))
 		if work != nil && transferRoot == root {
-			if err := work.recordTransferCompletion(src, verified, hex.EncodeToString(h.Sum(nil))); err != nil {
+			if err := work.recordTransferCompletion(src, verified, digest); err != nil {
 				return err
 			}
 		}
@@ -808,7 +809,7 @@ func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File
 			return err
 		}
 		if work != nil {
-			work.recordCompletedTransfer(root, f, verified)
+			work.recordCompletedTransfer(root, f, verified, digest)
 		}
 		return nil
 	}

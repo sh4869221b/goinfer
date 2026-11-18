@@ -37,6 +37,7 @@ type checkpointTransferSnapshot struct {
 	Size    int64  `json:"size"`
 	ModTime int64  `json:"mtime"`
 	FileID  string `json:"file_id,omitempty"`
+	NoProof bool   `json:"no_proof,omitempty"`
 }
 
 // Save a hard link as proof of the transferred inode. A missing receipt or
@@ -46,15 +47,15 @@ func (w *checkpointWorkspace) recordTransfer(stage *os.Root, file File) {
 	if err != nil {
 		return
 	}
-	w.recordCompletedTransfer(stage, file, info)
+	w.recordCompletedTransfer(stage, file, info, file.SHA256)
 }
 
-func (w *checkpointWorkspace) recordCompletedTransfer(stage *os.Root, file File, info os.FileInfo) {
+func (w *checkpointWorkspace) recordCompletedTransfer(stage *os.Root, file File, info os.FileInfo, digest string) {
 	if !info.Mode().IsRegular() || info.Size() != file.Size {
 		return
 	}
 	w.recordReceipt(checkpointReceipt{
-		Owner: w.owner, Path: file.Path, Size: info.Size(), ModTime: info.ModTime().UnixNano(), SHA256: file.SHA256,
+		Owner: w.owner, Path: file.Path, Size: info.Size(), ModTime: info.ModTime().UnixNano(), SHA256: digest,
 	}, info)
 	w.pruneTransferReceipts(stage, file.Path, nil)
 	w.pruneTransferReceipts(stage, file.Path+".part", nil)
@@ -231,6 +232,9 @@ func (w *checkpointWorkspace) captureTransferSnapshot(stage *os.Root, receipt ch
 	}
 	defer r.Close()
 	file, err := openRegularDownloadFile(r, "file", os.O_RDONLY)
+	if os.IsNotExist(err) {
+		return checkpointTransferSnapshot{NoProof: true}, true
+	}
 	if err != nil {
 		return checkpointTransferSnapshot{}, false
 	}
@@ -241,6 +245,37 @@ func (w *checkpointWorkspace) captureTransferSnapshot(stage *os.Root, receipt ch
 	}
 	path, _, err := transferStagePath(stage, receipt, proof)
 	return checkpointTransferSnapshot{Path: filepath.ToSlash(path), Size: proof.Size(), ModTime: proof.ModTime().UnixNano(), FileID: checkpointFileID(file, proof)}, err == nil
+}
+
+// A later writer can reuse files recorded by the publication. A new or changed
+// receipt therefore prevents recovery from touching any of the staging files.
+func (w *checkpointWorkspace) canResumeCleanup(stage *os.Root, sealed map[string]checkpointTransferSnapshot) bool {
+	if len(sealed) == 0 {
+		return false
+	}
+	w.indexTransferReceipts()
+	for _, receipts := range w.receipts {
+		for _, receipt := range receipts {
+			previous, ok := sealed[receipt.dirName]
+			if !ok {
+				return false
+			}
+			current, ok := w.captureTransferSnapshot(stage, receipt)
+			if !ok {
+				return false
+			}
+			if current.NoProof {
+				continue // cleanup may already have removed the proof
+			}
+			if current.Path == "" {
+				current.Path = previous.Path // cleanup may already have unlinked the staged entry
+			}
+			if current != previous {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (w *checkpointWorkspace) reclaimTransfers(stage *os.Root, sealed map[string]checkpointTransferSnapshot) {
@@ -392,7 +427,7 @@ func transferStagePath(stage *os.Root, receipt checkpointReceipt, proof os.FileI
 }
 
 func (s checkpointTransferSnapshot) matches(root *os.Root, proof os.FileInfo, path string) bool {
-	if (path != "" && filepath.ToSlash(path) != s.Path) || proof.Size() != s.Size || proof.ModTime().UnixNano() != s.ModTime {
+	if s.NoProof || (path != "" && filepath.ToSlash(path) != s.Path) || proof.Size() != s.Size || proof.ModTime().UnixNano() != s.ModTime {
 		return false
 	}
 	if s.FileID == "" {
@@ -408,15 +443,18 @@ func (s checkpointTransferSnapshot) matches(root *os.Root, proof os.FileInfo, pa
 }
 
 func (r checkpointReceipt) canReclaim(stage *os.Root, path string, info os.FileInfo, renamedPartial bool) bool {
-	if !r.Partial {
-		return info.Size() == r.Size && info.ModTime().UnixNano() == r.ModTime
-	}
-	if !renamedPartial {
+	if r.Partial && !renamedPartial {
 		return true
 	}
-	// The hard link proves identity, while the pre-rename record proves the contents at completion.
-	c := r.Completion
-	if c == nil || c.SHA256 == "" || info.Size() != c.Size || info.ModTime().UnixNano() != c.ModTime {
+	verified := checkpointTransferCompletion{Size: r.Size, ModTime: r.ModTime, SHA256: r.SHA256}
+	if renamedPartial {
+		// A pre-rename record also proves the contents if completion was interrupted.
+		if r.Completion == nil {
+			return false
+		}
+		verified = *r.Completion
+	}
+	if verified.SHA256 == "" || info.Size() != verified.Size || info.ModTime().UnixNano() != verified.ModTime {
 		return false
 	}
 	f, err := openRegularDownloadFile(stage, path, os.O_RDONLY)
@@ -428,8 +466,7 @@ func (r checkpointReceipt) canReclaim(stage *os.Root, path string, info os.FileI
 	if err != nil || !sameCheckpointFileState(info, opened) {
 		return false
 	}
-	digest, err := hashCheckpointFile(File{Path: path, Size: c.Size}, f)
-	return err == nil && digest == c.SHA256 && confirmCheckpointFile(stage, path, f, info) == nil
+	return checkOpenCheckpointDigest(stage, path, File{Path: path, Size: verified.Size, SHA256: verified.SHA256}, f, info) == nil
 }
 
 func (w *checkpointWorkspace) hasCompletedTransfer(path string, info os.FileInfo) bool {

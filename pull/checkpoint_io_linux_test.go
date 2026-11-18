@@ -1,6 +1,7 @@
 package pull
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"io/fs"
 	"os"
@@ -124,10 +125,12 @@ func TestCheckpointReceiptReadsScaleLinearly(t *testing.T) {
 			}
 			defer stage.Close()
 			before := checkpointIOCount(t, "syscr")
+			contents := []byte("weight")
+			digest := fmt.Sprintf("%x", sha256.Sum256(contents))
 			for i := range shards {
 				name := fmt.Sprintf("model-%05d-of-%05d.safetensors", i+1, shards)
 				part := name + ".part"
-				if err := stage.WriteFile(part, []byte("weight"), 0o600); err != nil {
+				if err := stage.WriteFile(part, contents, 0o600); err != nil {
 					t.Fatal(err)
 				}
 				info, err := stage.Lstat(part)
@@ -138,7 +141,7 @@ func TestCheckpointReceiptReadsScaleLinearly(t *testing.T) {
 				if err := stage.Rename(part, name); err != nil {
 					t.Fatal(err)
 				}
-				work.recordTransfer(stage, File{Path: name, Size: info.Size()})
+				work.recordTransfer(stage, File{Path: name, Size: info.Size(), SHA256: digest})
 			}
 			work.Close()
 			recovered, err := lockCheckpointDestination(parent, dest)
@@ -149,8 +152,8 @@ func TestCheckpointReceiptReadsScaleLinearly(t *testing.T) {
 			recovered.reclaimTransfers(stage, recovered.snapshotTransfers(stage))
 			reads := checkpointIOCount(t, "syscr") - before
 			t.Logf("%d shards, %d process read calls", shards, reads)
-			if reads > int64(3*shards+12) {
-				t.Errorf("expected linear receipt reads with fixed overhead, got %d", reads)
+			if reads > int64(6*shards+12) {
+				t.Errorf("expected linear receipt and content reads with fixed overhead, got %d", reads)
 			}
 			if names, err := fs.ReadDir(stage.FS(), "."); err != nil || len(names) != 1 || names[0].Name() != checkpointOwnerName {
 				t.Errorf("expected only the owner record in the stage, got %v, %v", names, err)

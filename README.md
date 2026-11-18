@@ -170,15 +170,18 @@ special.
 For safetensors pulls, `.<destination>.pull2` is a private sibling workspace for each output
 directory. Retry the same destination after an interruption to resume its verified staging data
 or finish cleanup for the matching publication. Cleanup uses the transfer records sealed when
-that checkpoint was published. Older checkpoints remain usable, and recovery leaves their
+that checkpoint was published and leaves the stage alone when a later transfer is detected.
+Older checkpoints remain usable, and recovery leaves their
 stage data in place when no matching cleanup record exists. Resuming an existing `.part`
 requires a transfer record with a matching hard link. On filesystems without hard links,
 interrupted transfers restart from the beginning. If the pull reports an unverified partial,
 inspect the file or choose a different destination.
-Each publication builds a clean directory from the plan. A process killed during publication
+Each publication builds a clean directory from the plan and rechecks the planned digests
+against the file contents. A process killed during publication
 can leave a `publish-*` directory in the workspace while the staging data remains resumable.
 On filesystems with hard links, successful publication reclaims old staged files and partial
-transfers whose records still match the original file. Unrecorded files stay in place. A process
+transfers whose records still match the original file. Completed transfers also need a matching
+content digest. Unrecorded files stay in place. A process
 killed during initialization can leave a `.goinfer-init-*` directory that requires manual
 inspection. The next pull can initialize its workspace independently. On Linux, creating a
 workspace or stage requires filesystem support for `RENAME_NOREPLACE` so a concurrent directory

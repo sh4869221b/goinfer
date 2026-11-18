@@ -747,6 +747,7 @@ func stageCheckpoint(ctx context.Context, work *checkpointWorkspace, root *os.Ro
 			if raw, readErr := readRootCheckpointMetadata(root, f.Path); statErr != nil || !info.Mode().IsRegular() || readErr != nil || !bytes.Equal(raw, planned) {
 				err = replaceRootFile(root, f.Path, planned)
 				if err == nil {
+					f.SHA256 = checkpoint.ConfigDigest(planned)
 					work.recordTransfer(root, f)
 				}
 			}
