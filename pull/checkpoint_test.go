@@ -618,6 +618,240 @@ func TestCheckpoint_interruptedSetNeverPublishes(t *testing.T) {
 	}
 }
 
+func TestCheckpointResumeAfterWeightLayoutChange(t *testing.T) {
+	const repo = "o/tiny"
+	const tokenizerFile = "tokenizer_config.json"
+	const firstShard = "model-00001-of-00002.safetensors"
+	const secondShard = "model-00002-of-00002.safetensors"
+	for _, tc := range []struct {
+		name                               string
+		toSingle, linkedIndex, reuseSingle bool
+	}{
+		{name: "split to single", toSingle: true},
+		{name: "split to single with linked index", toSingle: true, linkedIndex: true},
+		{name: "single to split"},
+		{name: "single to split that reuses the single file", reuseSingle: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withCacheRoot(t)
+			split := shardedTinyRepo(t)
+			split[tokenizerFile] = []byte(`{"model_max_length":2048,"padding_side":"right"}`)
+			weights, err := os.ReadFile("../testdata/llama-tiny/model.safetensors")
+			if err != nil {
+				t.Fatal(err)
+			}
+			single := map[string][]byte{"config.json": split["config.json"], tokenizerFile: split[tokenizerFile], checkpointWeights: weights}
+			if tc.reuseSingle {
+				split[checkpointIndex] = bytes.ReplaceAll(split[checkpointIndex], []byte(firstShard), []byte(checkpointWeights))
+				delete(split, firstShard)
+				split[checkpointWeights] = weights
+			}
+			old, current := single, split
+			if tc.toSingle {
+				old, current = split, single
+			}
+			h := &fakeHF{files: old, failOnce: tokenizerFile}
+			h.serve(t, repo)
+			ctx := t.Context()
+			dest, err := CacheDir(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldPlan, download, err := PrepareCheckpointFor(ctx, repo, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, err := download(ctx, dest, nil); got != "" || err == nil || !strings.Contains(err.Error(), tokenizerFile) {
+				t.Fatalf("expected interruption during %s, got %q, %v", tokenizerFile, got, err)
+			}
+			staging := dest + ".partial"
+			part, err := os.Stat(filepath.Join(staging, tokenizerFile+".part"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.toSingle {
+				if raw, err := os.ReadFile(filepath.Join(staging, checkpointIndex)); err != nil || !bytes.Equal(raw, old[checkpointIndex]) {
+					t.Fatalf("interrupted pull did not stage the old index: %v", err)
+				}
+			}
+			if tc.linkedIndex {
+				stagedIndex := filepath.Join(staging, checkpointIndex)
+				outside := filepath.Join(t.TempDir(), checkpointIndex)
+				if err := os.Rename(stagedIndex, outside); err != nil {
+					t.Fatal(err)
+				}
+				saveCheckpointConfigLink(t, outside, stagedIndex)
+				t.Cleanup(func() {
+					if raw, err := os.ReadFile(outside); err != nil || !bytes.Equal(raw, old[checkpointIndex]) {
+						t.Errorf("cleanup modified the external index target: %v", err)
+					}
+				})
+			}
+			h.mu.Lock()
+			h.files = current
+			h.mu.Unlock()
+			plan, err := PlanCheckpoint(ctx, repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := plan.VerifyPin(oldPlan.TreeDigest()); err == nil {
+				t.Fatal("a new weight layout matched the previous tree pin")
+			}
+			if got, err := Resolve(ctx, "hf:"+repo+":safetensors", nil); got != dest || err != nil {
+				t.Fatalf("resume after layout change = %q, %v; want %s", got, err, dest)
+			}
+			if _, ok := CachedCheckpoint(dest); !ok {
+				t.Fatal("resumed checkpoint failed the offline cache check")
+			}
+			model, err := decoder.Load(dest, decoder.Options{Backend: "cpu"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			model.Close()
+			marker := readTestCheckpointMarker(t, dest)
+			if tc.toSingle {
+				if _, err := os.Lstat(filepath.Join(dest, checkpointIndex)); !os.IsNotExist(err) {
+					t.Errorf("obsolete index survived publication: %v", err)
+				}
+				for _, shard := range []string{firstShard, secondShard} {
+					if _, err := os.Stat(filepath.Join(dest, shard)); err != nil {
+						t.Errorf("cleanup removed previously downloaded shard %s: %v", shard, err)
+					}
+				}
+			}
+			if listed := slices.ContainsFunc(marker.Files, func(f File) bool { return f.Path == checkpointWeights }); listed != (tc.toSingle || tc.reuseSingle) {
+				t.Errorf("single file manifest entry = %t", listed)
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if got := h.ranges[tokenizerFile]; got != fmt.Sprintf("bytes=%d-", part.Size()) {
+				t.Errorf("tokenizer resume Range = %q", got)
+			}
+			if h.hits[checkpointWeights] != 1 {
+				t.Errorf("single weight file should be downloaded exactly once across both pulls: %v", h.hits)
+			}
+		})
+	}
+}
+
+func TestCheckpointLayoutCleanupLeavesOtherDirectoriesAlone(t *testing.T) {
+	const repo = "o/tiny"
+	const spec = "hf:o/tiny:safetensors"
+	for _, completed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("completed=%t", completed), func(t *testing.T) {
+			withCacheRoot(t)
+			split := shardedTinyRepo(t)
+			weights, err := os.ReadFile("../testdata/llama-tiny/model.safetensors")
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := &fakeHF{files: map[string][]byte{"config.json": split["config.json"], checkpointWeights: weights}}
+			h.serve(t, repo)
+			ctx := t.Context()
+			dest, err := CacheDir(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, download, err := PrepareCheckpointFor(ctx, repo, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var indexPath, wantError string
+			if completed {
+				if _, err := download(ctx, dest, nil); err != nil {
+					t.Fatal(err)
+				}
+				indexPath = filepath.Join(dest, checkpointIndex)
+				wantError = "unexpected " + checkpointIndex
+			} else {
+				if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				outside := t.TempDir()
+				saveCheckpointConfigLink(t, outside, dest+".partial")
+				indexPath = filepath.Join(outside, checkpointIndex)
+				wantError = "opening staging directory"
+			}
+			if err := os.WriteFile(indexPath, split[checkpointIndex], 0o644); err != nil {
+				t.Fatal(err)
+			}
+			h.mu.Lock()
+			requests := h.requests
+			h.mu.Unlock()
+			if path, err := download(ctx, dest, nil); path != "" || err == nil || !strings.Contains(err.Error(), wantError) {
+				t.Errorf("download = %q, %v; want refusal mentioning %q", path, err, wantError)
+			}
+			if raw, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(raw, split[checkpointIndex]) {
+				t.Errorf("refusal modified the index: %v", err)
+			}
+			if completed {
+				if _, ok := CachedCheckpoint(dest); ok {
+					t.Error("CachedCheckpoint accepted a completed directory with an unlisted index")
+				}
+				if path, err := Resolve(ctx, spec, nil); path != "" || err == nil || !strings.Contains(err.Error(), wantError) {
+					t.Errorf("Resolve = %q, %v; want the same refusal", path, err)
+				}
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if h.requests != requests {
+				t.Errorf("refusing unsafe staging or completed cache made %d requests", h.requests-requests)
+			}
+		})
+	}
+}
+
+func TestCheckpointLayoutCleanupRejectsReplacedStaging(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires renaming an open staging directory")
+	}
+	const repo = "o/tiny"
+	files := shardedTinyRepo(t)
+	const shard = "model-00001-of-00002.safetensors"
+	h := &fakeHF{files: map[string][]byte{"config.json": files["config.json"], checkpointWeights: files[shard]}}
+	h.serve(t, repo)
+	_, download, err := PrepareCheckpointFor(t.Context(), repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "checkpoint")
+	staging := dest + ".partial"
+	if err := os.Mkdir(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside, moved := t.TempDir(), staging+".moved"
+	for _, dir := range []string{staging, outside} {
+		if err := os.WriteFile(filepath.Join(dir, checkpointIndex), files[checkpointIndex], 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var replaced bool
+	progress := func(done, total int64, name string) {
+		if replaced || done != total || name != checkpointWeights {
+			return
+		}
+		if _, err := os.Stat(filepath.Join(staging, checkpointWeights)); err != nil {
+			return // wait for the callback after Download renames the file
+		}
+		if err := os.Rename(staging, moved); err != nil {
+			t.Fatal(err)
+		}
+		saveCheckpointConfigLink(t, outside, staging)
+		replaced = true
+	}
+	if path, err := download(t.Context(), dest, progress); !replaced || path != "" || err == nil || !strings.Contains(err.Error(), "staging directory changed") {
+		t.Fatalf("download = %q, %v after staging replacement=%t; want refusal", path, err, replaced)
+	}
+	if _, err := os.Lstat(dest); !os.IsNotExist(err) {
+		t.Errorf("the replacement staging path was published: %v", err)
+	}
+	for _, dir := range []string{moved, outside} {
+		if raw, err := os.ReadFile(filepath.Join(dir, checkpointIndex)); err != nil || !bytes.Equal(raw, files[checkpointIndex]) {
+			t.Errorf("refusal modified the index in %s: %v", dir, err)
+		}
+	}
+}
+
 func TestCheckpointResumeUsesPlannedConfig(t *testing.T) {
 	const repo = "o/tiny"
 	const firstShard = "model-00001-of-00002.safetensors"

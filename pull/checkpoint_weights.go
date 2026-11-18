@@ -79,7 +79,7 @@ func verifyCheckpointWeights(root *os.Root, files []File, plannedIndex []byte) e
 		return fmt.Errorf("checkpoint has no config.json entry")
 	}
 	if _, indexed := byPath[checkpointIndex]; !indexed {
-		// An unlisted index in a staging directory or cache would take precedence over the single file.
+		// An unlisted index would take precedence over the single file in the decoder.
 		if _, err := root.Stat(checkpointIndex); err == nil || !os.IsNotExist(err) {
 			return fmt.Errorf("unexpected %s outside the checkpoint file list", checkpointIndex)
 		}

@@ -571,6 +571,24 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 	if err := os.MkdirAll(staging, 0o755); err != nil {
 		return "", err
 	}
+	if err := stageCheckpoint(ctx, p, metadata, staging, progress); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.Rename(staging, dest); err != nil {
+		return "", fmt.Errorf("publishing %s: %w", dest, err)
+	}
+	return dest, nil
+}
+
+func stageCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata, staging string, progress func(done, total int64, file string)) error {
+	root, err := openCheckpointStaging(staging)
+	if err != nil {
+		return fmt.Errorf("opening staging directory %s: %w", staging, err)
+	}
+	defer root.Close()
 	var done int64
 	for _, f := range p.Files {
 		var err error
@@ -586,39 +604,92 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 			})
 		}
 		if err != nil {
-			return "", fmt.Errorf("%s (file %s; re-run to resume, the files already verified are kept): %w", p.Repo, f.Path, err)
+			return fmt.Errorf("%s (file %s; re-run to resume, the files already verified are kept): %w", p.Repo, f.Path, err)
 		}
 		done += f.Size
 		if progress != nil {
 			progress(done, p.Bytes, f.Path)
 		}
 	}
-	markerFiles, err := checkpointMarkerFiles(staging, p, metadata)
+	info, err := os.Lstat(staging)
 	if err != nil {
-		return "", fmt.Errorf("checking staged checkpoint %s: %w", staging, err)
+		return err
+	}
+	if err := checkCheckpointStaging(root, info); err != nil {
+		return fmt.Errorf("checking staging directory %s: %w", staging, err)
+	}
+	if metadata.index == nil {
+		// Only the index can shadow the new layout. Existing weights may be useful to a later retry.
+		if err := discardStagedIndex(root); err != nil {
+			return fmt.Errorf("removing stale %s in %s: %w", checkpointIndex, staging, err)
+		}
+	}
+	markerFiles, err := checkpointMarkerFiles(root, p, metadata)
+	if err != nil {
+		return fmt.Errorf("checking staged checkpoint %s: %w", staging, err)
 	}
 	mb, err := json.MarshalIndent(markerDoc{Repo: p.Repo, Files: markerFiles}, "", " ")
 	if err != nil {
-		return "", err
+		return err
 	}
-	if err := os.WriteFile(filepath.Join(staging, checkpointMarker), mb, 0o644); err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		return "", err
-	}
-	if err := os.Rename(staging, dest); err != nil {
-		return "", fmt.Errorf("publishing %s: %w", dest, err)
-	}
-	return dest, nil
+	return root.WriteFile(checkpointMarker, mb, 0o644)
 }
 
-func checkpointMarkerFiles(staging string, p Plan, metadata checkpointMetadata) ([]File, error) {
-	root, err := os.OpenRoot(staging)
+// Open the staging directory itself before any transfer writes, then keep cleanup rooted there.
+func openCheckpointStaging(staging string) (*os.Root, error) {
+	parent, err := os.OpenRoot(filepath.Dir(staging))
 	if err != nil {
 		return nil, err
 	}
-	defer root.Close()
+	defer parent.Close()
+	name := filepath.Base(staging)
+	info, err := parent.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("staging path must be a directory")
+	}
+	root, err := parent.OpenRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkCheckpointStaging(root, info); err != nil {
+		root.Close()
+		return nil, err
+	}
+	return root, nil
+}
+
+func checkCheckpointStaging(root *os.Root, info os.FileInfo) error {
+	opened, err := root.Stat(".")
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || !os.SameFile(info, opened) {
+		return fmt.Errorf("staging directory changed")
+	}
+	return nil
+}
+
+func discardStagedIndex(root *os.Root) error {
+	info, err := root.Lstat(checkpointIndex)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("expected a regular file or symlink")
+	}
+	if err := root.Remove(checkpointIndex); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func checkpointMarkerFiles(root *os.Root, p Plan, metadata checkpointMetadata) ([]File, error) {
 	if err := verifyCheckpointWeights(root, p.Files, metadata.index); err != nil {
 		return nil, err
 	}
