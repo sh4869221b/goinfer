@@ -9,6 +9,8 @@ import (
 	"path"
 	"slices"
 	"strconv"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/checkpoint"
 )
 
 // gemma4BidirectionalAttention is Config.UseBidirectionalAttention's type; see that field for why a plain string is unsafe.
@@ -1312,6 +1314,19 @@ func loadConfig(fsys fs.FS, name string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decoder: read %s: %w", name, err)
 	}
+	return parseConfig(fsys, name, b)
+}
+
+func loadDirConfig(dir string) (*Config, error) {
+	fsys := os.DirFS(dir)
+	b, err := checkpoint.ReadConfig(dir)
+	if err != nil {
+		return nil, fmt.Errorf("decoder: read config.json: %w", err)
+	}
+	return parseConfig(fsys, "config.json", b)
+}
+
+func parseConfig(fsys fs.FS, name string, b []byte) (*Config, error) {
 	b = lenientConfigJSON(b) // Python's Infinity and NaN, as released configs carry them; request bodies stay strict
 	var c Config
 	if err := json.Unmarshal(b, &c); err != nil {

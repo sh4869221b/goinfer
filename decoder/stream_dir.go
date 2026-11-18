@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 )
 
 // streamDirSwapForTest writes layers 0 and 1 of a streamed directory transcode in each other's place: G-DS1's planted
@@ -35,7 +34,7 @@ func StreamTranscodeDir(ctx context.Context, dir string, out io.Writer, quant st
 	if q.half16() {
 		return 0, fmt.Errorf("decoder: quant %q has no bundle form (a CPU-path load mode)", quant)
 	}
-	cfg, err := loadConfig(os.DirFS(dir), "config.json")
+	cfg, err := loadDirConfig(dir)
 	if err != nil {
 		return 0, err
 	}

@@ -9,8 +9,9 @@ import (
 	"hash"
 	"math"
 	"os"
-	"path/filepath"
 	"reflect"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/checkpoint"
 )
 
 // programFingerprint is a SHA-256 over p's operations and parameters: VK4's program fingerprint
@@ -92,7 +93,11 @@ func configExperts(a *Architecture) func(int) bool {
 // from whether the checkpoint has an lm_head tensor; from a config the best reading is tie_word_embeddings (top level,
 // or under text_config), and where it is absent the adapter's default stands.
 func programForConfigDir(dir string) (*layerProgram, error) {
-	cfg, err := loadConfig(os.DirFS(dir), "config.json")
+	raw, err := checkpoint.ReadConfig(dir)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := parseConfig(os.DirFS(dir), "config.json", raw)
 	if err != nil {
 		return nil, err
 	}
@@ -100,18 +105,14 @@ func programForConfigDir(dir string) (*layerProgram, error) {
 	if err != nil {
 		return nil, err
 	}
-	if tied, ok := configTie(dir); ok {
+	if tied, ok := configTie(raw); ok {
 		arch.TiedLMHead = tied
 	}
 	return buildProgram(arch, configExperts(arch)), nil
 }
 
-// configTie reads tie_word_embeddings from the config.json in dir.
-func configTie(dir string) (tied, ok bool) {
-	b, err := os.ReadFile(filepath.Join(dir, "config.json"))
-	if err != nil {
-		return false, false
-	}
+// configTie reads tie_word_embeddings from the same config bytes used to build the program.
+func configTie(b []byte) (tied, ok bool) {
 	var c struct {
 		Tie  *bool `json:"tie_word_embeddings"`
 		Text struct {

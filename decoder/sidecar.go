@@ -19,6 +19,8 @@ import (
 	"github.com/townsendmerino/goinfer/internal/runtime/diskfree"
 	"github.com/townsendmerino/goinfer/internal/runtime/giw"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/checkpoint"
 )
 
 // metaPrefixCap bounds how much of the source GGUF we read to extract the tokenizer
@@ -256,6 +258,11 @@ func residentDirBody(w io.Writer, dir, lora, quant string, embedInt4 bool, targe
 // being silently served). The one-time transcode is logged to stderr (it can take minutes and write
 // tens of GB) so a slow first start isn't mistaken for a hang. Returns the .giw path to load.
 func EnsureCachedGIW(ctx context.Context, ggufPath, quant, backend string, embedInt4 bool) (string, error) {
+	if isDir(ggufPath) {
+		if _, err := checkpoint.ReadVerifiedConfig(ggufPath); err != nil {
+			return "", err
+		}
+	}
 	target := GIWTargetForBackend(backend)
 	cache := streamCachePath(ggufPath, quant, embedInt4, target)
 	if freshCache(cache, legacyCachePath(ggufPath, quant, embedInt4, target), ggufPath) {
@@ -459,7 +466,7 @@ func gatherTableTag(src, quant string, embedInt4 bool) string {
 // the GGUF's tensor directory or the directory's config.json. An unreadable source reads as false.
 func hasPerLayerTable(src string) bool {
 	if isDir(src) {
-		raw, err := os.ReadFile(filepath.Join(src, "config.json"))
+		raw, err := checkpoint.ReadConfig(src)
 		if err != nil {
 			return false
 		}

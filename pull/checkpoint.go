@@ -14,6 +14,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/checkpoint"
 )
 
 // A safetensors checkpoint as a pull target (docs/tasks/task-checkpoint-fetch-2026-09.md). GGUF is one
@@ -26,8 +28,6 @@ import (
 // CheckpointSelector is the selector that names a repo's safetensors checkpoint ("owner/repo:safetensors"). No GGUF
 // quant is called that, so it cannot shadow a quant selector.
 const CheckpointSelector = "safetensors"
-
-const maxCheckpointConfigBytes = 4 << 20
 
 type checkpointConfig struct {
 	ModelType  string `json:"model_type"`
@@ -199,13 +199,6 @@ func PlanCheckpoint(ctx context.Context, repo string) (Plan, error) {
 	return PlanCheckpointFor(ctx, repo, generativeLoads)
 }
 
-func checkCheckpointLayout(repo, modelType string) error {
-	if modelType == "plamo3" {
-		return fmt.Errorf("repo %s uses PLaMo 3, which requires tokenizer.jsonl: built-in checkpoint pull does not support this layout; download the official checkpoint to a local directory and use demo/plamo-translate (docs/plamo3.md)", repo)
-	}
-	return nil
-}
-
 // PlanCheckpointFor is PlanCheckpoint with the caller's model_type check. loads names the family that will load the
 // checkpoint, or returns why it cannot, and a refusal still comes after reading config.json and before any weight file.
 // serve's -embed-model uses it with its encoder's own check, because an embedding encoder is not a generative family in
@@ -222,7 +215,7 @@ func PlanCheckpointFor(ctx context.Context, repo string, loads func(modelType st
 	if _, ok := byPath["config.json"]; !ok {
 		return Plan{}, fmt.Errorf("repo %s has no config.json: not a safetensors (transformers) checkpoint", repo)
 	}
-	cfgRaw, err := fetchSmall(ctx, repo, "config.json", maxCheckpointConfigBytes)
+	cfgRaw, err := fetchSmall(ctx, repo, "config.json", checkpoint.MaxConfigBytes)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -237,7 +230,7 @@ func PlanCheckpointFor(ctx context.Context, repo string, loads func(modelType st
 	if err != nil {
 		return Plan{}, fmt.Errorf("repo %s is %w; nothing was downloaded", repo, err)
 	}
-	if err := checkCheckpointLayout(repo, cfg.ModelType); err != nil {
+	if err := checkpoint.CheckLayout(repo, cfg.ModelType); err != nil {
 		return Plan{}, err
 	}
 	p := Plan{Repo: repo, ModelType: cfg.ModelType, Family: fam, Dtype: cfg.TorchDtype}
@@ -332,7 +325,7 @@ func (p Plan) SizeNote() string {
 
 // checkpointMarker is the file a completed checkpoint directory carries: the plan it was built from, so a later pull or
 // Resolve can tell a complete, goinfer-pulled checkpoint from anything else at that path and verify it offline.
-const checkpointMarker = ".goinfer-checkpoint.json"
+const checkpointMarker = checkpoint.MarkerName
 
 type markerDoc struct {
 	Repo  string `json:"repo"`
@@ -342,11 +335,22 @@ type markerDoc struct {
 // checkpointComplete reports whether dir is a complete checkpoint for these files: the marker is there, names the same
 // files, and the files and layout verify.
 func checkpointComplete(dir string, files []File) bool {
-	m, ok := readCheckpointMarker(dir)
-	if !ok || !slices.Equal(m.Files, files) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
 		return false
 	}
-	ok, _ = verifyCachedCheckpoint(dir, m)
+	defer root.Close()
+	m, ok := readCheckpointMarker(root)
+	if !ok || !slices.EqualFunc(m.Files, files, func(got, want File) bool {
+		// A locally computed config hash does not change the remote plan or its pin.
+		if want.Path == "config.json" && want.SHA256 == "" {
+			got.SHA256 = ""
+		}
+		return got == want
+	}) {
+		return false
+	}
+	ok, _ = verifyCachedCheckpoint(dir, root, m)
 	return ok
 }
 
@@ -360,40 +364,44 @@ func CachedCheckpoint(dir string) (string, bool) {
 
 // checkCachedCheckpoint reports an unusable config or unsupported layout separately from a cache miss.
 func checkCachedCheckpoint(dir string) (bool, error) {
-	m, ok := readCheckpointMarker(dir)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return false, nil
+	}
+	defer root.Close()
+	m, ok := readCheckpointMarker(root)
 	if !ok {
 		return false, nil
 	}
-	return verifyCachedCheckpoint(dir, m)
+	return verifyCachedCheckpoint(dir, root, m)
 }
 
-func readCheckpointMarker(dir string) (markerDoc, bool) {
-	var m markerDoc
-	b, err := os.ReadFile(filepath.Join(dir, checkpointMarker))
-	if err != nil || json.Unmarshal(b, &m) != nil || len(m.Files) == 0 {
+func readCheckpointMarker(root *os.Root) (markerDoc, bool) {
+	marker, err := checkpoint.ReadMarker(root)
+	if err != nil || len(marker.Files) == 0 {
 		return markerDoc{}, false
+	}
+	m := markerDoc{Repo: marker.Repo, Files: make([]File, 0, len(marker.Files))}
+	for _, f := range marker.Files {
+		m.Files = append(m.Files, File(f))
 	}
 	return m, true
 }
 
-func verifyCachedCheckpoint(dir string, m markerDoc) (bool, error) {
-	config, err := readCachedCheckpointConfig(dir)
+func verifyCachedCheckpoint(dir string, root *os.Root, m markerDoc) (bool, error) {
+	config, err := checkpoint.ReadRootConfig(root)
 	if err != nil {
 		return false, fmt.Errorf("cached checkpoint %s: config.json must be a readable regular file inside the checkpoint directory: %w", dir, err)
 	}
 	if config != nil {
-		var cfg checkpointConfig
-		if err := json.Unmarshal(config, &cfg); err != nil {
-			return false, fmt.Errorf("cached checkpoint %s: parsing config.json: %w", dir, err)
-		}
-		if err := checkCheckpointLayout(m.Repo, cfg.ModelType); err != nil {
+		if err := checkpoint.ValidateConfig(m.Repo, config); err != nil {
 			return false, fmt.Errorf("cached checkpoint %s: %w", dir, err)
 		}
 	}
 	for _, f := range m.Files {
 		if f.Path == "config.json" {
 			// Verify the same bytes used for the layout check without following the link again.
-			if config == nil || int64(len(config)) != f.Size || f.SHA256 != "" && fmt.Sprintf("%x", sha256.Sum256(config)) != f.SHA256 {
+			if !checkpoint.ConfigMatches(config, f.Size, f.SHA256) {
 				return false, nil
 			}
 		} else if _, ok := cachedIntact(filepath.Join(dir, filepath.FromSlash(path.Dir(f.Path))), f); !ok {
@@ -409,132 +417,7 @@ func readCachedCheckpointConfig(dir string) ([]byte, error) {
 		return nil, err
 	}
 	defer root.Close()
-	name := "config.json"
-	info, err := root.Lstat(name)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		name, info, err = resolveCachedConfigLink(root, name)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("config target is not a regular file")
-	}
-	if info.Size() > maxCheckpointConfigBytes {
-		return nil, fmt.Errorf("config exceeds %d bytes", maxCheckpointConfigBytes)
-	}
-	f, err := root.Open(name)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	opened, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-		return nil, fmt.Errorf("config target changed while opening")
-	}
-	raw, err := io.ReadAll(io.LimitReader(f, maxCheckpointConfigBytes+1))
-	if len(raw) > maxCheckpointConfigBytes {
-		return nil, fmt.Errorf("config exceeds %d bytes", maxCheckpointConfigBytes)
-	}
-	return raw, err
-}
-
-// Expand each component through root so an absolute link can be converted to a rooted name at any hop.
-func resolveCachedConfigLink(root *os.Root, name string) (string, os.FileInfo, error) {
-	const maxLinks = 40
-	pending := []string{name}
-	var parents []string
-	links := 0
-	for len(pending) != 0 {
-		part := pending[0]
-		pending = pending[1:]
-		switch part {
-		case "", ".":
-			continue
-		case "..":
-			if len(parents) == 0 {
-				return "", nil, fmt.Errorf("relative config link leaves the checkpoint directory")
-			}
-			parents = parents[:len(parents)-1]
-			continue
-		}
-		name := filepath.Join(append(parents, part)...)
-		info, err := root.Lstat(name)
-		if err != nil {
-			return "", nil, err
-		}
-		if info.Mode()&os.ModeSymlink == 0 {
-			if len(pending) == 0 {
-				return name, info, nil
-			}
-			if !info.IsDir() {
-				return "", nil, fmt.Errorf("config link component %q is not a directory", name)
-			}
-			parents = append(parents, part)
-			continue
-		}
-		links++
-		if links > maxLinks {
-			return "", nil, fmt.Errorf("config link exceeds %d symlink hops", maxLinks)
-		}
-		target, err := root.Readlink(name)
-		if err != nil {
-			return "", nil, err
-		}
-		if filepath.IsAbs(target) {
-			target, err = rootedConfigTarget(root, target, len(pending) != 0)
-			if err != nil {
-				return "", nil, err
-			}
-			parents = nil
-		} else if filepath.VolumeName(target) != "" || strings.HasPrefix(filepath.ToSlash(target), "/") {
-			return "", nil, fmt.Errorf("config link has no local relative target")
-		}
-		pending = append(strings.Split(filepath.ToSlash(target), "/"), pending...)
-	}
-	return "", nil, fmt.Errorf("config target is not a regular file")
-}
-
-// Match the first absolute directory prefix with the identity of the open root. Once inside,
-// the remainder is resolved through root, including links that might try to leave it again.
-func rootedConfigTarget(root *os.Root, target string, directory bool) (string, error) {
-	if filepath.Clean(target) != target {
-		return "", fmt.Errorf("absolute config link is not canonical")
-	}
-	rootInfo, err := root.Stat(".")
-	if err != nil {
-		return "", err
-	}
-	var prefixes []string
-	lastDir := filepath.Dir(target)
-	if directory {
-		lastDir = target
-	}
-	for dir := lastDir; ; dir = filepath.Dir(dir) {
-		prefixes = append(prefixes, dir)
-		if filepath.Dir(dir) == dir {
-			break
-		}
-	}
-	for i := len(prefixes) - 1; i >= 0; i-- {
-		info, err := os.Stat(prefixes[i])
-		if err != nil {
-			return "", err
-		}
-		if os.SameFile(rootInfo, info) {
-			return filepath.Rel(prefixes[i], target)
-		}
-	}
-	return "", fmt.Errorf("absolute config link leaves the checkpoint directory")
+	return checkpoint.ReadRootConfig(root)
 }
 
 // DownloadCheckpoint fetches every file in p into dest and returns dest. The set is assembled in a staging directory
@@ -583,7 +466,24 @@ func DownloadCheckpoint(ctx context.Context, p Plan, dest string, progress func(
 			progress(done, p.Bytes, f.Path)
 		}
 	}
-	mb, err := json.MarshalIndent(markerDoc{Repo: p.Repo, Files: p.Files}, "", " ")
+	markerFiles := slices.Clone(p.Files)
+	for i, file := range markerFiles {
+		if file.Path != "config.json" {
+			continue
+		}
+		raw, err := readCachedCheckpointConfig(staging)
+		if err != nil {
+			return "", fmt.Errorf("checking staged config.json: %w", err)
+		}
+		if !checkpoint.ConfigMatches(raw, file.Size, file.SHA256) {
+			return "", fmt.Errorf("staged config.json does not match the checkpoint plan")
+		}
+		if err := checkpoint.ValidateConfig(p.Repo, raw); err != nil {
+			return "", err
+		}
+		markerFiles[i].SHA256 = checkpoint.ConfigDigest(raw)
+	}
+	mb, err := json.MarshalIndent(markerDoc{Repo: p.Repo, Files: markerFiles}, "", " ")
 	if err != nil {
 		return "", err
 	}

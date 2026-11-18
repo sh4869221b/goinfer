@@ -38,6 +38,8 @@ import (
 	"time"
 
 	"github.com/townsendmerino/goinfer/internal/runtime/diskfree"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/checkpoint"
 )
 
 // hfAPI and hfCDN are split because they are different services with different failure
@@ -707,11 +709,7 @@ func render(files []File) string {
 // CacheRoot is the directory every pulled model lands under: <user cache>/goinfer/models. The serve
 // web UI confines its load route to it, so CacheDir must stay a subdirectory of this.
 func CacheRoot() (string, error) {
-	base, err := os.UserCacheDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(base, "goinfer", "models"), nil
+	return checkpoint.CacheRoot()
 }
 
 // CacheHelp is the sentence --help prints about where `pull` puts models and what moves it

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -424,6 +425,99 @@ func saveCheckpointConfigLink(t *testing.T, target, link string) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestPublicCheckpointLoadsRecheckConfig(t *testing.T) {
+	withCacheRoot(t)
+	const repo = "o/tiny"
+	files := shardedTinyRepo(t)
+	h := &fakeHF{files: files}
+	h.serve(t, repo)
+	dir, err := Resolve(t.Context(), "hf:"+repo+":safetensors", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.json")
+	outside := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(outside, files["config.json"], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaders := []struct {
+		name string
+		load func(string) error
+	}{
+		{"Load", func(p string) error {
+			m, err := decoder.Load(p, decoder.Options{DirectLoad: true})
+			if err != nil {
+				return err
+			}
+			return m.Close()
+		}},
+		{"LoadWeights", func(p string) error {
+			_, err := decoder.LoadWeights(p)
+			return err
+		}},
+		{"StreamTranscodeDir", func(p string) error {
+			_, err := decoder.StreamTranscodeDir(t.Context(), p, io.Discard, "f32", false, decoder.GIWTargetNone, "tiny")
+			return err
+		}},
+	}
+	checkRefusal := func(t *testing.T, dir, want string) {
+		t.Helper()
+		for _, loader := range loaders {
+			t.Run(loader.name, func(t *testing.T) {
+				if err := loader.load(dir); err == nil || !strings.Contains(err.Error(), want) {
+					t.Fatalf("want error containing %q, got %v", want, err)
+				}
+			})
+		}
+	}
+	t.Run("outside link after Resolve", func(t *testing.T) {
+		if err := os.Remove(configPath); err != nil {
+			t.Fatal(err)
+		}
+		saveCheckpointConfigLink(t, outside, configPath)
+		checkRefusal(t, dir, "inside the checkpoint directory")
+		if err := os.Remove(configPath); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("same-size config change", func(t *testing.T) {
+		original := files["config.json"]
+		changed := bytes.Replace(original, []byte(`"eos_token_id": 2`), []byte(`"eos_token_id": 3`), 1)
+		if bytes.Equal(changed, original) || len(changed) != len(original) {
+			t.Fatal("fixture must change content without changing length")
+		}
+		if err := os.WriteFile(configPath, changed, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		checkRefusal(t, dir, "config.json does not match the checkpoint marker")
+		if err := os.WriteFile(configPath, original, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("missing marker after Resolve", func(t *testing.T) {
+		if err := os.Remove(filepath.Join(dir, checkpointMarker)); err != nil {
+			t.Fatal(err)
+		}
+		checkRefusal(t, dir, "checkpoint marker")
+		alias := filepath.Join(t.TempDir(), "alias")
+		saveCheckpointConfigLink(t, dir, alias)
+		checkRefusal(t, alias, "checkpoint marker")
+	})
+	t.Run("local directory keeps external config links", func(t *testing.T) {
+		local := filepath.Join(t.TempDir(), "local")
+		if err := os.Rename(dir, local); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(local, "config.json")); err != nil {
+			t.Fatal(err)
+		}
+		saveCheckpointConfigLink(t, outside, filepath.Join(local, "config.json"))
+		if err := loaders[0].load(local); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 // TestCheckpoint_shardedRoundTrip is P9's first gate (docs/tasks/task-checkpoint-fetch-2026-09.md): a safetensors
