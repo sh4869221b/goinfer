@@ -861,13 +861,12 @@ func TestCheckpointLayoutCleanupRejectsReplacedStaging(t *testing.T) {
 	if _, err := os.Lstat(dest); !os.IsNotExist(err) {
 		t.Errorf("the replacement staging path was published: %v", err)
 	}
-	if raw, err := os.ReadFile(filepath.Join(moved, checkpointWeights)); err != nil || !bytes.Equal(raw, files[shard]) {
-		t.Errorf("transfer did not stay with the original staging directory: %v", err)
-	}
-	if _, err := os.Lstat(filepath.Join(outside, checkpointWeights)); !os.IsNotExist(err) {
-		t.Errorf("transfer wrote through the replaced staging path: %v", err)
-	}
 	for _, dir := range []string{moved, outside} {
+		for _, name := range []string{checkpointWeights, checkpointWeights + ".part"} {
+			if _, err := os.Lstat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+				t.Errorf("transfer wrote %s in %s after the staging replacement: %v", name, dir, err)
+			}
+		}
 		if raw, err := os.ReadFile(filepath.Join(dir, checkpointIndex)); err != nil || !bytes.Equal(raw, files[checkpointIndex]) {
 			t.Errorf("refusal modified the index in %s: %v", dir, err)
 		}

@@ -76,8 +76,9 @@ func ConfigMatches(raw []byte, size int64, digest string) bool {
 func ConfigDigest(raw []byte) string { return fmt.Sprintf("%x", sha256.Sum256(raw)) }
 
 type Marker struct {
-	Repo  string `json:"repo"`
-	Files []struct {
+	Repo        string `json:"repo"`
+	Publication string `json:"publication,omitempty"`
+	Files       []struct {
 		Path   string
 		Size   int64
 		SHA256 string

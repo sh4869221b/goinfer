@@ -13,9 +13,10 @@ import (
 )
 
 const (
-	checkpointStageName  = "stage"
-	checkpointOwnerName  = ".goinfer-owner.json"
-	checkpointWorkSuffix = ".pull2"
+	checkpointStageName       = "stage"
+	checkpointOwnerName       = ".goinfer-owner.json"
+	checkpointWorkSuffix      = ".pull2"
+	checkpointPublicationName = ".goinfer-publication.json"
 )
 
 func checkpointWorkspaceName(dest string) string { return "." + dest + checkpointWorkSuffix }
@@ -31,6 +32,11 @@ type checkpointWorkspace struct {
 type checkpointWorkspaceOwner struct {
 	Destination string `json:"destination"`
 	Token       string `json:"token"`
+}
+
+type checkpointPublication struct {
+	Owner checkpointWorkspaceOwner `json:"owner"`
+	Token string                   `json:"token"`
 }
 
 func (w *checkpointWorkspace) Close() {
@@ -106,7 +112,10 @@ func lockCheckpointWorkspace(parent *os.Root, dest string, create bool) (*checkp
 
 // A finished destination can be reused while its writer is still cleaning up.
 // Retry interrupted cleanup only when the existing workspace can be locked.
-func recoverCheckpointTransfers(dest string, complete os.FileInfo) {
+func recoverCheckpointTransfers(dest string, complete *completedCheckpoint) {
+	if complete.publication == "" {
+		return
+	}
 	parent, err := os.OpenRoot(filepath.Dir(filepath.Clean(dest)))
 	if err != nil {
 		return
@@ -121,9 +130,9 @@ func recoverCheckpointTransfers(dest string, complete os.FileInfo) {
 	work.reclaimCompletedStage(parent, name, complete)
 }
 
-func (w *checkpointWorkspace) reclaimCompletedStage(parent *os.Root, dest string, complete os.FileInfo) {
+func (w *checkpointWorkspace) reclaimCompletedStage(parent *os.Root, dest string, complete *completedCheckpoint) {
 	info, err := parent.Stat(dest)
-	if err != nil || !os.SameFile(info, complete) {
+	if err != nil || !os.SameFile(info, complete.directory) {
 		return
 	}
 	stage, err := w.openStage(false)
@@ -131,7 +140,30 @@ func (w *checkpointWorkspace) reclaimCompletedStage(parent *os.Root, dest string
 		return
 	}
 	defer stage.Close()
-	w.reclaimTransfers(stage)
+	if w.matchesPublication(stage, complete.publication) {
+		w.reclaimTransfers(stage)
+	}
+}
+
+// Rotate the stage token before mutating any files. A restored checkpoint from an earlier
+// publication cannot authorize cleanup of a later transfer at the same destination.
+func (w *checkpointWorkspace) beginPublication(stage *os.Root) (string, error) {
+	var old checkpointPublication
+	err := readCheckpointWorkspaceRecord(stage, checkpointPublicationName, &old)
+	if !os.IsNotExist(err) && (err != nil || old.Owner != w.owner || old.Token == "") {
+		return "", fmt.Errorf("%s has no verified owner", checkpointPublicationName)
+	}
+	next := checkpointPublication{Owner: w.owner, Token: rand.Text()}
+	raw, err := json.Marshal(next)
+	if err != nil {
+		return "", err
+	}
+	return next.Token, replaceRootFile(stage, checkpointPublicationName, raw)
+}
+
+func (w *checkpointWorkspace) matchesPublication(stage *os.Root, token string) bool {
+	var record checkpointPublication
+	return token != "" && readCheckpointWorkspaceRecord(stage, checkpointPublicationName, &record) == nil && record.Owner == w.owner && record.Token == token
 }
 
 // Keep the stable workspace or stage name absent until its owner is fully recorded.
@@ -179,20 +211,24 @@ func writeCheckpointOwner(root *os.Root, owner checkpointWorkspaceOwner) error {
 
 func readCheckpointOwner(root *os.Root) (checkpointWorkspaceOwner, error) {
 	var owner checkpointWorkspaceOwner
-	file, err := openRegularDownloadFile(root, checkpointOwnerName, os.O_RDONLY)
+	err := readCheckpointWorkspaceRecord(root, checkpointOwnerName, &owner)
+	return owner, err
+}
+
+func readCheckpointWorkspaceRecord(root *os.Root, name string, value any) error {
+	file, err := openRegularDownloadFile(root, name, os.O_RDONLY)
 	if err != nil {
-		return owner, err
+		return err
 	}
 	defer file.Close()
 	raw, err := io.ReadAll(io.LimitReader(file, 4097))
 	if err != nil {
-		return owner, err
+		return err
 	}
 	if len(raw) > 4096 {
-		return owner, fmt.Errorf("checkpoint owner record is too large")
+		return fmt.Errorf("checkpoint workspace record %s is too large", name)
 	}
-	err = json.Unmarshal(raw, &owner)
-	return owner, err
+	return json.Unmarshal(raw, value)
 }
 
 func (w *checkpointWorkspace) openStage(create bool) (*os.Root, error) {
@@ -214,6 +250,14 @@ func (w *checkpointWorkspace) openStage(create bool) (*os.Root, error) {
 		return nil, fmt.Errorf("staging directory has no verified owner for %s; existing data was kept", w.owner.Destination)
 	}
 	return stage, nil
+}
+
+func (w *checkpointWorkspace) checkStageIdentity(stage *os.Root) error {
+	info, err := w.root.Lstat(checkpointStageName)
+	if err != nil {
+		return err
+	}
+	return checkCheckpointStaging(stage, info)
 }
 
 func reusableStagedFile(root *os.Root, name string, f File) bool {
@@ -265,7 +309,7 @@ func hashCheckpointFile(f File, r io.Reader) (string, error) {
 
 // publishCheckpoint builds a clean directory from the plan. Staging keeps its
 // identity, including when the writer is killed before the final rename.
-func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Root, dest string, p Plan, metadata checkpointMetadata) error {
+func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Root, dest string, p Plan, metadata checkpointMetadata, publication string) error {
 	workspace, err := parent.Lstat(work.name)
 	if err != nil {
 		return err
@@ -273,11 +317,7 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 	if err := checkCheckpointStaging(work.root, workspace); err != nil {
 		return err
 	}
-	stageInfo, err := work.root.Lstat(checkpointStageName)
-	if err != nil {
-		return err
-	}
-	if err := checkCheckpointStaging(stage, stageInfo); err != nil {
+	if err := work.checkStageIdentity(stage); err != nil {
 		return err
 	}
 	name := "publish-" + rand.Text()
@@ -306,7 +346,7 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 	if err != nil {
 		return err
 	}
-	marker, err := json.MarshalIndent(markerDoc{Repo: p.Repo, Files: files}, "", " ")
+	marker, err := json.MarshalIndent(markerDoc{Repo: p.Repo, Files: files, Publication: publication}, "", " ")
 	if err != nil {
 		return err
 	}
@@ -329,6 +369,9 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 	}
 	if err := renameCheckpointPublication(parent, relativePublish, dest); err != nil {
 		return err
+	}
+	if !work.matchesPublication(stage, publication) {
+		return nil
 	}
 	// Remove only the source files that were published. Unlisted data in the
 	// workspace may belong to someone else, even when the stage belongs to us.

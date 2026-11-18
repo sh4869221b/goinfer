@@ -798,6 +798,15 @@ func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File
 			h.Reset()
 		}
 	}
+	finish := func(transferRoot *os.Root, src, target string, verified os.FileInfo, id string) error {
+		if err := commitDownload(transferRoot, src, target, verified, id, f.SHA256); err != nil {
+			return err
+		}
+		if work != nil {
+			work.recordCompletedTransfer(root, f, verified)
+		}
+		return nil
+	}
 
 	resp, err := getRange(ctx, hfCDN+"/"+repo+"/resolve/main/"+f.Path, resumeFrom)
 	if err != nil {
@@ -828,7 +837,7 @@ func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File
 				return fmt.Errorf("checksum mismatch for %s:\n  want %s (declared by HuggingFace)\n  got  %s\nthe local partial download was already complete but corrupt; removed, re-run to refetch", f.Path, f.SHA256, got)
 			}
 		}
-		return commitDownload(root, part, final, prefixInfo, prefixID, f.SHA256)
+		return finish(root, part, final, prefixInfo, prefixID)
 	default:
 		return fmt.Errorf("downloading %s: HuggingFace returned %s", f.Path, resp.Status)
 	}
@@ -840,7 +849,13 @@ func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File
 	if newPart {
 		flags |= os.O_CREATE | os.O_EXCL
 	}
-	out, err := openRegularDownloadFile(root, part, flags)
+	var out *os.File
+	var privatePart string
+	if newPart && work != nil {
+		out, privatePart, err = work.createPartial(root, part, f.SHA256)
+	} else {
+		out, err = openRegularDownloadFile(root, part, flags)
+	}
 	if err != nil {
 		return err
 	}
@@ -858,9 +873,6 @@ func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File
 			out.Close()
 			return err
 		}
-	}
-	if newPart && work != nil {
-		work.recordPartial(root, part, opened)
 	}
 	total := f.Size
 	if total <= 0 {
@@ -888,13 +900,20 @@ func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File
 	if verified.Size() != pw.done {
 		return fmt.Errorf("partial %s changed size during transfer", part)
 	}
+	transferRoot := root
+	if privatePart != "" {
+		if err := work.checkStageIdentity(root); err != nil {
+			return err
+		}
+		transferRoot, part, final = work.root, privatePart, filepath.Join(checkpointStageName, final)
+	}
 	if f.SHA256 != "" {
 		if got := hex.EncodeToString(h.Sum(nil)); got != f.SHA256 {
-			removeUnchangedDownloadFile(root, part, verified)
+			removeUnchangedDownloadFile(transferRoot, part, verified)
 			return fmt.Errorf("checksum mismatch for %s:\n  want %s (declared by HuggingFace)\n  got  %s\nthe download was corrupted or the file changed upstream; nothing was written", f.Path, f.SHA256, got)
 		}
 	}
-	return commitDownload(root, part, final, verified, fileID, f.SHA256)
+	return finish(transferRoot, part, final, verified, fileID)
 }
 
 func removeUnchangedDownloadFile(root *os.Root, name string, verified os.FileInfo) {
@@ -903,11 +922,13 @@ func removeUnchangedDownloadFile(root *os.Root, name string, verified os.FileInf
 	}
 }
 
+var renameCompletedDownload = (*os.Root).Rename
+
 func commitDownload(root *os.Root, part, final string, verified os.FileInfo, id, digest string) error {
 	if info, err := root.Lstat(part); err != nil || !sameCheckpointFileState(info, verified) {
 		return fmt.Errorf("partial %s changed before completion", part)
 	}
-	if err := root.Rename(part, final); err != nil {
+	if err := renameCompletedDownload(root, part, final); err != nil {
 		return err
 	}
 	if info, err := root.Lstat(final); err != nil || !sameCheckpointFileState(info, verified) {

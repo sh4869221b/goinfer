@@ -376,13 +376,19 @@ func (p Plan) SizeNote() string {
 const checkpointMarker = checkpoint.MarkerName
 
 type markerDoc struct {
-	Repo  string `json:"repo"`
-	Files []File `json:"files"`
+	Repo        string `json:"repo"`
+	Files       []File `json:"files"`
+	Publication string `json:"publication,omitempty"`
+}
+
+type completedCheckpoint struct {
+	directory   os.FileInfo
+	publication string
 }
 
 // reuseCheckpointDestination distinguishes an absent destination from one that has completed.
 // An existing directory whose files differ from the plan is preserved for the caller.
-func reuseCheckpointDestination(ctx context.Context, dir string, p Plan, metadata checkpointMetadata) (os.FileInfo, error) {
+func reuseCheckpointDestination(ctx context.Context, dir string, p Plan, metadata checkpointMetadata) (*completedCheckpoint, error) {
 	if _, err := os.Lstat(dir); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -395,7 +401,7 @@ func reuseCheckpointDestination(ctx context.Context, dir string, p Plan, metadat
 	return nil, fmt.Errorf("%s exists but is not a complete checkpoint of %s pulled by goinfer: move it aside, or pull with -o <dir>", dir, p.Repo)
 }
 
-func checkCompletedCheckpoint(ctx context.Context, dir string, p Plan, metadata checkpointMetadata) (os.FileInfo, error) {
+func checkCompletedCheckpoint(ctx context.Context, dir string, p Plan, metadata checkpointMetadata) (*completedCheckpoint, error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, nil
@@ -421,7 +427,11 @@ func checkCompletedCheckpoint(ctx context.Context, dir string, p Plan, metadata 
 			}
 		}
 	}
-	return root.Stat(".")
+	info, err := root.Stat(".")
+	if err != nil {
+		return nil, err
+	}
+	return &completedCheckpoint{directory: info, publication: m.Publication}, nil
 }
 
 // A legacy marker can lack a digest. A complete directory can be reused after a full
@@ -484,7 +494,7 @@ func readCheckpointMarker(root *os.Root) (markerDoc, bool) {
 	if err != nil || len(marker.Files) == 0 {
 		return markerDoc{}, false
 	}
-	m := markerDoc{Repo: marker.Repo, Files: make([]File, 0, len(marker.Files))}
+	m := markerDoc{Repo: marker.Repo, Files: make([]File, 0, len(marker.Files)), Publication: marker.Publication}
 	for _, f := range marker.Files {
 		m.Files = append(m.Files, File(f))
 	}
@@ -604,7 +614,8 @@ func DownloadCheckpoint(ctx context.Context, p Plan, dest string, progress func(
 func plannedCheckpointFiles(p Plan) (map[string]File, error) {
 	byPath := make(map[string]File, len(p.Files))
 	for _, f := range p.Files {
-		if !safeRepoPath(f.Path) || !filepath.IsLocal(filepath.FromSlash(f.Path)) || f.Path == checkpointMarker || f.Path == checkpointOwnerName {
+		first, _, _ := strings.Cut(f.Path, "/")
+		if !safeRepoPath(f.Path) || !filepath.IsLocal(filepath.FromSlash(f.Path)) || f.Path == checkpointMarker || f.Path == checkpointOwnerName || strings.EqualFold(first, checkpointPublicationName) {
 			return nil, fmt.Errorf("unsafe path %q in the plan for %s", f.Path, p.Repo)
 		}
 		if _, exists := byPath[f.Path]; exists {
@@ -707,6 +718,10 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 		}
 		defer root.Close()
 	}
+	publication, err := work.beginPublication(root)
+	if err != nil {
+		return "", fmt.Errorf("recording staging for %s: %w", dest, err)
+	}
 	if err := stageCheckpoint(ctx, work, root, p, metadata, progress); err != nil {
 		return "", err
 	}
@@ -717,7 +732,7 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 	if !sameCheckpointDirectory(parent, parentInfo) {
 		return "", fmt.Errorf("checkpoint destination directory changed during download")
 	}
-	if err := publishCheckpoint(parent, work, root, destName, p, metadata); err != nil {
+	if err := publishCheckpoint(parent, work, root, destName, p, metadata, publication); err != nil {
 		return "", fmt.Errorf("publishing %s: %w", dest, err)
 	}
 	return dest, nil
@@ -747,9 +762,6 @@ func stageCheckpoint(ctx context.Context, work *checkpointWorkspace, root *os.Ro
 						progress(base+d, p.Bytes, f.Path)
 					}
 				}, work)
-				if err == nil {
-					work.recordTransfer(root, f)
-				}
 			}
 		}
 		if err != nil {

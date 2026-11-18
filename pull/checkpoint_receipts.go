@@ -3,6 +3,7 @@ package pull
 import (
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -27,9 +28,15 @@ type checkpointReceipt struct {
 // Save a hard link as proof of the transferred inode. A missing receipt or
 // unsupported hard links means the file will be left in staging.
 func (w *checkpointWorkspace) recordTransfer(stage *os.Root, file File) {
-	name := filepath.FromSlash(file.Path)
-	info, err := stage.Lstat(name)
-	if err != nil || !info.Mode().IsRegular() || info.Size() != file.Size {
+	info, err := stage.Lstat(filepath.FromSlash(file.Path))
+	if err != nil {
+		return
+	}
+	w.recordCompletedTransfer(stage, file, info)
+}
+
+func (w *checkpointWorkspace) recordCompletedTransfer(stage *os.Root, file File, info os.FileInfo) {
+	if !info.Mode().IsRegular() || info.Size() != file.Size {
 		return
 	}
 	w.recordReceipt(checkpointReceipt{
@@ -39,48 +46,104 @@ func (w *checkpointWorkspace) recordTransfer(stage *os.Root, file File) {
 	w.pruneTransferReceipts(stage, file.Path+".part", false)
 }
 
-// Only an exclusively created partial can be claimed. A failed transfer or
-// SIGKILL can then leave bytes on the same inode without invalidating ownership.
-func (w *checkpointWorkspace) recordPartial(stage *os.Root, name string, info os.FileInfo) {
-	path := filepath.ToSlash(name)
-	w.recordReceipt(checkpointReceipt{Owner: w.owner, Path: path, Partial: true}, info)
-	w.pruneTransferReceipts(stage, path, false)
+var createCheckpointPartFile = openRegularDownloadFile
+var linkCheckpointPartial = (*os.Root).Link
+
+// Create the inode at its recorded location first. Linking it into staging then exposes
+// the canonical partial atomically, without replacing an existing file.
+func (w *checkpointWorkspace) createPartial(stage *os.Root, name, digest string) (*os.File, string, error) {
+	receipt := checkpointReceipt{Owner: w.owner, Path: filepath.ToSlash(name), Partial: true, SHA256: digest}
+	r, err := w.newTransferReceipt(&receipt)
+	if err != nil {
+		return nil, "", err
+	}
+	defer r.Close()
+	out, err := createCheckpointPartFile(r, "file", os.O_WRONLY|os.O_CREATE|os.O_EXCL)
+	if err != nil {
+		return nil, "", err
+	}
+	keep, linked := false, false
+	defer func() {
+		if !keep {
+			out.Close()
+			if !linked {
+				w.removeTransferReceipt(r, receipt)
+			}
+		}
+	}()
+	if err := w.checkStageIdentity(stage); err != nil {
+		return nil, "", err
+	}
+	private := filepath.Join(receipt.dirName, "file")
+	if err := linkCheckpointPartial(w.root, private, filepath.Join(checkpointStageName, name)); err != nil {
+		if _, statErr := stage.Lstat(name); !os.IsNotExist(statErr) {
+			return nil, "", err
+		}
+		// A filesystem without hard links can still pull through this private file.
+		// The stage has no resumable name until the private file is renamed on success.
+	} else {
+		linked = true
+		info, err := out.Stat()
+		if err != nil {
+			return nil, "", err
+		}
+		staged, err := stage.Lstat(name)
+		if err != nil || !staged.Mode().IsRegular() || !os.SameFile(staged, info) {
+			return nil, "", fmt.Errorf("partial %s changed while linking", name)
+		}
+		private = ""
+	}
+	w.pruneTransferReceipts(stage, receipt.Path, false)
+	w.addTransferReceipt(receipt)
+	keep = true
+	return out, private, nil
 }
 
-func (w *checkpointWorkspace) recordReceipt(receipt checkpointReceipt, info os.FileInfo) {
+func (w *checkpointWorkspace) newTransferReceipt(receipt *checkpointReceipt) (*os.Root, error) {
 	w.indexTransferReceipts()
 	raw, err := json.Marshal(receipt)
 	if err != nil {
-		return
+		return nil, err
 	}
 	record := checkpointReceiptPrefix + rand.Text()
 	if err := w.root.Mkdir(record, 0o700); err != nil {
-		return
+		return nil, err
 	}
 	r, err := openCheckpointStaging(w.root, record)
+	if err != nil {
+		return nil, err
+	}
+	dirInfo, err := r.Stat(".")
+	if err != nil {
+		r.Close()
+		return nil, err
+	}
+	if err := replaceRootFile(r, "transfer.json", raw); err != nil {
+		r.Close()
+		return nil, err
+	}
+	receipt.dirName, receipt.dirInfo = record, dirInfo
+	return r, nil
+}
+
+func (w *checkpointWorkspace) recordReceipt(receipt checkpointReceipt, info os.FileInfo) {
+	r, err := w.newTransferReceipt(&receipt)
 	if err != nil {
 		return
 	}
 	defer r.Close()
-	dirInfo, err := r.Stat(".")
-	if err != nil {
+	if err := w.root.Link(filepath.Join(checkpointStageName, filepath.FromSlash(receipt.Path)), filepath.Join(receipt.dirName, "file")); err != nil {
+		w.removeTransferReceipt(r, receipt)
 		return
 	}
-	if err := replaceRootFile(r, "transfer.json", raw); err != nil {
+	if proof, err := r.Lstat("file"); err != nil || !proof.Mode().IsRegular() || !sameCheckpointFileState(proof, info) {
+		w.removeTransferReceipt(r, receipt)
 		return
 	}
-	if err := w.root.Link(filepath.Join(checkpointStageName, filepath.FromSlash(receipt.Path)), filepath.Join(record, "file")); err != nil {
-		_ = r.Remove("transfer.json")
-		_ = w.root.Remove(record)
-		return
-	}
-	if proof, err := r.Lstat("file"); err != nil || !os.SameFile(proof, info) {
-		_ = r.Remove("file")
-		_ = r.Remove("transfer.json")
-		_ = w.root.Remove(record)
-		return
-	}
-	receipt.dirName, receipt.dirInfo = record, dirInfo
+	w.addTransferReceipt(receipt)
+}
+
+func (w *checkpointWorkspace) addTransferReceipt(receipt checkpointReceipt) {
 	w.receipts[receipt.Path] = append(w.receipts[receipt.Path], receipt)
 }
 
@@ -162,8 +225,11 @@ func (w *checkpointWorkspace) readTransferReceipt(name string) (checkpointReceip
 	if err != nil || receipt.Owner != w.owner || !safeRepoPath(receipt.Path) || !filepath.IsLocal(filepath.FromSlash(receipt.Path)) || receipt.Path == checkpointOwnerName {
 		return receipt, false
 	}
-	if receipt.Partial && !strings.HasSuffix(receipt.Path, ".part") {
-		return receipt, false
+	if receipt.Partial {
+		final, ok := strings.CutSuffix(receipt.Path, ".part")
+		if !ok || !safeRepoPath(final) || final == checkpointOwnerName || final == checkpointPublicationName {
+			return receipt, false
+		}
 	}
 	receipt.dirName = name
 	receipt.dirInfo, err = r.Stat(".")
@@ -192,11 +258,27 @@ func (w *checkpointWorkspace) releaseTransfer(stage *os.Root, receipt checkpoint
 	switch {
 	case err == nil && proof.Mode().IsRegular():
 		path := filepath.FromSlash(receipt.Path)
+		sidecar := !receipt.Partial
 		info, err := stage.Lstat(path)
 		if err != nil && !os.IsNotExist(err) {
 			return false
 		}
 		stillStaged := err == nil && info.Mode().IsRegular() && os.SameFile(info, proof)
+		if receipt.Partial && !stillStaged {
+			// A writer can die after renaming the partial but before recording the final file.
+			final := strings.TrimSuffix(path, ".part")
+			completed, err := stage.Lstat(final)
+			if err != nil && !os.IsNotExist(err) {
+				return false
+			}
+			if err == nil && completed.Mode().IsRegular() && os.SameFile(completed, proof) {
+				if !reclaim && !w.hasCompletedTransfer(filepath.ToSlash(final), completed) {
+					return false
+				}
+				path, info, stillStaged = final, completed, reclaim
+				sidecar = true
+			}
+		}
 		if stillStaged && !reclaim {
 			return false
 		}
@@ -204,14 +286,27 @@ func (w *checkpointWorkspace) releaseTransfer(stage *os.Root, receipt checkpoint
 			if err := stage.Remove(path); err != nil {
 				return false
 			}
-			if receipt.SHA256 != "" && checkpointDigestSidecar(stage, path, info) == receipt.SHA256 {
+			if sidecar && receipt.SHA256 != "" && checkpointDigestSidecar(stage, path, info) == receipt.SHA256 {
 				_ = stage.Remove(sidecarPath(path))
 			}
 		}
-		if err := r.Remove("file"); err != nil {
-			return false
-		}
 	case !os.IsNotExist(err):
+		return false
+	}
+	return w.removeTransferReceipt(r, receipt)
+}
+
+func (w *checkpointWorkspace) hasCompletedTransfer(path string, info os.FileInfo) bool {
+	for _, receipt := range w.receipts[path] {
+		if !receipt.Partial && receipt.Size == info.Size() && receipt.ModTime == info.ModTime().UnixNano() && w.matchesTransferProof(receipt, info) {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *checkpointWorkspace) removeTransferReceipt(r *os.Root, receipt checkpointReceipt) bool {
+	if err := r.Remove("file"); err != nil && !os.IsNotExist(err) {
 		return false
 	}
 	if err := r.Remove("transfer.json"); err != nil && !os.IsNotExist(err) {
