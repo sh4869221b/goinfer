@@ -83,9 +83,8 @@ func Resolve(ctx context.Context, spec string, progress func(done, total int64))
 	return DownloadSet(ctx, ref.Repo, set, dir, progress)
 }
 
-// resolveCheckpoint is Resolve for "hf:owner/repo:safetensors": the cached directory when a complete, verified
-// checkpoint is already there (offline, from its marker), else CheckAccess, PlanCheckpoint and DownloadCheckpoint into
-// CacheDir(repo). Returns the directory decoder.Load opens.
+// resolveCheckpoint returns an offline cache hit or checks access and downloads using the newly planned config.
+// The returned directory is the decoder's checkpoint path under CacheDir(repo).
 func resolveCheckpoint(ctx context.Context, ref Ref, loads func(string) (string, error), progress func(done, total int64)) (string, error) {
 	dir, err := CacheDir(ref.Repo)
 	if err != nil {
@@ -99,7 +98,7 @@ func resolveCheckpoint(ctx context.Context, ref Ref, loads func(string) (string,
 	if err := CheckAccess(ctx, ref.Repo); err != nil {
 		return "", err
 	}
-	p, err := PlanCheckpointFor(ctx, ref.Repo, loads)
+	p, config, err := planCheckpointFor(ctx, ref.Repo, loads)
 	if err != nil {
 		return "", err
 	}
@@ -107,7 +106,7 @@ func resolveCheckpoint(ctx context.Context, ref Ref, loads func(string) (string,
 	if progress != nil {
 		prog = func(done, total int64, _ string) { progress(done, total) }
 	}
-	return DownloadCheckpoint(ctx, p, dir, prog)
+	return downloadCheckpoint(ctx, p, config, dir, prog)
 }
 
 // ResolveCheckpointFor resolves an `hf:<owner>/<repo>:safetensors` spec with the caller's model_type check

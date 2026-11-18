@@ -36,31 +36,35 @@ type checkpointConfig struct {
 	Dtype      string `json:"dtype"`
 }
 
-// Plan is what a safetensors checkpoint pull would fetch, decided before any weight byte moves.
-// JSON preserves the metadata. Obtain a fresh plan with PlanCheckpoint or PlanCheckpointFor
-// before downloading a checkpoint after decoding that metadata.
+// Plan describes a safetensors checkpoint's metadata, decided before any weight byte moves.
+// Its JSON form carries the same metadata. DownloadCheckpoint checks config.json again at use time.
 type Plan struct {
 	Repo      string
-	Files     planFiles // config, tokenizer and processor files, then the weights; sorted by path
-	Bytes     int64     // the sum of Files' sizes: what the transfer costs in disk and bandwidth
-	ModelType string    // config.json's model_type
-	Family    string    // the capability-matrix family that loads it
-	Dtype     string    // config.json's torch_dtype (or dtype), "" if absent
-
-	configJSON  string // validated config bytes, separate from the remote tree metadata
-	configRepo  string // repository those bytes were fetched from
-	configFiles *File  // first file of the backing slice that was planned with those bytes
+	Files     []File // config, tokenizer and processor files, then the weights; sorted by path
+	Bytes     int64  // the sum of Files' sizes: what the transfer costs in disk and bandwidth
+	ModelType string // config.json's model_type
+	Family    string // the capability-matrix family that loads it
+	Dtype     string // config.json's torch_dtype (or dtype), "" if absent
 }
 
-type planFiles []File
+// CheckpointDownload downloads a prepared checkpoint using the config read during planning.
+type CheckpointDownload func(ctx context.Context, dest string, progress func(done, total int64, file string)) (string, error)
 
-// UnmarshalJSON replaces the backing slice so decoded metadata cannot reuse an older config.
-// Keeping the method on Files lets structs embedding Plan decode their own fields normally.
-func (f *planFiles) UnmarshalJSON(data []byte) error {
-	var decoded []File
-	err := json.Unmarshal(data, &decoded)
-	*f = decoded
-	return err
+// PrepareCheckpointFor returns the plan and a download function bound to its validated config and file list.
+// A nil loads uses the generative check. The returned metadata can be copied or serialized independently.
+func PrepareCheckpointFor(ctx context.Context, repo string, loads func(modelType string) (family string, err error)) (Plan, CheckpointDownload, error) {
+	if loads == nil {
+		loads = generativeLoads
+	}
+	plan, raw, err := planCheckpointFor(ctx, repo, loads)
+	if err != nil {
+		return Plan{}, nil, err
+	}
+	snapshot := plan
+	snapshot.Files = slices.Clone(plan.Files)
+	return plan, func(ctx context.Context, dest string, progress func(done, total int64, file string)) (string, error) {
+		return downloadCheckpoint(ctx, snapshot, raw, dest, progress)
+	}, nil
 }
 
 // checkpointExtras are the non-weight files a checkpoint plan takes when the repo has them: the tokenizer in its several
@@ -222,9 +226,14 @@ func PlanCheckpoint(ctx context.Context, repo string) (Plan, error) {
 // serve's -embed-model uses it with its encoder's own check, because an embedding encoder is not a generative family in
 // the capability matrix.
 func PlanCheckpointFor(ctx context.Context, repo string, loads func(modelType string) (family string, err error)) (Plan, error) {
+	plan, _, err := planCheckpointFor(ctx, repo, loads)
+	return plan, err
+}
+
+func planCheckpointFor(ctx context.Context, repo string, loads func(modelType string) (family string, err error)) (Plan, []byte, error) {
 	files, err := listTree(ctx, repo)
 	if err != nil {
-		return Plan{}, err
+		return Plan{}, nil, err
 	}
 	byPath := map[string]File{}
 	for _, f := range files {
@@ -232,33 +241,20 @@ func PlanCheckpointFor(ctx context.Context, repo string, loads func(modelType st
 	}
 	configFile, ok := byPath["config.json"]
 	if !ok {
-		return Plan{}, fmt.Errorf("repo %s has no config.json: not a safetensors (transformers) checkpoint", repo)
+		return Plan{}, nil, fmt.Errorf("repo %s has no config.json: not a safetensors (transformers) checkpoint", repo)
 	}
-	cfgRaw, err := fetchSmall(ctx, repo, "config.json", checkpoint.MaxConfigBytes)
+	cfgRaw, cfg, err := fetchCheckpointConfig(ctx, repo, configFile)
 	if err != nil {
-		return Plan{}, err
-	}
-	if !checkpoint.ConfigMatches(cfgRaw, configFile.Size, configFile.SHA256) {
-		return Plan{}, fmt.Errorf("repo %s's config.json does not match the tree listing; re-run to refresh the plan", repo)
-	}
-	var cfg checkpointConfig
-	if err := json.Unmarshal(cfgRaw, &cfg); err != nil {
-		return Plan{}, fmt.Errorf("parsing %s's config.json: %w", repo, err)
-	}
-	if cfg.ModelType == "" {
-		return Plan{}, fmt.Errorf("repo %s's config.json has no model_type, so goinfer cannot tell what it is", repo)
+		return Plan{}, nil, err
 	}
 	fam, err := loads(cfg.ModelType)
 	if err != nil {
-		return Plan{}, fmt.Errorf("repo %s is %w; nothing was downloaded", repo, err)
+		return Plan{}, nil, fmt.Errorf("repo %s is %w; nothing was downloaded", repo, err)
 	}
 	if err := checkpoint.CheckLayout(repo, cfg.ModelType); err != nil {
-		return Plan{}, err
+		return Plan{}, nil, err
 	}
-	p := Plan{Repo: repo, ModelType: cfg.ModelType, Family: fam, Dtype: cfg.TorchDtype, configJSON: string(cfgRaw), configRepo: repo}
-	if p.Dtype == "" {
-		p.Dtype = cfg.Dtype
-	}
+	p := Plan{Repo: repo, ModelType: cfg.ModelType, Family: fam, Dtype: cfg.TorchDtype}
 	want := map[string]bool{}
 	for name := range checkpointExtras {
 		if _, ok := byPath[name]; ok {
@@ -268,40 +264,60 @@ func PlanCheckpointFor(ctx context.Context, repo string, loads func(modelType st
 	if _, ok := byPath["model.safetensors.index.json"]; ok {
 		idxRaw, err := fetchSmall(ctx, repo, "model.safetensors.index.json", 64<<20)
 		if err != nil {
-			return Plan{}, err
+			return Plan{}, nil, err
 		}
 		var idx struct {
 			WeightMap map[string]string `json:"weight_map"`
 		}
 		if err := json.Unmarshal(idxRaw, &idx); err != nil {
-			return Plan{}, fmt.Errorf("parsing %s's shard index: %w", repo, err)
+			return Plan{}, nil, fmt.Errorf("parsing %s's shard index: %w", repo, err)
 		}
 		if len(idx.WeightMap) == 0 {
-			return Plan{}, fmt.Errorf("repo %s's shard index names no weights", repo)
+			return Plan{}, nil, fmt.Errorf("repo %s's shard index names no weights", repo)
 		}
 		want["model.safetensors.index.json"] = true
 		for _, shard := range idx.WeightMap {
 			if _, ok := byPath[shard]; !ok {
-				return Plan{}, fmt.Errorf("repo %s's shard index names %q, which the repo does not have", repo, shard)
+				return Plan{}, nil, fmt.Errorf("repo %s's shard index names %q, which the repo does not have", repo, shard)
 			}
 			want[shard] = true
 		}
 	} else if _, ok := byPath["model.safetensors"]; ok {
 		want["model.safetensors"] = true
 	} else {
-		return Plan{}, fmt.Errorf("repo %s has a config.json but no model.safetensors or model.safetensors.index.json", repo)
+		return Plan{}, nil, fmt.Errorf("repo %s has a config.json but no model.safetensors or model.safetensors.index.json", repo)
 	}
 	for name := range want {
 		if !safeRepoPath(name) {
-			return Plan{}, fmt.Errorf("repo %s lists an unsafe path %q", repo, name)
+			return Plan{}, nil, fmt.Errorf("repo %s lists an unsafe path %q", repo, name)
 		}
 		f := byPath[name]
 		p.Files = append(p.Files, f)
 		p.Bytes += f.Size
 	}
 	sort.Slice(p.Files, func(i, j int) bool { return p.Files[i].Path < p.Files[j].Path })
-	p.configFiles = &p.Files[0]
-	return p, nil
+	return p, cfgRaw, nil
+}
+
+func fetchCheckpointConfig(ctx context.Context, repo string, file File) ([]byte, checkpointConfig, error) {
+	var cfg checkpointConfig
+	raw, err := fetchSmall(ctx, repo, "config.json", checkpoint.MaxConfigBytes)
+	if err != nil {
+		return nil, cfg, err
+	}
+	if !checkpoint.ConfigMatches(raw, file.Size, file.SHA256) {
+		return nil, cfg, fmt.Errorf("repo %s's config.json does not match the checkpoint metadata; re-run to refresh the plan", repo)
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return nil, cfg, fmt.Errorf("parsing %s's config.json: %w", repo, err)
+	}
+	if cfg.ModelType == "" {
+		return nil, cfg, fmt.Errorf("repo %s's config.json has no model_type, so goinfer cannot tell what it is", repo)
+	}
+	if cfg.TorchDtype == "" {
+		cfg.TorchDtype = cfg.Dtype
+	}
+	return raw, cfg, nil
 }
 
 // TreeDigest is the digest a registry entry pins for a checkpoint directory: sha256 over one line per planned file, in path
@@ -422,17 +438,19 @@ func verifyCachedCheckpoint(dir string, root *os.Root, m markerDoc, plannedConfi
 			return false, fmt.Errorf("cached checkpoint %s: %w", dir, err)
 		}
 	}
+	foundConfig := false
 	for _, f := range m.Files {
 		if f.Path == "config.json" {
 			// Verify the same bytes used for the layout check without following the link again.
 			if !checkpoint.ConfigMatches(config, f.Size, f.SHA256) {
 				return false, nil
 			}
+			foundConfig = true
 		} else if _, ok := cachedIntact(filepath.Join(dir, filepath.FromSlash(path.Dir(f.Path))), f); !ok {
 			return false, nil
 		}
 	}
-	return true, nil
+	return foundConfig, nil
 }
 
 func readCachedCheckpointConfig(dir string) ([]byte, error) {
@@ -444,32 +462,55 @@ func readCachedCheckpointConfig(dir string) ([]byte, error) {
 	return checkpoint.ReadRootConfig(root)
 }
 
-// DownloadCheckpoint fetches every file in p into dest and returns dest. The set is assembled in a staging directory
-// beside dest (dest + ".partial"). Planned config bytes are staged directly; other files go through Download with
-// its own .part, digest check and resume. The destination
-// appears only when the whole set has verified: one rename, after a marker naming the set is written. So an interrupted
-// pull leaves no loadable-looking directory at dest, and a re-run resumes in the staging directory, skipping files
-// already verified there. A complete dest that matches the plan is a no-op. Use a fresh plan for config.json;
-// serialized metadata cannot supply its validated bytes. A conflicting dest is preserved and reported as an error.
-// progress reports bytes over the whole set and the file in flight; it may be nil.
+// DownloadCheckpoint checks the current remote config against p before fetching weights.
+// A Plan supplies metadata, including when it has been decoded from JSON. Use PrepareCheckpointFor
+// to download with the exact config from the planning request and avoid a second config fetch.
 func DownloadCheckpoint(ctx context.Context, p Plan, dest string, progress func(done, total int64, file string)) (string, error) {
-	if len(p.Files) == 0 {
-		return "", fmt.Errorf("checkpoint plan for %s has no files", p.Repo)
+	file, err := plannedConfigFile(p)
+	if err != nil {
+		return "", err
 	}
-	var plannedConfig []byte
+	raw, cfg, err := fetchCheckpointConfig(ctx, p.Repo, file)
+	if err != nil {
+		return "", err
+	}
+	if (p.ModelType != "" && p.ModelType != cfg.ModelType) || (p.Dtype != "" && p.Dtype != cfg.TorchDtype) {
+		return "", fmt.Errorf("repo %s's config.json model type or dtype differs from the plan; re-plan before downloading", p.Repo)
+	}
+	if err := checkpoint.CheckLayout(p.Repo, cfg.ModelType); err != nil {
+		return "", err
+	}
+	return downloadCheckpoint(ctx, p, raw, dest, progress)
+}
+
+func plannedConfigFile(p Plan) (File, error) {
+	var config File
 	for _, f := range p.Files {
 		if !safeRepoPath(f.Path) {
-			return "", fmt.Errorf("unsafe path %q in the plan for %s", f.Path, p.Repo)
+			return File{}, fmt.Errorf("unsafe path %q in the plan for %s", f.Path, p.Repo)
 		}
 		if f.Path == "config.json" {
-			if p.configJSON == "" || p.Repo != p.configRepo || p.configFiles != &p.Files[0] {
-				return "", fmt.Errorf("checkpoint plan for %s has no validated config.json bytes; re-plan with PlanCheckpoint or PlanCheckpointFor before downloading", p.Repo)
+			if config.Path != "" {
+				return File{}, fmt.Errorf("checkpoint plan for %s lists config.json more than once", p.Repo)
 			}
-			plannedConfig = []byte(p.configJSON)
-			if !checkpoint.ConfigMatches(plannedConfig, f.Size, f.SHA256) {
-				return "", fmt.Errorf("planned config.json does not match the checkpoint files")
-			}
+			config = f
 		}
+	}
+	if config.Path == "" {
+		return File{}, fmt.Errorf("checkpoint plan for %s has no config.json", p.Repo)
+	}
+	return config, nil
+}
+
+// downloadCheckpoint stages the validated config alongside resumable downloads, then publishes
+// the complete set by renaming the directory. An existing destination must match the plan.
+func downloadCheckpoint(ctx context.Context, p Plan, plannedConfig []byte, dest string, progress func(done, total int64, file string)) (string, error) {
+	config, err := plannedConfigFile(p)
+	if err != nil {
+		return "", err
+	}
+	if !checkpoint.ConfigMatches(plannedConfig, config.Size, config.SHA256) {
+		return "", fmt.Errorf("planned config.json does not match the checkpoint files")
 	}
 	complete, err := checkCompletedCheckpoint(dest, p.Files, plannedConfig)
 	if err != nil {

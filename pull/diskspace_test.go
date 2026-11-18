@@ -162,14 +162,21 @@ func TestDownloadSet_aCompletePartCostsNothing(t *testing.T) {
 	}
 }
 
+const diskCheckpointConfig = `{"model_type":"llama"}`
+
+func diskCheckpointPlan(files []File) Plan {
+	files = append(files, File{Path: "config.json", Size: int64(len(diskCheckpointConfig))})
+	return Plan{Repo: "o/r", Files: files, Bytes: SetBytes(files)}
+}
+
 func TestDownloadCheckpoint_refusesWhatWillNotFit_beforeAnyByte(t *testing.T) {
-	d := newDiskTestFiles(t, 1499, true)
+	d := newDiskTestFiles(t, 1499+int64(len(diskCheckpointConfig)), true)
 	root := t.TempDir()
 	dest := filepath.Join(root, "ckpt")
-	p := Plan{Repo: "o/r", Files: d.set, Bytes: SetBytes(d.set)}
-	_, err := DownloadCheckpoint(context.Background(), p, dest, nil)
+	p := diskCheckpointPlan(d.set)
+	_, err := downloadCheckpoint(context.Background(), p, []byte(diskCheckpointConfig), dest, nil)
 	if err == nil {
-		t.Fatal("1,499 bytes free for a 1,500-byte checkpoint: want a refusal")
+		t.Fatal("one byte short of the checkpoint size: want a refusal")
 	}
 	if n := d.hits.Load(); n != 0 {
 		t.Errorf("%d requests made before refusing, want 0", n)
@@ -203,8 +210,11 @@ func TestDownloadCheckpoint_countsPartialsInSubdirectories(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(sub, "b.gguf.part"), bytes.Repeat([]byte("b"), 499), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			p := Plan{Repo: "o/r", Files: d.set, Bytes: SetBytes(d.set)}
-			_, err := DownloadCheckpoint(context.Background(), p, dest, nil)
+			if err := os.WriteFile(filepath.Join(dest+".partial", "config.json"), []byte(diskCheckpointConfig), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			p := diskCheckpointPlan(d.set)
+			_, err := downloadCheckpoint(context.Background(), p, []byte(diskCheckpointConfig), dest, nil)
 			if (err == nil) != tc.ok {
 				t.Fatalf("1,001 bytes left and %d free: err %v, want ok=%v", tc.free, err, tc.ok)
 			}

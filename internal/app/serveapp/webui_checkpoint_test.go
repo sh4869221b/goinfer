@@ -130,8 +130,8 @@ func fakeCheckpointRepo(t *testing.T, repo string, planErr error) (plans, fetche
 	}
 	plan := pull.Plan{Repo: repo, Files: files, Bytes: total, ModelType: "llama", Family: "llama", Dtype: "float32"}
 	var np, nf int
-	oa, ol, op, of := webCheckAccess, webListFiles, webPlanCheckpoint, webFetchCheckpoint
-	t.Cleanup(func() { webCheckAccess, webListFiles, webPlanCheckpoint, webFetchCheckpoint = oa, ol, op, of })
+	oa, ol, op, of := webCheckAccess, webListFiles, webPlanCheckpoint, webPrepareCheckpoint
+	t.Cleanup(func() { webCheckAccess, webListFiles, webPlanCheckpoint, webPrepareCheckpoint = oa, ol, op, of })
 	webCheckAccess = func(context.Context, string) error { return nil }
 	webListFiles = func(context.Context, string) ([]pull.File, error) { return nil, nil }
 	webPlanCheckpoint = func(_ context.Context, r string) (pull.Plan, error) {
@@ -144,15 +144,21 @@ func fakeCheckpointRepo(t *testing.T, repo string, planErr error) (plans, fetche
 		}
 		return plan, nil
 	}
-	webFetchCheckpoint = func(_ context.Context, p pull.Plan, dest string, progress func(done, total int64, file string)) (string, error) {
-		nf++
-		var done int64
-		for _, f := range p.Files {
-			done += f.Size
-			progress(done, p.Bytes, f.Path)
+	webPrepareCheckpoint = func(ctx context.Context, r string) (pull.Plan, pull.CheckpointDownload, error) {
+		p, err := webPlanCheckpoint(ctx, r)
+		if err != nil {
+			return pull.Plan{}, nil, err
 		}
-		writeCheckpoint(t, dest, p.Repo)
-		return dest, nil
+		return p, func(_ context.Context, dest string, progress func(done, total int64, file string)) (string, error) {
+			nf++
+			var done int64
+			for _, f := range p.Files {
+				done += f.Size
+				progress(done, p.Bytes, f.Path)
+			}
+			writeCheckpoint(t, dest, p.Repo)
+			return dest, nil
+		}, nil
 	}
 	return &np, &nf
 }

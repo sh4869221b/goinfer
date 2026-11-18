@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -634,11 +635,11 @@ func TestCheckpointResumeUsesPlannedConfig(t *testing.T) {
 			h.serve(t, repo)
 			ctx := t.Context()
 			dest := filepath.Join(t.TempDir(), "checkpoint")
-			oldPlan, err := PlanCheckpoint(ctx, repo)
+			oldPlan, oldDownload, err := PrepareCheckpointFor(ctx, repo, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := DownloadCheckpoint(ctx, oldPlan, dest, nil); err == nil {
+			if _, err := oldDownload(ctx, dest, nil); err == nil {
 				t.Fatal("first download should stop on the interrupted shard")
 			}
 			staging := dest + ".partial"
@@ -657,7 +658,7 @@ func TestCheckpointResumeUsesPlannedConfig(t *testing.T) {
 			h.files["config.json"] = updated
 			firstHits := h.hits[firstShard]
 			h.mu.Unlock()
-			plan, err := PlanCheckpoint(ctx, repo)
+			plan, download, err := PrepareCheckpointFor(ctx, repo, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -665,11 +666,12 @@ func TestCheckpointResumeUsesPlannedConfig(t *testing.T) {
 			if err := plan.VerifyPin(pin); err != nil {
 				t.Fatalf("same-size non-LFS config changed the tree pin: %v", err)
 			}
+			plan.Files[0].Path = "metadata-only.json"
 			h.mu.Lock()
 			configHits := h.hits["config.json"]
 			h.files["config.json"] = original // the plan still owns the bytes it validated
 			h.mu.Unlock()
-			if _, err := DownloadCheckpoint(ctx, plan, dest, nil); err != nil {
+			if _, err := download(ctx, dest, nil); err != nil {
 				t.Fatalf("resume: %v", err)
 			}
 			got, err := os.ReadFile(filepath.Join(dest, "config.json"))
@@ -709,11 +711,11 @@ func TestDownloadCheckpointRejectsCompletedConfigDrift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldPlan, err := PlanCheckpoint(ctx, repo)
+	oldPlan, oldDownload, err := PrepareCheckpointFor(ctx, repo, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := DownloadCheckpoint(ctx, oldPlan, dest, nil); err != nil {
+	if _, err := oldDownload(ctx, dest, nil); err != nil {
 		t.Fatal(err)
 	}
 	marker, err := os.ReadFile(filepath.Join(dest, checkpointMarker))
@@ -724,7 +726,7 @@ func TestDownloadCheckpointRejectsCompletedConfigDrift(t *testing.T) {
 	h.mu.Lock()
 	h.files["config.json"] = updated
 	h.mu.Unlock()
-	plan, err := PlanCheckpoint(ctx, repo)
+	plan, download, err := PrepareCheckpointFor(ctx, repo, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -734,11 +736,14 @@ func TestDownloadCheckpointRejectsCompletedConfigDrift(t *testing.T) {
 	h.mu.Lock()
 	requests := h.requests
 	h.mu.Unlock()
-	if got, err := DownloadCheckpoint(ctx, oldPlan, dest, nil); err != nil || got != dest {
+	if got, err := oldDownload(ctx, dest, nil); err != nil || got != dest {
 		t.Errorf("matching plan should reuse the completed checkpoint: %q, %v", got, err)
 	}
-	if got, err := DownloadCheckpoint(ctx, plan, dest, nil); got != "" || err == nil || !strings.Contains(err.Error(), "differs from the current checkpoint plan") {
+	if got, err := download(ctx, dest, nil); got != "" || err == nil || !strings.Contains(err.Error(), "differs from the current checkpoint plan") {
 		t.Errorf("changed config should refuse the completed destination: %q, %v", got, err)
+	}
+	if got, err := DownloadCheckpoint(ctx, oldPlan, dest, nil); got != "" || err == nil || !strings.Contains(err.Error(), "differs from the current checkpoint plan") {
+		t.Errorf("download from metadata should also refuse the completed destination: %q, %v", got, err)
 	}
 	if got, err := Resolve(ctx, "hf:"+repo+":safetensors", nil); err != nil || got != dest {
 		t.Errorf("offline Resolve should still open the verified cache: %q, %v", got, err)
@@ -760,8 +765,8 @@ func TestDownloadCheckpointRejectsCompletedConfigDrift(t *testing.T) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.requests != requests {
-		t.Errorf("completed destination checks made %d network requests", h.requests-requests)
+	if h.requests != requests+1 {
+		t.Errorf("expected only the config revalidation request, got %d requests", h.requests-requests)
 	}
 }
 
@@ -787,7 +792,105 @@ func TestPlanJSONEmbedding(t *testing.T) {
 	}
 }
 
-func TestDownloadCheckpointRejectsRestoredConfigPlan(t *testing.T) {
+func TestPlanFilesHasOriginalSliceType(t *testing.T) {
+	if _, ok := any(Plan{}.Files).([]File); !ok {
+		t.Fatalf("Plan.Files has type %T; want []File", Plan{}.Files)
+	}
+	type callerFiles []File
+	plan := Plan{Files: callerFiles{{Path: "config.json"}}}
+	var files callerFiles = plan.Files
+	if len(files) != 1 || files[0].Path != "config.json" {
+		t.Fatalf("assignment through named slice = %v", files)
+	}
+}
+
+func TestDownloadCheckpointConfigAfterPartialJSON(t *testing.T) {
+	const repo = "o/tiny"
+	files := shardedTinyRepo(t)
+	original := files["config.json"]
+	updated := configWithDifferentEOS(t, original)
+	h := &fakeHF{files: files}
+	h.serve(t, repo)
+	plan, err := PlanCheckpoint(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(`{"Family":"llama"}`), &plan); err != nil {
+		t.Fatal(err)
+	}
+	h.mu.Lock()
+	h.files["config.json"] = updated
+	h.mu.Unlock()
+	dest := filepath.Join(t.TempDir(), "checkpoint")
+	if _, err := DownloadCheckpoint(t.Context(), plan, dest, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "config.json"))
+	if err != nil || !bytes.Equal(got, updated) {
+		t.Fatalf("download did not use current config after decoding JSON without Files (read error %v)", err)
+	}
+}
+
+func TestDownloadCheckpointClonedFiles(t *testing.T) {
+	const repo = "o/tiny"
+	h := &fakeHF{files: shardedTinyRepo(t)}
+	h.serve(t, repo)
+	plan, err := PlanCheckpoint(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Files = slices.Clone(plan.Files)
+	if _, err := DownloadCheckpoint(t.Context(), plan, filepath.Join(t.TempDir(), "checkpoint"), nil); err != nil {
+		t.Fatalf("download from a cloned file list: %v", err)
+	}
+}
+
+func TestDownloadCheckpointRequiresConfigEntry(t *testing.T) {
+	const repo = "o/tiny"
+	h := &fakeHF{files: shardedTinyRepo(t)}
+	h.serve(t, repo)
+	plan, err := PlanCheckpoint(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Files = slices.DeleteFunc(plan.Files, func(f File) bool { return f.Path == "config.json" })
+	dest := filepath.Join(t.TempDir(), "checkpoint")
+	h.mu.Lock()
+	requests := h.requests
+	h.mu.Unlock()
+	if path, err := DownloadCheckpoint(t.Context(), plan, dest, nil); path != "" || err == nil || !strings.Contains(err.Error(), "no config.json") {
+		t.Errorf("plan without config.json should fail: %q, %v", path, err)
+	}
+	for _, path := range []string{dest, dest + ".partial"} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("refused plan left %s: %v", path, err)
+		}
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.requests != requests {
+		t.Errorf("refused plan made %d network requests", h.requests-requests)
+	}
+}
+
+func TestCachedCheckpointRequiresConfigEntry(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string][]byte{
+		"config.json":       []byte(`{"model_type":"llama"}`),
+		"model.safetensors": []byte("weight"),
+		checkpointMarker:    []byte(`{"repo":"o/tiny","files":[{"Path":"model.safetensors","Size":6}]}`),
+	}
+	for name, raw := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok := CachedCheckpoint(dir); ok {
+		t.Fatal("a marker without config.json claimed a usable checkpoint")
+	}
+}
+
+func TestDownloadCheckpointRevalidatesRestoredConfigPlan(t *testing.T) {
 	const repo = "o/tiny"
 	const shardPart = "model-00001-of-00002.safetensors.part"
 	files := shardedTinyRepo(t)
@@ -821,13 +924,15 @@ func TestDownloadCheckpointRejectsRestoredConfigPlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		name     string
-		initial  Plan
-		embedded bool
+		name        string
+		initial     Plan
+		embedded    bool
+		unavailable bool
 	}{
-		{"zero receiver", Plan{}, false},
-		{"receiver with an older config", oldPlan, false},
-		{"embedded receiver with an older config", oldPlan, true},
+		{name: "zero receiver"},
+		{name: "receiver with an older config", initial: oldPlan},
+		{name: "embedded receiver with an older config", initial: oldPlan, embedded: true},
+		{name: "config unavailable", initial: oldPlan, unavailable: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			restored := tc.initial
@@ -859,22 +964,41 @@ func TestDownloadCheckpointRejectsRestoredConfigPlan(t *testing.T) {
 			}
 			h.mu.Lock()
 			requests := h.requests
+			configHits := h.hits["config.json"]
+			if tc.unavailable {
+				delete(h.files, "config.json")
+			}
 			h.mu.Unlock()
-			if got, err := DownloadCheckpoint(t.Context(), restored, dest, nil); got != "" || err == nil || !strings.Contains(err.Error(), "re-plan") {
-				t.Errorf("restored plan should request replanning: %q, %v", got, err)
-			}
-			if _, err := os.Stat(dest); !os.IsNotExist(err) {
-				t.Errorf("restored plan published a checkpoint: %v", err)
-			}
-			for name, want := range staged {
-				if got, err := os.ReadFile(filepath.Join(staging, name)); err != nil || !bytes.Equal(got, want) {
-					t.Errorf("refusal changed staged %s: %v", name, err)
+			got, err := DownloadCheckpoint(t.Context(), restored, dest, nil)
+			if tc.unavailable {
+				if err == nil || got != "" {
+					t.Errorf("unavailable config should refuse the download: %q, %v", got, err)
 				}
+				if _, err := os.Stat(dest); !os.IsNotExist(err) {
+					t.Errorf("restored plan published a checkpoint: %v", err)
+				}
+				for name, want := range staged {
+					if got, err := os.ReadFile(filepath.Join(staging, name)); err != nil || !bytes.Equal(got, want) {
+						t.Errorf("refusal changed staged %s: %v", name, err)
+					}
+				}
+				h.mu.Lock()
+				defer h.mu.Unlock()
+				if h.requests != requests+1 {
+					t.Errorf("expected only the failed config request, got %d requests", h.requests-requests)
+				}
+				return
+			}
+			if err != nil || got != dest {
+				t.Fatalf("download restored plan: %q, %v", got, err)
+			}
+			if raw, err := os.ReadFile(filepath.Join(dest, "config.json")); err != nil || !bytes.Equal(raw, updated) {
+				t.Errorf("download used stale config: %v", err)
 			}
 			h.mu.Lock()
 			defer h.mu.Unlock()
-			if h.requests != requests {
-				t.Errorf("restored plan made %d network requests", h.requests-requests)
+			if h.hits["config.json"] != configHits+1 || h.ranges["model-00001-of-00002.safetensors"] != "bytes=32-" {
+				t.Errorf("expected one config fetch and a resumed shard: hits %v, ranges %v", h.hits, h.ranges)
 			}
 		})
 	}
