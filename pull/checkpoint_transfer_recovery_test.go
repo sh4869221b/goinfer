@@ -158,8 +158,9 @@ func TestCheckpointRetriesCleanupAfterKilledPublication(t *testing.T) {
 	if dest := os.Getenv(child); dest != "" {
 		hfAPI = os.Getenv("GOINFER_TEST_CHECKPOINT_API")
 		hfCDN = os.Getenv("GOINFER_TEST_CHECKPOINT_CDN")
-		renameCheckpointPublication = func(root *os.Root, src, dest string) error {
-			if err := root.Rename(src, dest); err != nil {
+		rename := renameCheckpointPublication
+		renameCheckpointPublication = func(ctx context.Context, root *os.Root, src, dest string) error {
+			if err := rename(ctx, root, src, dest); err != nil {
 				return err
 			}
 			fmt.Println("published")

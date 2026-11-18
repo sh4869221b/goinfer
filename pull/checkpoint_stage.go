@@ -1,6 +1,7 @@
 package pull
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -124,8 +125,8 @@ func lockCheckpointWorkspace(parent *os.Root, dest string, create bool) (*checkp
 
 // A finished destination can be reused while its writer is still cleaning up.
 // Retry interrupted cleanup only when the existing workspace can be locked.
-func recoverCheckpointTransfers(dest string, complete *completedCheckpoint) {
-	if complete.publication == "" {
+func recoverCheckpointTransfers(ctx context.Context, dest string, complete *completedCheckpoint) {
+	if complete.publication == "" || ctx.Err() != nil {
 		return
 	}
 	parent, err := os.OpenRoot(filepath.Dir(filepath.Clean(dest)))
@@ -139,10 +140,13 @@ func recoverCheckpointTransfers(dest string, complete *completedCheckpoint) {
 		return
 	}
 	defer work.Close()
-	work.reclaimCompletedStage(parent, name, complete)
+	work.reclaimCompletedStage(ctx, parent, name, complete)
 }
 
-func (w *checkpointWorkspace) reclaimCompletedStage(parent *os.Root, dest string, complete *completedCheckpoint) {
+func (w *checkpointWorkspace) reclaimCompletedStage(ctx context.Context, parent *os.Root, dest string, complete *completedCheckpoint) {
+	if ctx.Err() != nil {
+		return
+	}
 	info, err := parent.Stat(dest)
 	if err != nil || !os.SameFile(info, complete.directory) {
 		return
@@ -154,7 +158,7 @@ func (w *checkpointWorkspace) reclaimCompletedStage(parent *os.Root, dest string
 	defer stage.Close()
 	if w.matchesPublication(stage, complete.publication) {
 		if cleanup, err := readCheckpointCleanup(stage); err == nil && cleanup.Owner == w.owner && cleanup.Token == complete.publication && w.canResumeCleanup(stage, cleanup.Transfers) {
-			w.reclaimTransfers(stage, cleanup.Transfers)
+			w.reclaimTransfers(ctx, stage, cleanup.Transfers)
 		}
 	}
 }
@@ -301,7 +305,7 @@ func (w *checkpointWorkspace) checkStageIdentity(stage *os.Root) error {
 	return checkCheckpointStaging(stage, info)
 }
 
-func reusableStagedFile(root *os.Root, name string, f File) bool {
+func reusableStagedFile(ctx context.Context, root *os.Root, name string, f File) bool {
 	if f.SHA256 == "" {
 		return false
 	}
@@ -311,10 +315,10 @@ func reusableStagedFile(root *os.Root, name string, f File) bool {
 	}
 	defer opened.Close()
 	info, err := opened.Stat()
-	return err == nil && info.Size() == f.Size && verifyOpenCheckpointDigest(root, name, f, opened, info) == nil
+	return err == nil && info.Size() == f.Size && verifyOpenCheckpointDigest(ctx, root, name, f, opened, info) == nil
 }
 
-func verifyPublishedFile(root *os.Root, f File) (string, error) {
+func verifyPublishedFile(ctx context.Context, root *os.Root, f File) (string, error) {
 	name := filepath.FromSlash(f.Path)
 	file, err := openRegularDownloadFile(root, name, os.O_RDONLY)
 	if err != nil {
@@ -325,16 +329,31 @@ func verifyPublishedFile(root *os.Root, f File) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := checkOpenCheckpointDigest(root, name, f, file, info); err != nil {
+	if err := checkOpenCheckpointDigest(ctx, root, name, f, file, info); err != nil {
 		return "", err
 	}
 	return writeRootDigest(root, name, info, checkpointFileID(file, info), f.SHA256), nil
 }
 
-func hashCheckpointFile(f File, r io.Reader) (string, error) {
+type checkpointContextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r checkpointContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
+}
+
+func hashCheckpointFile(ctx context.Context, f File, r io.Reader) (string, error) {
 	h := sha256.New()
-	n, err := io.Copy(h, r)
+	n, err := io.Copy(h, checkpointContextReader{ctx: ctx, reader: r})
 	if err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 	if n != f.Size {
@@ -343,9 +362,29 @@ func hashCheckpointFile(f File, r io.Reader) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// Bound each copy operation so the file-to-file fast path can check cancellation between chunks.
+const checkpointCopyChunk = 4 << 20
+
+func copyCheckpointFile(ctx context.Context, dst io.Writer, src io.Reader, size int64) error {
+	for size > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, err := io.CopyN(dst, src, min(size, checkpointCopyChunk))
+		if err != nil {
+			return err
+		}
+		size -= n
+	}
+	return ctx.Err()
+}
+
 // publishCheckpoint builds a clean directory from the plan. Staging keeps its
 // identity, including when the writer is killed before the final rename.
-func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Root, dest string, p Plan, metadata checkpointMetadata, publication string, publicationBytes int64) error {
+func publishCheckpoint(ctx context.Context, parent *os.Root, work *checkpointWorkspace, stage *os.Root, dest string, p Plan, metadata checkpointMetadata, publication string, publicationBytes int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	workspace, err := parent.Lstat(work.name)
 	if err != nil {
 		return err
@@ -386,7 +425,7 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 			f.SHA256 = transfer.SHA256
 			p.Files[i] = f
 		}
-		info, sidecarDigest, err := preparePublishedFile(stage, publish, f)
+		info, sidecarDigest, err := preparePublishedFile(ctx, stage, publish, f)
 		if err != nil {
 			return fmt.Errorf("publishing %s: %w", f.Path, err)
 		}
@@ -395,7 +434,7 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 			sidecarDigests[filepath.ToSlash(sidecarPath(filepath.FromSlash(f.Path)))] = sidecarDigest
 		}
 	}
-	files, err := checkpointMarkerFiles(publish, p, metadata)
+	files, err := checkpointMarkerFiles(ctx, publish, p, metadata)
 	if err != nil {
 		return err
 	}
@@ -423,6 +462,9 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 	if !work.matchesPublication(stage, publication) {
 		return fmt.Errorf("checkpoint publication record changed before rename")
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// Seal exactly the receipts and file states this publication is allowed to reclaim.
 	var candidate *checkpointPublicationCandidate
 	if id := checkpointPublicationDirectoryID(publish); id != "" {
@@ -432,7 +474,7 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 	if err != nil {
 		return err
 	}
-	if err := renameCheckpointPublication(parent, relativePublish, dest); err != nil {
+	if err := renameCheckpointPublication(ctx, parent, relativePublish, dest); err != nil {
 		return err
 	}
 	if !work.matchesPublication(stage, publication) {
@@ -440,15 +482,26 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 	}
 	// The source can still change after it is copied. Recheck it before unlinking.
 	for _, file := range files {
-		removeCopiedStageFile(stage, file, sources[file.Path])
+		if ctx.Err() != nil {
+			return nil // the checkpoint is already published and the sealed cleanup can resume later
+		}
+		removeCopiedStageFile(ctx, stage, file, sources[file.Path])
 	}
-	work.reclaimTransfers(stage, cleanup.Transfers)
+	work.reclaimTransfers(ctx, stage, cleanup.Transfers)
 	return nil
 }
 
-var renameCheckpointPublication = (*os.Root).Rename
+var renameCheckpointPublication = func(ctx context.Context, parent *os.Root, src, dest string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return parent.Rename(src, dest)
+}
 
-func preparePublishedFile(stage, publish *os.Root, f File) (os.FileInfo, string, error) {
+func preparePublishedFile(ctx context.Context, stage, publish *os.Root, f File) (os.FileInfo, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
 	name := filepath.FromSlash(f.Path)
 	in, err := openRegularDownloadFile(stage, name, os.O_RDONLY)
 	if err != nil {
@@ -470,7 +523,7 @@ func preparePublishedFile(stage, publish *os.Root, f File) (os.FileInfo, string,
 	if err != nil {
 		return nil, "", err
 	}
-	_, copyErr := io.CopyN(out, in, f.Size)
+	copyErr := copyCheckpointFile(ctx, out, in, f.Size)
 	closeErr := out.Close()
 	if copyErr != nil {
 		return nil, "", copyErr
@@ -479,7 +532,7 @@ func preparePublishedFile(stage, publish *os.Root, f File) (os.FileInfo, string,
 		return nil, "", closeErr
 	}
 	if f.SHA256 != "" {
-		digest, err := verifyPublishedFile(publish, f)
+		digest, err := verifyPublishedFile(ctx, publish, f)
 		if err != nil {
 			if errors.Is(err, errCheckpointDigestMismatch) {
 				discardStagedDigest(stage, name, in, source, f.SHA256)
@@ -491,7 +544,7 @@ func preparePublishedFile(stage, publish *os.Root, f File) (os.FileInfo, string,
 	return source, "", nil
 }
 
-func removeCopiedStageFile(stage *os.Root, f File, source os.FileInfo) {
+func removeCopiedStageFile(ctx context.Context, stage *os.Root, f File, source os.FileInfo) {
 	name := filepath.FromSlash(f.Path)
 	file, err := openRegularDownloadFile(stage, name, os.O_RDONLY)
 	if err != nil {
@@ -502,12 +555,12 @@ func removeCopiedStageFile(stage *os.Root, f File, source os.FileInfo) {
 		file.Close()
 		return
 	}
-	err = checkOpenCheckpointDigest(stage, name, f, file, info)
+	err = checkOpenCheckpointDigest(ctx, stage, name, f, file, info)
 	if closeErr := file.Close(); err != nil || closeErr != nil {
 		return
 	}
 	current, err := stage.Lstat(name)
-	if err != nil || !sameCheckpointFileState(info, current) || stage.Remove(name) != nil {
+	if err != nil || !sameCheckpointFileState(info, current) || ctx.Err() != nil || stage.Remove(name) != nil {
 		return
 	}
 	if checkpointDigestSidecar(stage, name, info) == f.SHA256 {

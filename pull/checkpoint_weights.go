@@ -2,6 +2,7 @@ package pull
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,7 +50,10 @@ const (
 )
 
 // Use the same confined regular-file open for size-only and digest checks.
-func verifyCheckpointFile(root *os.Root, file File, check checkpointDigestCheck) error {
+func verifyCheckpointFile(ctx context.Context, root *os.Root, file File, check checkpointDigestCheck) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	name := filepath.FromSlash(file.Path)
 	f, err := checkpoint.OpenRootFile(root, name)
 	if err != nil {
@@ -67,17 +71,17 @@ func verifyCheckpointFile(root *os.Root, file File, check checkpointDigestCheck)
 		return nil
 	}
 	if check == checkpointReadOnlyDigest {
-		return checkOpenCheckpointDigest(root, name, file, f, info)
+		return checkOpenCheckpointDigest(ctx, root, name, file, f, info)
 	}
 	if check == checkpointFreshDigest {
 		cached, record := readCheckpointDigestRecord(root, name, info)
-		err := checkOpenCheckpointDigest(root, name, file, f, info)
+		err := checkOpenCheckpointDigest(ctx, root, name, file, f, info)
 		if errors.Is(err, errCheckpointDigestMismatch) && record != nil && cached.SHA256 == file.SHA256 && cached.FileID != "" && cached.FileID == checkpointFileID(f, info) {
 			return errors.Join(err, invalidateCheckpointDigest(root, name, f, info, cached, record))
 		}
 		return err
 	}
-	return verifyOpenCheckpointDigest(root, name, file, f, info)
+	return verifyOpenCheckpointDigest(ctx, root, name, file, f, info)
 }
 
 // Invalidate only the sidecar observed before checking the same checkpoint file.
@@ -104,7 +108,7 @@ func invalidateCheckpointDigest(root *os.Root, name string, file *os.File, befor
 
 // Reuse a digest only with a matching inode and kernel change time. Legacy
 // records and platforms without a change time require reading the file.
-func verifyOpenCheckpointDigest(root *os.Root, name string, file File, f *os.File, info os.FileInfo) error {
+func verifyOpenCheckpointDigest(ctx context.Context, root *os.Root, name string, file File, f *os.File, info os.FileInfo) error {
 	id := checkpointFileID(f, info)
 	changed := checkpointChangeTime(info)
 	if id != "" && changed != 0 {
@@ -113,7 +117,7 @@ func verifyOpenCheckpointDigest(root *os.Root, name string, file File, f *os.Fil
 			return confirmCheckpointFile(root, name, f, info)
 		}
 	}
-	if err := checkOpenCheckpointDigest(root, name, file, f, info); err != nil {
+	if err := checkOpenCheckpointDigest(ctx, root, name, file, f, info); err != nil {
 		return err
 	}
 	if id != "" && changed != 0 {
@@ -125,8 +129,8 @@ func verifyOpenCheckpointDigest(root *os.Root, name string, file File, f *os.Fil
 var errCheckpointDigestMismatch = errors.New("file does not match the checkpoint digest")
 
 // Check the opened bytes directly when publishing or discarding staging data.
-func checkOpenCheckpointDigest(root *os.Root, name string, file File, f *os.File, info os.FileInfo) error {
-	digest, err := hashCheckpointFile(file, f)
+func checkOpenCheckpointDigest(ctx context.Context, root *os.Root, name string, file File, f *os.File, info os.FileInfo) error {
+	digest, err := hashCheckpointFile(ctx, file, f)
 	if err != nil {
 		return err
 	}
@@ -136,7 +140,7 @@ func checkOpenCheckpointDigest(root *os.Root, name string, file File, f *os.File
 	if err := confirmCheckpointFile(root, name, f, info); err != nil {
 		return fmt.Errorf("checking %s: %w", file.Path, err)
 	}
-	return nil
+	return ctx.Err()
 }
 
 func confirmCheckpointFile(root *os.Root, name string, hashed *os.File, before os.FileInfo) error {

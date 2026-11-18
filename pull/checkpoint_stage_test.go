@@ -25,7 +25,7 @@ type testCheckpointPartial struct {
 func (w *checkpointWorkspace) recordPartial(stage *os.Root, name string, info os.FileInfo) {
 	path := filepath.ToSlash(name)
 	w.recordReceipt(checkpointReceipt{Owner: w.owner, Path: path, Partial: true}, info)
-	w.pruneTransferReceipts(stage, path, nil)
+	w.pruneTransferReceipts(context.Background(), stage, path, nil)
 }
 
 func createTestCheckpointStage(t *testing.T, dest string, partials ...testCheckpointPartial) string {
@@ -310,7 +310,7 @@ func TestCheckpointRecoversStageAfterKilledPublisher(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := preparePublishedFile(stage, publish, File{Path: completed, Size: info.Size()}); err != nil {
+		if _, _, err := preparePublishedFile(t.Context(), stage, publish, File{Path: completed, Size: info.Size()}); err != nil {
 			t.Fatal(err)
 		}
 		fmt.Println("prepared")

@@ -171,6 +171,9 @@ For safetensors pulls, `.<destination>.pull2` is a private sibling workspace for
 directory. Retry the same destination after an interruption to resume its verified staging data
 or finish cleanup for the matching publication. Cleanup uses the transfer records sealed when
 that checkpoint was published and leaves the stage alone when a later transfer is detected.
+Cancelling before the final directory rename keeps the staged downloads for a retry. Once the
+rename has succeeded, the published checkpoint is usable and any interrupted cleanup can resume
+on the next pull.
 Older checkpoints remain usable, and recovery leaves their
 stage data in place when no matching cleanup record exists. Resuming an existing `.part`
 requires a transfer record with a matching hard link. On filesystems without hard links,

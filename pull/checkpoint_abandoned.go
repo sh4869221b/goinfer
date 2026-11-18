@@ -1,6 +1,7 @@
 package pull
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"io/fs"
@@ -34,7 +35,10 @@ func checkpointPublicationDirectoryID(root *os.Root) string {
 
 // The destination lock is held. An abandoned copy is eligible only if it was
 // sealed, still has the recorded identity and contains only its verified data.
-func (w *checkpointWorkspace) reclaimAbandonedPublication(stage *os.Root) {
+func (w *checkpointWorkspace) reclaimAbandonedPublication(ctx context.Context, stage *os.Root) {
+	if ctx.Err() != nil {
+		return
+	}
 	cleanup, err := readCheckpointCleanup(stage)
 	if err != nil || cleanup.Owner != w.owner || !w.matchesPublication(stage, cleanup.Token) {
 		return
@@ -51,7 +55,7 @@ func (w *checkpointWorkspace) reclaimAbandonedPublication(stage *os.Root) {
 	if checkpointPublicationDirectoryID(publish) != candidate.FileID {
 		return
 	}
-	entries, ok := candidate.verifiedContents(publish, cleanup.Token)
+	entries, ok := candidate.verifiedContents(ctx, publish, cleanup.Token)
 	if !ok {
 		return
 	}
@@ -59,6 +63,9 @@ func (w *checkpointWorkspace) reclaimAbandonedPublication(stage *os.Root) {
 		return
 	}
 	for _, entry := range slices.Backward(entries) {
+		if ctx.Err() != nil {
+			return
+		}
 		info, err := publish.Lstat(entry.path)
 		if err != nil || !os.SameFile(entry.info, info) {
 			return
@@ -80,7 +87,7 @@ type checkpointCandidateEntry struct {
 	info os.FileInfo
 }
 
-func (c checkpointPublicationCandidate) verifiedContents(root *os.Root, token string) ([]checkpointCandidateEntry, bool) {
+func (c checkpointPublicationCandidate) verifiedContents(ctx context.Context, root *os.Root, token string) ([]checkpointCandidateEntry, bool) {
 	f, err := openRegularDownloadFile(root, checkpointMarker, os.O_RDONLY)
 	if err != nil {
 		return nil, false
@@ -113,6 +120,9 @@ func (c checkpointPublicationCandidate) verifiedContents(root *os.Root, token st
 		if err != nil || path == "." {
 			return err
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		path = filepath.FromSlash(path)
 		info, err := entry.Info()
 		if err != nil {
@@ -125,7 +135,7 @@ func (c checkpointPublicationCandidate) verifiedContents(root *os.Root, token st
 		source, sidecar := sidecars[path]
 		switch {
 		case info.IsDir() && dirs[path]:
-		case info.Mode().IsRegular() && payload && verifyAbandonedFile(root, path, file, info):
+		case info.Mode().IsRegular() && payload && verifyAbandonedFile(ctx, root, path, file, info):
 		case info.Mode().IsRegular() && sidecar && verifyAbandonedSidecar(root, path, source, info, c.Sidecars[filepath.ToSlash(path)]):
 			digestEntries = append(digestEntries, checkpointCandidateEntry{path: path, info: info})
 			return nil
@@ -139,14 +149,14 @@ func (c checkpointPublicationCandidate) verifiedContents(root *os.Root, token st
 	return append(entries, digestEntries...), err == nil
 }
 
-func verifyAbandonedFile(root *os.Root, path string, file File, info os.FileInfo) bool {
+func verifyAbandonedFile(ctx context.Context, root *os.Root, path string, file File, info os.FileInfo) bool {
 	f, err := openRegularDownloadFile(root, path, os.O_RDONLY)
 	if err != nil {
 		return false
 	}
 	defer f.Close()
 	opened, err := f.Stat()
-	return err == nil && sameCheckpointFileState(info, opened) && checkOpenCheckpointDigest(root, path, file, f, info) == nil
+	return err == nil && sameCheckpointFileState(info, opened) && checkOpenCheckpointDigest(ctx, root, path, file, f, info) == nil
 }
 
 func verifyAbandonedSidecar(root *os.Root, path string, source File, info os.FileInfo, expected string) bool {

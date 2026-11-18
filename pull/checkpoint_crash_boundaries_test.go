@@ -70,17 +70,19 @@ func TestCheckpointTransferCrashBoundaries(t *testing.T) {
 				return nil
 			}
 		case "published":
-			renameCheckpointPublication = func(root *os.Root, src, dest string) error {
-				if err := root.Rename(src, dest); err != nil {
+			rename := renameCheckpointPublication
+			renameCheckpointPublication = func(ctx context.Context, root *os.Root, src, dest string) error {
+				if err := rename(ctx, root, src, dest); err != nil {
 					return err
 				}
 				pause()
 				return nil
 			}
 		case "before publish":
-			renameCheckpointPublication = func(root *os.Root, src, dest string) error {
+			rename := renameCheckpointPublication
+			renameCheckpointPublication = func(ctx context.Context, root *os.Root, src, dest string) error {
 				pause()
-				return root.Rename(src, dest)
+				return rename(ctx, root, src, dest)
 			}
 		}
 		_, download, err := PrepareCheckpointFor(t.Context(), checkpointCrashRepo, nil)
