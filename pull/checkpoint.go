@@ -524,10 +524,13 @@ func verifyCachedCheckpoint(dir string, root *os.Root, m markerDoc, metadata che
 		case checkpointIndex, checkpoint.GenerationConfigName:
 			// The metadata readers verify the same bytes used for the layout or generation checks.
 		default:
-			if _, ok := cachedIntact(filepath.Join(dir, filepath.FromSlash(path.Dir(f.Path))), f); !ok {
-				return false, nil
+			if err := verifyCheckpointFile(root, f, true); err != nil {
+				return false, fmt.Errorf("cached checkpoint %s: %w", dir, err)
 			}
 		}
+	}
+	if err := verifyCheckpointExtras(root, m.Files); err != nil {
+		return false, fmt.Errorf("cached checkpoint %s: %w", dir, err)
 	}
 	return true, nil
 }
@@ -601,7 +604,7 @@ func DownloadCheckpoint(ctx context.Context, p Plan, dest string, progress func(
 func plannedCheckpointFiles(p Plan) (map[string]File, error) {
 	byPath := make(map[string]File, len(p.Files))
 	for _, f := range p.Files {
-		if !safeRepoPath(f.Path) || !filepath.IsLocal(filepath.FromSlash(f.Path)) || f.Path == checkpointMarker {
+		if !safeRepoPath(f.Path) || !filepath.IsLocal(filepath.FromSlash(f.Path)) || f.Path == checkpointMarker || f.Path == checkpointOwnerName {
 			return nil, fmt.Errorf("unsafe path %q in the plan for %s", f.Path, p.Repo)
 		}
 		if _, exists := byPath[f.Path]; exists {
@@ -612,12 +615,24 @@ func plannedCheckpointFiles(p Plan) (map[string]File, error) {
 	if _, ok := byPath["config.json"]; !ok {
 		return nil, fmt.Errorf("checkpoint plan for %s has no config.json", p.Repo)
 	}
+	for _, f := range p.Files {
+		if _, ok := byPath[f.Path+".part"]; ok {
+			return nil, fmt.Errorf("checkpoint plan for %s uses %q as both a file and a transfer partial", p.Repo, f.Path+".part")
+		}
+		sidecar := filepath.ToSlash(sidecarPath(filepath.FromSlash(f.Path)))
+		if _, ok := byPath[sidecar]; ok {
+			return nil, fmt.Errorf("checkpoint plan for %s uses %q as both a file and a checksum sidecar", p.Repo, sidecar)
+		}
+	}
 	return byPath, nil
 }
 
 // downloadCheckpoint stages the config and index alongside resumable downloads, then publishes
 // the complete set by renaming the directory. An existing destination must match the plan.
 func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata, dest string, progress func(done, total int64, file string)) (string, error) {
+	if err := validateCheckpointDestination(dest); err != nil {
+		return "", err
+	}
 	byPath, err := plannedCheckpointFiles(p)
 	if err != nil {
 		return "", err
@@ -632,28 +647,35 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 	} else if complete {
 		return dest, nil
 	}
-	staging := filepath.Clean(dest) + ".partial"
-	if err := os.MkdirAll(filepath.Dir(staging), 0o755); err != nil {
+	parentDir := filepath.Dir(filepath.Clean(dest))
+	if err := os.MkdirAll(parentDir, 0o755); err != nil {
 		return "", err
 	}
-	parent, err := os.OpenRoot(filepath.Dir(staging))
+	parent, err := os.OpenRoot(parentDir)
 	if err != nil {
 		return "", err
 	}
 	defer parent.Close()
-	stagingName, destName := filepath.Base(staging), filepath.Base(dest)
-	lock, claim, err := lockCheckpointDestination(parent, destName)
+	destName := filepath.Base(dest)
+	work, err := lockCheckpointDestination(parent, destName)
 	if err != nil {
 		return "", fmt.Errorf("locking checkpoint %s: %w", dest, err)
 	}
-	defer lock.Close()
+	defer work.Close()
 	if complete, err := reuseCheckpointDestination(ctx, dest, p, metadata); err != nil {
 		return "", err
 	} else if complete {
 		return dest, nil
 	}
-	if err := recoverCheckpointStage(parent, stagingName, claim); err != nil {
-		return "", fmt.Errorf("recovering checkpoint %s: %w", dest, err)
+	root, err := work.openStage(false)
+	if err != nil {
+		return "", fmt.Errorf("opening staging directory for %s: %w", dest, err)
+	}
+	staging := filepath.Join(parentDir, work.name, checkpointStageName)
+	probe := parentDir
+	if root != nil {
+		defer root.Close()
+		probe = staging
 	}
 	var need int64
 	for _, f := range p.Files {
@@ -673,28 +695,27 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 			}
 		}
 	}
-	if err := checkDiskSpace(p.Repo, need, staging); err != nil {
+	if err := checkDiskSpace(p.Repo, need, probe); err != nil {
 		return "", err
 	}
-	if err := parent.Mkdir(stagingName, 0o755); err != nil && !os.IsExist(err) {
-		return "", err
+	if root == nil {
+		root, err = work.openStage(true)
+		if err != nil {
+			return "", fmt.Errorf("opening staging directory %s: %w", staging, err)
+		}
+		defer root.Close()
 	}
-	root, err := openCheckpointStaging(parent, stagingName)
-	if err != nil {
-		return "", fmt.Errorf("opening staging directory %s: %w", staging, err)
-	}
-	defer root.Close()
 	if err := stageCheckpoint(ctx, root, p, metadata, progress); err != nil {
 		return "", err
 	}
-	parentInfo, err := os.Stat(filepath.Dir(staging))
+	parentInfo, err := os.Stat(parentDir)
 	if err != nil {
 		return "", err
 	}
 	if !sameCheckpointDirectory(parent, parentInfo) {
 		return "", fmt.Errorf("checkpoint destination directory changed during download")
 	}
-	if err := publishCheckpoint(parent, root, stagingName, destName, claim, p, metadata); err != nil {
+	if err := publishCheckpoint(parent, work, root, destName, p, metadata); err != nil {
 		return "", fmt.Errorf("publishing %s: %w", dest, err)
 	}
 	return dest, nil

@@ -167,12 +167,13 @@ of config, tokenizer and weight shards; nothing lands until every file has check
 transfer starts. A plain path still means a plain path — only the `hf:` and `demo:` prefixes are
 special.
 
-For safetensors pulls, each output directory has a private sibling workspace named
-`.<destination>.pull`. It holds the destination's lock and any files awaiting publication.
-Retry the same destination to recover after an interruption during publication. If the
-interrupted pull used `.goinfer-pulls/<destination>`, retry with the version that created it.
-Older `.goinfer-publish-*` directories lack destination information, so their files require
-manual identification before recovery or removal.
+For safetensors pulls, `.<destination>.pull2` is a private sibling workspace for each output
+directory. Retry the same destination after an interruption to resume its verified staging data.
+Each publication builds a clean directory from the plan. A process killed during publication
+can leave a `publish-*` directory in the workspace while the staging data remains resumable.
+For older `.partial`, `.pull`, or `.goinfer-pulls/<destination>` layouts, recovery uses the
+version that created the workspace. Older `.goinfer-publish-*` directories lack destination
+information and require manual identification before recovery or removal.
 
 To see the checkpoints this project has actually run:
 

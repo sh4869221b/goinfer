@@ -53,9 +53,19 @@ func CacheEntries() ([]CacheEntry, error) {
 				continue
 			}
 			dir := filepath.Join(root, o.Name(), r.Name())
+			if name, ok := strings.CutSuffix(strings.TrimPrefix(r.Name(), "."), checkpointWorkSuffix); ok && strings.HasPrefix(r.Name(), ".") {
+				dest := filepath.Join(root, o.Name(), name)
+				if bytes := checkpointStagingBytes(dir, name, dest); bytes > 0 {
+					out = append(out, CacheEntry{Repo: o.Name() + "/" + name, Path: dest, Kind: "checkpoint", Bytes: bytes})
+				}
+				continue
+			}
 			if name, ok := strings.CutSuffix(r.Name(), ".partial"); ok {
-				// A checkpoint still being assembled (DownloadCheckpoint's staging directory).
-				out = append(out, CacheEntry{Repo: o.Name() + "/" + name, Path: filepath.Join(root, o.Name(), name), Kind: "checkpoint", Bytes: dirBytes(dir)})
+				// Legacy resumable checkpoints used a sibling .partial directory.
+				dest := filepath.Join(root, o.Name(), name)
+				if _, err := os.Lstat(dest); os.IsNotExist(err) && checkpointStagingBytes(filepath.Join(root, o.Name(), checkpointWorkspaceName(name)), name, dest) == 0 {
+					out = append(out, CacheEntry{Repo: o.Name() + "/" + name, Path: dest, Kind: "checkpoint", Bytes: dirBytes(dir)})
+				}
 				continue
 			}
 			out = append(out, repoEntries(o.Name()+"/"+r.Name(), dir)...)
@@ -68,6 +78,37 @@ func CacheEntries() ([]CacheEntry, error) {
 		return out[i].Path < out[j].Path
 	})
 	return out, nil
+}
+
+func checkpointStagingBytes(dir, name, dest string) int64 {
+	if _, err := os.Lstat(dest); !os.IsNotExist(err) {
+		return 0
+	}
+	parent, err := os.OpenRoot(filepath.Dir(dir))
+	if err != nil {
+		return 0
+	}
+	defer parent.Close()
+	root, err := openCheckpointStaging(parent, filepath.Base(dir))
+	if err != nil {
+		return 0
+	}
+	defer root.Close()
+	owner, err := readCheckpointOwner(root)
+	if err != nil || owner.Destination != name || owner.Token == "" {
+		return 0
+	}
+	workspace := checkpointWorkspace{root: root, owner: owner}
+	stage, err := workspace.openStage(false)
+	if err != nil || stage == nil {
+		return 0
+	}
+	defer stage.Close()
+	info, err := stage.Lstat(checkpointOwnerName)
+	if err != nil {
+		return 0
+	}
+	return dirBytes(stage.Name()) - info.Size()
 }
 
 // repoEntries is one repo directory's models: a checkpoint (the directory itself, when it carries the marker), and the
@@ -85,13 +126,12 @@ func repoEntries(repo, dir string) []CacheEntry {
 			complete := verifyCheckpointWeights(root, m.Files, nil) == nil
 			if complete {
 				_, err := readCachedGeneration(root, m.Files)
-				complete = err == nil
+				complete = err == nil && verifyCheckpointExtras(root, m.Files) == nil
 			}
 			for _, f := range m.Files {
 				inMarker[filepath.Base(f.Path)] = true
 				if complete {
-					st, err := os.Stat(filepath.Join(dir, filepath.FromSlash(f.Path)))
-					complete = err == nil && st.Mode().IsRegular() && st.Size() == f.Size
+					complete = verifyCheckpointFile(root, f, false) == nil
 				}
 			}
 			out = append(out, CacheEntry{Repo: repo, Path: dir, Kind: "checkpoint", Bytes: dirBytes(dir), Complete: complete})

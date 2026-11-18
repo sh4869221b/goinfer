@@ -13,6 +13,136 @@ import (
 	"time"
 )
 
+func testCheckpointStagePath(dest string) string {
+	return filepath.Join(filepath.Dir(dest), checkpointWorkspaceName(filepath.Base(dest)), checkpointStageName)
+}
+
+func createTestCheckpointStage(t *testing.T, dest string) string {
+	t.Helper()
+	parent, err := os.OpenRoot(filepath.Dir(dest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	work, err := lockCheckpointDestination(parent, filepath.Base(dest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer work.Close()
+	stage, err := work.openStage(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage.Close()
+	return testCheckpointStagePath(dest)
+}
+
+func TestCheckpointPreservesLegacyWorkspaceUsedAsDestination(t *testing.T) {
+	const repo = "o/tiny"
+	h := &fakeHF{files: shardedTinyRepo(t)}
+	h.serve(t, repo)
+	_, download, err := PrepareCheckpointFor(t.Context(), repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := t.TempDir()
+	legacy := filepath.Join(parent, ".model.pull", "checkpoint")
+	if _, err := download(t.Context(), legacy, nil); err != nil {
+		t.Fatal(err)
+	}
+	notes := filepath.Join(legacy, "notes.txt")
+	if err := os.WriteFile(notes, []byte("keep me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(parent, "model")
+	if got, err := download(t.Context(), dest, nil); got != dest || err != nil {
+		t.Errorf("independent pull = %q, %v", got, err)
+	}
+	if got, err := os.ReadFile(notes); err != nil || string(got) != "keep me" {
+		t.Errorf("other destination lost notes: %q, %v", got, err)
+	}
+	if _, ok := CachedCheckpoint(legacy); !ok {
+		t.Error("other destination no longer verifies")
+	}
+}
+
+func TestCheckpointIsolatesStageFromPreviousWriter(t *testing.T) {
+	const child = "GOINFER_TEST_PREVIOUS_CHECKPOINT_STAGE"
+	const aux = "tokenizer_config.json"
+	if stage := os.Getenv(child); stage != "" {
+		root, err := os.OpenRoot(stage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+		fmt.Println("opened")
+		if _, err := bufio.NewReader(os.Stdin).ReadByte(); err != nil {
+			t.Fatal(err)
+		}
+		if err := root.WriteFile(aux, []byte(`{"model_max_length":111}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	const repo = "o/tiny"
+	files := shardedTinyRepo(t)
+	files[aux] = []byte(`{"model_max_length":222}`)
+	h := &fakeHF{files: files}
+	h.serve(t, repo)
+	_, download, err := PrepareCheckpointFor(t.Context(), repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "model")
+	legacy := dest + ".partial"
+	if err := os.Mkdir(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCheckpointIsolatesStageFromPreviousWriter$")
+	cmd.Env = append(os.Environ(), child+"="+legacy)
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	})
+	if line, err := bufio.NewReader(out).ReadString('\n'); err != nil || strings.TrimSpace(line) != "opened" {
+		t.Fatalf("previous writer did not open stage: %q, %v", line, err)
+	}
+	if _, err := download(t.Context(), dest, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(in, "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(dest, aux)); err != nil || string(raw) != string(files[aux]) {
+		t.Errorf("old writer modified publication: %q, %v", raw, err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(legacy, aux)); err != nil || string(raw) != `{"model_max_length":111}` {
+		t.Errorf("old stage was moved or modified: %q, %v", raw, err)
+	}
+	if _, ok := CachedCheckpoint(dest); !ok {
+		t.Error("old writer invalidated published cache")
+	}
+}
+
 func TestCheckpointPullIgnoresInaccessibleLegacyWorkspace(t *testing.T) {
 	const repo = "o/tiny"
 	shared := t.TempDir()
@@ -49,17 +179,17 @@ func TestCheckpointLocksAreIndependentAcrossDestinations(t *testing.T) {
 	}
 	defer parent.Close()
 	for _, dest := range []string{"first", "second"} {
-		lock, claim, err := lockCheckpointDestination(parent, dest)
+		work, err := lockCheckpointDestination(parent, dest)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer lock.Close()
-		if want := filepath.Join("."+dest+".pull", "checkpoint"); claim != want {
-			t.Errorf("claim for %s = %q, want %q", dest, claim, want)
+		defer work.Close()
+		if want := "." + dest + ".pull2"; work.name != want {
+			t.Errorf("workspace for %s = %q, want %q", dest, work.name, want)
 		}
-		if lock, _, err := lockCheckpointDestination(parent, dest); err == nil || !strings.Contains(err.Error(), "another checkpoint pull") {
-			if lock != nil {
-				lock.Close()
+		if work, err := lockCheckpointDestination(parent, dest); err == nil || !strings.Contains(err.Error(), "another checkpoint pull") {
+			if work != nil {
+				work.Close()
 			}
 			t.Errorf("second lock for %s = %v, want a lock conflict", dest, err)
 		}
@@ -119,31 +249,48 @@ func TestCheckpointParallelPullCannotWriteToPublishedDirectory(t *testing.T) {
 	}
 }
 
-func TestCheckpointRecoversClaimAfterKilledProcess(t *testing.T) {
+func TestCheckpointRecoversStageAfterKilledPublisher(t *testing.T) {
 	const child = "GOINFER_TEST_CLAIMED_CHECKPOINT"
 	const name = "checkpoint"
-	const staging = name + ".partial"
+	const interruptedPublish = "publish-interrupted"
+	const completed = "model-00001-of-00002.safetensors"
+	const interrupted = "model-00002-of-00002.safetensors"
 	if dir := os.Getenv(child); dir != "" {
 		parent, err := os.OpenRoot(dir)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer parent.Close()
-		lock, claim, err := lockCheckpointDestination(parent, name)
+		work, err := lockCheckpointDestination(parent, name)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer lock.Close()
-		if err := parent.Rename(staging, claim); err != nil {
+		defer work.Close()
+		stage, err := work.openStage(false)
+		if err != nil || stage == nil {
+			t.Fatalf("open resumed stage: %v", err)
+		}
+		defer stage.Close()
+		if err := work.root.Mkdir(interruptedPublish, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		fmt.Println("claimed")
+		publish, err := work.root.OpenRoot(interruptedPublish)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer publish.Close()
+		info, err := stage.Lstat(completed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := preparePublishedFile(work.root, stage, publish, interruptedPublish, File{Path: completed, Size: info.Size()}); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Println("prepared")
 		_, _ = io.Copy(io.Discard, os.Stdin)
 		return
 	}
 	const repo = "o/tiny"
-	const completed = "model-00001-of-00002.safetensors"
-	const interrupted = "model-00002-of-00002.safetensors"
 	files := shardedTinyRepo(t)
 	h := &fakeHF{files: files}
 	h.serve(t, repo)
@@ -152,10 +299,8 @@ func TestCheckpointRecoversClaimAfterKilledProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	stagePath, dest := filepath.Join(dir, staging), filepath.Join(dir, name)
-	if err := os.Mkdir(stagePath, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	dest := filepath.Join(dir, name)
+	stagePath := createTestCheckpointStage(t, dest)
 	for filename, raw := range map[string][]byte{completed: files[completed], interrupted + ".part": files[interrupted][:32]} {
 		if err := os.WriteFile(filepath.Join(stagePath, filename), raw, 0o644); err != nil {
 			t.Fatal(err)
@@ -163,7 +308,7 @@ func TestCheckpointRecoversClaimAfterKilledProcess(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCheckpointRecoversClaimAfterKilledProcess$")
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCheckpointRecoversStageAfterKilledPublisher$")
 	cmd.Env = append(os.Environ(), child+"="+dir)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -183,8 +328,8 @@ func TestCheckpointRecoversClaimAfterKilledProcess(t *testing.T) {
 			_ = cmd.Wait()
 		}
 	})
-	if line, err := bufio.NewReader(stdout).ReadString('\n'); strings.TrimSpace(line) != "claimed" || err != nil {
-		t.Fatalf("waiting for the child to claim staging: %q, %v", line, err)
+	if line, err := bufio.NewReader(stdout).ReadString('\n'); strings.TrimSpace(line) != "prepared" || err != nil {
+		t.Fatalf("waiting for the child to stage publication: %q, %v", line, err)
 	}
 	if got, err := download(t.Context(), dest, nil); got != "" || err == nil || !strings.Contains(err.Error(), "another checkpoint pull") {
 		t.Fatalf("live owner's claim was not protected: %q, %v", got, err)
@@ -198,9 +343,9 @@ func TestCheckpointRecoversClaimAfterKilledProcess(t *testing.T) {
 	if got, err := download(t.Context(), dest, nil); got != dest || err != nil {
 		t.Fatalf("retry after killing the writer = %q, %v", got, err)
 	}
-	claim := filepath.Join(dir, checkpointWorkspaceName(name), "checkpoint")
-	if _, err := os.Lstat(claim); !os.IsNotExist(err) {
-		t.Errorf("publish claim still present after retry: %v", err)
+	claim := filepath.Join(dir, checkpointWorkspaceName(name), interruptedPublish, completed)
+	if raw, err := os.ReadFile(claim); err != nil || string(raw) != string(files[completed]) {
+		t.Errorf("retry modified the abandoned publication: %v", err)
 	}
 	if _, ok := CachedCheckpoint(dest); !ok {
 		t.Error("recovered checkpoint did not verify")
@@ -212,33 +357,48 @@ func TestCheckpointRecoversClaimAfterKilledProcess(t *testing.T) {
 	}
 }
 
-func TestCheckpointPreservesConflictingRecoveryDirectories(t *testing.T) {
-	const dest = "checkpoint"
-	parent, err := os.OpenRoot(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer parent.Close()
-	lock, claim, err := lockCheckpointDestination(parent, dest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lock.Close()
-	paths := map[string]string{dest + ".partial": "normal stage", claim: "interrupted publish"}
-	for dir, data := range paths {
-		if err := parent.Mkdir(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := parent.WriteFile(filepath.Join(dir, "data"), []byte(data), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := recoverCheckpointStage(parent, dest+".partial", claim); err == nil || !strings.Contains(err.Error(), "contain staging data") {
-		t.Errorf("expected a recovery conflict, got %v", err)
-	}
-	for dir, want := range paths {
-		if got, err := parent.ReadFile(filepath.Join(dir, "data")); err != nil || string(got) != want {
-			t.Errorf("conflict changed %s: %q, %v", dir, got, err)
-		}
+func TestCheckpointPreservesUnownedRecoveryDirectories(t *testing.T) {
+	const repo = "o/tiny"
+	for _, fixture := range []string{"unowned workspace", "unowned stage", "other destination"} {
+		t.Run(fixture, func(t *testing.T) {
+			h := &fakeHF{files: shardedTinyRepo(t)}
+			h.serve(t, repo)
+			_, download, err := PrepareCheckpointFor(t.Context(), repo, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dest := filepath.Join(t.TempDir(), "checkpoint")
+			stage := testCheckpointStagePath(dest)
+			switch fixture {
+			case "unowned stage":
+				createTestCheckpointStage(t, dest)
+				if err := os.Remove(filepath.Join(stage, checkpointOwnerName)); err != nil {
+					t.Fatal(err)
+				}
+			case "other destination":
+				other := filepath.Join(filepath.Dir(dest), "other")
+				otherStage := createTestCheckpointStage(t, other)
+				if err := os.Rename(filepath.Dir(otherStage), filepath.Dir(stage)); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				if err := os.MkdirAll(stage, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			file := filepath.Join(stage, "notes.txt")
+			if err := os.WriteFile(file, []byte("leave in place"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := download(t.Context(), dest, nil); got != "" || err == nil || !strings.Contains(err.Error(), "no verified owner") {
+				t.Errorf("unowned stage pull = %q, %v", got, err)
+			}
+			if raw, err := os.ReadFile(file); err != nil || string(raw) != "leave in place" {
+				t.Errorf("unowned stage was modified: %q, %v", raw, err)
+			}
+			if _, err := os.Lstat(dest); !os.IsNotExist(err) {
+				t.Errorf("unowned stage was published: %v", err)
+			}
+		})
 	}
 }

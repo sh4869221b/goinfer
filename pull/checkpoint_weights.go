@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -11,6 +13,72 @@ import (
 
 	"github.com/townsendmerino/goinfer/internal/runtime/checkpoint"
 )
+
+func checkpointDigestSidecar(root *os.Root, name string, info os.FileInfo) string {
+	f, err := openRegularDownloadFile(root, sidecarPath(name), os.O_RDONLY)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	var stored digestSidecar
+	if err := json.NewDecoder(io.LimitReader(f, 4096)).Decode(&stored); err == nil && stored.Size == info.Size() && stored.ModTime == info.ModTime().UnixNano() {
+		return stored.SHA256
+	}
+	return ""
+}
+
+// Use the same confined regular-file open for size-only and digest checks.
+func verifyCheckpointFile(root *os.Root, file File, verifyDigest bool) error {
+	name := filepath.FromSlash(file.Path)
+	f, err := checkpoint.OpenRootFile(root, name)
+	if err != nil {
+		return fmt.Errorf("checking %s: %w", file.Path, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("checking %s: %w", file.Path, err)
+	}
+	if info.Size() != file.Size {
+		return fmt.Errorf("%s has size %d, want %d", file.Path, info.Size(), file.Size)
+	}
+	if !verifyDigest || file.SHA256 == "" || checkpointDigestSidecar(root, name, info) == file.SHA256 {
+		return nil
+	}
+	digest, err := hashCheckpointFile(file, f)
+	if err != nil {
+		return err
+	}
+	if digest != file.SHA256 {
+		return fmt.Errorf("%s does not match the checkpoint digest", file.Path)
+	}
+	return nil
+}
+
+// Some callers read optional files by name, including ones present in older caches
+// without a marker entry. Keep those paths confined as well.
+func verifyCheckpointExtras(root *os.Root, files []File) error {
+	listed := make(map[string]bool, len(files))
+	for _, file := range files {
+		listed[file.Path] = true
+	}
+	for _, name := range append(slices.Sorted(maps.Keys(checkpointExtras)), "tokenizer.jsonl", "tekken.json") {
+		if listed[name] {
+			continue
+		}
+		file, err := checkpoint.OpenRootFile(root, filepath.FromSlash(name))
+		if os.IsNotExist(err) {
+			if info, _ := root.Lstat(filepath.FromSlash(name)); info == nil {
+				continue
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("checking optional %s: %w", name, err)
+		}
+		file.Close()
+	}
+	return nil
+}
 
 const (
 	checkpointWeights = "model.safetensors"

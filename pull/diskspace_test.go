@@ -183,7 +183,7 @@ func TestDownloadCheckpoint_refusesWhatWillNotFit_beforeAnyByte(t *testing.T) {
 	if n := d.hits.Load(); n != 0 {
 		t.Errorf("%d requests made before refusing, want 0", n)
 	}
-	if _, serr := os.Stat(dest + ".partial"); !os.IsNotExist(serr) {
+	if _, serr := os.Stat(testCheckpointStagePath(dest)); !os.IsNotExist(serr) {
 		t.Errorf("a refusal left the staging directory behind: %v", serr)
 	}
 	if strings.Contains(err.Error(), ".partial") || !strings.Contains(err.Error(), root+" has") {
@@ -205,14 +205,15 @@ func TestDownloadCheckpoint_countsPartialsInSubdirectories(t *testing.T) {
 			d := newDiskTestFiles(t, tc.free, true)
 			d.set[1].Path = "sub/b.gguf"
 			dest := filepath.Join(t.TempDir(), "ckpt")
-			sub := filepath.Join(dest+".partial", "sub")
+			stage := createTestCheckpointStage(t, dest)
+			sub := filepath.Join(stage, "sub")
 			if err := os.MkdirAll(sub, 0o755); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(filepath.Join(sub, "b.gguf.part"), bytes.Repeat([]byte("b"), 499), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(filepath.Join(dest+".partial", "config.json"), []byte(diskCheckpointConfig), 0o644); err != nil {
+			if err := os.WriteFile(filepath.Join(stage, "config.json"), []byte(diskCheckpointConfig), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			p := diskCheckpointPlan(d.set)
@@ -220,8 +221,8 @@ func TestDownloadCheckpoint_countsPartialsInSubdirectories(t *testing.T) {
 			if (err == nil) != tc.ok {
 				t.Fatalf("1,001 bytes left and %d free: err %v, want ok=%v", tc.free, err, tc.ok)
 			}
-			if len(d.asked) != 1 || d.asked[0] != dest+".partial" {
-				t.Errorf("free space asked of %v, want once, of %s.partial", d.asked, dest)
+			if len(d.asked) != 1 || d.asked[0] != stage {
+				t.Errorf("free space asked of %v, want once, of %s", d.asked, stage)
 			}
 		})
 	}

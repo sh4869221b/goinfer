@@ -558,8 +558,8 @@ func TestCheckpoint_shardedRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if _, err := os.Stat(dir + ".partial"); !os.IsNotExist(err) {
-		t.Fatalf("the staging directory survived a completed pull: %v", err)
+	if _, err := os.Stat(filepath.Join(testCheckpointStagePath(dir), "model-00001-of-00002.safetensors")); !os.IsNotExist(err) {
+		t.Fatalf("published shard was left in staging: %v", err)
 	}
 	m, err := decoder.Load(dir, decoder.Options{Backend: "cpu"})
 	if err != nil {
@@ -604,8 +604,11 @@ func TestCheckpoint_interruptedSetNeverPublishes(t *testing.T) {
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("an incomplete set published %s (stat err %v)", dir, err)
 	}
-	if _, err := os.Stat(dir + ".partial"); err != nil {
+	if _, err := os.Stat(testCheckpointStagePath(dir)); err != nil {
 		t.Fatalf("the staging directory is gone, so nothing can resume: %v", err)
+	}
+	if entries, err := CacheEntries(); err != nil || len(entries) != 1 || entries[0].Path != dir || entries[0].Complete {
+		t.Errorf("CacheEntries during interrupted pull = %v, %v", entries, err)
 	}
 	firstShard := h.hits["model-00001-of-00002.safetensors"]
 	if _, err := Resolve(context.Background(), "hf:o/tiny:safetensors", nil); err != nil {
@@ -665,7 +668,7 @@ func TestCheckpointResumeAfterWeightLayoutChange(t *testing.T) {
 			if got, err := download(ctx, dest, nil); got != "" || err == nil || !strings.Contains(err.Error(), tokenizerFile) {
 				t.Fatalf("expected interruption during %s, got %q, %v", tokenizerFile, got, err)
 			}
-			staging := dest + ".partial"
+			staging := testCheckpointStagePath(dest)
 			if _, err := os.Stat(filepath.Join(staging, tokenizerFile+".part")); err != nil {
 				t.Fatal(err)
 			}
@@ -768,7 +771,11 @@ func TestCheckpointLayoutCleanupLeavesOtherDirectoriesAlone(t *testing.T) {
 					t.Fatal(err)
 				}
 				outside := t.TempDir()
-				saveCheckpointConfigLink(t, outside, dest+".partial")
+				staging := createTestCheckpointStage(t, dest)
+				if err := os.RemoveAll(staging); err != nil {
+					t.Fatal(err)
+				}
+				saveCheckpointConfigLink(t, outside, staging)
 				indexPath = filepath.Join(outside, checkpointIndex)
 				wantError = "opening staging directory"
 			}
@@ -815,10 +822,7 @@ func TestCheckpointLayoutCleanupRejectsReplacedStaging(t *testing.T) {
 		t.Fatal(err)
 	}
 	dest := filepath.Join(t.TempDir(), "checkpoint")
-	staging := dest + ".partial"
-	if err := os.Mkdir(staging, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	staging := createTestCheckpointStage(t, dest)
 	outside, moved := t.TempDir(), staging+".moved"
 	for _, dir := range []string{staging, outside} {
 		if err := os.WriteFile(filepath.Join(dir, checkpointIndex), files[checkpointIndex], 0o644); err != nil {
@@ -879,7 +883,7 @@ func TestCheckpointResumeUsesPlannedConfig(t *testing.T) {
 			if _, err := oldDownload(ctx, dest, nil); err == nil {
 				t.Fatal("first download should stop on the interrupted shard")
 			}
-			staging := dest + ".partial"
+			staging := testCheckpointStagePath(dest)
 			part, err := os.Stat(filepath.Join(staging, resumedShard+".part"))
 			if err != nil || part.Size() <= 0 {
 				t.Fatalf("expected a partially downloaded shard, stat=%v (%v)", part, err)
@@ -961,7 +965,7 @@ func TestCheckpointResumeUsesCurrentGenerationConfig(t *testing.T) {
 			if _, err := download(ctx, dest, nil); err == nil || !strings.Contains(err.Error(), interrupted) {
 				t.Fatalf("want interrupted tokenizer, got %v", err)
 			}
-			staging := dest + ".partial"
+			staging := testCheckpointStagePath(dest)
 			if old, err := os.ReadFile(filepath.Join(staging, generation)); err != nil || !bytes.Equal(old, files[generation]) {
 				t.Fatalf("old generation file was not staged: %v", err)
 			}
@@ -1007,6 +1011,9 @@ func TestCheckpointResumeUsesCurrentGenerationConfig(t *testing.T) {
 			for _, name := range []string{"unused", "model-old.safetensors.part"} {
 				if _, err := os.Lstat(filepath.Join(dest, name)); !os.IsNotExist(err) {
 					t.Errorf("unplanned path %s was published: %v", name, err)
+				}
+				if _, err := os.Lstat(filepath.Join(staging, name)); err != nil {
+					t.Errorf("unplanned path %s was removed from staging: %v", name, err)
 				}
 			}
 			if raw, err := os.ReadFile(outside); err != nil || string(raw) != "keep" {
@@ -1199,6 +1206,83 @@ func TestCheckpointRepullLegacyTemplateSymlink(t *testing.T) {
 	}
 }
 
+func TestCheckpointRejectsExternalAuxiliaryLinksAcrossEntrypoints(t *testing.T) {
+	const repo = "o/tiny"
+	for _, tc := range []struct {
+		name, aux        string
+		legacy, unlisted bool
+	}{
+		{name: "with digest", aux: "chat_template.jinja"},
+		{name: "legacy without digest", aux: "chat_template.jinja", legacy: true},
+		{name: "nested config", aux: "1_Pooling/config.json"},
+		{name: "unlisted tokenizer", aux: "tokenizer.json", unlisted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			aux := tc.aux
+			withCacheRoot(t)
+			files := shardedTinyRepo(t)
+			files[aux] = []byte("{{ messages }}\n")
+			h := &fakeHF{files: files}
+			h.serve(t, repo)
+			ctx := t.Context()
+			_, download, err := PrepareCheckpointFor(ctx, repo, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dest, err := CacheDir(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := download(ctx, dest, nil); err != nil {
+				t.Fatal(err)
+			}
+			if tc.legacy || tc.unlisted {
+				marker := readTestCheckpointMarker(t, dest)
+				if tc.unlisted {
+					marker.Files = slices.DeleteFunc(marker.Files, func(f File) bool { return f.Path == aux })
+					h.mu.Lock()
+					delete(h.files, aux)
+					h.mu.Unlock()
+					_, download, err = PrepareCheckpointFor(ctx, repo, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					for i, f := range marker.Files {
+						if f.Path == aux {
+							marker.Files[i].SHA256 = ""
+						}
+					}
+				}
+				raw, err := json.Marshal(marker)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dest, checkpointMarker), raw, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			target := filepath.Join(t.TempDir(), filepath.Base(aux))
+			if err := os.Rename(filepath.Join(dest, aux), target); err != nil {
+				t.Fatal(err)
+			}
+			saveCheckpointConfigLink(t, target, filepath.Join(dest, aux))
+			if _, ok := CachedCheckpoint(dest); ok {
+				t.Error("CachedCheckpoint accepted outside auxiliary file")
+			}
+			if entries, err := CacheEntries(); err != nil || len(entries) != 1 || entries[0].Complete {
+				t.Errorf("CacheEntries = %+v, %v; want incomplete", entries, err)
+			}
+			if got, err := Resolve(ctx, "hf:"+repo+":safetensors", nil); got != "" || err == nil || !strings.Contains(err.Error(), aux) {
+				t.Errorf("Resolve = %q, %v", got, err)
+			}
+			if got, err := download(ctx, dest, nil); got != "" || err == nil || !strings.Contains(err.Error(), aux) {
+				t.Errorf("explicit pull = %q, %v", got, err)
+			}
+		})
+	}
+}
+
 func TestCheckpointRejectsUnverifiedGenerationConfig(t *testing.T) {
 	const repo = "o/tiny"
 	const generation = "generation_config.json"
@@ -1304,8 +1388,8 @@ func TestDownloadCheckpointRejectsCompletedConfigDrift(t *testing.T) {
 	if got, err := Resolve(ctx, "hf:"+repo+":safetensors", nil); err != nil || got != dest {
 		t.Errorf("offline Resolve should still open the verified cache: %q, %v", got, err)
 	}
-	if _, err := os.Stat(dest + ".partial"); !os.IsNotExist(err) {
-		t.Errorf("refusal left a staging directory: %v", err)
+	if _, err := os.Stat(filepath.Join(testCheckpointStagePath(dest), "config.json")); !os.IsNotExist(err) {
+		t.Errorf("refusal staged a new config: %v", err)
 	}
 	for _, f := range oldPlan.Files {
 		want := files[f.Path]
@@ -1417,7 +1501,7 @@ func TestDownloadCheckpointRequiresConfigEntry(t *testing.T) {
 	if path, err := DownloadCheckpoint(t.Context(), plan, dest, nil); path != "" || err == nil || !strings.Contains(err.Error(), "no config.json") {
 		t.Errorf("plan without config.json should fail: %q, %v", path, err)
 	}
-	for _, path := range []string{dest, dest + ".partial"} {
+	for _, path := range []string{dest, testCheckpointStagePath(dest)} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Errorf("refused plan left %s: %v", path, err)
 		}
@@ -1453,7 +1537,7 @@ func TestDownloadCheckpointRequiresWeights(t *testing.T) {
 			if path, err := DownloadCheckpoint(t.Context(), plan, dest, nil); path != "" || err == nil || !strings.Contains(err.Error(), tc.wantError) {
 				t.Errorf("DownloadCheckpoint = %q, %v; want refusal mentioning %q", path, err, tc.wantError)
 			}
-			for _, path := range []string{dest, filepath.Join(dest+".partial", checkpointMarker)} {
+			for _, path := range []string{dest, filepath.Join(testCheckpointStagePath(dest), checkpointMarker)} {
 				if _, err := os.Stat(path); !os.IsNotExist(err) {
 					t.Errorf("refused plan published %s: %v", path, err)
 				}
@@ -1511,10 +1595,7 @@ func TestCheckpointResumeUsesPlannedIndex(t *testing.T) {
 				h.mu.Unlock()
 			}
 			dest := filepath.Join(t.TempDir(), "checkpoint")
-			staging := dest + ".partial"
-			if err := os.Mkdir(staging, 0o755); err != nil {
-				t.Fatal(err)
-			}
+			staging := createTestCheckpointStage(t, dest)
 			for name, raw := range map[string][]byte{checkpointIndex: stale, shard: files[shard], interrupted + ".part": files[interrupted][:32]} {
 				if err := os.WriteFile(filepath.Join(staging, name), raw, 0o644); err != nil {
 					t.Fatal(err)
@@ -1583,10 +1664,7 @@ func TestDownloadCheckpointRejectsInvalidRemoteIndexBeforeUpdatingStaging(t *tes
 		t.Fatal(err)
 	}
 	dest := filepath.Join(t.TempDir(), "checkpoint")
-	staging := dest + ".partial"
-	if err := os.Mkdir(staging, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	staging := createTestCheckpointStage(t, dest)
 	indexPath := filepath.Join(staging, checkpointIndex)
 	if err := os.WriteFile(indexPath, original, 0o644); err != nil {
 		t.Fatal(err)
@@ -1895,10 +1973,7 @@ func TestDownloadCheckpointRevalidatesRestoredConfigPlan(t *testing.T) {
 				t.Fatalf("restored metadata lost its tree pin: %v", err)
 			}
 			dest := filepath.Join(t.TempDir(), "checkpoint")
-			staging := dest + ".partial"
-			if err := os.Mkdir(staging, 0o755); err != nil {
-				t.Fatal(err)
-			}
+			staging := createTestCheckpointStage(t, dest)
 			staged := map[string][]byte{"config.json": original, shardPart: files["model-00001-of-00002.safetensors"][:32]}
 			for name, raw := range staged {
 				if err := os.WriteFile(filepath.Join(staging, name), raw, 0o644); err != nil {

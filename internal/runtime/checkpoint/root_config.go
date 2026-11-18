@@ -178,6 +178,9 @@ func rootedFileTarget(root *os.Root, target string, directory bool) (string, err
 	}
 	for i := len(prefixes) - 1; i >= 0; i-- {
 		info, err := os.Stat(prefixes[i])
+		if os.IsNotExist(err) {
+			break // no prefix reached the open checkpoint root
+		}
 		if err != nil {
 			return "", err
 		}
