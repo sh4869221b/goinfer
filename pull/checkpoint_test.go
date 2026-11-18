@@ -765,6 +765,28 @@ func TestDownloadCheckpointRejectsCompletedConfigDrift(t *testing.T) {
 	}
 }
 
+func TestPlanJSONEmbedding(t *testing.T) {
+	type request struct {
+		Plan
+		Destination string
+	}
+	want := request{
+		Plan:        Plan{Repo: "o/tiny", Files: []File{{Path: "config.json", Size: 2}}, Bytes: 2, ModelType: "llama", Family: "llama", Dtype: "float32"},
+		Destination: "models/tiny",
+	}
+	const wire = `{"Repo":"o/tiny","Files":[{"Path":"config.json","Size":2,"SHA256":""}],"Bytes":2,"ModelType":"llama","Family":"llama","Dtype":"float32","Destination":"models/tiny"}`
+	if got, err := json.Marshal(want); err != nil || string(got) != wire {
+		t.Fatalf("embedded Plan JSON = %s, %v; want %s", got, err, wire)
+	}
+	var got request
+	if err := json.Unmarshal([]byte(wire), &got); err != nil {
+		t.Fatal(err)
+	}
+	if encoded, err := json.Marshal(got); err != nil || string(encoded) != wire {
+		t.Fatalf("round-trip JSON = %s, %v; want %s", encoded, err, wire)
+	}
+}
+
 func TestDownloadCheckpointRejectsRestoredConfigPlan(t *testing.T) {
 	const repo = "o/tiny"
 	const shardPart = "model-00001-of-00002.safetensors.part"
@@ -789,16 +811,36 @@ func TestDownloadCheckpointRejectsRestoredConfigPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	type request struct {
+		Plan
+		Destination string
+	}
+	const destination = "models/tiny"
+	embedded, err := json.Marshal(request{Plan: plan, Destination: destination})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
-		name    string
-		initial Plan
+		name     string
+		initial  Plan
+		embedded bool
 	}{
-		{"zero receiver", Plan{}},
-		{"receiver with an older config", oldPlan},
+		{"zero receiver", Plan{}, false},
+		{"receiver with an older config", oldPlan, false},
+		{"embedded receiver with an older config", oldPlan, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			restored := tc.initial
-			if err := json.Unmarshal(data, &restored); err != nil {
+			if tc.embedded {
+				got := request{Plan: restored}
+				if err := json.Unmarshal(embedded, &got); err != nil {
+					t.Fatal(err)
+				}
+				if got.Destination != destination {
+					t.Errorf("restored destination = %q; want %q", got.Destination, destination)
+				}
+				restored = got.Plan
+			} else if err := json.Unmarshal(data, &restored); err != nil {
 				t.Fatal(err)
 			}
 			if err := restored.VerifyPin(plan.TreeDigest()); err != nil {

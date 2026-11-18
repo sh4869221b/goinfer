@@ -41,20 +41,26 @@ type checkpointConfig struct {
 // before downloading a checkpoint after decoding that metadata.
 type Plan struct {
 	Repo      string
-	Files     []File // config, tokenizer and processor files, then the weights; sorted by path
-	Bytes     int64  // the sum of Files' sizes: what the transfer costs in disk and bandwidth
-	ModelType string // config.json's model_type
-	Family    string // the capability-matrix family that loads it
-	Dtype     string // config.json's torch_dtype (or dtype), "" if absent
+	Files     planFiles // config, tokenizer and processor files, then the weights; sorted by path
+	Bytes     int64     // the sum of Files' sizes: what the transfer costs in disk and bandwidth
+	ModelType string    // config.json's model_type
+	Family    string    // the capability-matrix family that loads it
+	Dtype     string    // config.json's torch_dtype (or dtype), "" if absent
 
-	configJSON string // validated config bytes, separate from the remote tree metadata
+	configJSON  string // validated config bytes, separate from the remote tree metadata
+	configRepo  string // repository those bytes were fetched from
+	configFiles *File  // first file of the backing slice that was planned with those bytes
 }
 
-// UnmarshalJSON restores plan metadata and discards any config retained from an earlier plan.
-func (p *Plan) UnmarshalJSON(data []byte) error {
-	type planFields Plan
-	p.configJSON = ""
-	return json.Unmarshal(data, (*planFields)(p))
+type planFiles []File
+
+// UnmarshalJSON replaces the backing slice so decoded metadata cannot reuse an older config.
+// Keeping the method on Files lets structs embedding Plan decode their own fields normally.
+func (f *planFiles) UnmarshalJSON(data []byte) error {
+	var decoded []File
+	err := json.Unmarshal(data, &decoded)
+	*f = decoded
+	return err
 }
 
 // checkpointExtras are the non-weight files a checkpoint plan takes when the repo has them: the tokenizer in its several
@@ -249,7 +255,7 @@ func PlanCheckpointFor(ctx context.Context, repo string, loads func(modelType st
 	if err := checkpoint.CheckLayout(repo, cfg.ModelType); err != nil {
 		return Plan{}, err
 	}
-	p := Plan{Repo: repo, ModelType: cfg.ModelType, Family: fam, Dtype: cfg.TorchDtype, configJSON: string(cfgRaw)}
+	p := Plan{Repo: repo, ModelType: cfg.ModelType, Family: fam, Dtype: cfg.TorchDtype, configJSON: string(cfgRaw), configRepo: repo}
 	if p.Dtype == "" {
 		p.Dtype = cfg.Dtype
 	}
@@ -294,6 +300,7 @@ func PlanCheckpointFor(ctx context.Context, repo string, loads func(modelType st
 		p.Bytes += f.Size
 	}
 	sort.Slice(p.Files, func(i, j int) bool { return p.Files[i].Path < p.Files[j].Path })
+	p.configFiles = &p.Files[0]
 	return p, nil
 }
 
@@ -455,7 +462,7 @@ func DownloadCheckpoint(ctx context.Context, p Plan, dest string, progress func(
 			return "", fmt.Errorf("unsafe path %q in the plan for %s", f.Path, p.Repo)
 		}
 		if f.Path == "config.json" {
-			if p.configJSON == "" {
+			if p.configJSON == "" || p.Repo != p.configRepo || p.configFiles != &p.Files[0] {
 				return "", fmt.Errorf("checkpoint plan for %s has no validated config.json bytes; re-plan with PlanCheckpoint or PlanCheckpointFor before downloading", p.Repo)
 			}
 			plannedConfig = []byte(p.configJSON)
