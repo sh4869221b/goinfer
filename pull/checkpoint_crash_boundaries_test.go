@@ -694,10 +694,11 @@ func TestCheckpointDefersCleanupForLegacyWriterWithoutLinks(t *testing.T) {
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("requires a filesystem change time")
 	}
-	for _, mode := range []string{"completed", "partial"} {
+	for _, mode := range []string{"completed", "partial", "replacement"} {
 		t.Run(mode, func(t *testing.T) {
 			const extra = "tokenizer.json"
 			const interrupted = "tokenizer_config.json"
+			const generation = "generation_config.json"
 			a, b := shardedTinyRepo(t), shardedTinyRepo(t)
 			b[interrupted] = []byte(`{"revision":"B"}`)
 			added := interrupted + ".part"
@@ -705,6 +706,10 @@ func TestCheckpointDefersCleanupForLegacyWriterWithoutLinks(t *testing.T) {
 			if mode == "completed" {
 				b[extra] = []byte(`{"vocab":{"new":1}}`)
 				added, want = extra, b[extra]
+			}
+			if mode == "replacement" {
+				a[generation], b[generation] = []byte(`{"eos_token_id":17}`), []byte(`{"eos_token_id":23}`)
+				added, want = generation, b[generation]
 			}
 			h := &fakeHF{files: a}
 			h.serve(t, checkpointCrashRepo)
@@ -716,14 +721,36 @@ func TestCheckpointDefersCleanupForLegacyWriterWithoutLinks(t *testing.T) {
 			}
 			stage := testCheckpointStagePath(dest)
 			newFile := filepath.Join(stage, added)
+			var previous os.FileInfo
+			var receipt string
+			if mode == "replacement" {
+				var err error
+				previous, err = os.Stat(newFile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				receipt = testSealedCheckpointReceipt(t, stage, generation)
+			}
 			if legacy := os.Getenv("GOINFER_TEST_LEGACY_NOLINK_PULL_BINARY"); legacy != "" {
 				setCrashRepoFiles(h, b, interrupted)
-				if mode == "completed" {
+				if mode != "partial" {
 					h.mu.Lock()
 					h.failOnce, h.rejectOnce = "", interrupted
 					h.mu.Unlock()
 				}
 				killCheckpointAtTransferBoundary(t, "older reuse without links", dest, nil)
+			} else if mode == "replacement" {
+				root, err := os.OpenRoot(stage)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer root.Close()
+				if err := replaceRootFile(root, generation, want); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.RemoveAll(receipt); err != nil {
+					t.Fatal(err)
+				}
 			} else {
 				// Older writers leave both completed files and partials unrecorded
 				// when linking is unavailable, without changing the publication token.
@@ -733,6 +760,15 @@ func TestCheckpointDefersCleanupForLegacyWriterWithoutLinks(t *testing.T) {
 			}
 			if raw, err := os.ReadFile(newFile); err != nil || !bytes.Equal(raw, want) {
 				t.Fatalf("legacy B did not stage %s: %v", added, err)
+			}
+			if mode == "replacement" {
+				current, err := os.Stat(newFile)
+				if err != nil || os.SameFile(previous, current) || current.Size() != previous.Size() {
+					t.Fatalf("B did not replace the generation config with a same-size file: %v", err)
+				}
+				if _, err := os.Lstat(receipt); !os.IsNotExist(err) {
+					t.Fatalf("B did not remove the old generation receipt: %v", err)
+				}
 			}
 			if err := os.Rename(backup, dest); err != nil {
 				t.Fatal(err)
@@ -747,7 +783,7 @@ func TestCheckpointDefersCleanupForLegacyWriterWithoutLinks(t *testing.T) {
 			if raw, err := os.ReadFile(newFile); err != nil || !bytes.Equal(raw, want) {
 				t.Errorf("retry of A changed the file staged by B: %v", err)
 			}
-			if mode == "completed" {
+			if mode != "partial" {
 				if err := os.Rename(dest, backup); err != nil {
 					t.Fatal(err)
 				}
@@ -761,6 +797,30 @@ func TestCheckpointDefersCleanupForLegacyWriterWithoutLinks(t *testing.T) {
 			}
 		})
 	}
+}
+
+func testSealedCheckpointReceipt(t *testing.T, stage, name string) string {
+	t.Helper()
+	root, err := os.OpenRoot(stage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	record, err := readCheckpointCleanup(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for dir, state := range record.Transfers {
+		if state.Path == name {
+			path := filepath.Join(filepath.Dir(stage), dir)
+			if _, err := os.Stat(filepath.Join(path, "transfer.json")); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		}
+	}
+	t.Fatalf("no sealed receipt for %s", name)
+	return ""
 }
 
 func TestCheckpointPullWhenPartialLinkUnavailable(t *testing.T) {

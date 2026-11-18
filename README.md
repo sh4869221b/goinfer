@@ -170,13 +170,13 @@ special.
 For safetensors pulls, `.<destination>.pull2` is a private sibling workspace for each output
 directory. Retry the same destination after an interruption to resume its verified staging data
 or finish cleanup for the matching publication. Recovery compares the sealed transfer records
-and staging file list with the current workspace. A new staging entry defers cleanup, including
-files added without a receipt by an older client.
+and staging file identities with the current workspace. New or changed stage files defer
+cleanup, as do missing transfer records for files still in staging.
 Cancelling before the final directory rename keeps the staged downloads for a retry. Once the
 rename has succeeded, the published checkpoint is usable and any interrupted cleanup can resume
 on the next pull.
 Older checkpoints remain usable. Recovery leaves their stage data in place when the matching
-cleanup record or its staging file list is unavailable. Resuming an existing `.part`
+cleanup record lacks a verifiable staging inventory. Resuming an existing `.part`
 requires a transfer record with a matching hard link. On filesystems without hard links,
 interrupted transfers restart from the beginning. Completed copies can still be reclaimed
 when the filesystem supplies a matching file ID and change time and the staged content matches

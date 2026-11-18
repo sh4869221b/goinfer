@@ -266,21 +266,26 @@ func (w *checkpointWorkspace) captureTransferSnapshot(stage *os.Root, receipt ch
 	return checkpointTransferSnapshot{Path: filepath.ToSlash(path), Size: proof.Size(), ModTime: proof.ModTime().UnixNano(), FileID: checkpointFileID(file, proof)}, err == nil
 }
 
-// A later writer can reuse files recorded by the publication. A new or changed
-// receipt therefore prevents recovery from touching any of the staging files.
-func (w *checkpointWorkspace) canResumeCleanup(stage *os.Root, sealed map[string]checkpointTransferSnapshot) bool {
+// A later writer can reuse files recorded by the publication. Missing receipts
+// are only consistent with cleanup when their stage files are also gone.
+func (w *checkpointWorkspace) canResumeCleanup(ctx context.Context, stage *os.Root, sealed map[string]checkpointTransferSnapshot) bool {
 	if len(sealed) == 0 {
 		return false
 	}
 	w.indexTransferReceipts()
+	seen := make(map[string]bool, len(sealed))
 	for _, receipts := range w.receipts {
 		for _, receipt := range receipts {
 			previous, ok := sealed[receipt.dirName]
+			if !ok || ctx.Err() != nil {
+				return false
+			}
+			seen[receipt.dirName] = true
+			current, ok := w.captureTransferSnapshot(stage, receipt)
 			if !ok {
 				return false
 			}
-			current, ok := w.captureTransferSnapshot(stage, receipt)
-			if !ok {
+			if (current.NoProof || current.Path == "") && !previous.stagePathGone(stage) {
 				return false
 			}
 			if current.NoProof {
@@ -294,7 +299,20 @@ func (w *checkpointWorkspace) canResumeCleanup(stage *os.Root, sealed map[string
 			}
 		}
 	}
-	return true
+	for name, previous := range sealed {
+		if !seen[name] && !previous.stagePathGone(stage) {
+			return false
+		}
+	}
+	return ctx.Err() == nil
+}
+
+func (s checkpointTransferSnapshot) stagePathGone(stage *os.Root) bool {
+	if s.Path == "" {
+		return true
+	}
+	_, err := stage.Lstat(filepath.FromSlash(s.Path))
+	return os.IsNotExist(err)
 }
 
 func (w *checkpointWorkspace) reclaimTransfers(ctx context.Context, stage *os.Root, cleanup *checkpointCleanup) {

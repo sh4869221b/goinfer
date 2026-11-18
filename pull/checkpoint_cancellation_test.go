@@ -17,7 +17,7 @@ func TestCheckpointCancelAfterRenameWithoutLinks(t *testing.T) {
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("requires a filesystem change time")
 	}
-	for _, mode := range []string{"unchanged", "edited", "replaced", "symlink", "legacy cleanup record"} {
+	for _, mode := range []string{"unchanged", "edited", "replaced", "symlink", "legacy cleanup record", "missing receipt", "partly reclaimed", "unrecorded file replaced"} {
 		t.Run(mode, func(t *testing.T) {
 			files := shardedTinyRepo(t)
 			h := &fakeHF{files: files}
@@ -65,8 +65,11 @@ func TestCheckpointCancelAfterRenameWithoutLinks(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				record.StageEntries, record.StageSidecars = nil, nil
-				raw, err := json.Marshal(record)
+				record.StageInventory = nil
+				raw, err := json.Marshal(struct {
+					checkpointCleanup
+					StageEntries []string `json:"stage_entries"`
+				}{record, []string{checkpointCrashShard, checkpointCrashTail}})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -100,10 +103,39 @@ func TestCheckpointCancelAfterRenameWithoutLinks(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if mode == "missing receipt" || mode == "partly reclaimed" {
+				receipt := testSealedCheckpointReceipt(t, stage, checkpointCrashShard)
+				if mode == "partly reclaimed" {
+					for _, path := range []string{staged, sidecarPath(staged)} {
+						if err := os.Remove(path); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				if err := os.RemoveAll(receipt); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "unrecorded file replaced" {
+				replacement := filepath.Join(t.TempDir(), "replacement")
+				original, err := os.Stat(note)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(replacement, []byte("keep"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chtimes(replacement, original.ModTime(), original.ModTime()); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(replacement, note); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if got, err := download(t.Context(), dest, nil); got != dest || err != nil {
 				t.Fatalf("retry of committed checkpoint without links = %q, %v", got, err)
 			}
-			if mode == "unchanged" {
+			if mode == "unchanged" || mode == "partly reclaimed" {
 				for _, shard := range []string{checkpointCrashShard, checkpointCrashTail} {
 					path := filepath.Join(stage, shard)
 					for _, name := range []string{path, sidecarPath(path)} {
@@ -118,6 +150,9 @@ func TestCheckpointCancelAfterRenameWithoutLinks(t *testing.T) {
 				}
 				if after, err := os.Lstat(staged); err != nil || !os.SameFile(info, after) {
 					t.Errorf("retry did not retain the %s staged inode: %v", mode, err)
+				}
+				if _, err := os.Stat(filepath.Join(stage, checkpointCrashTail)); err != nil {
+					t.Errorf("retry reclaimed a shared shard in mode %s: %v", mode, err)
 				}
 			}
 			if raw, err := os.ReadFile(note); err != nil || string(raw) != "keep" {

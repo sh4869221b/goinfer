@@ -48,10 +48,10 @@ type checkpointPublication struct {
 
 type checkpointCleanup struct {
 	checkpointPublication
-	Transfers     map[string]checkpointTransferSnapshot `json:"transfers"`
-	Candidate     *checkpointPublicationCandidate       `json:"candidate,omitempty"`
-	StageEntries  []string                              `json:"stage_entries,omitempty"`
-	StageSidecars map[string]checkpointStageSidecar     `json:"stage_sidecars,omitempty"`
+	Transfers      map[string]checkpointTransferSnapshot `json:"transfers"`
+	Candidate      *checkpointPublicationCandidate       `json:"candidate,omitempty"`
+	StageInventory map[string]checkpointStageEntry       `json:"stage_inventory,omitempty"`
+	StageSidecars  map[string]checkpointStageSidecar     `json:"stage_sidecars,omitempty"`
 }
 
 func (w *checkpointWorkspace) Close() {
@@ -160,7 +160,7 @@ func (w *checkpointWorkspace) reclaimCompletedStage(ctx context.Context, parent 
 	defer stage.Close()
 	if w.matchesPublication(stage, complete.publication) {
 		if cleanup, err := readCheckpointCleanup(stage); err == nil && cleanup.Owner == w.owner && cleanup.Token == complete.publication &&
-			cleanup.matchesStageEntries(ctx, stage) && w.canResumeCleanup(stage, cleanup.Transfers) {
+			cleanup.matchesStageInventory(ctx, stage) && w.canResumeCleanup(ctx, stage, cleanup.Transfers) {
 			w.reclaimTransfers(ctx, stage, &cleanup)
 		}
 	}
@@ -198,13 +198,13 @@ func readCheckpointCleanup(stage *os.Root) (checkpointCleanup, error) {
 	return record, err
 }
 
-func (w *checkpointWorkspace) sealCheckpointCleanup(ctx context.Context, stage *os.Root, token string, candidate *checkpointPublicationCandidate) (checkpointCleanup, error) {
+func (w *checkpointWorkspace) sealCheckpointCleanup(ctx context.Context, stage *os.Root, token string, candidate *checkpointPublicationCandidate, files []File) (checkpointCleanup, error) {
 	old, err := readCheckpointCleanup(stage)
 	if !os.IsNotExist(err) && (err != nil || old.Owner != w.owner || old.Token == "") {
 		return checkpointCleanup{}, fmt.Errorf("%s has no verified owner", checkpointCleanupName)
 	}
 	cleanup := checkpointCleanup{checkpointPublication: checkpointPublication{Owner: w.owner, Token: token}, Transfers: w.snapshotTransfers(stage), Candidate: candidate}
-	cleanup.captureStage(ctx, stage)
+	cleanup.captureStage(ctx, stage, files)
 	if err := ctx.Err(); err != nil {
 		return checkpointCleanup{}, err
 	}
@@ -477,7 +477,7 @@ func publishCheckpoint(ctx context.Context, parent *os.Root, work *checkpointWor
 	if id := checkpointPublicationDirectoryID(publish); id != "" {
 		candidate = &checkpointPublicationCandidate{Name: name, FileID: id, MarkerSHA256: checkpoint.ConfigDigest(marker), Sidecars: sidecarDigests}
 	}
-	cleanup, err := work.sealCheckpointCleanup(ctx, stage, publication, candidate)
+	cleanup, err := work.sealCheckpointCleanup(ctx, stage, publication, candidate, files)
 	if err != nil {
 		return err
 	}

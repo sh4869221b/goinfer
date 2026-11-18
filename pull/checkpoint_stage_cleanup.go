@@ -8,8 +8,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"slices"
-	"strings"
 
 	"github.com/townsendmerino/goinfer/internal/runtime/checkpoint"
 )
@@ -20,15 +18,39 @@ type checkpointStageSidecar struct {
 	SHA256     string `json:"sha256"`
 }
 
-// Older writers can add stage entries without receipts or a new publication token.
-// Record even unowned entries so their presence can be distinguished from later work.
-func (c *checkpointCleanup) captureStage(ctx context.Context, stage *os.Root) {
-	var entries []string
+type checkpointStageEntry struct {
+	Mode       fs.FileMode `json:"mode"`
+	FileID     string      `json:"file_id,omitempty"`
+	Size       int64       `json:"size,omitempty"`
+	ModTime    int64       `json:"mtime,omitempty"`
+	ChangeTime int64       `json:"change_time,omitempty"`
+}
+
+// Older writers can add or replace stage files without receipts or a new
+// publication token. Include unowned files to detect those changes.
+func (c *checkpointCleanup) captureStage(ctx context.Context, stage *os.Root, files []File) {
+	entries := map[string]checkpointStageEntry{}
 	sidecars := map[string]checkpointStageSidecar{}
+	payloads := make(map[string]bool, len(files))
+	for _, file := range files {
+		payloads[file.Path] = true
+	}
+	for _, transfer := range c.Transfers {
+		if transfer.Path != "" {
+			payloads[transfer.Path] = true
+		}
+	}
+	digestPaths := make(map[string]bool, len(payloads))
+	for path := range payloads {
+		digestPaths[filepath.ToSlash(sidecarPath(filepath.FromSlash(path)))] = true
+	}
 	err := walkCheckpointStage(ctx, stage, func(name string, entry fs.DirEntry) error {
-		entries = append(entries, name)
-		base := entry.Name()
-		if entry.Type().IsRegular() && strings.HasPrefix(base, ".") && strings.HasSuffix(base, ".sha256") {
+		state, err := readStageEntry(stage, name, entry)
+		if err != nil {
+			return err
+		}
+		entries[name] = state
+		if state.Mode.IsRegular() && digestPaths[name] && !payloads[name] {
 			if _, state, info := readStageSidecar(stage, filepath.FromSlash(name)); info != nil {
 				sidecars[name] = state
 			}
@@ -36,25 +58,60 @@ func (c *checkpointCleanup) captureStage(ctx context.Context, stage *os.Root) {
 		return nil
 	})
 	if err == nil {
-		slices.Sort(entries)
-		c.StageEntries, c.StageSidecars = entries, sidecars
+		c.StageInventory, c.StageSidecars = entries, sidecars
 	}
 }
 
-func (c checkpointCleanup) matchesStageEntries(ctx context.Context, stage *os.Root) bool {
+func (c checkpointCleanup) matchesStageInventory(ctx context.Context, stage *os.Root) bool {
 	// Without a complete inventory there is no way to rule out an unrecorded legacy transfer.
-	if len(c.StageEntries) == 0 {
+	if len(c.StageInventory) == 0 {
 		return false
 	}
-	contains := true
-	err := walkCheckpointStage(ctx, stage, func(name string, _ fs.DirEntry) error {
-		if _, found := slices.BinarySearch(c.StageEntries, name); !found {
-			contains = false
-			return fs.SkipAll
+	err := walkCheckpointStage(ctx, stage, func(name string, entry fs.DirEntry) error {
+		sealed, found := c.StageInventory[name]
+		if !found {
+			return fs.ErrInvalid
+		}
+		if _, sidecar := c.StageSidecars[name]; sidecar && entry.Type().IsRegular() {
+			return nil // its independent identity and digest are checked before removal
+		}
+		current, err := readStageEntry(stage, name, entry)
+		if err != nil {
+			return err
+		}
+		if current != sealed || (current.Mode.IsRegular() && current.FileID == "") ||
+			(!current.Mode.IsRegular() && !current.Mode.IsDir()) {
+			return fs.ErrInvalid
 		}
 		return nil
 	})
-	return contains && err == nil && ctx.Err() == nil
+	return err == nil && ctx.Err() == nil
+}
+
+func readStageEntry(stage *os.Root, name string, entry fs.DirEntry) (checkpointStageEntry, error) {
+	info, err := entry.Info()
+	if err != nil {
+		return checkpointStageEntry{}, err
+	}
+	state := checkpointStageEntry{Mode: info.Mode()}
+	if !info.Mode().IsRegular() {
+		return state, nil
+	}
+	file, err := openRegularDownloadFile(stage, filepath.FromSlash(name), os.O_RDONLY)
+	if err != nil {
+		return checkpointStageEntry{}, err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil {
+		return checkpointStageEntry{}, err
+	}
+	if !sameCheckpointFileState(info, opened) || checkpointChangeTime(info) != checkpointChangeTime(opened) {
+		return checkpointStageEntry{}, fs.ErrInvalid
+	}
+	state.FileID, state.Size = checkpointFileID(file, opened), opened.Size()
+	state.ModTime, state.ChangeTime = opened.ModTime().UnixNano(), checkpointChangeTime(opened)
+	return state, nil
 }
 
 func walkCheckpointStage(ctx context.Context, stage *os.Root, visit func(string, fs.DirEntry) error) error {
