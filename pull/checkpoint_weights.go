@@ -1,6 +1,7 @@
 package pull
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -63,7 +64,7 @@ func checkpointWeightPaths(files map[string]File, readIndex func() ([]byte, erro
 
 // verifyCheckpointWeights checks the on-disk layout against the manifest without hashing
 // weights. Download and the full cache check verify file digests separately.
-func verifyCheckpointWeights(root *os.Root, files []File) error {
+func verifyCheckpointWeights(root *os.Root, files []File, plannedIndex []byte) error {
 	byPath := make(map[string]File, len(files))
 	for _, f := range files {
 		if !safeRepoPath(f.Path) || !filepath.IsLocal(filepath.FromSlash(f.Path)) {
@@ -87,6 +88,9 @@ func verifyCheckpointWeights(root *os.Root, files []File) error {
 		raw, err := checkpoint.ReadRootFile(root, checkpointIndex, maxIndexBytes)
 		if err != nil {
 			return nil, err
+		}
+		if plannedIndex != nil && !bytes.Equal(raw, plannedIndex) {
+			return nil, fmt.Errorf("index differs from the current checkpoint plan")
 		}
 		index := byPath[checkpointIndex]
 		if !checkpoint.ConfigMatches(raw, index.Size, index.SHA256) {

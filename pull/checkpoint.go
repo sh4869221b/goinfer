@@ -36,8 +36,23 @@ type checkpointConfig struct {
 	Dtype      string `json:"dtype"`
 }
 
+type checkpointMetadata struct {
+	config, index []byte
+}
+
+func (m checkpointMetadata) contents(name string) []byte {
+	switch name {
+	case "config.json":
+		return m.config
+	case checkpointIndex:
+		return m.index
+	default:
+		return nil
+	}
+}
+
 // Plan describes a safetensors checkpoint's metadata, decided before any weight byte moves.
-// Its JSON form carries the same metadata. DownloadCheckpoint checks config.json again at use time.
+// Its JSON form carries the same metadata. DownloadCheckpoint fetches the config and any index at use time.
 type Plan struct {
 	Repo      string
 	Files     []File // config, tokenizer and processor files, then the weights; sorted by path
@@ -47,23 +62,23 @@ type Plan struct {
 	Dtype     string // config.json's torch_dtype (or dtype), "" if absent
 }
 
-// CheckpointDownload downloads a prepared checkpoint using the config read during planning.
+// CheckpointDownload downloads a prepared checkpoint using the config and index read during planning.
 type CheckpointDownload func(ctx context.Context, dest string, progress func(done, total int64, file string)) (string, error)
 
-// PrepareCheckpointFor returns the plan and a download function bound to its validated config and file list.
+// PrepareCheckpointFor returns the plan and a download function bound to its validated config, index and file list.
 // A nil loads uses the generative check. The returned metadata can be copied or serialized independently.
 func PrepareCheckpointFor(ctx context.Context, repo string, loads func(modelType string) (family string, err error)) (Plan, CheckpointDownload, error) {
 	if loads == nil {
 		loads = generativeLoads
 	}
-	plan, raw, err := planCheckpointFor(ctx, repo, loads)
+	plan, metadata, err := planCheckpointFor(ctx, repo, loads)
 	if err != nil {
 		return Plan{}, nil, err
 	}
 	snapshot := plan
 	snapshot.Files = slices.Clone(plan.Files)
 	return plan, func(ctx context.Context, dest string, progress func(done, total int64, file string)) (string, error) {
-		return downloadCheckpoint(ctx, snapshot, raw, dest, progress)
+		return downloadCheckpoint(ctx, snapshot, metadata, dest, progress)
 	}, nil
 }
 
@@ -164,24 +179,27 @@ func listTree(ctx context.Context, repo string) ([]File, error) {
 	return out, nil
 }
 
-// fetchSmall reads a small repo file (a config or an index) into memory, refusing anything over max bytes.
-func fetchSmall(ctx context.Context, repo, p string, max int64) ([]byte, error) {
-	resp, err := get(ctx, hfCDN+"/"+repo+"/resolve/main/"+p)
+// fetchCheckpointMetadata reads a bounded config or index and checks the declared size and digest.
+func fetchCheckpointMetadata(ctx context.Context, repo string, file File, limit int64) ([]byte, error) {
+	resp, err := get(ctx, hfCDN+"/"+repo+"/resolve/main/"+file.Path)
 	if err != nil {
-		return nil, fmt.Errorf("fetching %s: %w", p, err)
+		return nil, fmt.Errorf("fetching %s: %w", file.Path, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetching %s: HuggingFace returned %s", p, resp.Status)
+		return nil, fmt.Errorf("fetching %s: HuggingFace returned %s", file.Path, resp.Status)
 	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
-		return nil, fmt.Errorf("fetching %s: %w", p, err)
+		return nil, fmt.Errorf("fetching %s: %w", file.Path, err)
 	}
-	if int64(len(b)) > max {
-		return nil, fmt.Errorf("%s is larger than %d bytes; not a config", p, max)
+	if int64(len(raw)) > limit {
+		return nil, fmt.Errorf("%s exceeds %d bytes", file.Path, limit)
 	}
-	return b, nil
+	if !checkpoint.ConfigMatches(raw, file.Size, file.SHA256) {
+		return nil, fmt.Errorf("repo %s's %s does not match the checkpoint metadata; re-run to refresh the plan", repo, file.Path)
+	}
+	return raw, nil
 }
 
 // matrixFamily is the subset of a capability-matrix row FamilyForModelType reads.
@@ -230,10 +248,10 @@ func PlanCheckpointFor(ctx context.Context, repo string, loads func(modelType st
 	return plan, err
 }
 
-func planCheckpointFor(ctx context.Context, repo string, loads func(modelType string) (family string, err error)) (Plan, []byte, error) {
+func planCheckpointFor(ctx context.Context, repo string, loads func(modelType string) (family string, err error)) (Plan, checkpointMetadata, error) {
 	files, err := listTree(ctx, repo)
 	if err != nil {
-		return Plan{}, nil, err
+		return Plan{}, checkpointMetadata{}, err
 	}
 	byPath := map[string]File{}
 	for _, f := range files {
@@ -241,18 +259,18 @@ func planCheckpointFor(ctx context.Context, repo string, loads func(modelType st
 	}
 	configFile, ok := byPath["config.json"]
 	if !ok {
-		return Plan{}, nil, fmt.Errorf("repo %s has no config.json: not a safetensors (transformers) checkpoint", repo)
+		return Plan{}, checkpointMetadata{}, fmt.Errorf("repo %s has no config.json: not a safetensors (transformers) checkpoint", repo)
 	}
 	cfgRaw, cfg, err := fetchCheckpointConfig(ctx, repo, configFile)
 	if err != nil {
-		return Plan{}, nil, err
+		return Plan{}, checkpointMetadata{}, err
 	}
 	fam, err := loads(cfg.ModelType)
 	if err != nil {
-		return Plan{}, nil, fmt.Errorf("repo %s is %w; nothing was downloaded", repo, err)
+		return Plan{}, checkpointMetadata{}, fmt.Errorf("repo %s is %w; nothing was downloaded", repo, err)
 	}
 	if err := checkpoint.CheckLayout(repo, cfg.ModelType); err != nil {
-		return Plan{}, nil, err
+		return Plan{}, checkpointMetadata{}, err
 	}
 	p := Plan{Repo: repo, ModelType: cfg.ModelType, Family: fam, Dtype: cfg.TorchDtype}
 	want := map[string]bool{}
@@ -261,35 +279,35 @@ func planCheckpointFor(ctx context.Context, repo string, loads func(modelType st
 			want[name] = true
 		}
 	}
+	metadata := checkpointMetadata{config: cfgRaw}
 	weights, err := checkpointWeightPaths(byPath, func() ([]byte, error) {
-		return fetchSmall(ctx, repo, checkpointIndex, maxIndexBytes)
+		raw, err := fetchCheckpointMetadata(ctx, repo, byPath[checkpointIndex], maxIndexBytes)
+		metadata.index = raw
+		return raw, err
 	})
 	if err != nil {
-		return Plan{}, nil, fmt.Errorf("repo %s: %w", repo, err)
+		return Plan{}, checkpointMetadata{}, fmt.Errorf("repo %s: %w", repo, err)
 	}
 	for _, name := range weights {
 		want[name] = true
 	}
 	for name := range want {
 		if !safeRepoPath(name) {
-			return Plan{}, nil, fmt.Errorf("repo %s lists an unsafe path %q", repo, name)
+			return Plan{}, checkpointMetadata{}, fmt.Errorf("repo %s lists an unsafe path %q", repo, name)
 		}
 		f := byPath[name]
 		p.Files = append(p.Files, f)
 		p.Bytes += f.Size
 	}
 	sort.Slice(p.Files, func(i, j int) bool { return p.Files[i].Path < p.Files[j].Path })
-	return p, cfgRaw, nil
+	return p, metadata, nil
 }
 
 func fetchCheckpointConfig(ctx context.Context, repo string, file File) ([]byte, checkpointConfig, error) {
 	var cfg checkpointConfig
-	raw, err := fetchSmall(ctx, repo, "config.json", checkpoint.MaxConfigBytes)
+	raw, err := fetchCheckpointMetadata(ctx, repo, file, checkpoint.MaxConfigBytes)
 	if err != nil {
 		return nil, cfg, err
-	}
-	if !checkpoint.ConfigMatches(raw, file.Size, file.SHA256) {
-		return nil, cfg, fmt.Errorf("repo %s's config.json does not match the checkpoint metadata; re-run to refresh the plan", repo)
 	}
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return nil, cfg, fmt.Errorf("parsing %s's config.json: %w", repo, err)
@@ -354,8 +372,8 @@ type markerDoc struct {
 	Files []File `json:"files"`
 }
 
-// checkCompletedCheckpoint reports whether dir contains the files and config of the current plan.
-func checkCompletedCheckpoint(dir string, files []File, plannedConfig []byte) (bool, error) {
+// checkCompletedCheckpoint reports whether dir contains the files of the current plan.
+func checkCompletedCheckpoint(dir string, files []File, metadata checkpointMetadata) (bool, error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return false, nil
@@ -363,15 +381,15 @@ func checkCompletedCheckpoint(dir string, files []File, plannedConfig []byte) (b
 	defer root.Close()
 	m, ok := readCheckpointMarker(root)
 	if !ok || !slices.EqualFunc(m.Files, files, func(got, want File) bool {
-		// A locally computed config hash does not change the remote plan or its pin.
-		if want.Path == "config.json" && want.SHA256 == "" {
+		// A locally computed config or index hash is independent of the remote tree pin.
+		if metadata.contents(want.Path) != nil && want.SHA256 == "" {
 			got.SHA256 = ""
 		}
 		return got == want
 	}) {
 		return false, nil
 	}
-	return verifyCachedCheckpoint(dir, root, m, plannedConfig)
+	return verifyCachedCheckpoint(dir, root, m, metadata)
 }
 
 // CachedCheckpoint is a complete, supported checkpoint in dir, verified offline from its marker.
@@ -393,7 +411,7 @@ func checkCachedCheckpoint(dir string) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	return verifyCachedCheckpoint(dir, root, m, nil)
+	return verifyCachedCheckpoint(dir, root, m, checkpointMetadata{})
 }
 
 func readCheckpointMarker(root *os.Root) (markerDoc, bool) {
@@ -408,12 +426,12 @@ func readCheckpointMarker(root *os.Root) (markerDoc, bool) {
 	return m, true
 }
 
-func verifyCachedCheckpoint(dir string, root *os.Root, m markerDoc, plannedConfig []byte) (bool, error) {
+func verifyCachedCheckpoint(dir string, root *os.Root, m markerDoc, metadata checkpointMetadata) (bool, error) {
 	config, err := checkpoint.ReadRootConfig(root)
 	if err != nil {
 		return false, fmt.Errorf("cached checkpoint %s: config.json must be a readable regular file inside the checkpoint directory: %w", dir, err)
 	}
-	if plannedConfig != nil && !bytes.Equal(config, plannedConfig) {
+	if metadata.config != nil && !bytes.Equal(config, metadata.config) {
 		return false, fmt.Errorf("config.json in %s differs from the current checkpoint plan; use -o <dir> to keep the existing checkpoint", dir)
 	}
 	if config != nil {
@@ -421,40 +439,48 @@ func verifyCachedCheckpoint(dir string, root *os.Root, m markerDoc, plannedConfi
 			return false, fmt.Errorf("cached checkpoint %s: %w", dir, err)
 		}
 	}
-	if err := verifyCheckpointWeights(root, m.Files); err != nil {
+	if err := verifyCheckpointWeights(root, m.Files, metadata.index); err != nil {
 		return false, fmt.Errorf("cached checkpoint %s: %w; move it aside, or pull with -o <dir>", dir, err)
 	}
 	for _, f := range m.Files {
-		if f.Path == "config.json" {
+		switch f.Path {
+		case "config.json":
 			// Verify the same bytes used for the layout check without following the link again.
 			if !checkpoint.ConfigMatches(config, f.Size, f.SHA256) {
 				return false, nil
 			}
-		} else if _, ok := cachedIntact(filepath.Join(dir, filepath.FromSlash(path.Dir(f.Path))), f); !ok {
-			return false, nil
+		case checkpointIndex:
+			// verifyCheckpointWeights checked the same bytes it used to validate the shard list.
+		default:
+			if _, ok := cachedIntact(filepath.Join(dir, filepath.FromSlash(path.Dir(f.Path))), f); !ok {
+				return false, nil
+			}
 		}
 	}
 	return true, nil
 }
 
-func readCachedCheckpointConfig(dir string) ([]byte, error) {
+func readCheckpointMetadata(dir, name string) ([]byte, error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, err
 	}
 	defer root.Close()
-	return checkpoint.ReadRootConfig(root)
+	if name == "config.json" {
+		return checkpoint.ReadRootConfig(root)
+	}
+	return checkpoint.ReadRootFile(root, name, maxIndexBytes)
 }
 
-// DownloadCheckpoint checks the current remote config against p before fetching weights.
+// DownloadCheckpoint checks the current remote config and index against p before fetching weights.
 // A Plan supplies metadata, including when it has been decoded from JSON. Use PrepareCheckpointFor
-// to download with the exact config from the planning request and avoid a second config fetch.
+// to download with the exact config and index from the planning request without fetching them again.
 func DownloadCheckpoint(ctx context.Context, p Plan, dest string, progress func(done, total int64, file string)) (string, error) {
-	file, err := plannedConfigFile(p)
+	config, index, err := plannedCheckpointFiles(p)
 	if err != nil {
 		return "", err
 	}
-	raw, cfg, err := fetchCheckpointConfig(ctx, p.Repo, file)
+	raw, cfg, err := fetchCheckpointConfig(ctx, p.Repo, config)
 	if err != nil {
 		return "", err
 	}
@@ -464,39 +490,61 @@ func DownloadCheckpoint(ctx context.Context, p Plan, dest string, progress func(
 	if err := checkpoint.CheckLayout(p.Repo, cfg.ModelType); err != nil {
 		return "", err
 	}
-	return downloadCheckpoint(ctx, p, raw, dest, progress)
+	metadata := checkpointMetadata{config: raw}
+	if index.Path != "" {
+		metadata.index, err = fetchCheckpointMetadata(ctx, p.Repo, index, maxIndexBytes)
+		if err != nil {
+			return "", err
+		}
+	}
+	byPath := make(map[string]File, len(p.Files))
+	for _, f := range p.Files {
+		byPath[f.Path] = f
+	}
+	if _, err := checkpointWeightPaths(byPath, func() ([]byte, error) { return metadata.index, nil }); err != nil {
+		return "", fmt.Errorf("repo %s: %w", p.Repo, err)
+	}
+	return downloadCheckpoint(ctx, p, metadata, dest, progress)
 }
 
-func plannedConfigFile(p Plan) (File, error) {
-	var config File
+func plannedCheckpointFiles(p Plan) (config, index File, err error) {
 	for _, f := range p.Files {
 		if !safeRepoPath(f.Path) {
-			return File{}, fmt.Errorf("unsafe path %q in the plan for %s", f.Path, p.Repo)
+			return File{}, File{}, fmt.Errorf("unsafe path %q in the plan for %s", f.Path, p.Repo)
 		}
-		if f.Path == "config.json" {
+		switch f.Path {
+		case "config.json":
 			if config.Path != "" {
-				return File{}, fmt.Errorf("checkpoint plan for %s lists config.json more than once", p.Repo)
+				return File{}, File{}, fmt.Errorf("checkpoint plan for %s lists config.json more than once", p.Repo)
 			}
 			config = f
+		case checkpointIndex:
+			if index.Path != "" {
+				return File{}, File{}, fmt.Errorf("checkpoint plan for %s lists %s more than once", p.Repo, checkpointIndex)
+			}
+			index = f
 		}
 	}
 	if config.Path == "" {
-		return File{}, fmt.Errorf("checkpoint plan for %s has no config.json", p.Repo)
+		return File{}, File{}, fmt.Errorf("checkpoint plan for %s has no config.json", p.Repo)
 	}
-	return config, nil
+	return config, index, nil
 }
 
-// downloadCheckpoint stages the validated config alongside resumable downloads, then publishes
+// downloadCheckpoint stages the config and index alongside resumable downloads, then publishes
 // the complete set by renaming the directory. An existing destination must match the plan.
-func downloadCheckpoint(ctx context.Context, p Plan, plannedConfig []byte, dest string, progress func(done, total int64, file string)) (string, error) {
-	config, err := plannedConfigFile(p)
+func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata, dest string, progress func(done, total int64, file string)) (string, error) {
+	config, index, err := plannedCheckpointFiles(p)
 	if err != nil {
 		return "", err
 	}
-	if !checkpoint.ConfigMatches(plannedConfig, config.Size, config.SHA256) {
+	if !checkpoint.ConfigMatches(metadata.config, config.Size, config.SHA256) {
 		return "", fmt.Errorf("planned config.json does not match the checkpoint files")
 	}
-	complete, err := checkCompletedCheckpoint(dest, p.Files, plannedConfig)
+	if index.Path != "" && !checkpoint.ConfigMatches(metadata.index, index.Size, index.SHA256) {
+		return "", fmt.Errorf("planned %s does not match the checkpoint files", checkpointIndex)
+	}
+	complete, err := checkCompletedCheckpoint(dest, p.Files, metadata)
 	if err != nil {
 		return "", err
 	}
@@ -509,9 +557,9 @@ func downloadCheckpoint(ctx context.Context, p Plan, plannedConfig []byte, dest 
 	staging := dest + ".partial"
 	var need int64
 	for _, f := range p.Files {
-		if f.Path == "config.json" {
-			if raw, err := readCachedCheckpointConfig(staging); err != nil || !bytes.Equal(raw, plannedConfig) {
-				need += f.Size // the replacement is written beside any stale config before rename
+		if planned := metadata.contents(f.Path); planned != nil {
+			if raw, err := readCheckpointMetadata(staging, f.Path); err != nil || !bytes.Equal(raw, planned) {
+				need += f.Size // replacements are written beside the stale file before rename
 			}
 			continue
 		}
@@ -526,8 +574,8 @@ func downloadCheckpoint(ctx context.Context, p Plan, plannedConfig []byte, dest 
 	var done int64
 	for _, f := range p.Files {
 		var err error
-		if f.Path == "config.json" {
-			err = stageCheckpointConfig(staging, plannedConfig)
+		if planned := metadata.contents(f.Path); planned != nil {
+			err = stageCheckpointMetadata(staging, f.Path, planned)
 		} else {
 			dir := filepath.Join(staging, filepath.FromSlash(path.Dir(f.Path)))
 			base := done
@@ -545,7 +593,7 @@ func downloadCheckpoint(ctx context.Context, p Plan, plannedConfig []byte, dest 
 			progress(done, p.Bytes, f.Path)
 		}
 	}
-	markerFiles, err := checkpointMarkerFiles(staging, p, plannedConfig)
+	markerFiles, err := checkpointMarkerFiles(staging, p, metadata)
 	if err != nil {
 		return "", fmt.Errorf("checking staged checkpoint %s: %w", staging, err)
 	}
@@ -565,20 +613,20 @@ func downloadCheckpoint(ctx context.Context, p Plan, plannedConfig []byte, dest 
 	return dest, nil
 }
 
-func checkpointMarkerFiles(staging string, p Plan, plannedConfig []byte) ([]File, error) {
+func checkpointMarkerFiles(staging string, p Plan, metadata checkpointMetadata) ([]File, error) {
 	root, err := os.OpenRoot(staging)
 	if err != nil {
 		return nil, err
 	}
 	defer root.Close()
-	if err := verifyCheckpointWeights(root, p.Files); err != nil {
+	if err := verifyCheckpointWeights(root, p.Files, metadata.index); err != nil {
 		return nil, err
 	}
 	raw, err := checkpoint.ReadRootConfig(root)
 	if err != nil {
 		return nil, fmt.Errorf("checking config.json: %w", err)
 	}
-	if !bytes.Equal(raw, plannedConfig) {
+	if !bytes.Equal(raw, metadata.config) {
 		return nil, fmt.Errorf("config.json does not match the checkpoint plan")
 	}
 	if err := checkpoint.ValidateConfig(p.Repo, raw); err != nil {
@@ -586,27 +634,26 @@ func checkpointMarkerFiles(staging string, p Plan, plannedConfig []byte) ([]File
 	}
 	files := slices.Clone(p.Files)
 	for i, f := range files {
-		if f.Path == "config.json" {
-			files[i].SHA256 = checkpoint.ConfigDigest(raw)
-			break
+		if planned := metadata.contents(f.Path); planned != nil {
+			files[i].SHA256 = checkpoint.ConfigDigest(planned)
 		}
 	}
 	return files, nil
 }
 
-func stageCheckpointConfig(dir string, config []byte) error {
-	if raw, err := readCachedCheckpointConfig(dir); err == nil && bytes.Equal(raw, config) {
+func stageCheckpointMetadata(dir, name string, planned []byte) error {
+	if raw, err := readCheckpointMetadata(dir, name); err == nil && bytes.Equal(raw, planned) {
 		return nil
 	}
-	tmp, err := os.MkdirTemp(dir, ".config.json-*")
+	tmp, err := os.MkdirTemp(dir, "."+name+"-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp)
-	staged := filepath.Join(tmp, "config.json")
+	staged := filepath.Join(tmp, name)
 	defer os.Remove(staged)
-	if err := os.WriteFile(staged, config, 0o644); err != nil {
+	if err := os.WriteFile(staged, planned, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(staged, filepath.Join(dir, "config.json"))
+	return os.Rename(staged, filepath.Join(dir, name))
 }

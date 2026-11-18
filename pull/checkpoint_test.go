@@ -397,7 +397,7 @@ func TestReadCachedCheckpointConfigWhileAliasChanges(t *testing.T) {
 	saveCheckpointConfigLink(t, dir, alias)
 	saveCheckpointConfigLink(t, filepath.Join(alias, "model-config.json"), filepath.Join(dir, "active.json"))
 	saveCheckpointConfigLink(t, "active.json", filepath.Join(dir, "config.json"))
-	if got, err := readCachedCheckpointConfig(dir); err != nil || string(got) != insideConfig {
+	if got, err := readCheckpointMetadata(dir, "config.json"); err != nil || string(got) != insideConfig {
 		t.Fatalf("initial config = %q, %v; want in-checkpoint data", got, err)
 	}
 
@@ -422,7 +422,7 @@ func TestReadCachedCheckpointConfigWhileAliasChanges(t *testing.T) {
 		done <- nil
 	}()
 	for range attempts {
-		got, err := readCachedCheckpointConfig(dir)
+		got, err := readCheckpointMetadata(dir, "config.json")
 		if err == nil && string(got) != insideConfig {
 			t.Errorf("read config outside checkpoint while its alias changed: %q", got)
 			break
@@ -765,8 +765,8 @@ func TestDownloadCheckpointRejectsCompletedConfigDrift(t *testing.T) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.requests != requests+1 {
-		t.Errorf("expected only the config revalidation request, got %d requests", h.requests-requests)
+	if h.requests != requests+2 {
+		t.Errorf("expected only the config and index revalidation requests, got %d requests", h.requests-requests)
 	}
 }
 
@@ -906,13 +906,123 @@ func TestDownloadCheckpointRequiresWeights(t *testing.T) {
 	}
 }
 
-func TestDownloadCheckpointValidatesStagedIndex(t *testing.T) {
+func TestCheckpointResumeUsesPlannedIndex(t *testing.T) {
 	const repo = "o/tiny"
-	const index = "model.safetensors.index.json"
+	const shard = "model-00001-of-00002.safetensors"
+	const interrupted = "model-00002-of-00002.safetensors"
+	for _, tc := range []struct {
+		name                        string
+		public, matching, malformed bool
+	}{
+		{name: "prepared with stale index"},
+		{name: "prepared with malformed index", malformed: true},
+		{name: "prepared with matching index", matching: true},
+		{name: "public with stale index", public: true},
+		{name: "public with malformed index", public: true, malformed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := shardedTinyRepo(t)
+			original := files[checkpointIndex]
+			stale := indexWithMissingTensor(t, original)
+			if tc.matching {
+				stale = original
+			} else if tc.malformed {
+				stale = bytes.Repeat([]byte("x"), len(original))
+			}
+			h := &fakeHF{files: files}
+			h.serve(t, repo)
+			plan, download, err := PrepareCheckpointFor(t.Context(), repo, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pin := plan.TreeDigest()
+			if tc.public {
+				data, err := json.Marshal(plan)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var restored Plan
+				if err := json.Unmarshal(data, &restored); err != nil {
+					t.Fatal(err)
+				}
+				download = func(ctx context.Context, dest string, progress func(int64, int64, string)) (string, error) {
+					return DownloadCheckpoint(ctx, restored, dest, progress)
+				}
+			} else {
+				// A prepared download uses the bytes it planned even if upstream changes later.
+				h.mu.Lock()
+				h.files[checkpointIndex] = stale
+				h.mu.Unlock()
+			}
+			dest := filepath.Join(t.TempDir(), "checkpoint")
+			staging := dest + ".partial"
+			if err := os.Mkdir(staging, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for name, raw := range map[string][]byte{checkpointIndex: stale, shard: files[shard], interrupted + ".part": files[interrupted][:32]} {
+				if err := os.WriteFile(filepath.Join(staging, name), raw, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f, err := os.Open(filepath.Join(staging, checkpointIndex))
+			if err != nil {
+				t.Fatal(err)
+			}
+			stagedIndex, err := f.Stat()
+			f.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if path, err := download(t.Context(), dest, nil); path != dest || err != nil {
+				t.Fatalf("resume = %q, %v; want %s", path, err, dest)
+			}
+			if raw, err := os.ReadFile(filepath.Join(dest, checkpointIndex)); err != nil || !bytes.Equal(raw, original) {
+				t.Errorf("published index differs from the planned bytes: %v", err)
+			}
+			if info, err := os.Stat(filepath.Join(dest, checkpointIndex)); err != nil || os.SameFile(stagedIndex, info) != tc.matching {
+				t.Errorf("published index should reuse the staged file only when it matches: %v", err)
+			}
+			model, err := decoder.Load(dest, decoder.Options{Backend: "cpu"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			model.Close()
+			marker := readTestCheckpointMarker(t, dest)
+			if i := slices.IndexFunc(marker.Files, func(f File) bool { return f.Path == checkpointIndex }); i < 0 || marker.Files[i].SHA256 != fmt.Sprintf("%x", sha256.Sum256(original)) {
+				t.Error("marker lacks the digest of the planned index")
+			}
+			if i := slices.IndexFunc(plan.Files, func(f File) bool { return f.Path == checkpointIndex }); i < 0 || plan.Files[i].SHA256 != "" || plan.VerifyPin(pin) != nil {
+				t.Error("the marker digest changed the public plan or the tree pin")
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			wantIndexHits := 1
+			if tc.public {
+				wantIndexHits++
+			}
+			if h.hits[checkpointIndex] != wantIndexHits || h.hits[shard] != 0 || h.hits[interrupted] != 1 || h.ranges[interrupted] != "bytes=32-" {
+				t.Errorf("index should be fetched %d times, the completed shard reused, and the interrupted shard resumed: requests %v, ranges %v", wantIndexHits, h.hits, h.ranges)
+			}
+		})
+	}
+}
+
+func indexWithMissingTensor(t *testing.T, original []byte) []byte {
+	t.Helper()
+	changed := bytes.Replace(original, []byte("model.embed_tokens.weight"), []byte("xodel.embed_tokens.weight"), 1)
+	if bytes.Equal(changed, original) || len(changed) != len(original) || !json.Valid(changed) {
+		t.Fatal("fixture must have two different valid indices of equal size")
+	}
+	return changed
+}
+
+func TestDownloadCheckpointRejectsInvalidRemoteIndexBeforeUpdatingStaging(t *testing.T) {
+	const repo = "o/tiny"
 	files := shardedTinyRepo(t)
+	original := files[checkpointIndex]
 	h := &fakeHF{files: files}
 	h.serve(t, repo)
-	_, download, err := PrepareCheckpointFor(t.Context(), repo, nil)
+	plan, err := PlanCheckpoint(t.Context(), repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -921,17 +1031,127 @@ func TestDownloadCheckpointValidatesStagedIndex(t *testing.T) {
 	if err := os.Mkdir(staging, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	invalid := bytes.Repeat([]byte("x"), len(files[index]))
-	if err := os.WriteFile(filepath.Join(staging, index), invalid, 0o644); err != nil {
+	indexPath := filepath.Join(staging, checkpointIndex)
+	if err := os.WriteFile(indexPath, original, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if path, err := download(t.Context(), dest, nil); path != "" || err == nil || !strings.Contains(err.Error(), index) {
-		t.Errorf("download = %q, %v; want refusal for the invalid staged index", path, err)
+	h.mu.Lock()
+	h.files[checkpointIndex] = bytes.Repeat([]byte("x"), len(original))
+	requests := h.requests
+	h.mu.Unlock()
+	if got, err := DownloadCheckpoint(t.Context(), plan, dest, nil); got != "" || err == nil || !strings.Contains(err.Error(), "parsing "+checkpointIndex) {
+		t.Errorf("refusing malformed remote index = %q, %v", got, err)
 	}
-	for _, path := range []string{dest, filepath.Join(staging, checkpointMarker)} {
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Errorf("refused download published %s: %v", path, err)
-		}
+	if raw, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(raw, original) {
+		t.Errorf("refusal changed the staged index: %v", err)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.requests != requests+2 {
+		t.Errorf("expected only config and index requests, got %d requests", h.requests-requests)
+	}
+}
+
+func readTestCheckpointMarker(t *testing.T, dir string) markerDoc {
+	t.Helper()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	marker, ok := readCheckpointMarker(root)
+	if !ok {
+		t.Fatal("failed to read checkpoint marker")
+	}
+	return marker
+}
+
+func TestCheckpointCompletedIndexCompatibility(t *testing.T) {
+	const repo = "o/tiny"
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy=%t", legacy), func(t *testing.T) {
+			withCacheRoot(t)
+			files := shardedTinyRepo(t)
+			original := files[checkpointIndex]
+			h := &fakeHF{files: files}
+			h.serve(t, repo)
+			ctx := t.Context()
+			dest, err := CacheDir(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, download, err := PrepareCheckpointFor(ctx, repo, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := download(ctx, dest, nil); err != nil {
+				t.Fatal(err)
+			}
+			markerPath := filepath.Join(dest, checkpointMarker)
+			if legacy {
+				marker := readTestCheckpointMarker(t, dest)
+				for i, f := range marker.Files {
+					if f.Path == checkpointIndex {
+						marker.Files[i].SHA256 = ""
+					}
+				}
+				raw, err := json.Marshal(marker)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(markerPath, raw, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			marker, err := os.ReadFile(markerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.mu.Lock()
+			requests := h.requests
+			h.mu.Unlock()
+			if got, err := download(ctx, dest, nil); got != dest || err != nil {
+				t.Errorf("matching plan should reuse the completed checkpoint: %q, %v", got, err)
+			}
+			if got, err := Resolve(ctx, "hf:"+repo+":safetensors", nil); got != dest || err != nil {
+				t.Errorf("offline Resolve should accept the completed checkpoint: %q, %v", got, err)
+			}
+			changed := indexWithMissingTensor(t, original)
+			h.mu.Lock()
+			if h.requests != requests {
+				t.Errorf("reusing the checkpoint made %d network requests", h.requests-requests)
+			}
+			h.files[checkpointIndex] = changed
+			h.mu.Unlock()
+			updatedPlan, updatedDownload, err := PrepareCheckpointFor(ctx, repo, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := updatedPlan.VerifyPin(plan.TreeDigest()); err != nil {
+				t.Fatalf("same-size non-LFS index changed the tree pin: %v", err)
+			}
+			if got, err := updatedDownload(ctx, dest, nil); got != "" || err == nil || !strings.Contains(err.Error(), "index differs from the current checkpoint plan") {
+				t.Errorf("changed index should refuse the completed destination: %q, %v", got, err)
+			}
+			indexPath := filepath.Join(dest, checkpointIndex)
+			if raw, err := os.ReadFile(indexPath); err != nil || !bytes.Equal(raw, original) {
+				t.Errorf("refusal changed the completed index: %v", err)
+			}
+			if raw, err := os.ReadFile(markerPath); err != nil || !bytes.Equal(raw, marker) {
+				t.Errorf("reusing or refusing the destination changed the marker: %v", err)
+			}
+			if !legacy {
+				if err := os.WriteFile(indexPath, changed, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if _, ok := CachedCheckpoint(dest); ok {
+					t.Error("CachedCheckpoint accepted a same-size index that differs from the marker digest")
+				}
+				if got, err := Resolve(ctx, "hf:"+repo+":safetensors", nil); got != "" || err == nil || !strings.Contains(err.Error(), "index does not match checkpoint metadata") {
+					t.Errorf("offline Resolve should refuse the changed index: %q, %v", got, err)
+				}
+			}
+		})
 	}
 }
 

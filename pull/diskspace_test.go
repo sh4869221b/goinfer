@@ -176,7 +176,7 @@ func TestDownloadCheckpoint_refusesWhatWillNotFit_beforeAnyByte(t *testing.T) {
 	root := t.TempDir()
 	dest := filepath.Join(root, "ckpt")
 	p := diskCheckpointPlan(d.set)
-	_, err := downloadCheckpoint(context.Background(), p, []byte(diskCheckpointConfig), dest, nil)
+	_, err := downloadCheckpoint(context.Background(), p, checkpointMetadata{config: []byte(diskCheckpointConfig)}, dest, nil)
 	if err == nil {
 		t.Fatal("one byte short of the checkpoint size: want a refusal")
 	}
@@ -216,7 +216,7 @@ func TestDownloadCheckpoint_countsPartialsInSubdirectories(t *testing.T) {
 				t.Fatal(err)
 			}
 			p := diskCheckpointPlan(d.set)
-			_, err := downloadCheckpoint(context.Background(), p, []byte(diskCheckpointConfig), dest, nil)
+			_, err := downloadCheckpoint(context.Background(), p, checkpointMetadata{config: []byte(diskCheckpointConfig)}, dest, nil)
 			if (err == nil) != tc.ok {
 				t.Fatalf("1,001 bytes left and %d free: err %v, want ok=%v", tc.free, err, tc.ok)
 			}
