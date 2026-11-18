@@ -755,14 +755,14 @@ func Download(ctx context.Context, repo string, f File, dir string, progress fun
 	}
 	defer root.Close()
 	name := filepath.Base(f.Path)
-	if err := downloadFile(ctx, root, name, repo, f, progress); err != nil {
+	if err := downloadFile(ctx, root, name, repo, f, true, progress); err != nil {
 		return "", err
 	}
 	return filepath.Join(dir, name), nil
 }
 
 // downloadFile performs all transfer operations in the already-open destination directory.
-func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File, progress func(done, total int64)) error {
+func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File, resume bool, progress func(done, total int64)) error {
 
 	// Resume from a previous interrupted attempt when one is on disk: these files are multi-gigabyte,
 	// and losing 4 GB to a dropped connection is the difference between an annoyance and an unusable
@@ -770,7 +770,7 @@ func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File
 	part := final + ".part"
 	var resumeFrom int64
 	h := sha256.New()
-	if st, err := root.Lstat(part); err == nil && st.Mode().IsRegular() && st.Size() > 0 && (f.Size <= 0 || st.Size() < f.Size) {
+	if st, err := root.Lstat(part); resume && err == nil && st.Mode().IsRegular() && st.Size() > 0 && (f.Size <= 0 || st.Size() < f.Size) {
 		// The running digest has to cover the bytes already on disk, so re-read them through the hash. That
 		// is a local read, trivial beside re-fetching, and it keeps the end-to-end sha256 check covering the
 		// whole file rather than only the tail.
@@ -786,6 +786,9 @@ func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File
 		return fmt.Errorf("downloading %s: %w", f.Path, err)
 	}
 	defer resp.Body.Close()
+	if resumeFrom == 0 && (resp.StatusCode == http.StatusPartialContent || resp.StatusCode == http.StatusRequestedRangeNotSatisfiable) {
+		return fmt.Errorf("downloading %s: unexpected Range response (%s) to a full request", f.Path, resp.Status)
+	}
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
 		// Server honoured the Range: append.

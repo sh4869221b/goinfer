@@ -380,24 +380,77 @@ type markerDoc struct {
 	Files []File `json:"files"`
 }
 
-// checkCompletedCheckpoint reports whether dir contains the files of the current plan.
-func checkCompletedCheckpoint(dir string, files []File, metadata checkpointMetadata) (bool, error) {
+// reuseCheckpointDestination distinguishes an absent destination from one that has completed.
+// An existing directory whose files differ from the plan is preserved for the caller.
+func reuseCheckpointDestination(ctx context.Context, dir string, p Plan, metadata checkpointMetadata) (bool, error) {
+	if _, err := os.Lstat(dir); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if ok, err := checkCompletedCheckpoint(ctx, dir, p, metadata); ok || err != nil {
+		return ok, err
+	}
+	return false, fmt.Errorf("%s exists but is not a complete checkpoint of %s pulled by goinfer: move it aside, or pull with -o <dir>", dir, p.Repo)
+}
+
+func checkCompletedCheckpoint(ctx context.Context, dir string, p Plan, metadata checkpointMetadata) (bool, error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return false, nil
 	}
 	defer root.Close()
 	m, ok := readCheckpointMarker(root)
-	if !ok || !slices.EqualFunc(m.Files, files, func(got, want File) bool {
-		// Locally computed metadata hashes are independent of the remote tree pin.
-		if metadata.contents(want.Path) != nil && want.SHA256 == "" {
+	if !ok || !slices.EqualFunc(m.Files, p.Files, func(got, want File) bool {
+		// Locally computed hashes are independent of the remote tree pin.
+		if want.SHA256 == "" {
 			got.SHA256 = ""
 		}
 		return got == want
 	}) {
 		return false, nil
 	}
-	return verifyCachedCheckpoint(dir, root, m, metadata)
+	if verified, err := verifyCachedCheckpoint(dir, root, m, metadata); !verified || err != nil {
+		return false, err
+	}
+	for i, f := range p.Files {
+		if f.SHA256 == "" && metadata.contents(f.Path) == nil {
+			if err := checkCompletedRemoteFile(ctx, root, p.Repo, f, m.Files[i].SHA256); err != nil {
+				return false, fmt.Errorf("checkpoint %s: %w; use -o <dir> to keep the existing checkpoint", dir, err)
+			}
+		}
+	}
+	return true, nil
+}
+
+// A legacy marker can lack a digest. A complete directory can be reused after a full
+// comparison with the current CDN file, without replacing the existing files.
+func checkCompletedRemoteFile(ctx context.Context, root *os.Root, repo string, f File, localDigest string) error {
+	if localDigest == "" {
+		var err error
+		localDigest, err = hashStagedFile(root, f)
+		if err != nil {
+			return err
+		}
+	}
+	resp, err := get(ctx, hfCDN+"/"+repo+"/resolve/main/"+f.Path)
+	if err != nil {
+		return fmt.Errorf("checking %s: %w", f.Path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("checking %s: HuggingFace returned %s", f.Path, resp.Status)
+	}
+	h := sha256.New()
+	n, err := io.Copy(h, io.LimitReader(resp.Body, f.Size+1))
+	if err != nil {
+		return fmt.Errorf("checking %s: %w", f.Path, err)
+	}
+	if n != f.Size || hex.EncodeToString(h.Sum(nil)) != localDigest {
+		return fmt.Errorf("%s differs from the current checkpoint plan", f.Path)
+	}
+	return nil
 }
 
 // CachedCheckpoint is a complete, supported checkpoint in dir, verified offline from its marker.
@@ -570,32 +623,12 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 			return "", fmt.Errorf("planned %s does not match the checkpoint files", name)
 		}
 	}
-	complete, err := checkCompletedCheckpoint(dest, p.Files, metadata)
-	if err != nil {
+	if complete, err := reuseCheckpointDestination(ctx, dest, p, metadata); err != nil {
 		return "", err
-	}
-	if complete {
+	} else if complete {
 		return dest, nil
 	}
-	if _, err := os.Lstat(dest); err == nil {
-		return "", fmt.Errorf("%s exists but is not a complete checkpoint of %s pulled by goinfer: move it aside, or pull with -o <dir>", dest, p.Repo)
-	} else if !os.IsNotExist(err) {
-		return "", err
-	}
 	staging := filepath.Clean(dest) + ".partial"
-	var need int64
-	for _, f := range p.Files {
-		if planned := metadata.contents(f.Path); planned != nil {
-			if raw, err := readCheckpointMetadata(staging, f.Path); err != nil || !bytes.Equal(raw, planned) {
-				need += f.Size // replacements are written beside the stale file before rename
-			}
-			continue
-		}
-		need += bytesLeft(f, filepath.Join(staging, filepath.FromSlash(path.Dir(f.Path))))
-	}
-	if err := checkDiskSpace(p.Repo, need, staging); err != nil {
-		return "", err
-	}
 	if err := os.MkdirAll(filepath.Dir(staging), 0o755); err != nil {
 		return "", err
 	}
@@ -604,7 +637,41 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 		return "", err
 	}
 	defer parent.Close()
-	stagingName := filepath.Base(staging)
+	stagingName, destName := filepath.Base(staging), filepath.Base(dest)
+	lock, claim, err := lockCheckpointDestination(parent, destName)
+	if err != nil {
+		return "", fmt.Errorf("locking checkpoint %s: %w", dest, err)
+	}
+	defer lock.Close()
+	if complete, err := reuseCheckpointDestination(ctx, dest, p, metadata); err != nil {
+		return "", err
+	} else if complete {
+		return dest, nil
+	}
+	if err := recoverCheckpointStage(parent, stagingName, claim); err != nil {
+		return "", fmt.Errorf("recovering checkpoint %s: %w", dest, err)
+	}
+	var need int64
+	for _, f := range p.Files {
+		if planned := metadata.contents(f.Path); planned != nil {
+			if raw, err := readCheckpointMetadata(staging, f.Path); err != nil || !bytes.Equal(raw, planned) {
+				need += f.Size // replacements are written beside the stale file before rename
+			}
+			continue
+		}
+		dir := filepath.Join(staging, filepath.FromSlash(path.Dir(f.Path)))
+		if f.SHA256 != "" {
+			need += bytesLeft(f, dir)
+		} else {
+			need += f.Size
+			if info, err := os.Lstat(filepath.Join(dir, filepath.Base(f.Path)) + ".part"); err == nil && info.Mode().IsRegular() {
+				need -= min(info.Size(), f.Size) // a full GET truncates the old partial before writing
+			}
+		}
+	}
+	if err := checkDiskSpace(p.Repo, need, staging); err != nil {
+		return "", err
+	}
 	if err := parent.Mkdir(stagingName, 0o755); err != nil && !os.IsExist(err) {
 		return "", err
 	}
@@ -623,7 +690,7 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 	if !sameCheckpointDirectory(parent, parentInfo) {
 		return "", fmt.Errorf("checkpoint destination directory changed during download")
 	}
-	if err := publishCheckpoint(parent, root, stagingName, filepath.Base(dest), p, metadata); err != nil {
+	if err := publishCheckpoint(parent, root, stagingName, destName, claim, p, metadata); err != nil {
 		return "", fmt.Errorf("publishing %s: %w", dest, err)
 	}
 	return dest, nil
@@ -645,7 +712,7 @@ func stageCheckpoint(ctx context.Context, root *os.Root, p Plan, metadata checkp
 					return err
 				}
 				base := done
-				err = downloadFile(ctx, root, name, p.Repo, f, func(d, _ int64) {
+				err = downloadFile(ctx, root, name, p.Repo, f, f.SHA256 != "", func(d, _ int64) {
 					if progress != nil {
 						progress(base+d, p.Bytes, f.Path)
 					}
@@ -734,6 +801,12 @@ func checkpointMarkerFiles(root *os.Root, p Plan, metadata checkpointMetadata) (
 				}
 			}
 			files[i].SHA256 = checkpoint.ConfigDigest(planned)
+		} else if f.SHA256 == "" {
+			digest, err := hashStagedFile(root, f)
+			if err != nil {
+				return nil, err
+			}
+			files[i].SHA256 = digest
 		}
 	}
 	return files, nil

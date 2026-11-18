@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/tokenizer"
 )
 
 // fakeHF serves a repo's tree, its files (with Range, as HF's resolve host does) and its metadata, counts requests per
@@ -665,8 +666,7 @@ func TestCheckpointResumeAfterWeightLayoutChange(t *testing.T) {
 				t.Fatalf("expected interruption during %s, got %q, %v", tokenizerFile, got, err)
 			}
 			staging := dest + ".partial"
-			part, err := os.Stat(filepath.Join(staging, tokenizerFile+".part"))
-			if err != nil {
+			if _, err := os.Stat(filepath.Join(staging, tokenizerFile+".part")); err != nil {
 				t.Fatal(err)
 			}
 			if tc.toSingle {
@@ -724,8 +724,8 @@ func TestCheckpointResumeAfterWeightLayoutChange(t *testing.T) {
 			}
 			h.mu.Lock()
 			defer h.mu.Unlock()
-			if got := h.ranges[tokenizerFile]; got != fmt.Sprintf("bytes=%d-", part.Size()) {
-				t.Errorf("tokenizer resume Range = %q", got)
+			if got := h.ranges[tokenizerFile]; got != "" {
+				t.Errorf("unidentified tokenizer config was resumed with Range %q", got)
 			}
 			if h.hits[checkpointWeights] != 1 {
 				t.Errorf("single weight file should be downloaded exactly once across both pulls: %v", h.hits)
@@ -1014,8 +1014,97 @@ func TestCheckpointResumeUsesCurrentGenerationConfig(t *testing.T) {
 			}
 			h.mu.Lock()
 			defer h.mu.Unlock()
-			if h.hits[shard] != hits || h.ranges[interrupted] == "" {
-				t.Errorf("resume re-fetched a shard or dropped the tokenizer range: %v %v", h.hits, h.ranges)
+			if h.hits[shard] != hits || h.ranges[interrupted] != "" {
+				t.Errorf("resume re-fetched a shard or reused unidentified tokenizer bytes: %v %v", h.hits, h.ranges)
+			}
+		})
+	}
+}
+
+func TestCheckpointResumeRefreshesUnidentifiedTokenizer(t *testing.T) {
+	const repo = "o/tiny"
+	const name = "tokenizer.json"
+	const shard = "model-00001-of-00002.safetensors"
+	old := []byte(`{"model":{"vocab":{"a":7,"b":8,"ab":9},"merges":["a b"],"type":"BPE"},"decoder":{"type":"ByteLevel"}}`)
+	updated := bytes.Replace(old, []byte(`"a":7,"b":8`), []byte(`"a":8,"b":7`), 1)
+	for _, interrupted := range []string{"tokenizer_config.json", name} {
+		t.Run(interrupted, func(t *testing.T) {
+			files := shardedTinyRepo(t)
+			files[name], files["tokenizer_config.json"] = old, []byte(`{"clean_up_tokenization_spaces":false}`)
+			h := &fakeHF{files: files, failOnce: interrupted}
+			h.serve(t, repo)
+			ctx := t.Context()
+			dir := t.TempDir()
+			dest := filepath.Join(dir, "resumed")
+			oldPlan, download, err := PrepareCheckpointFor(ctx, repo, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := download(ctx, dest, nil); err == nil || !strings.Contains(err.Error(), interrupted) {
+				t.Fatalf("want interrupted %s, got %v", interrupted, err)
+			}
+			h.mu.Lock()
+			hits := h.hits[shard]
+			files[name] = updated
+			h.mu.Unlock()
+			plan, download, err := PrepareCheckpointFor(ctx, repo, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := plan.VerifyPin(oldPlan.TreeDigest()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := download(ctx, dest, nil); err != nil {
+				t.Fatal(err)
+			}
+			h.mu.Lock()
+			shardHits, tokenizerRange := h.hits[shard], h.ranges[name]
+			h.mu.Unlock()
+			if shardHits != hits || tokenizerRange != "" {
+				t.Errorf("resume should reuse the shard and fetch the full tokenizer: shard hits %d, Range %q", shardHits, tokenizerRange)
+			}
+			fresh := filepath.Join(dir, "fresh")
+			if _, err := download(ctx, fresh, nil); err != nil {
+				t.Fatal(err)
+			}
+			for _, dir := range []string{dest, fresh} {
+				tk, err := tokenizer.Load(dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, err := tk.Encode("a", false); err != nil || !slices.Equal(got, []int{8}) {
+					t.Errorf("%s encoded a as %v, %v; want [8]", dir, got, err)
+				}
+			}
+			marker := readTestCheckpointMarker(t, dest)
+			if i := slices.IndexFunc(marker.Files, func(f File) bool { return f.Path == name }); i < 0 || marker.Files[i].SHA256 != fmt.Sprintf("%x", sha256.Sum256(updated)) {
+				t.Error("marker lacks the digest of the downloaded tokenizer")
+			}
+			if interrupted == name {
+				for i, file := range marker.Files {
+					if file.Path == name {
+						marker.Files[i].SHA256 = ""
+					}
+				}
+				legacyMarker, err := json.Marshal(marker)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dest, checkpointMarker), legacyMarker, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got, err := download(ctx, dest, nil); got != dest || err != nil {
+				t.Errorf("matching explicit pull = %q, %v", got, err)
+			}
+			h.mu.Lock()
+			files[name] = old
+			h.mu.Unlock()
+			if got, err := download(ctx, dest, nil); got != "" || err == nil || !strings.Contains(err.Error(), name+" differs") {
+				t.Errorf("explicit pull accepted changed tokenizer in completed directory: %q, %v", got, err)
+			}
+			if _, ok := CachedCheckpoint(dest); !ok {
+				t.Error("refusal changed the offline cache")
 			}
 		})
 	}

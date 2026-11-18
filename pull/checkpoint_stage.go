@@ -1,7 +1,6 @@
 package pull
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,15 +11,75 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 )
 
+const checkpointWorkDir = ".goinfer-pulls"
+
+// A lock file stays in place so all writers use the same inode. Closing its handle
+// (including on process death) releases the lock. The claim belongs to the same destination.
+func lockCheckpointDestination(parent *os.Root, dest string) (*os.File, string, error) {
+	if strings.EqualFold(dest, checkpointWorkDir) {
+		return nil, "", fmt.Errorf("%s is reserved for checkpoint downloads", dest)
+	}
+	if err := parent.Mkdir(checkpointWorkDir, 0o700); err != nil && !os.IsExist(err) {
+		return nil, "", err
+	}
+	work, err := openCheckpointStaging(parent, checkpointWorkDir)
+	if err != nil {
+		return nil, "", err
+	}
+	defer work.Close()
+	if err := work.Mkdir(dest, 0o700); err != nil && !os.IsExist(err) {
+		return nil, "", err
+	}
+	workspace, err := openCheckpointStaging(work, dest)
+	if err != nil {
+		return nil, "", err
+	}
+	defer workspace.Close()
+	lock, err := openRegularDownloadFile(workspace, "lock", os.O_RDWR|os.O_CREATE)
+	if err != nil {
+		return nil, "", err
+	}
+	acquired, err := tryCheckpointLock(lock)
+	if err != nil || !acquired {
+		lock.Close()
+		if err != nil {
+			return nil, "", err
+		}
+		return nil, "", fmt.Errorf("another checkpoint pull is running for %s", dest)
+	}
+	return lock, filepath.Join(checkpointWorkDir, dest, "checkpoint"), nil
+}
+
+func recoverCheckpointStage(parent *os.Root, staging, claim string) error {
+	info, err := parent.Lstat(claim)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("checkpoint recovery path %s must be a directory", claim)
+	}
+	if _, err := parent.Lstat(staging); !os.IsNotExist(err) {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("both %s and %s contain staging data; use a different output directory to keep both", staging, claim)
+	}
+	return parent.Rename(claim, staging)
+}
+
 func reusableStagedFile(root *os.Root, name string, f File) bool {
+	if f.SHA256 == "" {
+		return false
+	}
 	info, err := root.Lstat(name)
 	if err != nil || !info.Mode().IsRegular() || info.Size() != f.Size {
 		return false
-	}
-	if f.SHA256 == "" {
-		return true
 	}
 	if sidecar, err := openRegularDownloadFile(root, sidecarPath(name), os.O_RDONLY); err == nil {
 		var stored digestSidecar
@@ -30,12 +89,24 @@ func reusableStagedFile(root *os.Root, name string, f File) bool {
 			return stored.SHA256 == f.SHA256
 		}
 	}
-	h := sha256.New()
-	if _, err := hashPrefix(root, h, name); err != nil || hex.EncodeToString(h.Sum(nil)) != f.SHA256 {
+	digest, err := hashStagedFile(root, f)
+	if err != nil || digest != f.SHA256 {
 		return false
 	}
 	recordVerifiedDigest(root, name, f.SHA256)
 	return true
+}
+
+func hashStagedFile(root *os.Root, f File) (string, error) {
+	h := sha256.New()
+	n, err := hashPrefix(root, h, filepath.FromSlash(f.Path))
+	if err != nil {
+		return "", err
+	}
+	if n != f.Size {
+		return "", fmt.Errorf("%s changed size during verification", f.Path)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // pruneCheckpointStage keeps the plan, its parent directories and checksum sidecars.
@@ -70,7 +141,7 @@ func pruneCheckpointStage(root *os.Root, files []File) error {
 
 // publishCheckpoint claims the staging name inside a private directory and then checks its identity.
 // Verification and cleanup use the same open directory that received the transfers.
-func publishCheckpoint(parent, stage *os.Root, staging, dest string, p Plan, metadata checkpointMetadata) (err error) {
+func publishCheckpoint(parent, stage *os.Root, staging, dest, claimed string, p Plan, metadata checkpointMetadata) (err error) {
 	info, err := parent.Lstat(staging)
 	if err != nil {
 		return err
@@ -78,12 +149,6 @@ func publishCheckpoint(parent, stage *os.Root, staging, dest string, p Plan, met
 	if err := checkCheckpointStaging(stage, info); err != nil {
 		return err
 	}
-	work := ".goinfer-publish-" + rand.Text()
-	if err := parent.Mkdir(work, 0o700); err != nil {
-		return err
-	}
-	defer parent.Remove(work)
-	claimed := filepath.Join(work, "checkpoint")
 	if err := parent.Rename(staging, claimed); err != nil {
 		return err
 	}
