@@ -744,6 +744,8 @@ func stageCheckpoint(ctx context.Context, work *checkpointWorkspace, root *os.Ro
 					if progress != nil {
 						progress(base+d, p.Bytes, f.Path)
 					}
+				}, func(part string, info os.FileInfo) {
+					work.recordPartial(root, part, info)
 				})
 				if err == nil {
 					work.recordTransfer(root, f)
@@ -833,7 +835,7 @@ func checkpointMarkerFiles(root *os.Root, p Plan, metadata checkpointMetadata) (
 			}
 			files[i].SHA256 = checkpoint.ConfigDigest(planned)
 		} else if f.SHA256 == "" {
-			digest, err := hashStagedFile(root, f)
+			digest, err := hashPublishedFile(root, f)
 			if err != nil {
 				return nil, err
 			}

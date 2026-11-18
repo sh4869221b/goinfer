@@ -28,13 +28,14 @@ import (
 // fakeHF serves a repo's tree, its files (with Range, as HF's resolve host does) and its metadata, counts requests per
 // file, and can fail one file's transfer midway.
 type fakeHF struct {
-	mu       sync.Mutex
-	files    map[string][]byte
-	gated    any
-	hits     map[string]int
-	ranges   map[string]string
-	requests int
-	failOnce string // a path whose next transfer is cut midway
+	mu           sync.Mutex
+	files        map[string][]byte
+	gated        any
+	hits         map[string]int
+	ranges       map[string]string
+	requests     int
+	failOnce     string // a path whose next transfer is cut midway
+	pausePartial bool   // hold the interrupted response open until the client disconnects
 }
 
 func (h *fakeHF) serve(t *testing.T, repo string) {
@@ -73,6 +74,10 @@ func (h *fakeHF) serve(t *testing.T, repo string) {
 				w.Header().Set("Content-Length", "999999999")
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write(b[:len(b)/2])
+				if h.pausePartial {
+					w.(http.Flusher).Flush()
+					<-r.Context().Done()
+				}
 				return
 			}
 			http.ServeContent(w, r, p, time.Unix(0, 0), bytes.NewReader(b))

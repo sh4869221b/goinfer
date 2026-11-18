@@ -755,27 +755,29 @@ func Download(ctx context.Context, repo string, f File, dir string, progress fun
 	}
 	defer root.Close()
 	name := filepath.Base(f.Path)
-	if err := downloadFile(ctx, root, name, repo, f, true, progress); err != nil {
+	if err := downloadFile(ctx, root, name, repo, f, true, progress, nil); err != nil {
 		return "", err
 	}
 	return filepath.Join(dir, name), nil
 }
 
 // downloadFile performs all transfer operations in the already-open destination directory.
-func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File, resume bool, progress func(done, total int64)) error {
+func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File, resume bool, progress func(done, total int64), created func(string, os.FileInfo)) error {
 
 	// Resume from a previous interrupted attempt when one is on disk: these files are multi-gigabyte,
 	// and losing 4 GB to a dropped connection is the difference between an annoyance and an unusable
 	// command on a flaky link.
 	part := final + ".part"
 	var resumeFrom int64
+	var prefixInfo os.FileInfo
+	var prefixID string
 	h := sha256.New()
 	if st, err := root.Lstat(part); resume && err == nil && st.Mode().IsRegular() && st.Size() > 0 && (f.Size <= 0 || st.Size() < f.Size) {
 		// The running digest has to cover the bytes already on disk, so re-read them through the hash. That
 		// is a local read, trivial beside re-fetching, and it keeps the end-to-end sha256 check covering the
 		// whole file rather than only the tail.
-		if n, err := hashPrefix(root, h, part); err == nil {
-			resumeFrom = n
+		if info, id, err := hashPrefix(root, h, part); err == nil {
+			resumeFrom, prefixInfo, prefixID = info.Size(), info, id
 		} else {
 			h.Reset()
 		}
@@ -806,31 +808,53 @@ func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File
 		// .part (hashPrefix, above); verify it directly instead of copying a body a 416 response does not have.
 		if f.SHA256 != "" {
 			if got := hex.EncodeToString(h.Sum(nil)); got != f.SHA256 {
-				root.Remove(part)
+				removeUnchangedDownloadFile(root, part, prefixInfo)
 				return fmt.Errorf("checksum mismatch for %s:\n  want %s (declared by HuggingFace)\n  got  %s\nthe local partial download was already complete but corrupt; removed, re-run to refetch", f.Path, f.SHA256, got)
 			}
 		}
-		if err := root.Rename(part, final); err != nil {
-			return err
-		}
-		recordVerifiedDigest(root, final, f.SHA256)
-		return nil
+		return commitDownload(root, part, final, prefixInfo, prefixID, f.SHA256)
 	default:
 		return fmt.Errorf("downloading %s: HuggingFace returned %s", f.Path, resp.Status)
 	}
 
-	flags := os.O_CREATE | os.O_WRONLY
+	flags := os.O_WRONLY
 	if resumeFrom > 0 {
 		flags |= os.O_APPEND
-	} else {
-		flags |= os.O_TRUNC
 	}
-	if info, err := root.Lstat(part); err == nil && !info.Mode().IsRegular() {
+	partInfo, err := root.Lstat(part)
+	newPart := os.IsNotExist(err)
+	if newPart && resumeFrom == 0 {
+		flags |= os.O_CREATE | os.O_EXCL
+	} else if err != nil {
+		return err
+	} else if !partInfo.Mode().IsRegular() {
 		return fmt.Errorf("partial %s is not a regular file", part)
 	}
 	out, err := openRegularDownloadFile(root, part, flags)
 	if err != nil {
 		return err
+	}
+	opened, err := out.Stat()
+	if err != nil {
+		out.Close()
+		return err
+	}
+	if resumeFrom > 0 && !sameCheckpointFileState(prefixInfo, opened) {
+		out.Close()
+		return fmt.Errorf("partial %s changed while resuming", part)
+	}
+	if resumeFrom == 0 && !newPart {
+		if !sameCheckpointFileState(partInfo, opened) {
+			out.Close()
+			return fmt.Errorf("partial %s changed before restarting", part)
+		}
+		if err := out.Truncate(0); err != nil {
+			out.Close()
+			return err
+		}
+	}
+	if newPart && created != nil {
+		created(part, opened)
 	}
 	total := f.Size
 	if total <= 0 {
@@ -838,6 +862,11 @@ func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File
 	}
 	pw := &progressWriter{w: io.MultiWriter(out, h), done: resumeFrom, total: total, report: progress, last: time.Now()}
 	_, copyErr := io.Copy(pw, resp.Body)
+	verified, statErr := out.Stat()
+	var fileID string
+	if statErr == nil {
+		fileID = checkpointFileID(out, verified)
+	}
 	closeErr := out.Close()
 	if copyErr != nil {
 		// Deliberately NOT removed: the bytes already fetched are the whole point of resume.
@@ -847,37 +876,44 @@ func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File
 	if closeErr != nil {
 		return closeErr
 	}
+	if statErr != nil {
+		return statErr
+	}
+	if verified.Size() != pw.done {
+		return fmt.Errorf("partial %s changed size during transfer", part)
+	}
 	if f.SHA256 != "" {
 		if got := hex.EncodeToString(h.Sum(nil)); got != f.SHA256 {
-			root.Remove(part)
+			removeUnchangedDownloadFile(root, part, verified)
 			return fmt.Errorf("checksum mismatch for %s:\n  want %s (declared by HuggingFace)\n  got  %s\nthe download was corrupted or the file changed upstream; nothing was written", f.Path, f.SHA256, got)
 		}
+	}
+	return commitDownload(root, part, final, verified, fileID, f.SHA256)
+}
+
+func removeUnchangedDownloadFile(root *os.Root, name string, verified os.FileInfo) {
+	if info, err := root.Lstat(name); err == nil && sameCheckpointFileState(info, verified) {
+		_ = root.Remove(name)
+	}
+}
+
+func commitDownload(root *os.Root, part, final string, verified os.FileInfo, id, digest string) error {
+	if info, err := root.Lstat(part); err != nil || !sameCheckpointFileState(info, verified) {
+		return fmt.Errorf("partial %s changed before completion", part)
 	}
 	if err := root.Rename(part, final); err != nil {
 		return err
 	}
-	recordVerifiedDigest(root, final, f.SHA256)
+	if info, err := root.Lstat(final); err != nil || !sameCheckpointFileState(info, verified) {
+		return fmt.Errorf("file %s changed while completing the transfer", final)
+	}
+	if digest != "" {
+		writeRootDigest(root, final, verified, id, digest)
+	}
 	return nil
 }
 
-// recordVerifiedDigest writes path's digest sidecar from a digest Download has JUST verified against
-// the streamed bytes, so the first Resolve after a pull (cachedIntact) does not read the whole file
-// again to arrive at it. A no-op when no digest was declared (sum == ""), so nothing unverified is ever
-// recorded. Best-effort like cachedFileSHA256's own write: a failure only costs the next call a re-hash.
-func recordVerifiedDigest(root *os.Root, path, sum string) {
-	if sum == "" {
-		return
-	}
-	f, err := openRegularDownloadFile(root, path, os.O_RDONLY)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	if info, err := f.Stat(); err == nil {
-		writeRootDigest(root, path, info, checkpointFileID(f, info), sum)
-	}
-}
-
+// The caller supplies the identity of the opened file whose bytes produced sum.
 func writeRootDigest(root *os.Root, path string, info os.FileInfo, id, sum string) {
 	if b, err := json.Marshal(digestSidecar{Size: info.Size(), ModTime: info.ModTime().UnixNano(), SHA256: sum, FileID: id}); err == nil {
 		_ = replaceRootFile(root, sidecarPath(path), b)
@@ -890,14 +926,29 @@ func writeDigestSidecar(path string, st os.FileInfo, sum string) {
 	}
 }
 
-// hashPrefix feeds path's current contents into h and returns how many bytes it covered.
-func hashPrefix(root *os.Root, h io.Writer, path string) (int64, error) {
+// hashPrefix binds the partial digest to the exact file whose bytes it read.
+func hashPrefix(root *os.Root, h io.Writer, path string) (os.FileInfo, string, error) {
 	fh, err := openRegularDownloadFile(root, path, os.O_RDONLY)
 	if err != nil {
-		return 0, err
+		return nil, "", err
 	}
 	defer fh.Close()
-	return io.Copy(h, fh)
+	before, err := fh.Stat()
+	if err != nil {
+		return nil, "", err
+	}
+	n, err := io.Copy(h, fh)
+	if err != nil {
+		return nil, "", err
+	}
+	after, err := fh.Stat()
+	if err != nil {
+		return nil, "", err
+	}
+	if n != before.Size() || !sameCheckpointFileState(before, after) {
+		return nil, "", fmt.Errorf("partial %s changed while hashing", path)
+	}
+	return after, checkpointFileID(fh, after), nil
 }
 
 // cachedIntact reports whether dir already holds f, verified: it re-checks the digest rather than

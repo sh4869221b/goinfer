@@ -179,28 +179,35 @@ func reusableStagedFile(root *os.Root, name string, f File) bool {
 	if f.SHA256 == "" {
 		return false
 	}
-	info, err := root.Lstat(name)
-	if err != nil || !info.Mode().IsRegular() || info.Size() != f.Size {
+	opened, err := openRegularDownloadFile(root, name, os.O_RDONLY)
+	if err != nil {
 		return false
 	}
-	if digest := checkpointDigestSidecar(root, name, info); digest != "" {
-		return digest == f.SHA256
-	}
-	digest, err := hashStagedFile(root, f)
-	if err != nil || digest != f.SHA256 {
-		return false
-	}
-	recordVerifiedDigest(root, name, f.SHA256)
-	return true
+	defer opened.Close()
+	info, err := opened.Stat()
+	return err == nil && info.Size() == f.Size && verifyOpenCheckpointDigest(root, name, f, opened, info) == nil
 }
 
-func hashStagedFile(root *os.Root, f File) (string, error) {
-	file, err := openRegularDownloadFile(root, filepath.FromSlash(f.Path), os.O_RDONLY)
+func hashPublishedFile(root *os.Root, f File) (string, error) {
+	name := filepath.FromSlash(f.Path)
+	file, err := openRegularDownloadFile(root, name, os.O_RDONLY)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
-	return hashCheckpointFile(f, file)
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	digest, err := hashCheckpointFile(f, file)
+	if err != nil {
+		return "", err
+	}
+	if err := confirmCheckpointFile(root, name, file, info); err != nil {
+		return "", err
+	}
+	writeRootDigest(root, name, info, checkpointFileID(file, info), digest)
+	return digest, nil
 }
 
 func hashCheckpointFile(f File, r io.Reader) (string, error) {
@@ -265,9 +272,6 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 	if err := replaceRootFile(publish, checkpointMarker, marker); err != nil {
 		return err
 	}
-	for _, f := range files {
-		recordVerifiedDigest(publish, filepath.FromSlash(f.Path), f.SHA256)
-	}
 	relativePublish := filepath.Join(work.name, name)
 	ready, err := parent.Lstat(relativePublish)
 	if err != nil {
@@ -289,7 +293,7 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 	// workspace may belong to someone else, even when the stage belongs to us.
 	for _, file := range files {
 		name := filepath.FromSlash(file.Path)
-		if info, err := stage.Lstat(name); err == nil && os.SameFile(sources[file.Path], info) {
+		if info, err := stage.Lstat(name); err == nil && sameCheckpointFileState(sources[file.Path], info) {
 			if err := stage.Remove(name); err == nil && file.SHA256 != "" && checkpointDigestSidecar(stage, name, info) == file.SHA256 {
 				_ = stage.Remove(sidecarPath(name))
 			}
@@ -313,8 +317,10 @@ func preparePublishedFile(work, stage, publish *os.Root, publishName string, f F
 	if source.Size() != f.Size {
 		return nil, fmt.Errorf("staged file has size %d, want %d", source.Size(), f.Size)
 	}
-	if f.SHA256 != "" && !reusableStagedFile(stage, name, f) {
-		return nil, fmt.Errorf("staged file does not match the checkpoint digest")
+	if f.SHA256 != "" {
+		if err := verifyOpenCheckpointDigest(stage, name, f, in, source); err != nil {
+			return nil, err
+		}
 	}
 	if err := publish.MkdirAll(filepath.Dir(name), 0o755); err != nil {
 		return nil, err
@@ -324,8 +330,11 @@ func preparePublishedFile(work, stage, publish *os.Root, publishName string, f F
 		if err != nil {
 			return nil, err
 		}
-		if !linked.Mode().IsRegular() || !os.SameFile(source, linked) {
+		if !linked.Mode().IsRegular() || !sameCheckpointFileState(source, linked) {
 			return nil, fmt.Errorf("staged file changed while linking")
+		}
+		if f.SHA256 != "" {
+			writeRootDigest(publish, name, linked, checkpointFileID(in, source), f.SHA256)
 		}
 		return source, nil
 	}
@@ -333,20 +342,40 @@ func preparePublishedFile(work, stage, publish *os.Root, publishName string, f F
 	if err := checkDiskSpace(f.Path, f.Size, publish.Name()); err != nil {
 		return nil, err
 	}
+	if _, err := in.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
 	out, err := openRegularDownloadFile(publish, name, os.O_CREATE|os.O_EXCL|os.O_WRONLY)
 	if err != nil {
 		return nil, err
 	}
-	n, copyErr := io.Copy(out, in)
+	var copyErr error
+	if f.SHA256 != "" {
+		digest, err := hashCheckpointFile(f, io.TeeReader(in, out))
+		copyErr = err
+		if err == nil && digest != f.SHA256 {
+			copyErr = fmt.Errorf("copied file does not match the checkpoint digest")
+		}
+		if copyErr == nil {
+			info, err := out.Stat()
+			copyErr = err
+			if err == nil {
+				writeRootDigest(publish, name, info, checkpointFileID(out, info), digest)
+			}
+		}
+	} else {
+		var n int64
+		n, copyErr = io.Copy(out, in)
+		if copyErr == nil && n != f.Size {
+			copyErr = fmt.Errorf("staged file changed while copying")
+		}
+	}
 	closeErr := out.Close()
 	if copyErr != nil {
 		return nil, copyErr
 	}
 	if closeErr != nil {
 		return nil, closeErr
-	}
-	if n != f.Size {
-		return nil, fmt.Errorf("staged file changed while copying")
 	}
 	return source, nil
 }

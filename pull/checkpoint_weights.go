@@ -49,6 +49,12 @@ func verifyCheckpointFile(root *os.Root, file File, verifyDigest bool) error {
 	if !verifyDigest || file.SHA256 == "" {
 		return nil
 	}
+	return verifyOpenCheckpointDigest(root, name, file, f, info)
+}
+
+// Verify the opened inode, never a digest associated with a coincidentally
+// equal size and timestamp on a different file.
+func verifyOpenCheckpointDigest(root *os.Root, name string, file File, f *os.File, info os.FileInfo) error {
 	id := checkpointFileID(f, info)
 	if cached := readCheckpointDigest(root, name, info); id != "" && cached.FileID == id && cached.SHA256 == file.SHA256 {
 		return nil
@@ -80,11 +86,15 @@ func confirmCheckpointFile(root *os.Root, name string, hashed *os.File, before o
 		if err != nil {
 			return err
 		}
-		if !os.SameFile(info, before) || info.Size() != before.Size() || !info.ModTime().Equal(before.ModTime()) {
+		if !sameCheckpointFileState(info, before) {
 			return fmt.Errorf("file changed while verifying its digest")
 		}
 	}
 	return nil
+}
+
+func sameCheckpointFileState(a, b os.FileInfo) bool {
+	return os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
 }
 
 // Some callers read optional files by name, including ones present in older caches

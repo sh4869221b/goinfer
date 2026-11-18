@@ -171,10 +171,13 @@ For safetensors pulls, `.<destination>.pull2` is a private sibling workspace for
 directory. Retry the same destination after an interruption to resume its verified staging data.
 Each publication builds a clean directory from the plan. A process killed during publication
 can leave a `publish-*` directory in the workspace while the staging data remains resumable.
-On filesystems with hard links, successful publication reclaims old staged files whose
-transfer records still match the original file. Unrecorded files stay in place. A process
+On filesystems with hard links, successful publication reclaims old staged files and partial
+transfers whose records still match the original file. Unrecorded files stay in place. A process
 killed during initialization can leave a `.goinfer-init-*` directory that requires manual
-inspection. The next pull can initialize its workspace independently.
+inspection. The next pull can initialize its workspace independently. On Linux, creating a
+workspace or stage requires filesystem support for `RENAME_NOREPLACE` so a concurrent directory
+creation cannot be overwritten. If the operation is unsupported, choose a destination on a
+filesystem that supports it.
 For older `.partial`, `.pull`, or `.goinfer-pulls/<destination>` layouts, recovery uses the
 version that created the workspace. Older `.goinfer-publish-*` directories lack destination
 information and require manual identification before recovery or removal.
