@@ -13,9 +13,10 @@ import (
 )
 
 type checkpointPublicationCandidate struct {
-	Name         string `json:"name"`
-	FileID       string `json:"file_id"`
-	MarkerSHA256 string `json:"marker_sha256"`
+	Name         string            `json:"name"`
+	FileID       string            `json:"file_id"`
+	MarkerSHA256 string            `json:"marker_sha256"`
+	Sidecars     map[string]string `json:"sidecars,omitempty"`
 }
 
 func checkpointPublicationDirectoryID(root *os.Root) string {
@@ -59,7 +60,13 @@ func (w *checkpointWorkspace) reclaimAbandonedPublication(stage *os.Root) {
 	}
 	for _, entry := range slices.Backward(entries) {
 		info, err := publish.Lstat(entry.path)
-		if err != nil || !os.SameFile(entry.info, info) || !info.IsDir() && !sameCheckpointFileState(entry.info, info) || publish.Remove(entry.path) != nil {
+		if err != nil || !os.SameFile(entry.info, info) {
+			return
+		}
+		if !info.IsDir() && (!sameCheckpointFileState(entry.info, info) || checkpointChangeTime(entry.info) != checkpointChangeTime(info)) {
+			return
+		}
+		if err := publish.Remove(entry.path); err != nil {
 			return
 		}
 	}
@@ -119,7 +126,7 @@ func (c checkpointPublicationCandidate) verifiedContents(root *os.Root, token st
 		switch {
 		case info.IsDir() && dirs[path]:
 		case info.Mode().IsRegular() && payload && verifyAbandonedFile(root, path, file, info):
-		case info.Mode().IsRegular() && sidecar && verifyAbandonedSidecar(root, source, info):
+		case info.Mode().IsRegular() && sidecar && verifyAbandonedSidecar(root, path, source, info, c.Sidecars[filepath.ToSlash(path)]):
 			digestEntries = append(digestEntries, checkpointCandidateEntry{path: path, info: info})
 			return nil
 		default:
@@ -142,7 +149,27 @@ func verifyAbandonedFile(root *os.Root, path string, file File, info os.FileInfo
 	return err == nil && sameCheckpointFileState(info, opened) && checkOpenCheckpointDigest(root, path, file, f, info) == nil
 }
 
-func verifyAbandonedSidecar(root *os.Root, source File, info os.FileInfo) bool {
+func verifyAbandonedSidecar(root *os.Root, path string, source File, info os.FileInfo, expected string) bool {
+	if expected == "" || info.Size() > 4096 {
+		return false
+	}
+	record, err := openRegularDownloadFile(root, path, os.O_RDONLY)
+	if err != nil {
+		return false
+	}
+	defer record.Close()
+	observed, err := record.Stat()
+	if err != nil || !sameCheckpointFileState(info, observed) {
+		return false
+	}
+	raw, err := io.ReadAll(io.LimitReader(record, 4097))
+	if err != nil || len(raw) > 4096 || checkpoint.ConfigDigest(raw) != expected {
+		return false
+	}
+	var digest digestSidecar
+	if err := json.Unmarshal(raw, &digest); err != nil {
+		return false
+	}
 	name := filepath.FromSlash(source.Path)
 	f, err := openRegularDownloadFile(root, name, os.O_RDONLY)
 	if err != nil {
@@ -153,6 +180,5 @@ func verifyAbandonedSidecar(root *os.Root, source File, info os.FileInfo) bool {
 	if err != nil || opened.Size() != source.Size {
 		return false
 	}
-	digest, record := readCheckpointDigestRecord(root, name, opened)
-	return record != nil && sameCheckpointFileState(info, record) && digest.SHA256 == source.SHA256 && digest.FileID == checkpointFileID(f, opened)
+	return digest.Size == opened.Size() && digest.ModTime == opened.ModTime().UnixNano() && digest.SHA256 == source.SHA256 && digest.FileID == checkpointFileID(f, opened) && digest.ChangeTime == checkpointChangeTime(opened)
 }

@@ -495,7 +495,11 @@ func checkCachedCheckpoint(dir string) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	return verifyCachedCheckpoint(dir, root, m, checkpointMetadata{}, checkpointCachedDigest)
+	check := checkpointCachedDigest
+	if info, err := root.Stat("."); err != nil || info.Mode().Perm()&0o222 == 0 {
+		check = checkpointReadOnlyDigest
+	}
+	return verifyCachedCheckpoint(dir, root, m, checkpointMetadata{}, check)
 }
 
 func readCheckpointMarker(root *os.Root) (markerDoc, bool) {

@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +30,12 @@ func TestCheckpointTransferCrashBoundaries(t *testing.T) {
 		hfAPI = os.Getenv("GOINFER_TEST_CHECKPOINT_API")
 		hfCDN = os.Getenv("GOINFER_TEST_CHECKPOINT_CDN")
 		dest := os.Getenv(checkpointCrashDest)
+		if mode == "valid readonly cache" {
+			if got, ok := CachedCheckpoint(dest); !ok || got != dest {
+				t.Fatalf("rejected the intact read-only cache: %q, %t", got, ok)
+			}
+			return
+		}
 		if mode == "damaged cache" {
 			if _, ok := CachedCheckpoint(dest); ok {
 				t.Error("cached checkpoint accepted a rejected digest")
@@ -90,9 +98,12 @@ func TestCheckpointTransferCrashBoundaries(t *testing.T) {
 		if mode == "before publish" && err == nil && got == dest {
 			return
 		}
-		if mode == "explicit repull" {
+		if mode == "explicit repull" || mode == "readonly repull" {
 			if got != "" || err == nil || !strings.Contains(err.Error(), "digest") {
 				t.Fatalf("explicit repull accepted modified weight: %q, %v", got, err)
+			}
+			if mode == "readonly repull" && !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("expected a denied sidecar removal in the read-only cache: %v", err)
 			}
 			return
 		}
@@ -383,6 +394,49 @@ func TestCheckpointExplicitRepullRehashesExistingWeight(t *testing.T) {
 	}
 }
 
+func TestCheckpointReadOnlyCacheRejectsChangedWeightAcrossProcesses(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Geteuid() == 0 {
+		t.Skip("requires Linux directory permissions and a non-root test process")
+	}
+	withCacheRoot(t)
+	files := shardedTinyRepo(t)
+	h := &fakeHF{files: files}
+	h.serve(t, checkpointCrashRepo)
+	dest, err := CacheDir(checkpointCrashRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pullCrashCheckpoint(t, dest)
+	weight := filepath.Join(dest, checkpointCrashShard)
+	sidecar := sidecarPath(weight)
+	record, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dest, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dest, 0o755) })
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if out, err := checkpointCrashCommand(ctx, "", "valid readonly cache", dest).CombinedOutput(); err != nil {
+		t.Fatalf("intact read-only cache as uid %d: %v\n%s", os.Geteuid(), err, out)
+	}
+	_, edited := rewriteCheckpointWeightInPlace(t, weight, files[checkpointCrashShard])
+	for _, mode := range []string{"readonly repull", "damaged cache"} {
+		if out, err := checkpointCrashCommand(ctx, "", mode, dest).CombinedOutput(); err != nil {
+			t.Errorf("%s as uid %d: %v\n%s", mode, os.Geteuid(), err, out)
+		}
+	}
+	if raw, err := os.ReadFile(weight); err != nil || !bytes.Equal(raw, edited) {
+		t.Errorf("read-only verification changed the weight: %v", err)
+	}
+	if raw, err := os.ReadFile(sidecar); err != nil || !bytes.Equal(raw, record) {
+		t.Errorf("read-only verification changed the sidecar: %v", err)
+	}
+	t.Logf("uid %d verified a 0555 checkpoint without modifying its weight or sidecar", os.Geteuid())
+}
+
 func TestCheckpointPublicationUsesCurrentTemplateReceipt(t *testing.T) {
 	files := shardedTinyRepo(t)
 	files[checkpointCrashTemplate] = []byte("{{ messages }}\n")
@@ -436,7 +490,7 @@ func TestCheckpointPublicationUsesCurrentTemplateReceipt(t *testing.T) {
 }
 
 func TestCheckpointReclaimsOnlyVerifiedAbandonedPublication(t *testing.T) {
-	for _, mode := range []string{"unchanged", "extra file", "edited payload"} {
+	for _, mode := range []string{"unchanged", "extra file", "edited payload", "edited sidecar"} {
 		t.Run(mode, func(t *testing.T) {
 			files := shardedTinyRepo(t)
 			h := &fakeHF{files: files}
@@ -464,6 +518,18 @@ func TestCheckpointReclaimsOnlyVerifiedAbandonedPublication(t *testing.T) {
 			if mode == "edited payload" {
 				path := filepath.Join(first[0], checkpointCrashShard)
 				_, preserved[path] = rewriteCheckpointWeightInPlace(t, path, files[checkpointCrashShard])
+			}
+			if mode == "edited sidecar" {
+				path := sidecarPath(filepath.Join(first[0], checkpointCrashShard))
+				raw, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				changed := append(bytes.TrimSuffix(raw, []byte("}")), []byte(`,"owner_note":"keep this record"}`)...)
+				if err := os.WriteFile(path, changed, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				preserved[path] = changed
 			}
 			killCheckpointAtTransferBoundary(t, "before publish", dest, nil)
 			if mode == "unchanged" {

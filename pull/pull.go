@@ -947,10 +947,13 @@ func commitDownload(root *os.Root, part, final string, verified os.FileInfo, id,
 }
 
 // The caller supplies the identity of the opened file whose bytes produced sum.
-func writeRootDigest(root *os.Root, path string, info os.FileInfo, id, sum string) {
-	if b, err := json.Marshal(digestSidecar{Size: info.Size(), ModTime: info.ModTime().UnixNano(), SHA256: sum, FileID: id}); err == nil {
-		_ = replaceRootFile(root, sidecarPath(path), b)
+func writeRootDigest(root *os.Root, path string, info os.FileInfo, id, sum string) string {
+	b, err := json.Marshal(digestSidecar{Size: info.Size(), ModTime: info.ModTime().UnixNano(), SHA256: sum, FileID: id, ChangeTime: checkpointChangeTime(info)})
+	if err != nil || replaceRootFile(root, sidecarPath(path), b) != nil {
+		return ""
 	}
+	digest := sha256.Sum256(b)
+	return hex.EncodeToString(digest[:])
 }
 
 func writeDigestSidecar(path string, st os.FileInfo, sum string) {
@@ -1019,10 +1022,11 @@ func fileSHA256(path string) (string, error) {
 // digestSidecar records path's SHA-256 alongside the (size, mtime) it was computed against: a
 // sidecar cache for the hash, as the .giw is for the transcode.
 type digestSidecar struct {
-	Size    int64  `json:"size"`
-	ModTime int64  `json:"mod_time_unix_nano"`
-	SHA256  string `json:"sha256"`
-	FileID  string `json:"file_id,omitempty"`
+	Size       int64  `json:"size"`
+	ModTime    int64  `json:"mod_time_unix_nano"`
+	SHA256     string `json:"sha256"`
+	FileID     string `json:"file_id,omitempty"`
+	ChangeTime int64  `json:"change_time_unix_nano,omitempty"`
 }
 
 // sidecarPath is path's digest cache file — a dotfile so it doesn't clutter a directory listing

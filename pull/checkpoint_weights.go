@@ -44,6 +44,7 @@ type checkpointDigestCheck uint8
 const (
 	checkpointSizeOnly checkpointDigestCheck = iota
 	checkpointCachedDigest
+	checkpointReadOnlyDigest
 	checkpointFreshDigest
 )
 
@@ -64,6 +65,9 @@ func verifyCheckpointFile(root *os.Root, file File, check checkpointDigestCheck)
 	}
 	if check == checkpointSizeOnly || file.SHA256 == "" {
 		return nil
+	}
+	if check == checkpointReadOnlyDigest {
+		return checkOpenCheckpointDigest(root, name, file, f, info)
 	}
 	if check == checkpointFreshDigest {
 		cached, record := readCheckpointDigestRecord(root, name, info)
@@ -98,17 +102,21 @@ func invalidateCheckpointDigest(root *os.Root, name string, file *os.File, befor
 	return nil
 }
 
-// Verify the opened inode, never a digest associated with a coincidentally
-// equal size and timestamp on a different file.
+// Reuse a digest only with a matching inode and kernel change time. Legacy
+// records and platforms without a change time require reading the file.
 func verifyOpenCheckpointDigest(root *os.Root, name string, file File, f *os.File, info os.FileInfo) error {
 	id := checkpointFileID(f, info)
-	if cached := readCheckpointDigest(root, name, info); id != "" && cached.FileID == id && cached.SHA256 == file.SHA256 {
-		return nil
+	changed := checkpointChangeTime(info)
+	if id != "" && changed != 0 {
+		cached := readCheckpointDigest(root, name, info)
+		if cached.FileID == id && cached.ChangeTime == changed && cached.SHA256 == file.SHA256 {
+			return confirmCheckpointFile(root, name, f, info)
+		}
 	}
 	if err := checkOpenCheckpointDigest(root, name, file, f, info); err != nil {
 		return err
 	}
-	if id != "" {
+	if id != "" && changed != 0 {
 		writeRootDigest(root, name, info, id, file.SHA256)
 	}
 	return nil
@@ -142,7 +150,7 @@ func confirmCheckpointFile(root *os.Root, name string, hashed *os.File, before o
 		if err != nil {
 			return err
 		}
-		if !sameCheckpointFileState(info, before) {
+		if !sameCheckpointFileState(info, before) || checkpointChangeTime(info) != checkpointChangeTime(before) {
 			return fmt.Errorf("file changed while verifying its digest")
 		}
 	}

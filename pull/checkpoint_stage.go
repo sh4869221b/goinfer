@@ -314,22 +314,21 @@ func reusableStagedFile(root *os.Root, name string, f File) bool {
 	return err == nil && info.Size() == f.Size && verifyOpenCheckpointDigest(root, name, f, opened, info) == nil
 }
 
-func verifyPublishedFile(root *os.Root, f File) error {
+func verifyPublishedFile(root *os.Root, f File) (string, error) {
 	name := filepath.FromSlash(f.Path)
 	file, err := openRegularDownloadFile(root, name, os.O_RDONLY)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := checkOpenCheckpointDigest(root, name, f, file, info); err != nil {
-		return err
+		return "", err
 	}
-	writeRootDigest(root, name, info, checkpointFileID(file, info), f.SHA256)
-	return nil
+	return writeRootDigest(root, name, info, checkpointFileID(file, info), f.SHA256), nil
 }
 
 func hashCheckpointFile(f File, r io.Reader) (string, error) {
@@ -375,6 +374,7 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 		}
 	}()
 	sources := make(map[string]os.FileInfo, len(p.Files))
+	sidecarDigests := make(map[string]string, len(p.Files))
 	// Keep learned digests local to publication. The remote tree pin stays independent.
 	p.Files = slices.Clone(p.Files)
 	for i, f := range p.Files {
@@ -386,11 +386,14 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 			f.SHA256 = transfer.SHA256
 			p.Files[i] = f
 		}
-		info, err := preparePublishedFile(stage, publish, f)
+		info, sidecarDigest, err := preparePublishedFile(stage, publish, f)
 		if err != nil {
 			return fmt.Errorf("publishing %s: %w", f.Path, err)
 		}
 		sources[f.Path] = info
+		if sidecarDigest != "" {
+			sidecarDigests[filepath.ToSlash(sidecarPath(filepath.FromSlash(f.Path)))] = sidecarDigest
+		}
 	}
 	files, err := checkpointMarkerFiles(publish, p, metadata)
 	if err != nil {
@@ -423,7 +426,7 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 	// Seal exactly the receipts and file states this publication is allowed to reclaim.
 	var candidate *checkpointPublicationCandidate
 	if id := checkpointPublicationDirectoryID(publish); id != "" {
-		candidate = &checkpointPublicationCandidate{Name: name, FileID: id, MarkerSHA256: checkpoint.ConfigDigest(marker)}
+		candidate = &checkpointPublicationCandidate{Name: name, FileID: id, MarkerSHA256: checkpoint.ConfigDigest(marker), Sidecars: sidecarDigests}
 	}
 	cleanup, err := work.sealCheckpointCleanup(stage, publication, candidate)
 	if err != nil {
@@ -445,45 +448,47 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 
 var renameCheckpointPublication = (*os.Root).Rename
 
-func preparePublishedFile(stage, publish *os.Root, f File) (os.FileInfo, error) {
+func preparePublishedFile(stage, publish *os.Root, f File) (os.FileInfo, string, error) {
 	name := filepath.FromSlash(f.Path)
 	in, err := openRegularDownloadFile(stage, name, os.O_RDONLY)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer in.Close()
 	source, err := in.Stat()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if source.Size() != f.Size {
-		return nil, fmt.Errorf("staged file has size %d, want %d", source.Size(), f.Size)
+		return nil, "", fmt.Errorf("staged file has size %d, want %d", source.Size(), f.Size)
 	}
 	if err := publish.MkdirAll(filepath.Dir(name), 0o755); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	// The published file has its own inode, including while receipts still link to staging.
 	out, err := openRegularDownloadFile(publish, name, os.O_CREATE|os.O_EXCL|os.O_WRONLY)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	_, copyErr := io.CopyN(out, in, f.Size)
 	closeErr := out.Close()
 	if copyErr != nil {
-		return nil, copyErr
+		return nil, "", copyErr
 	}
 	if closeErr != nil {
-		return nil, closeErr
+		return nil, "", closeErr
 	}
 	if f.SHA256 != "" {
-		if err := verifyPublishedFile(publish, f); err != nil {
+		digest, err := verifyPublishedFile(publish, f)
+		if err != nil {
 			if errors.Is(err, errCheckpointDigestMismatch) {
 				discardStagedDigest(stage, name, in, source, f.SHA256)
 			}
-			return nil, err
+			return nil, "", err
 		}
+		return source, digest, nil
 	}
-	return source, nil
+	return source, "", nil
 }
 
 func removeCopiedStageFile(stage *os.Root, f File, source os.FileInfo) {
