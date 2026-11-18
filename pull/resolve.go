@@ -91,8 +91,10 @@ func resolveCheckpoint(ctx context.Context, ref Ref, loads func(string) (string,
 	if err != nil {
 		return "", err
 	}
-	if path, ok := CachedCheckpoint(dir); ok {
-		return path, nil
+	if ok, err := checkCachedCheckpoint(dir); err != nil {
+		return "", err
+	} else if ok {
+		return dir, nil
 	}
 	if err := CheckAccess(ctx, ref.Repo); err != nil {
 		return "", err

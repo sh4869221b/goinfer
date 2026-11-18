@@ -14,6 +14,7 @@ func TestTranslationSegments(t *testing.T) {
 	}{
 		{"easy target", "en", "ja(easy)", header + lang + "en" + msg, output + lang + "ja(easy)" + msg},
 		{"easy source", "ja(easy)", "zh-hans", header + lang + "ja(easy)" + msg, output + lang + "zh-hans" + msg},
+		{"three-letter language", "jpn", "eng", header + lang + "jpn" + msg, output + lang + "eng" + msg},
 		{"unspecified source", "", "ja", header + msg, output + lang + "ja" + msg},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -30,12 +31,15 @@ func TestTranslationSegments(t *testing.T) {
 			}
 		})
 	}
-	for _, code := range []string{"ja(other)", "ja(easy)<|plamo:tag|>"} {
+	for _, code := range []string{"EN", "en-US", "en-us", "a", "zh-Hans", "zh--hans", "en1", "ja(other)", "ja(easy)<|plamo:tag|>"} {
 		if _, err := translationSegments(code, "en", text); err == nil {
 			t.Errorf("accepted invalid source language %q", code)
 		}
 		if _, err := translationSegments("en", code, text); err == nil {
 			t.Errorf("accepted invalid target language %q", code)
 		}
+	}
+	if _, err := translationSegments("en", "", text); err == nil {
+		t.Error("accepted an empty target language")
 	}
 }

@@ -13,6 +13,8 @@ import (
 	"github.com/townsendmerino/goinfer/tokenizer"
 )
 
+var translationLanguage = regexp.MustCompile(`^(?:[a-z]{2,3}(?:-[a-z]{4})?|ja\(easy\))$`)
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -75,9 +77,11 @@ func run() error {
 }
 
 func translationSegments(source, target, text string) ([]tokenizer.Segment, error) {
-	language := regexp.MustCompile(`^(?:[a-zA-Z][a-zA-Z0-9-]*|ja\(easy\))$`)
-	if !language.MatchString(target) || source != "" && !language.MatchString(source) {
-		return nil, fmt.Errorf("invalid language code")
+	if source != "" && !translationLanguage.MatchString(source) {
+		return nil, fmt.Errorf("invalid -source-lang %q (use a lowercase code such as en, ja, zh-hans, or ja(easy))", source)
+	}
+	if !translationLanguage.MatchString(target) {
+		return nil, fmt.Errorf("invalid -target-lang %q (use a lowercase code such as en, ja, zh-hans, or ja(easy))", target)
 	}
 	header := "<|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input"
 	if source != "" {

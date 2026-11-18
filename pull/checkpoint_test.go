@@ -28,6 +28,7 @@ type fakeHF struct {
 	files    map[string][]byte
 	gated    any
 	hits     map[string]int
+	requests int
 	failOnce string // a path whose next transfer is cut midway
 }
 
@@ -37,6 +38,7 @@ func (h *fakeHF) serve(t *testing.T, repo string) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
+		h.requests++
 		switch {
 		case r.URL.Path == "/api/models/"+repo:
 			_ = json.NewEncoder(w).Encode(map[string]any{"gated": h.gated, "private": false})
@@ -206,6 +208,63 @@ func TestPlanCheckpointRejectsPlamo3BeforeWeights(t *testing.T) {
 			defer h.mu.Unlock()
 			if len(h.hits) != 1 || h.hits["config.json"] != 2 {
 				t.Errorf("requested files = %v; only config.json should be fetched", h.hits)
+			}
+		})
+	}
+}
+
+func TestResolveLegacyCheckpointCache(t *testing.T) {
+	for _, modelType := range []string{"plamo3", "llama"} {
+		t.Run(modelType, func(t *testing.T) {
+			withCacheRoot(t)
+			const repo = "o/legacy"
+			dir, err := CacheDir(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			config := []byte(fmt.Sprintf(`{"model_type":%q}`, modelType))
+			weights := []byte("legacy weights")
+			marker, err := json.Marshal(markerDoc{Repo: repo, Files: []File{
+				{Path: "config.json", Size: int64(len(config))},
+				{Path: "model.safetensors", Size: int64(len(weights)), SHA256: fmt.Sprintf("%x", sha256.Sum256(weights))},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			files := map[string][]byte{"config.json": config, "model.safetensors": weights, checkpointMarker: marker}
+			for name, data := range files {
+				if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h := &fakeHF{}
+			h.serve(t, repo)
+			resolved, err := Resolve(t.Context(), "hf:"+repo+":safetensors", nil)
+			cached, ok := CachedCheckpoint(dir)
+			if modelType == "plamo3" {
+				if resolved != "" || err == nil || !strings.Contains(err.Error(), "tokenizer.jsonl") || !strings.Contains(err.Error(), "local directory") {
+					t.Errorf("Resolve = %q, %v; want local-directory guidance", resolved, err)
+				}
+				if cached != "" || ok {
+					t.Errorf("CachedCheckpoint = %q, %v; want refusal", cached, ok)
+				}
+			} else if err != nil || resolved != dir || !ok || cached != dir {
+				t.Errorf("Resolve = %q, %v and CachedCheckpoint = %q, %v; want %q", resolved, err, cached, ok, dir)
+			}
+			h.mu.Lock()
+			requests := h.requests
+			h.mu.Unlock()
+			if requests != 0 {
+				t.Errorf("cache lookup made %d network requests", requests)
+			}
+			for name, want := range files {
+				got, err := os.ReadFile(filepath.Join(dir, name))
+				if err != nil || !bytes.Equal(got, want) {
+					t.Errorf("cache file %s changed: %v", name, err)
+				}
 			}
 		})
 	}

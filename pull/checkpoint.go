@@ -26,6 +26,14 @@ import (
 // quant is called that, so it cannot shadow a quant selector.
 const CheckpointSelector = "safetensors"
 
+const maxCheckpointConfigBytes = 4 << 20
+
+type checkpointConfig struct {
+	ModelType  string `json:"model_type"`
+	TorchDtype string `json:"torch_dtype"`
+	Dtype      string `json:"dtype"`
+}
+
 // Plan is what a safetensors checkpoint pull would fetch, decided before any weight byte moves.
 type Plan struct {
 	Repo      string
@@ -190,6 +198,13 @@ func PlanCheckpoint(ctx context.Context, repo string) (Plan, error) {
 	return PlanCheckpointFor(ctx, repo, generativeLoads)
 }
 
+func checkCheckpointLayout(repo, modelType string) error {
+	if modelType == "plamo3" {
+		return fmt.Errorf("repo %s uses PLaMo 3, which requires tokenizer.jsonl: built-in checkpoint pull does not support this layout; download the official checkpoint to a local directory and use demo/plamo-translate (docs/plamo3.md)", repo)
+	}
+	return nil
+}
+
 // PlanCheckpointFor is PlanCheckpoint with the caller's model_type check. loads names the family that will load the
 // checkpoint, or returns why it cannot, and a refusal still comes after reading config.json and before any weight file.
 // serve's -embed-model uses it with its encoder's own check, because an embedding encoder is not a generative family in
@@ -206,15 +221,11 @@ func PlanCheckpointFor(ctx context.Context, repo string, loads func(modelType st
 	if _, ok := byPath["config.json"]; !ok {
 		return Plan{}, fmt.Errorf("repo %s has no config.json: not a safetensors (transformers) checkpoint", repo)
 	}
-	cfgRaw, err := fetchSmall(ctx, repo, "config.json", 4<<20)
+	cfgRaw, err := fetchSmall(ctx, repo, "config.json", maxCheckpointConfigBytes)
 	if err != nil {
 		return Plan{}, err
 	}
-	var cfg struct {
-		ModelType  string `json:"model_type"`
-		TorchDtype string `json:"torch_dtype"`
-		Dtype      string `json:"dtype"`
-	}
+	var cfg checkpointConfig
 	if err := json.Unmarshal(cfgRaw, &cfg); err != nil {
 		return Plan{}, fmt.Errorf("parsing %s's config.json: %w", repo, err)
 	}
@@ -225,8 +236,8 @@ func PlanCheckpointFor(ctx context.Context, repo string, loads func(modelType st
 	if err != nil {
 		return Plan{}, fmt.Errorf("repo %s is %w; nothing was downloaded", repo, err)
 	}
-	if cfg.ModelType == "plamo3" {
-		return Plan{}, fmt.Errorf("repo %s uses PLaMo 3, which requires tokenizer.jsonl: built-in checkpoint pull does not support this layout; download the official checkpoint to a local directory and use demo/plamo-translate (docs/plamo3.md)", repo)
+	if err := checkCheckpointLayout(repo, cfg.ModelType); err != nil {
+		return Plan{}, err
 	}
 	p := Plan{Repo: repo, ModelType: cfg.ModelType, Family: fam, Dtype: cfg.TorchDtype}
 	if p.Dtype == "" {
@@ -351,21 +362,47 @@ func checkpointComplete(dir string, files []File) bool {
 	return true
 }
 
-// CachedCheckpoint is a complete checkpoint already in dir, verified offline from its marker (no network). ok is false
-// when dir has none.
+// CachedCheckpoint is a complete, supported checkpoint in dir, verified offline from its marker.
 func CachedCheckpoint(dir string) (string, bool) {
+	if ok, _ := checkCachedCheckpoint(dir); ok {
+		return dir, true
+	}
+	return "", false
+}
+
+// checkCachedCheckpoint reports an unsupported layout separately from a cache miss.
+func checkCachedCheckpoint(dir string) (bool, error) {
 	b, err := os.ReadFile(filepath.Join(dir, checkpointMarker))
 	if err != nil {
-		return "", false
+		return false, nil
 	}
 	var m markerDoc
 	if json.Unmarshal(b, &m) != nil || len(m.Files) == 0 {
-		return "", false
+		return false, nil
 	}
-	if !checkpointComplete(dir, m.Files) {
-		return "", false
+	if err := checkCheckpointLayout(m.Repo, cachedCheckpointModelType(dir)); err != nil {
+		return false, fmt.Errorf("cached checkpoint %s: %w", dir, err)
 	}
-	return dir, true
+	return checkpointComplete(dir, m.Files), nil
+}
+
+func cachedCheckpointModelType(dir string) string {
+	p := filepath.Join(dir, "config.json")
+	info, err := os.Lstat(p)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > maxCheckpointConfigBytes {
+		return ""
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxCheckpointConfigBytes+1))
+	var cfg checkpointConfig
+	if err != nil || len(raw) > maxCheckpointConfigBytes || json.Unmarshal(raw, &cfg) != nil {
+		return ""
+	}
+	return cfg.ModelType
 }
 
 // DownloadCheckpoint fetches every file in p into dest and returns dest. The set is assembled in a staging directory
