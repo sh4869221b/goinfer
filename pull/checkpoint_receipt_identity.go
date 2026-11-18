@@ -63,7 +63,7 @@ func (r checkpointReceipt) identitySnapshot(stage, record *os.Root) (checkpointT
 	}, info, true
 }
 
-func (w *checkpointWorkspace) releaseIdentityTransfer(ctx context.Context, stage, record *os.Root, receipt checkpointReceipt, sealed *checkpointTransferSnapshot) bool {
+func (w *checkpointWorkspace) releaseIdentityTransfer(ctx context.Context, stage, record *os.Root, receipt checkpointReceipt, sealed *checkpointTransferSnapshot, cleanup *checkpointCleanup) bool {
 	state, info, ok := receipt.identitySnapshot(stage, record)
 	if !ok {
 		return false
@@ -85,8 +85,6 @@ func (w *checkpointWorkspace) releaseIdentityTransfer(ctx context.Context, stage
 	if err := stage.Remove(path); err != nil {
 		return false
 	}
-	if checkpointDigestSidecar(stage, path, info) == receipt.SHA256 {
-		_ = stage.Remove(sidecarPath(path))
-	}
+	cleanup.removeStageSidecar(stage, path, info, receipt.SHA256)
 	return w.removeTransferReceipt(record, receipt)
 }

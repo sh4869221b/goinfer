@@ -48,8 +48,10 @@ type checkpointPublication struct {
 
 type checkpointCleanup struct {
 	checkpointPublication
-	Transfers map[string]checkpointTransferSnapshot `json:"transfers"`
-	Candidate *checkpointPublicationCandidate       `json:"candidate,omitempty"`
+	Transfers     map[string]checkpointTransferSnapshot `json:"transfers"`
+	Candidate     *checkpointPublicationCandidate       `json:"candidate,omitempty"`
+	StageEntries  []string                              `json:"stage_entries,omitempty"`
+	StageSidecars map[string]checkpointStageSidecar     `json:"stage_sidecars,omitempty"`
 }
 
 func (w *checkpointWorkspace) Close() {
@@ -157,8 +159,9 @@ func (w *checkpointWorkspace) reclaimCompletedStage(ctx context.Context, parent 
 	}
 	defer stage.Close()
 	if w.matchesPublication(stage, complete.publication) {
-		if cleanup, err := readCheckpointCleanup(stage); err == nil && cleanup.Owner == w.owner && cleanup.Token == complete.publication && w.canResumeCleanup(stage, cleanup.Transfers) {
-			w.reclaimTransfers(ctx, stage, cleanup.Transfers)
+		if cleanup, err := readCheckpointCleanup(stage); err == nil && cleanup.Owner == w.owner && cleanup.Token == complete.publication &&
+			cleanup.matchesStageEntries(ctx, stage) && w.canResumeCleanup(stage, cleanup.Transfers) {
+			w.reclaimTransfers(ctx, stage, &cleanup)
 		}
 	}
 }
@@ -195,12 +198,16 @@ func readCheckpointCleanup(stage *os.Root) (checkpointCleanup, error) {
 	return record, err
 }
 
-func (w *checkpointWorkspace) sealCheckpointCleanup(stage *os.Root, token string, candidate *checkpointPublicationCandidate) (checkpointCleanup, error) {
+func (w *checkpointWorkspace) sealCheckpointCleanup(ctx context.Context, stage *os.Root, token string, candidate *checkpointPublicationCandidate) (checkpointCleanup, error) {
 	old, err := readCheckpointCleanup(stage)
 	if !os.IsNotExist(err) && (err != nil || old.Owner != w.owner || old.Token == "") {
 		return checkpointCleanup{}, fmt.Errorf("%s has no verified owner", checkpointCleanupName)
 	}
 	cleanup := checkpointCleanup{checkpointPublication: checkpointPublication{Owner: w.owner, Token: token}, Transfers: w.snapshotTransfers(stage), Candidate: candidate}
+	cleanup.captureStage(ctx, stage)
+	if err := ctx.Err(); err != nil {
+		return checkpointCleanup{}, err
+	}
 	raw, err := json.Marshal(cleanup)
 	if err != nil {
 		return checkpointCleanup{}, err
@@ -470,7 +477,7 @@ func publishCheckpoint(ctx context.Context, parent *os.Root, work *checkpointWor
 	if id := checkpointPublicationDirectoryID(publish); id != "" {
 		candidate = &checkpointPublicationCandidate{Name: name, FileID: id, MarkerSHA256: checkpoint.ConfigDigest(marker), Sidecars: sidecarDigests}
 	}
-	cleanup, err := work.sealCheckpointCleanup(stage, publication, candidate)
+	cleanup, err := work.sealCheckpointCleanup(ctx, stage, publication, candidate)
 	if err != nil {
 		return err
 	}
@@ -485,9 +492,9 @@ func publishCheckpoint(ctx context.Context, parent *os.Root, work *checkpointWor
 		if ctx.Err() != nil {
 			return nil // the checkpoint is already published and the sealed cleanup can resume later
 		}
-		removeCopiedStageFile(ctx, stage, file, sources[file.Path])
+		removeCopiedStageFile(ctx, stage, file, sources[file.Path], cleanup)
 	}
-	work.reclaimTransfers(ctx, stage, cleanup.Transfers)
+	work.reclaimTransfers(ctx, stage, &cleanup)
 	return nil
 }
 
@@ -544,7 +551,7 @@ func preparePublishedFile(ctx context.Context, stage, publish *os.Root, f File) 
 	return source, "", nil
 }
 
-func removeCopiedStageFile(ctx context.Context, stage *os.Root, f File, source os.FileInfo) {
+func removeCopiedStageFile(ctx context.Context, stage *os.Root, f File, source os.FileInfo, cleanup checkpointCleanup) {
 	name := filepath.FromSlash(f.Path)
 	file, err := openRegularDownloadFile(stage, name, os.O_RDONLY)
 	if err != nil {
@@ -563,9 +570,7 @@ func removeCopiedStageFile(ctx context.Context, stage *os.Root, f File, source o
 	if err != nil || !sameCheckpointFileState(info, current) || ctx.Err() != nil || stage.Remove(name) != nil {
 		return
 	}
-	if checkpointDigestSidecar(stage, name, info) == f.SHA256 {
-		_ = stage.Remove(sidecarPath(name))
-	}
+	cleanup.removeStageSidecar(stage, name, info, f.SHA256)
 }
 
 // A retry can refetch the shard once the contradicted sidecar is gone.
@@ -574,7 +579,9 @@ func discardStagedDigest(stage *os.Root, name string, file *os.File, source os.F
 	if err != nil || !sameCheckpointFileState(source, info) {
 		return
 	}
-	if cached := readCheckpointDigest(stage, name, info); cached.SHA256 == digest && cached.FileID == checkpointFileID(file, source) {
-		_ = stage.Remove(sidecarPath(name))
+	path := sidecarPath(name)
+	cached, _, sidecar := readStageSidecar(stage, path)
+	if sidecar != nil && cached.Size == info.Size() && cached.ModTime == info.ModTime().UnixNano() && cached.SHA256 == digest && cached.FileID == checkpointFileID(file, source) {
+		removeUnchangedStageSidecar(stage, path, sidecar)
 	}
 }

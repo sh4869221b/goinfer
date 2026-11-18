@@ -16,10 +16,6 @@ import (
 	"github.com/townsendmerino/goinfer/internal/runtime/checkpoint"
 )
 
-func checkpointDigestSidecar(root *os.Root, name string, info os.FileInfo) string {
-	return readCheckpointDigest(root, name, info).SHA256
-}
-
 func readCheckpointDigest(root *os.Root, name string, info os.FileInfo) digestSidecar {
 	stored, _ := readCheckpointDigestRecord(root, name, info)
 	return stored

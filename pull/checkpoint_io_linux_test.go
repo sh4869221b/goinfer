@@ -149,7 +149,8 @@ func TestCheckpointReceiptReadsScaleLinearly(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer recovered.Close()
-			recovered.reclaimTransfers(t.Context(), stage, recovered.snapshotTransfers(stage))
+			cleanup := checkpointCleanup{Transfers: recovered.snapshotTransfers(stage)}
+			recovered.reclaimTransfers(t.Context(), stage, &cleanup)
 			reads := checkpointIOCount(t, "syscr") - before
 			t.Logf("%d shards, %d process read calls", shards, reads)
 			if reads > int64(6*shards+12) {

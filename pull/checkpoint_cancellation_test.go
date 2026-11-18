@@ -3,6 +3,7 @@ package pull
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,7 +17,7 @@ func TestCheckpointCancelAfterRenameWithoutLinks(t *testing.T) {
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("requires a filesystem change time")
 	}
-	for _, mode := range []string{"unchanged", "edited", "replaced", "symlink"} {
+	for _, mode := range []string{"unchanged", "edited", "replaced", "symlink", "legacy cleanup record"} {
 		t.Run(mode, func(t *testing.T) {
 			files := shardedTinyRepo(t)
 			h := &fakeHF{files: files}
@@ -36,17 +37,43 @@ func TestCheckpointCancelAfterRenameWithoutLinks(t *testing.T) {
 				cancel()
 				return err
 			}
-			if got, err := download(ctx, dest, nil); got != dest || err != nil || ctx.Err() != context.Canceled {
+			stage := testCheckpointStagePath(dest)
+			note := filepath.Join(stage, "user-notes.txt")
+			if got, err := download(ctx, dest, func(done, total int64, _ string) {
+				if done == total {
+					if err := os.WriteFile(note, []byte("keep"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}); got != dest || err != nil || ctx.Err() != context.Canceled {
 				t.Fatalf("canceled after rename without links = %q, %v, context=%v", got, err, ctx.Err())
 			}
 			renameCheckpointPublication = rename
-			stage := testCheckpointStagePath(dest)
 			staged := filepath.Join(stage, checkpointCrashShard)
 			info, err := os.Stat(staged)
 			if err != nil {
 				t.Fatalf("cancellation did not defer stage cleanup: %v", err)
 			}
 			want := files[checkpointCrashShard]
+			if mode == "legacy cleanup record" {
+				root, err := os.OpenRoot(stage)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer root.Close()
+				record, err := readCheckpointCleanup(root)
+				if err != nil {
+					t.Fatal(err)
+				}
+				record.StageEntries, record.StageSidecars = nil, nil
+				raw, err := json.Marshal(record)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := replaceRootFile(root, checkpointCleanupName, raw); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if mode == "edited" {
 				info, want = rewriteCheckpointWeightInPlace(t, staged, want)
 			}
@@ -73,17 +100,16 @@ func TestCheckpointCancelAfterRenameWithoutLinks(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			note := filepath.Join(stage, "user-notes.txt")
-			if err := os.WriteFile(note, []byte("keep"), 0o644); err != nil {
-				t.Fatal(err)
-			}
 			if got, err := download(t.Context(), dest, nil); got != dest || err != nil {
 				t.Fatalf("retry of committed checkpoint without links = %q, %v", got, err)
 			}
 			if mode == "unchanged" {
 				for _, shard := range []string{checkpointCrashShard, checkpointCrashTail} {
-					if _, err := os.Lstat(filepath.Join(stage, shard)); !os.IsNotExist(err) {
-						t.Errorf("retry retained staged shard %s: %v", shard, err)
+					path := filepath.Join(stage, shard)
+					for _, name := range []string{path, sidecarPath(path)} {
+						if _, err := os.Lstat(name); !os.IsNotExist(err) {
+							t.Errorf("retry retained staged file %s: %v", name, err)
+						}
 					}
 				}
 			} else {
@@ -104,6 +130,112 @@ func TestCheckpointCancelAfterRenameWithoutLinks(t *testing.T) {
 			defer h.mu.Unlock()
 			if h.hits[checkpointCrashShard] != 1 || h.hits[checkpointCrashTail] != 1 {
 				t.Errorf("retry downloaded weights again: %v", h.hits)
+			}
+		})
+	}
+}
+
+func TestCheckpointCleanupPreservesReplacedStageSidecar(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		recover       bool
+		noLinks       bool
+		unchangedJSON bool
+		beforeSeal    bool
+		kill          bool
+	}{
+		{name: "before sealing", beforeSeal: true},
+		{name: "during publication"},
+		{name: "after publication", recover: true},
+		{name: "after SIGKILL", recover: true, kill: true},
+		{name: "after publication without links", recover: true, noLinks: true},
+		{name: "byte identical replacement", recover: true, unchangedJSON: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.noLinks && runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+				t.Skip("requires a filesystem change time")
+			}
+			h := &fakeHF{files: shardedTinyRepo(t)}
+			h.serve(t, checkpointCrashRepo)
+			dest := filepath.Join(t.TempDir(), "checkpoint")
+			stage := testCheckpointStagePath(dest)
+			staged := filepath.Join(stage, checkpointCrashShard)
+			sidecar := sidecarPath(staged)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			link, rename := linkCheckpointTransfer, renameCheckpointPublication
+			t.Cleanup(func() { linkCheckpointTransfer, renameCheckpointPublication = link, rename })
+			if tc.noLinks {
+				linkCheckpointTransfer = func(*os.Root, string, string) error { return errors.ErrUnsupported }
+			}
+			var want []byte
+			var replacement os.FileInfo
+			replace := func() error {
+				var err error
+				want, err = os.ReadFile(sidecar)
+				if err != nil {
+					return err
+				}
+				if !tc.unchangedJSON {
+					want = append(bytes.TrimSuffix(want, []byte("}")), []byte(`,"local_note":"keep"}`)...)
+				}
+				path := filepath.Join(t.TempDir(), "replacement")
+				if err := os.WriteFile(path, want, 0o600); err != nil {
+					return err
+				}
+				replacement, err = os.Stat(path)
+				if err != nil {
+					return err
+				}
+				return os.Rename(path, sidecar)
+			}
+			renameCheckpointPublication = func(ctx context.Context, root *os.Root, src, dest string) error {
+				if err := rename(ctx, root, src, dest); err != nil {
+					return err
+				}
+				if !tc.beforeSeal {
+					if err := replace(); err != nil {
+						return err
+					}
+				}
+				if tc.recover {
+					cancel()
+				}
+				return nil
+			}
+			if tc.kill {
+				killCheckpointAtTransferBoundary(t, "published", dest, nil)
+				if err := replace(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				_, download, err := PrepareCheckpointFor(ctx, checkpointCrashRepo, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, err := download(ctx, dest, func(done, total int64, _ string) {
+					if tc.beforeSeal && done == total && replacement == nil {
+						if err := replace(); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}); err != nil || got != dest {
+					t.Fatalf("publication returned %q, %v", got, err)
+				}
+			}
+			if tc.recover {
+				renameCheckpointPublication = rename
+				pullCrashCheckpoint(t, dest)
+			}
+			if _, err := os.Lstat(staged); !os.IsNotExist(err) {
+				t.Errorf("cleanup retained the unchanged weight: %v", err)
+			}
+			after, err := os.Stat(sidecar)
+			if err != nil || !os.SameFile(after, replacement) {
+				t.Fatalf("cleanup did not preserve the replacement sidecar inode: %v", err)
+			}
+			if raw, err := os.ReadFile(sidecar); err != nil || !bytes.Equal(raw, want) {
+				t.Fatalf("cleanup changed the replacement sidecar: %v", err)
 			}
 		})
 	}

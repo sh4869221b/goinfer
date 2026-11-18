@@ -35,6 +35,7 @@ type fakeHF struct {
 	ranges       map[string]string
 	requests     int
 	failOnce     string // a path whose next transfer is cut midway
+	rejectOnce   string // a path whose next transfer fails before writing any bytes
 	pausePartial bool   // hold the interrupted response open until the client disconnects
 	beforeSend   func(string)
 }
@@ -72,6 +73,11 @@ func (h *fakeHF) serve(t *testing.T, repo string) {
 			h.ranges[p] = r.Header.Get("Range")
 			if h.beforeSend != nil {
 				h.beforeSend(p)
+			}
+			if p == h.rejectOnce {
+				h.rejectOnce = ""
+				http.Error(w, "transfer interrupted", http.StatusForbidden)
+				return
 			}
 			if p == h.failOnce {
 				h.failOnce = ""

@@ -297,8 +297,8 @@ func (w *checkpointWorkspace) canResumeCleanup(stage *os.Root, sealed map[string
 	return true
 }
 
-func (w *checkpointWorkspace) reclaimTransfers(ctx context.Context, stage *os.Root, sealed map[string]checkpointTransferSnapshot) {
-	if len(sealed) == 0 || ctx.Err() != nil {
+func (w *checkpointWorkspace) reclaimTransfers(ctx context.Context, stage *os.Root, cleanup *checkpointCleanup) {
+	if len(cleanup.Transfers) == 0 || ctx.Err() != nil {
 		return
 	}
 	w.indexTransferReceipts()
@@ -306,17 +306,13 @@ func (w *checkpointWorkspace) reclaimTransfers(ctx context.Context, stage *os.Ro
 		if ctx.Err() != nil {
 			return
 		}
-		w.pruneTransferReceipts(ctx, stage, path, sealed)
+		w.pruneTransferReceipts(ctx, stage, path, cleanup)
 	}
 }
 
-func (w *checkpointWorkspace) pruneTransferReceipts(ctx context.Context, stage *os.Root, path string, sealed map[string]checkpointTransferSnapshot) {
+func (w *checkpointWorkspace) pruneTransferReceipts(ctx context.Context, stage *os.Root, path string, cleanup *checkpointCleanup) {
 	remaining := slices.DeleteFunc(w.receipts[path], func(receipt checkpointReceipt) bool {
-		if sealed == nil {
-			return w.releaseTransfer(ctx, stage, receipt, nil)
-		}
-		state, ok := sealed[receipt.dirName]
-		return ok && w.releaseTransfer(ctx, stage, receipt, &state)
+		return w.releaseTransfer(ctx, stage, receipt, cleanup)
 	})
 	if len(remaining) > 0 {
 		w.receipts[path] = remaining
@@ -391,9 +387,17 @@ func (w *checkpointWorkspace) openTransferReceipt(receipt checkpointReceipt) *os
 	return r
 }
 
-func (w *checkpointWorkspace) releaseTransfer(ctx context.Context, stage *os.Root, receipt checkpointReceipt, sealed *checkpointTransferSnapshot) bool {
+func (w *checkpointWorkspace) releaseTransfer(ctx context.Context, stage *os.Root, receipt checkpointReceipt, cleanup *checkpointCleanup) bool {
 	if ctx.Err() != nil {
 		return false
+	}
+	var sealed *checkpointTransferSnapshot
+	if cleanup != nil {
+		state, ok := cleanup.Transfers[receipt.dirName]
+		if !ok {
+			return false
+		}
+		sealed = &state
 	}
 	r := w.openTransferReceipt(receipt)
 	if r == nil {
@@ -401,7 +405,7 @@ func (w *checkpointWorkspace) releaseTransfer(ctx context.Context, stage *os.Roo
 	}
 	defer r.Close()
 	if receipt.Identity != nil {
-		return w.releaseIdentityTransfer(ctx, stage, r, receipt, sealed)
+		return w.releaseIdentityTransfer(ctx, stage, r, receipt, sealed, cleanup)
 	}
 	proof, err := r.Lstat("file")
 	switch {
@@ -424,8 +428,8 @@ func (w *checkpointWorkspace) releaseTransfer(ctx context.Context, stage *os.Roo
 				if err != nil || !sameCheckpointFileState(info, current) || ctx.Err() != nil || stage.Remove(path) != nil {
 					return false
 				}
-				if (!receipt.Partial || renamedPartial) && receipt.SHA256 != "" && checkpointDigestSidecar(stage, path, info) == receipt.SHA256 {
-					_ = stage.Remove(sidecarPath(path))
+				if (!receipt.Partial || renamedPartial) && receipt.SHA256 != "" {
+					cleanup.removeStageSidecar(stage, path, info, receipt.SHA256)
 				}
 			}
 		}

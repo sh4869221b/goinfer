@@ -169,13 +169,14 @@ special.
 
 For safetensors pulls, `.<destination>.pull2` is a private sibling workspace for each output
 directory. Retry the same destination after an interruption to resume its verified staging data
-or finish cleanup for the matching publication. Cleanup uses the transfer records sealed when
-that checkpoint was published and leaves the stage alone when a later transfer is detected.
+or finish cleanup for the matching publication. Recovery compares the sealed transfer records
+and staging file list with the current workspace. A new staging entry defers cleanup, including
+files added without a receipt by an older client.
 Cancelling before the final directory rename keeps the staged downloads for a retry. Once the
 rename has succeeded, the published checkpoint is usable and any interrupted cleanup can resume
 on the next pull.
-Older checkpoints remain usable, and recovery leaves their
-stage data in place when no matching cleanup record exists. Resuming an existing `.part`
+Older checkpoints remain usable. Recovery leaves their stage data in place when the matching
+cleanup record or its staging file list is unavailable. Resuming an existing `.part`
 requires a transfer record with a matching hard link. On filesystems without hard links,
 interrupted transfers restart from the beginning. Completed copies can still be reclaimed
 when the filesystem supplies a matching file ID and change time and the staged content matches
@@ -195,7 +196,8 @@ and contents, including the complete sidecar files, can be verified. Unsealed or
 candidates remain for inspection.
 On filesystems with hard links, successful publication reclaims old staged files and partial
 transfers whose records still match the original file. Completed transfers also need a matching
-content digest. Unrecorded files stay in place. A process
+content digest. Unrecorded files stay in place, and staging digest sidecars are reclaimed only
+when their file identity and full contents still match the sealed record. A process
 killed during initialization can leave a `.goinfer-init-*` directory that requires manual
 inspection. The next pull can initialize its workspace independently. On Linux, creating a
 workspace or stage requires filesystem support for `RENAME_NOREPLACE` so a concurrent directory

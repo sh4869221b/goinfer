@@ -69,7 +69,10 @@ func TestCheckpointTransferCrashBoundaries(t *testing.T) {
 				}
 				return nil
 			}
-		case "published":
+		case "published", "published without links":
+			if mode == "published without links" {
+				linkCheckpointTransfer = func(*os.Root, string, string) error { return errors.ErrUnsupported }
+			}
 			rename := renameCheckpointPublication
 			renameCheckpointPublication = func(ctx context.Context, root *os.Root, src, dest string) error {
 				if err := rename(ctx, root, src, dest); err != nil {
@@ -687,6 +690,79 @@ func TestCheckpointDefersCleanupForLegacyWriterReuse(t *testing.T) {
 	}
 }
 
+func TestCheckpointDefersCleanupForLegacyWriterWithoutLinks(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("requires a filesystem change time")
+	}
+	for _, mode := range []string{"completed", "partial"} {
+		t.Run(mode, func(t *testing.T) {
+			const extra = "tokenizer.json"
+			const interrupted = "tokenizer_config.json"
+			a, b := shardedTinyRepo(t), shardedTinyRepo(t)
+			b[interrupted] = []byte(`{"revision":"B"}`)
+			added := interrupted + ".part"
+			want := b[interrupted][:len(b[interrupted])/2]
+			if mode == "completed" {
+				b[extra] = []byte(`{"vocab":{"new":1}}`)
+				added, want = extra, b[extra]
+			}
+			h := &fakeHF{files: a}
+			h.serve(t, checkpointCrashRepo)
+			parent := t.TempDir()
+			dest, backup := filepath.Join(parent, "checkpoint"), filepath.Join(parent, "backup")
+			killCheckpointAtTransferBoundary(t, "published without links", dest, nil)
+			if err := os.Rename(dest, backup); err != nil {
+				t.Fatal(err)
+			}
+			stage := testCheckpointStagePath(dest)
+			newFile := filepath.Join(stage, added)
+			if legacy := os.Getenv("GOINFER_TEST_LEGACY_NOLINK_PULL_BINARY"); legacy != "" {
+				setCrashRepoFiles(h, b, interrupted)
+				if mode == "completed" {
+					h.mu.Lock()
+					h.failOnce, h.rejectOnce = "", interrupted
+					h.mu.Unlock()
+				}
+				killCheckpointAtTransferBoundary(t, "older reuse without links", dest, nil)
+			} else {
+				// Older writers leave both completed files and partials unrecorded
+				// when linking is unavailable, without changing the publication token.
+				if err := os.WriteFile(newFile, want, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if raw, err := os.ReadFile(newFile); err != nil || !bytes.Equal(raw, want) {
+				t.Fatalf("legacy B did not stage %s: %v", added, err)
+			}
+			if err := os.Rename(backup, dest); err != nil {
+				t.Fatal(err)
+			}
+			setCrashRepoFiles(h, a, "")
+			pullCrashCheckpoint(t, dest)
+			for _, shard := range []string{checkpointCrashShard, checkpointCrashTail} {
+				if raw, err := os.ReadFile(filepath.Join(stage, shard)); err != nil || !bytes.Equal(raw, b[shard]) {
+					t.Errorf("retry of A removed B's reusable shard %s: %v", shard, err)
+				}
+			}
+			if raw, err := os.ReadFile(newFile); err != nil || !bytes.Equal(raw, want) {
+				t.Errorf("retry of A changed the file staged by B: %v", err)
+			}
+			if mode == "completed" {
+				if err := os.Rename(dest, backup); err != nil {
+					t.Fatal(err)
+				}
+				setCrashRepoFiles(h, b, "")
+				pullCrashCheckpoint(t, dest)
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if h.hits[checkpointCrashShard] != 1 || h.hits[checkpointCrashTail] != 1 {
+				t.Errorf("B refetched shared shards: %v", h.hits)
+			}
+		})
+	}
+}
+
 func TestCheckpointPullWhenPartialLinkUnavailable(t *testing.T) {
 	link := linkCheckpointTransfer
 	linkCheckpointTransfer = func(*os.Root, string, string) error { return os.ErrPermission }
@@ -749,6 +825,9 @@ func killCheckpointAtTransferBoundary(t *testing.T, mode, dest string, during fu
 	var legacy string
 	if mode == "older writer" || mode == "older lock" || mode == "older reuse" {
 		legacy = os.Getenv("GOINFER_TEST_LEGACY_PULL_BINARY")
+	}
+	if mode == "older reuse without links" {
+		legacy = os.Getenv("GOINFER_TEST_LEGACY_NOLINK_PULL_BINARY")
 	}
 	cmd := checkpointCrashCommand(ctx, legacy, mode, dest)
 	in, err := cmd.StdinPipe()
