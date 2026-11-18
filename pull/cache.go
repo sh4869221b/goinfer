@@ -83,6 +83,10 @@ func repoEntries(repo, dir string) []CacheEntry {
 		defer root.Close()
 		if m, ok := readCheckpointMarker(root); ok {
 			complete := verifyCheckpointWeights(root, m.Files, nil) == nil
+			if complete {
+				_, err := readCachedGeneration(root, m.Files)
+				complete = err == nil
+			}
 			for _, f := range m.Files {
 				inMarker[filepath.Base(f.Path)] = true
 				if complete {

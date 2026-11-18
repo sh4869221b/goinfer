@@ -714,8 +714,8 @@ func TestCheckpointResumeAfterWeightLayoutChange(t *testing.T) {
 					t.Errorf("obsolete index survived publication: %v", err)
 				}
 				for _, shard := range []string{firstShard, secondShard} {
-					if _, err := os.Stat(filepath.Join(dest, shard)); err != nil {
-						t.Errorf("cleanup removed previously downloaded shard %s: %v", shard, err)
+					if _, err := os.Stat(filepath.Join(dest, shard)); !os.IsNotExist(err) {
+						t.Errorf("cleanup retained the unplanned shard %s: %v", shard, err)
 					}
 				}
 			}
@@ -826,12 +826,9 @@ func TestCheckpointLayoutCleanupRejectsReplacedStaging(t *testing.T) {
 		}
 	}
 	var replaced bool
-	progress := func(done, total int64, name string) {
-		if replaced || done != total || name != checkpointWeights {
-			return
-		}
-		if _, err := os.Stat(filepath.Join(staging, checkpointWeights)); err != nil {
-			return // wait for the callback after Download renames the file
+	progress := func(_, _ int64, name string) {
+		if replaced || name != "config.json" {
+			return // replace the directory before the first weight write
 		}
 		if err := os.Rename(staging, moved); err != nil {
 			t.Fatal(err)
@@ -844,6 +841,12 @@ func TestCheckpointLayoutCleanupRejectsReplacedStaging(t *testing.T) {
 	}
 	if _, err := os.Lstat(dest); !os.IsNotExist(err) {
 		t.Errorf("the replacement staging path was published: %v", err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(moved, checkpointWeights)); err != nil || !bytes.Equal(raw, files[shard]) {
+		t.Errorf("transfer did not stay with the original staging directory: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(outside, checkpointWeights)); !os.IsNotExist(err) {
+		t.Errorf("transfer wrote through the replaced staging path: %v", err)
 	}
 	for _, dir := range []string{moved, outside} {
 		if raw, err := os.ReadFile(filepath.Join(dir, checkpointIndex)); err != nil || !bytes.Equal(raw, files[checkpointIndex]) {
@@ -928,6 +931,147 @@ func TestCheckpointResumeUsesPlannedConfig(t *testing.T) {
 			}
 			if got, want := h.ranges[resumedShard], fmt.Sprintf("bytes=%d-", part.Size()); got != want {
 				t.Errorf("resumed shard request range = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestCheckpointResumeUsesCurrentGenerationConfig(t *testing.T) {
+	const repo = "o/tiny"
+	const generation = "generation_config.json"
+	const interrupted = "tokenizer_config.json"
+	const shard = "model-00001-of-00002.safetensors"
+	for _, change := range []string{"removed", "same size"} {
+		t.Run(change, func(t *testing.T) {
+			withCacheRoot(t)
+			files := shardedTinyRepo(t)
+			files[generation] = []byte(`{"eos_token_id":17}`)
+			files[interrupted] = []byte(`{"model_max_length":2048,"padding_side":"right"}`)
+			h := &fakeHF{files: files, failOnce: interrupted}
+			h.serve(t, repo)
+			ctx := t.Context()
+			dest, err := CacheDir(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldPlan, download, err := PrepareCheckpointFor(ctx, repo, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := download(ctx, dest, nil); err == nil || !strings.Contains(err.Error(), interrupted) {
+				t.Fatalf("want interrupted tokenizer, got %v", err)
+			}
+			staging := dest + ".partial"
+			if old, err := os.ReadFile(filepath.Join(staging, generation)); err != nil || !bytes.Equal(old, files[generation]) {
+				t.Fatalf("old generation file was not staged: %v", err)
+			}
+			if err := os.Mkdir(filepath.Join(staging, "unused"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			outside := filepath.Join(t.TempDir(), "keep")
+			if err := os.WriteFile(outside, []byte("keep"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			saveCheckpointConfigLink(t, outside, filepath.Join(staging, "unused", "link"))
+			if err := os.WriteFile(filepath.Join(staging, "model-old.safetensors.part"), []byte("obsolete"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			wantEOS := []int{2}
+			h.mu.Lock()
+			hits := h.hits[shard]
+			if change == "removed" {
+				delete(files, generation)
+			} else {
+				files[generation] = []byte(`{"eos_token_id":23}`)
+				wantEOS = append(wantEOS, 23)
+			}
+			h.mu.Unlock()
+			plan, download, err := PrepareCheckpointFor(ctx, repo, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if change == "same size" && plan.VerifyPin(oldPlan.TreeDigest()) != nil {
+				t.Fatal("same-size generation config changed the tree pin")
+			}
+			if path, err := download(ctx, dest, nil); path != dest || err != nil {
+				t.Fatalf("resume = %q, %v", path, err)
+			}
+			m, err := decoder.Load(dest, decoder.Options{Backend: "cpu"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			if got := m.Config().EOSIDs(); !slices.Equal(got, wantEOS) {
+				t.Errorf("EOS IDs = %v, want %v", got, wantEOS)
+			}
+			for _, name := range []string{"unused", "model-old.safetensors.part"} {
+				if _, err := os.Lstat(filepath.Join(dest, name)); !os.IsNotExist(err) {
+					t.Errorf("unplanned path %s was published: %v", name, err)
+				}
+			}
+			if raw, err := os.ReadFile(outside); err != nil || string(raw) != "keep" {
+				t.Errorf("cleanup changed symlink target: %q, %v", raw, err)
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if h.hits[shard] != hits || h.ranges[interrupted] == "" {
+				t.Errorf("resume re-fetched a shard or dropped the tokenizer range: %v %v", h.hits, h.ranges)
+			}
+		})
+	}
+}
+
+func TestCheckpointRejectsUnverifiedGenerationConfig(t *testing.T) {
+	const repo = "o/tiny"
+	const generation = "generation_config.json"
+	for _, listed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("listed=%t", listed), func(t *testing.T) {
+			withCacheRoot(t)
+			files := shardedTinyRepo(t)
+			if listed {
+				files[generation] = []byte(`{"eos_token_id":17}`)
+			}
+			h := &fakeHF{files: files}
+			h.serve(t, repo)
+			ctx := t.Context()
+			public, err := PlanCheckpoint(ctx, repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dest, err := CacheDir(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DownloadCheckpoint(ctx, public, dest, nil); err != nil {
+				t.Fatal(err)
+			}
+			if listed {
+				marker := readTestCheckpointMarker(t, dest)
+				if i := slices.IndexFunc(marker.Files, func(f File) bool { return f.Path == generation }); i < 0 || marker.Files[i].SHA256 != fmt.Sprintf("%x", sha256.Sum256(files[generation])) {
+					t.Error("the marker did not record the generation config digest")
+				}
+			}
+			if _, ok := CachedCheckpoint(dest); !ok {
+				t.Fatal("newly published checkpoint failed verification")
+			}
+			if err := os.WriteFile(filepath.Join(dest, generation), []byte(`{"eos_token_id":23}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := CachedCheckpoint(dest); ok {
+				t.Error("unverified generation config passed cached validation")
+			}
+			if entries, err := CacheEntries(); err != nil || len(entries) != 1 || entries[0].Complete {
+				t.Errorf("cache listing accepted unverified generation config: %v, %v", entries, err)
+			}
+			if path, err := Resolve(ctx, "hf:"+repo+":safetensors", nil); path != "" || err == nil || !strings.Contains(err.Error(), generation) {
+				t.Errorf("Resolve accepted unverified generation config: %q, %v", path, err)
+			}
+			m, err := decoder.Load(dest, decoder.Options{Backend: "cpu"})
+			if m != nil {
+				m.Close()
+			}
+			if err == nil || !strings.Contains(err.Error(), generation) {
+				t.Errorf("decoder accepted unverified generation config: %v", err)
 			}
 		})
 	}

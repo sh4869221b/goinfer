@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	MarkerName     = ".goinfer-checkpoint.json"
-	MaxConfigBytes = 4 << 20
+	MarkerName           = ".goinfer-checkpoint.json"
+	GenerationConfigName = "generation_config.json"
+	MaxConfigBytes       = 4 << 20
 )
 
 // CacheRoot is the model directory shared by pull and on-disk model loaders.
@@ -126,6 +127,18 @@ func readVerifiedConfig(dir string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	var genSize int64
+	var genDigest string
+	var genListed bool
+	for _, file := range marker.Files {
+		if file.Path == GenerationConfigName {
+			genSize, genDigest, genListed = file.Size, file.SHA256, true
+			break
+		}
+	}
+	if _, err := ReadRootGeneration(root, genSize, genDigest, genListed); err != nil {
+		return nil, err
+	}
 	raw, err := ReadRootConfig(root)
 	if err != nil {
 		return nil, fmt.Errorf("config.json must be a readable regular file inside the checkpoint directory: %w", err)
@@ -142,6 +155,24 @@ func readVerifiedConfig(dir string) ([]byte, error) {
 		}
 	}
 	return nil, fmt.Errorf("checkpoint marker has no config.json entry")
+}
+
+// ReadRootGeneration checks the optional generation settings against the checkpoint's manifest.
+func ReadRootGeneration(root *os.Root, size int64, digest string, listed bool) ([]byte, error) {
+	if !listed {
+		if _, err := root.Lstat(GenerationConfigName); !os.IsNotExist(err) {
+			return nil, fmt.Errorf("unexpected %s outside the checkpoint file list", GenerationConfigName)
+		}
+		return nil, nil
+	}
+	raw, err := ReadRootFile(root, GenerationConfigName, MaxConfigBytes)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", GenerationConfigName, err)
+	}
+	if !ConfigMatches(raw, size, digest) {
+		return nil, fmt.Errorf("%s does not match the checkpoint manifest", GenerationConfigName)
+	}
+	return raw, nil
 }
 
 // ReadConfig verifies marked or built-in cached checkpoints. Other directories use the normal
