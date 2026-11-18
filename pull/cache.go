@@ -1,7 +1,6 @@
 package pull
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,10 +24,9 @@ type CacheEntry struct {
 	Sidecars int64
 }
 
-// CacheEntries lists what the pull cache holds, sorted by repo then path. It reads the cache layout and file sizes
-// only: a checkpoint counts as complete when its marker is there and every file it names has its recorded size, and no
-// digest is computed, so listing a cache of large models stays fast. Loading still verifies in full. A missing cache is
-// an empty list, not an error.
+// CacheEntries lists what the pull cache holds, sorted by repo then path. A checkpoint counts as complete when its
+// marker covers its weight layout and every file has its recorded size. Listing skips weight digests. A missing
+// cache is an empty list.
 func CacheEntries() ([]CacheEntry, error) {
 	root, err := CacheRoot()
 	if err != nil {
@@ -81,14 +79,15 @@ func repoEntries(repo, dir string) []CacheEntry {
 	}
 	var out []CacheEntry
 	inMarker := map[string]bool{}
-	if b, err := os.ReadFile(filepath.Join(dir, checkpointMarker)); err == nil {
-		var m markerDoc
-		if json.Unmarshal(b, &m) == nil && len(m.Files) > 0 {
-			complete := true
+	if root, err := os.OpenRoot(dir); err == nil {
+		defer root.Close()
+		if m, ok := readCheckpointMarker(root); ok {
+			complete := verifyCheckpointWeights(root, m.Files) == nil
 			for _, f := range m.Files {
 				inMarker[filepath.Base(f.Path)] = true
-				if st, err := os.Stat(filepath.Join(dir, filepath.FromSlash(f.Path))); err != nil || st.Size() != f.Size {
-					complete = false
+				if complete {
+					st, err := os.Stat(filepath.Join(dir, filepath.FromSlash(f.Path)))
+					complete = err == nil && st.Mode().IsRegular() && st.Size() == f.Size
 				}
 			}
 			out = append(out, CacheEntry{Repo: repo, Path: dir, Kind: "checkpoint", Bytes: dirBytes(dir), Complete: complete})

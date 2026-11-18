@@ -873,6 +873,173 @@ func TestDownloadCheckpointRequiresConfigEntry(t *testing.T) {
 	}
 }
 
+func TestDownloadCheckpointRequiresWeights(t *testing.T) {
+	const repo = "o/tiny"
+	const missingShard = "model-00002-of-00002.safetensors"
+	h := &fakeHF{files: shardedTinyRepo(t)}
+	h.serve(t, repo)
+	full, err := PlanCheckpoint(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, wantError string
+		keep            func(File) bool
+	}{
+		{"config only", "model.safetensors", func(f File) bool { return f.Path == "config.json" }},
+		{"missing shard", missingShard, func(f File) bool { return f.Path != missingShard }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := full
+			plan.Files = slices.DeleteFunc(slices.Clone(full.Files), func(f File) bool { return !tc.keep(f) })
+			plan.Bytes = SetBytes(plan.Files)
+			dest := filepath.Join(t.TempDir(), "checkpoint")
+			if path, err := DownloadCheckpoint(t.Context(), plan, dest, nil); path != "" || err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Errorf("DownloadCheckpoint = %q, %v; want refusal mentioning %q", path, err, tc.wantError)
+			}
+			for _, path := range []string{dest, filepath.Join(dest+".partial", checkpointMarker)} {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Errorf("refused plan published %s: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestDownloadCheckpointValidatesStagedIndex(t *testing.T) {
+	const repo = "o/tiny"
+	const index = "model.safetensors.index.json"
+	files := shardedTinyRepo(t)
+	h := &fakeHF{files: files}
+	h.serve(t, repo)
+	_, download, err := PrepareCheckpointFor(t.Context(), repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "checkpoint")
+	staging := dest + ".partial"
+	if err := os.Mkdir(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	invalid := bytes.Repeat([]byte("x"), len(files[index]))
+	if err := os.WriteFile(filepath.Join(staging, index), invalid, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if path, err := download(t.Context(), dest, nil); path != "" || err == nil || !strings.Contains(err.Error(), index) {
+		t.Errorf("download = %q, %v; want refusal for the invalid staged index", path, err)
+	}
+	for _, path := range []string{dest, filepath.Join(staging, checkpointMarker)} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("refused download published %s: %v", path, err)
+		}
+	}
+}
+
+func TestCachedCheckpointWeightLayout(t *testing.T) {
+	const repo = "o/tiny"
+	const single = "model.safetensors"
+	const index = "model.safetensors.index.json"
+	const shard = "model-00001-of-00002.safetensors"
+	const otherShard = "model-00002-of-00002.safetensors"
+	fixture := shardedTinyRepo(t)
+	weights, err := os.ReadFile("../testdata/llama-tiny/model.safetensors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture[single] = weights
+	shardIndex := string(fixture[index])
+	for _, tc := range []struct {
+		name, indexJSON                 string
+		weights                         []string
+		unlisted, missing, absoluteLink string
+		outsideLink, wantComplete       bool
+	}{
+		{name: "legacy single", weights: []string{single}, wantComplete: true},
+		{name: "legacy sharded", indexJSON: shardIndex, weights: []string{shard, otherShard}, wantComplete: true},
+		{name: "legacy sharded with local index link", indexJSON: shardIndex, weights: []string{shard, otherShard}, absoluteLink: index, wantComplete: true},
+		{name: "legacy single with local weight link", weights: []string{single}, absoluteLink: single, wantComplete: true},
+		{name: "external index link", indexJSON: shardIndex, weights: []string{shard, otherShard}, absoluteLink: index, outsideLink: true},
+		{name: "external weight link", weights: []string{single}, absoluteLink: single, outsideLink: true},
+		{name: "config only"},
+		{name: "unlisted shard", indexJSON: shardIndex, weights: []string{shard}, unlisted: otherShard},
+		{name: "missing shard on disk", indexJSON: shardIndex, weights: []string{shard, otherShard}, missing: otherShard},
+		{name: "malformed index", indexJSON: `{"weight_map":`, weights: []string{shard}},
+		{name: "empty index", indexJSON: `{"weight_map":{}}`},
+		{name: "unsafe shard", indexJSON: `{"weight_map":{"first":"../outside.safetensors"}}`},
+		{name: "index references config as a shard", indexJSON: `{"weight_map":{"first":"config.json"}}`},
+		{name: "unlisted index shadows single file", weights: []string{single}, unlisted: index},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withCacheRoot(t)
+			dir, err := CacheDir(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			body := map[string][]byte{"config.json": fixture["config.json"]}
+			for _, name := range tc.weights {
+				body[name] = fixture[name]
+			}
+			if tc.indexJSON != "" {
+				body[index] = []byte(tc.indexJSON)
+			}
+			marker := markerDoc{Repo: repo}
+			for name, raw := range body {
+				marker.Files = append(marker.Files, File{Path: name, Size: int64(len(raw))})
+			}
+			raw, err := json.Marshal(marker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body[checkpointMarker] = raw
+			if tc.unlisted != "" {
+				body[tc.unlisted] = fixture[tc.unlisted]
+			}
+			delete(body, tc.missing)
+			for name, raw := range body {
+				path := filepath.Join(dir, name)
+				if name == tc.absoluteLink {
+					target := path + ".data"
+					if tc.outsideLink {
+						target = filepath.Join(t.TempDir(), name)
+					}
+					saveCheckpointConfigLink(t, target, path)
+					path = target
+				}
+				if err := os.WriteFile(path, raw, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h := &fakeHF{}
+			h.serve(t, repo)
+			if path, ok := CachedCheckpoint(dir); ok != tc.wantComplete || (path == dir) != tc.wantComplete {
+				t.Errorf("CachedCheckpoint = %q, %v; want complete=%v", path, ok, tc.wantComplete)
+			}
+			if path, err := Resolve(t.Context(), "hf:"+repo+":safetensors", nil); (err == nil) != tc.wantComplete || (path == dir) != tc.wantComplete {
+				t.Errorf("Resolve = %q, %v; want complete=%v", path, err, tc.wantComplete)
+			}
+			if tc.wantComplete {
+				model, err := decoder.Load(dir, decoder.Options{Backend: "cpu"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				model.Close()
+			}
+			entries, err := CacheEntries()
+			if err != nil || len(entries) != 1 || entries[0].Complete != tc.wantComplete {
+				t.Errorf("CacheEntries = %+v, %v; want one entry with complete=%v", entries, err, tc.wantComplete)
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if h.requests != 0 {
+				t.Errorf("cache lookup made %d network requests", h.requests)
+			}
+		})
+	}
+}
+
 func TestCachedCheckpointRequiresConfigEntry(t *testing.T) {
 	dir := t.TempDir()
 	files := map[string][]byte{
@@ -1056,7 +1223,7 @@ func TestCheckpoint_badIndexAndPathsRefused(t *testing.T) {
 	delete(files, "model-00002-of-00002.safetensors")
 	h := &fakeHF{files: files, gated: false}
 	h.serve(t, "o/tiny")
-	if _, err := PlanCheckpoint(context.Background(), "o/tiny"); err == nil || !strings.Contains(err.Error(), "does not have") {
+	if _, err := PlanCheckpoint(context.Background(), "o/tiny"); err == nil || !strings.Contains(err.Error(), "model-00002-of-00002.safetensors") {
 		t.Fatalf("an index naming a missing shard: err %v", err)
 	}
 	for _, p := range []string{"../x", "/abs", "a/../b", "a\\b", ""} {

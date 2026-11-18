@@ -28,6 +28,7 @@ func newDiskTestFiles(t *testing.T, free int64, known bool) *diskTestFiles {
 	t.Helper()
 	d := &diskTestFiles{}
 	bodies := map[string][]byte{"a.gguf": bytes.Repeat([]byte("a"), 1000), "b.gguf": bytes.Repeat([]byte("b"), 500)}
+	bodies["model.safetensors"] = bodies["a.gguf"]
 	for _, p := range []string{"a.gguf", "b.gguf"} {
 		sum := sha256.Sum256(bodies[p])
 		d.set = append(d.set, File{Path: p, Size: int64(len(bodies[p])), SHA256: hex.EncodeToString(sum[:])})
@@ -165,6 +166,7 @@ func TestDownloadSet_aCompletePartCostsNothing(t *testing.T) {
 const diskCheckpointConfig = `{"model_type":"llama"}`
 
 func diskCheckpointPlan(files []File) Plan {
+	files[0].Path = "model.safetensors"
 	files = append(files, File{Path: "config.json", Size: int64(len(diskCheckpointConfig))})
 	return Plan{Repo: "o/r", Files: files, Bytes: SetBytes(files)}
 }

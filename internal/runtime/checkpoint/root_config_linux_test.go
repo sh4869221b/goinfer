@@ -35,7 +35,7 @@ func TestCheckedConfigOpenRejectsFIFOReplacement(t *testing.T) {
 		if err := syscall.Mkfifo(path, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := readCheckedConfig(root, name, info); err == nil || !strings.Contains(err.Error(), "changed while opening") {
+		if _, err := readCheckedRootFile(root, name, info, MaxConfigBytes); err == nil || !strings.Contains(err.Error(), "changed while opening") {
 			t.Fatalf("expected FIFO rejection, got %v", err)
 		}
 		return

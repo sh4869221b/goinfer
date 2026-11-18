@@ -261,31 +261,14 @@ func planCheckpointFor(ctx context.Context, repo string, loads func(modelType st
 			want[name] = true
 		}
 	}
-	if _, ok := byPath["model.safetensors.index.json"]; ok {
-		idxRaw, err := fetchSmall(ctx, repo, "model.safetensors.index.json", 64<<20)
-		if err != nil {
-			return Plan{}, nil, err
-		}
-		var idx struct {
-			WeightMap map[string]string `json:"weight_map"`
-		}
-		if err := json.Unmarshal(idxRaw, &idx); err != nil {
-			return Plan{}, nil, fmt.Errorf("parsing %s's shard index: %w", repo, err)
-		}
-		if len(idx.WeightMap) == 0 {
-			return Plan{}, nil, fmt.Errorf("repo %s's shard index names no weights", repo)
-		}
-		want["model.safetensors.index.json"] = true
-		for _, shard := range idx.WeightMap {
-			if _, ok := byPath[shard]; !ok {
-				return Plan{}, nil, fmt.Errorf("repo %s's shard index names %q, which the repo does not have", repo, shard)
-			}
-			want[shard] = true
-		}
-	} else if _, ok := byPath["model.safetensors"]; ok {
-		want["model.safetensors"] = true
-	} else {
-		return Plan{}, nil, fmt.Errorf("repo %s has a config.json but no model.safetensors or model.safetensors.index.json", repo)
+	weights, err := checkpointWeightPaths(byPath, func() ([]byte, error) {
+		return fetchSmall(ctx, repo, checkpointIndex, maxIndexBytes)
+	})
+	if err != nil {
+		return Plan{}, nil, fmt.Errorf("repo %s: %w", repo, err)
+	}
+	for _, name := range weights {
+		want[name] = true
 	}
 	for name := range want {
 		if !safeRepoPath(name) {
@@ -438,19 +421,20 @@ func verifyCachedCheckpoint(dir string, root *os.Root, m markerDoc, plannedConfi
 			return false, fmt.Errorf("cached checkpoint %s: %w", dir, err)
 		}
 	}
-	foundConfig := false
+	if err := verifyCheckpointWeights(root, m.Files); err != nil {
+		return false, fmt.Errorf("cached checkpoint %s: %w; move it aside, or pull with -o <dir>", dir, err)
+	}
 	for _, f := range m.Files {
 		if f.Path == "config.json" {
 			// Verify the same bytes used for the layout check without following the link again.
 			if !checkpoint.ConfigMatches(config, f.Size, f.SHA256) {
 				return false, nil
 			}
-			foundConfig = true
 		} else if _, ok := cachedIntact(filepath.Join(dir, filepath.FromSlash(path.Dir(f.Path))), f); !ok {
 			return false, nil
 		}
 	}
-	return foundConfig, nil
+	return true, nil
 }
 
 func readCachedCheckpointConfig(dir string) ([]byte, error) {
@@ -561,22 +545,9 @@ func downloadCheckpoint(ctx context.Context, p Plan, plannedConfig []byte, dest 
 			progress(done, p.Bytes, f.Path)
 		}
 	}
-	markerFiles := slices.Clone(p.Files)
-	for i, file := range markerFiles {
-		if file.Path != "config.json" {
-			continue
-		}
-		raw, err := readCachedCheckpointConfig(staging)
-		if err != nil {
-			return "", fmt.Errorf("checking staged config.json: %w", err)
-		}
-		if !checkpoint.ConfigMatches(raw, file.Size, file.SHA256) || !bytes.Equal(raw, plannedConfig) {
-			return "", fmt.Errorf("staged config.json does not match the checkpoint plan")
-		}
-		if err := checkpoint.ValidateConfig(p.Repo, raw); err != nil {
-			return "", err
-		}
-		markerFiles[i].SHA256 = checkpoint.ConfigDigest(raw)
+	markerFiles, err := checkpointMarkerFiles(staging, p, plannedConfig)
+	if err != nil {
+		return "", fmt.Errorf("checking staged checkpoint %s: %w", staging, err)
 	}
 	mb, err := json.MarshalIndent(markerDoc{Repo: p.Repo, Files: markerFiles}, "", " ")
 	if err != nil {
@@ -592,6 +563,35 @@ func downloadCheckpoint(ctx context.Context, p Plan, plannedConfig []byte, dest 
 		return "", fmt.Errorf("publishing %s: %w", dest, err)
 	}
 	return dest, nil
+}
+
+func checkpointMarkerFiles(staging string, p Plan, plannedConfig []byte) ([]File, error) {
+	root, err := os.OpenRoot(staging)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	if err := verifyCheckpointWeights(root, p.Files); err != nil {
+		return nil, err
+	}
+	raw, err := checkpoint.ReadRootConfig(root)
+	if err != nil {
+		return nil, fmt.Errorf("checking config.json: %w", err)
+	}
+	if !bytes.Equal(raw, plannedConfig) {
+		return nil, fmt.Errorf("config.json does not match the checkpoint plan")
+	}
+	if err := checkpoint.ValidateConfig(p.Repo, raw); err != nil {
+		return nil, err
+	}
+	files := slices.Clone(p.Files)
+	for i, f := range files {
+		if f.Path == "config.json" {
+			files[i].SHA256 = checkpoint.ConfigDigest(raw)
+			break
+		}
+	}
+	return files, nil
 }
 
 func stageCheckpointConfig(dir string, config []byte) error {

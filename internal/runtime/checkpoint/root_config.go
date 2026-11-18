@@ -20,21 +20,44 @@ func ReadRootConfig(root *os.Root) ([]byte, error) {
 		return nil, err
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		name, info, err = resolveCachedConfigLink(root, name)
+		name, info, err = resolveRootFileLink(root, name)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("config target is not a regular file")
-	}
-	if info.Size() > MaxConfigBytes {
-		return nil, fmt.Errorf("config exceeds %d bytes", MaxConfigBytes)
-	}
-	return readCheckedConfig(root, name, info)
+	return readCheckedRootFile(root, name, info, MaxConfigBytes)
 }
 
-func readCheckedConfig(root *os.Root, name string, info os.FileInfo) ([]byte, error) {
+// StatRootFile follows a top-level checkpoint file's links within root, including absolute aliases.
+func StatRootFile(root *os.Root, name string) (os.FileInfo, error) {
+	_, info, err := rootFileInfo(root, name)
+	return info, err
+}
+
+// ReadRootFile reads up to limit bytes from a top-level regular file inside root.
+func ReadRootFile(root *os.Root, name string, limit int64) ([]byte, error) {
+	name, info, err := rootFileInfo(root, name)
+	if err != nil {
+		return nil, err
+	}
+	return readCheckedRootFile(root, name, info, limit)
+}
+
+func rootFileInfo(root *os.Root, name string) (string, os.FileInfo, error) {
+	info, err := root.Lstat(name)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return name, info, err
+	}
+	return resolveRootFileLink(root, name)
+}
+
+func readCheckedRootFile(root *os.Root, name string, info os.FileInfo, limit int64) ([]byte, error) {
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", name)
+	}
+	if info.Size() > limit {
+		return nil, fmt.Errorf("%s exceeds %d bytes", name, limit)
+	}
 	f, err := root.OpenFile(name, readFlags, 0)
 	if err != nil {
 		return nil, err
@@ -45,17 +68,17 @@ func readCheckedConfig(root *os.Root, name string, info os.FileInfo) ([]byte, er
 		return nil, err
 	}
 	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-		return nil, fmt.Errorf("config target changed while opening")
+		return nil, fmt.Errorf("%s changed while opening", name)
 	}
-	raw, err := io.ReadAll(io.LimitReader(f, MaxConfigBytes+1))
-	if len(raw) > MaxConfigBytes {
-		return nil, fmt.Errorf("config exceeds %d bytes", MaxConfigBytes)
+	raw, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if int64(len(raw)) > limit {
+		return nil, fmt.Errorf("%s exceeds %d bytes", name, limit)
 	}
 	return raw, err
 }
 
 // Expand each component through root so an absolute link can be converted to a rooted name at any hop.
-func resolveCachedConfigLink(root *os.Root, name string) (string, os.FileInfo, error) {
+func resolveRootFileLink(root *os.Root, name string) (string, os.FileInfo, error) {
 	const maxLinks = 40
 	pending := []string{name}
 	var parents []string
@@ -68,7 +91,7 @@ func resolveCachedConfigLink(root *os.Root, name string) (string, os.FileInfo, e
 			continue
 		case "..":
 			if len(parents) == 0 {
-				return "", nil, fmt.Errorf("relative config link leaves the checkpoint directory")
+				return "", nil, fmt.Errorf("relative link leaves the checkpoint directory")
 			}
 			parents = parents[:len(parents)-1]
 			continue
@@ -83,38 +106,38 @@ func resolveCachedConfigLink(root *os.Root, name string) (string, os.FileInfo, e
 				return name, info, nil
 			}
 			if !info.IsDir() {
-				return "", nil, fmt.Errorf("config link component %q is not a directory", name)
+				return "", nil, fmt.Errorf("link component %q is not a directory", name)
 			}
 			parents = append(parents, part)
 			continue
 		}
 		links++
 		if links > maxLinks {
-			return "", nil, fmt.Errorf("config link exceeds %d symlink hops", maxLinks)
+			return "", nil, fmt.Errorf("link exceeds %d symlink hops", maxLinks)
 		}
 		target, err := root.Readlink(name)
 		if err != nil {
 			return "", nil, err
 		}
 		if filepath.IsAbs(target) {
-			target, err = rootedConfigTarget(root, target, len(pending) != 0)
+			target, err = rootedFileTarget(root, target, len(pending) != 0)
 			if err != nil {
 				return "", nil, err
 			}
 			parents = nil
 		} else if filepath.VolumeName(target) != "" || strings.HasPrefix(filepath.ToSlash(target), "/") {
-			return "", nil, fmt.Errorf("config link has no local relative target")
+			return "", nil, fmt.Errorf("link has no local relative target")
 		}
 		pending = append(strings.Split(filepath.ToSlash(target), "/"), pending...)
 	}
-	return "", nil, fmt.Errorf("config target is not a regular file")
+	return "", nil, fmt.Errorf("link target is not a regular file")
 }
 
 // Match the first absolute directory prefix with the identity of the open root. Once inside,
 // the remainder is resolved through root, including links that might try to leave it again.
-func rootedConfigTarget(root *os.Root, target string, directory bool) (string, error) {
+func rootedFileTarget(root *os.Root, target string, directory bool) (string, error) {
 	if filepath.Clean(target) != target {
-		return "", fmt.Errorf("absolute config link is not canonical")
+		return "", fmt.Errorf("absolute link is not canonical")
 	}
 	rootInfo, err := root.Stat(".")
 	if err != nil {
@@ -140,5 +163,5 @@ func rootedConfigTarget(root *os.Root, target string, directory bool) (string, e
 			return filepath.Rel(prefixes[i], target)
 		}
 	}
-	return "", fmt.Errorf("absolute config link leaves the checkpoint directory")
+	return "", fmt.Errorf("absolute link leaves the checkpoint directory")
 }
