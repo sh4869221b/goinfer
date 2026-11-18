@@ -32,8 +32,16 @@ func readCheckpointDigest(root *os.Root, name string, info os.FileInfo) digestSi
 	return digestSidecar{}
 }
 
+type checkpointDigestCheck uint8
+
+const (
+	checkpointSizeOnly checkpointDigestCheck = iota
+	checkpointCachedDigest
+	checkpointFreshDigest
+)
+
 // Use the same confined regular-file open for size-only and digest checks.
-func verifyCheckpointFile(root *os.Root, file File, verifyDigest bool) error {
+func verifyCheckpointFile(root *os.Root, file File, check checkpointDigestCheck) error {
 	name := filepath.FromSlash(file.Path)
 	f, err := checkpoint.OpenRootFile(root, name)
 	if err != nil {
@@ -47,8 +55,11 @@ func verifyCheckpointFile(root *os.Root, file File, verifyDigest bool) error {
 	if info.Size() != file.Size {
 		return fmt.Errorf("%s has size %d, want %d", file.Path, info.Size(), file.Size)
 	}
-	if !verifyDigest || file.SHA256 == "" {
+	if check == checkpointSizeOnly || file.SHA256 == "" {
 		return nil
+	}
+	if check == checkpointFreshDigest {
+		return checkOpenCheckpointDigest(root, name, file, f, info)
 	}
 	return verifyOpenCheckpointDigest(root, name, file, f, info)
 }

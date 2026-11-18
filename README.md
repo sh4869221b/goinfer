@@ -176,9 +176,12 @@ stage data in place when no matching cleanup record exists. Resuming an existing
 requires a transfer record with a matching hard link. On filesystems without hard links,
 interrupted transfers restart from the beginning. If the pull reports an unverified partial,
 inspect the file or choose a different destination.
-Each publication builds a clean directory from the plan and rechecks the planned digests
-against the file contents. A process killed during publication
-can leave a `publish-*` directory in the workspace while the staging data remains resumable.
+Publication writes a separate copy of the staged files and checks the planned digests against
+that copy. Allow space for the remaining downloads and one full copy, about twice the file
+payload for a fresh pull. Copying and verification add local disk reads and writes. An explicit
+pull into an existing checkpoint rehashes its contents and reports any mismatch without
+replacing the files. A process killed during publication can leave a `publish-*` directory
+with a partial or full copy while the staging data remains resumable.
 On filesystems with hard links, successful publication reclaims old staged files and partial
 transfers whose records still match the original file. Completed transfers also need a matching
 content digest. Unrecorded files stay in place. A process

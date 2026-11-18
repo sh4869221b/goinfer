@@ -59,12 +59,17 @@ func TestCheckpointTransferCrashBoundaries(t *testing.T) {
 				pause()
 				return nil
 			}
+		case "before publish":
+			renameCheckpointPublication = func(root *os.Root, src, dest string) error {
+				pause()
+				return root.Rename(src, dest)
+			}
 		}
 		_, download, err := PrepareCheckpointFor(t.Context(), checkpointCrashRepo, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = download(t.Context(), dest, func(_, _ int64, name string) {
+		got, err := download(t.Context(), dest, func(_, _ int64, name string) {
 			if mode == "after shard" && name == checkpointCrashShard {
 				path := filepath.Join(testCheckpointStagePath(dest), name)
 				if _, err := os.Stat(path); err == nil {
@@ -72,6 +77,15 @@ func TestCheckpointTransferCrashBoundaries(t *testing.T) {
 				}
 			}
 		})
+		if mode == "before publish" && err == nil && got == dest {
+			return
+		}
+		if mode == "explicit repull" {
+			if got != "" || err == nil || !strings.Contains(err.Error(), "digest") {
+				t.Fatalf("explicit repull accepted modified weight: %q, %v", got, err)
+			}
+			return
+		}
 		if (mode == "other version" || mode == "older writer") && err != nil && strings.Contains(err.Error(), checkpointCrashShard) {
 			pause()
 			return
@@ -253,6 +267,118 @@ func TestCheckpointTransferCrashBoundaries(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCheckpointPublicationIsIndependentOfLateStageWrites(t *testing.T) {
+	files := shardedTinyRepo(t)
+	h := &fakeHF{files: files}
+	h.serve(t, checkpointCrashRepo)
+	dest := filepath.Join(t.TempDir(), "checkpoint")
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cmd := checkpointCrashCommand(ctx, "", "before publish", dest)
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+	reader := bufio.NewReader(out)
+	if line, err := reader.ReadString('\n'); line != "ready\n" || err != nil {
+		t.Fatalf("writer did not reach publication: %q, %v", line, err)
+	}
+	stage := testCheckpointStagePath(dest)
+	path := filepath.Join(stage, checkpointCrashShard)
+	staged, edited := rewriteCheckpointWeightInPlace(t, path, files[checkpointCrashShard])
+	prepared, err := filepath.Glob(filepath.Join(filepath.Dir(stage), "publish-*", checkpointCrashShard))
+	if err != nil || len(prepared) != 1 {
+		t.Fatalf("publication candidate = %v, %v", prepared, err)
+	}
+	if candidate, err := os.Stat(prepared[0]); err != nil || os.SameFile(staged, candidate) {
+		t.Errorf("candidate shares the staging inode: %v", err)
+	}
+	payload := SetBytes(readTestCheckpointMarker(t, filepath.Dir(prepared[0])).Files)
+	t.Logf("checkpoint payload %d bytes per directory, %d bytes across stage and candidate", payload, 2*payload)
+	if err := in.Close(); err != nil {
+		t.Fatal(err)
+	}
+	childOutput, _ := io.ReadAll(reader)
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("writer failed: %v\n%s", err, childOutput)
+	}
+	_, cached := CachedCheckpoint(dest)
+	if raw, err := os.ReadFile(filepath.Join(dest, checkpointCrashShard)); err != nil || !bytes.Equal(raw, files[checkpointCrashShard]) || !cached {
+		t.Errorf("published bytes = %d bytes, CachedCheckpoint=%t, err=%v", len(raw), cached, err)
+	}
+	if raw, err := os.ReadFile(path); err != nil || !bytes.Equal(raw, edited) {
+		t.Errorf("cleanup changed the edited stage: %d bytes, %v", len(raw), err)
+	}
+}
+
+func TestCheckpointExplicitRepullRehashesExistingWeight(t *testing.T) {
+	files := shardedTinyRepo(t)
+	h := &fakeHF{files: files}
+	h.serve(t, checkpointCrashRepo)
+	dest := filepath.Join(t.TempDir(), "checkpoint")
+	pullCrashCheckpoint(t, dest)
+	weight := filepath.Join(dest, checkpointCrashShard)
+	info, edited := rewriteCheckpointWeightInPlace(t, weight, files[checkpointCrashShard])
+	sidecar := sidecarPath(weight)
+	saved, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if out, err := checkpointCrashCommand(ctx, "", "explicit repull", dest).CombinedOutput(); err != nil {
+		t.Fatalf("explicit repull: %v\n%s", err, out)
+	}
+	if after, err := os.Stat(weight); err != nil || !sameCheckpointFileState(info, after) {
+		t.Errorf("repull changed the existing inode or metadata: %v", err)
+	}
+	if raw, err := os.ReadFile(weight); err != nil || !bytes.Equal(raw, edited) {
+		t.Errorf("repull changed the existing contents: %v", err)
+	}
+	if raw, err := os.ReadFile(sidecar); err != nil || !bytes.Equal(raw, saved) {
+		t.Errorf("repull changed the existing sidecar: %v", err)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.hits[checkpointCrashShard] != 1 {
+		t.Errorf("repull downloaded the existing shard again: %v", h.hits)
+	}
+}
+
+func rewriteCheckpointWeightInPlace(t *testing.T, path string, contents []byte) (os.FileInfo, []byte) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edited := bytes.Clone(contents)
+	edited[len(edited)-1] ^= 1
+	if err := os.WriteFile(path, edited, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if after, err := os.Stat(path); err != nil || !sameCheckpointFileState(info, after) {
+		t.Fatalf("failed to preserve inode, size and mtime: %v", err)
+	}
+	return info, edited
 }
 
 func TestCheckpointRechecksCompletedStageBytes(t *testing.T) {

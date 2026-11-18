@@ -310,7 +310,7 @@ func TestCheckpointRecoversStageAfterKilledPublisher(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := preparePublishedFile(work.root, stage, publish, interruptedPublish, File{Path: completed, Size: info.Size()}); err != nil {
+		if _, err := preparePublishedFile(stage, publish, File{Path: completed, Size: info.Size()}); err != nil {
 			t.Fatal(err)
 		}
 		fmt.Println("prepared")

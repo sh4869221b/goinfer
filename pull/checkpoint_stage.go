@@ -324,6 +324,9 @@ func hashPublishedFile(root *os.Root, f File) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if f.SHA256 != "" && digest != f.SHA256 {
+		return "", fmt.Errorf("%s: %w", f.Path, errCheckpointDigestMismatch)
+	}
 	if err := confirmCheckpointFile(root, name, file, info); err != nil {
 		return "", err
 	}
@@ -345,7 +348,7 @@ func hashCheckpointFile(f File, r io.Reader) (string, error) {
 
 // publishCheckpoint builds a clean directory from the plan. Staging keeps its
 // identity, including when the writer is killed before the final rename.
-func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Root, dest string, p Plan, metadata checkpointMetadata, publication string) error {
+func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Root, dest string, p Plan, metadata checkpointMetadata, publication string, publicationBytes int64) error {
 	workspace, err := parent.Lstat(work.name)
 	if err != nil {
 		return err
@@ -354,6 +357,9 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 		return err
 	}
 	if err := work.checkStageIdentity(stage); err != nil {
+		return err
+	}
+	if err := checkDiskSpace(p.Repo, publicationBytes, work.root.Name()); err != nil {
 		return err
 	}
 	name := "publish-" + rand.Text()
@@ -372,7 +378,7 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 	}()
 	sources := make(map[string]os.FileInfo, len(p.Files))
 	for _, f := range p.Files {
-		info, err := preparePublishedFile(work.root, stage, publish, name, f)
+		info, err := preparePublishedFile(stage, publish, f)
 		if err != nil {
 			return fmt.Errorf("publishing %s: %w", f.Path, err)
 		}
@@ -417,15 +423,9 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 	if !work.matchesPublication(stage, publication) {
 		return nil
 	}
-	// Remove only the source files that were published. Unlisted data in the
-	// workspace may belong to someone else, even when the stage belongs to us.
+	// The source can still change after it is copied. Recheck it before unlinking.
 	for _, file := range files {
-		name := filepath.FromSlash(file.Path)
-		if info, err := stage.Lstat(name); err == nil && sameCheckpointFileState(sources[file.Path], info) {
-			if err := stage.Remove(name); err == nil && file.SHA256 != "" && checkpointDigestSidecar(stage, name, info) == file.SHA256 {
-				_ = stage.Remove(sidecarPath(name))
-			}
-		}
+		removeCopiedStageFile(stage, file, sources[file.Path])
 	}
 	work.reclaimTransfers(stage, cleanup.Transfers)
 	return nil
@@ -433,7 +433,7 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 
 var renameCheckpointPublication = (*os.Root).Rename
 
-func preparePublishedFile(work, stage, publish *os.Root, publishName string, f File) (os.FileInfo, error) {
+func preparePublishedFile(stage, publish *os.Root, f File) (os.FileInfo, error) {
 	name := filepath.FromSlash(f.Path)
 	in, err := openRegularDownloadFile(stage, name, os.O_RDONLY)
 	if err != nil {
@@ -450,55 +450,12 @@ func preparePublishedFile(work, stage, publish *os.Root, publishName string, f F
 	if err := publish.MkdirAll(filepath.Dir(name), 0o755); err != nil {
 		return nil, err
 	}
-	if err := work.Link(filepath.Join(checkpointStageName, name), filepath.Join(publishName, name)); err == nil {
-		linked, err := publish.Lstat(name)
-		if err != nil {
-			return nil, err
-		}
-		if !linked.Mode().IsRegular() || !sameCheckpointFileState(source, linked) {
-			return nil, fmt.Errorf("staged file changed while linking")
-		}
-		if f.SHA256 != "" {
-			if err := checkOpenCheckpointDigest(publish, name, f, in, source); err != nil {
-				if errors.Is(err, errCheckpointDigestMismatch) {
-					discardStagedDigest(stage, name, in, source, f.SHA256)
-				}
-				return nil, err
-			}
-			writeRootDigest(publish, name, linked, checkpointFileID(in, source), f.SHA256)
-		}
-		return source, nil
-	}
-	// Filesystems without hard links can publish via a copy on the same disk.
-	if err := checkDiskSpace(f.Path, f.Size, publish.Name()); err != nil {
-		return nil, err
-	}
+	// The published file has its own inode, including while receipts still link to staging.
 	out, err := openRegularDownloadFile(publish, name, os.O_CREATE|os.O_EXCL|os.O_WRONLY)
 	if err != nil {
 		return nil, err
 	}
-	var copyErr error
-	if f.SHA256 != "" {
-		digest, err := hashCheckpointFile(f, io.TeeReader(in, out))
-		copyErr = err
-		if err == nil && digest != f.SHA256 {
-			discardStagedDigest(stage, name, in, source, f.SHA256)
-			copyErr = errCheckpointDigestMismatch
-		}
-		if copyErr == nil {
-			info, err := out.Stat()
-			copyErr = err
-			if err == nil {
-				writeRootDigest(publish, name, info, checkpointFileID(out, info), digest)
-			}
-		}
-	} else {
-		var n int64
-		n, copyErr = io.Copy(out, in)
-		if copyErr == nil && n != f.Size {
-			copyErr = fmt.Errorf("staged file changed while copying")
-		}
-	}
+	_, copyErr := io.CopyN(out, in, f.Size)
 	closeErr := out.Close()
 	if copyErr != nil {
 		return nil, copyErr
@@ -506,7 +463,39 @@ func preparePublishedFile(work, stage, publish *os.Root, publishName string, f F
 	if closeErr != nil {
 		return nil, closeErr
 	}
+	if f.SHA256 != "" {
+		if _, err := hashPublishedFile(publish, f); err != nil {
+			if errors.Is(err, errCheckpointDigestMismatch) {
+				discardStagedDigest(stage, name, in, source, f.SHA256)
+			}
+			return nil, err
+		}
+	}
 	return source, nil
+}
+
+func removeCopiedStageFile(stage *os.Root, f File, source os.FileInfo) {
+	name := filepath.FromSlash(f.Path)
+	file, err := openRegularDownloadFile(stage, name, os.O_RDONLY)
+	if err != nil {
+		return
+	}
+	info, err := file.Stat()
+	if err != nil || !sameCheckpointFileState(source, info) {
+		file.Close()
+		return
+	}
+	err = checkOpenCheckpointDigest(stage, name, f, file, info)
+	if closeErr := file.Close(); err != nil || closeErr != nil {
+		return
+	}
+	current, err := stage.Lstat(name)
+	if err != nil || !sameCheckpointFileState(info, current) || stage.Remove(name) != nil {
+		return
+	}
+	if checkpointDigestSidecar(stage, name, info) == f.SHA256 {
+		_ = stage.Remove(sidecarPath(name))
+	}
 }
 
 // A retry can refetch the shard once the contradicted sidecar is gone.

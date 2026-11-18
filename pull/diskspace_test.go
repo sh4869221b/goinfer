@@ -172,13 +172,14 @@ func diskCheckpointPlan(files []File) Plan {
 }
 
 func TestDownloadCheckpoint_refusesWhatWillNotFit_beforeAnyByte(t *testing.T) {
-	d := newDiskTestFiles(t, 1499+int64(len(diskCheckpointConfig)), true)
+	const payload = 1500 + int64(len(diskCheckpointConfig))
+	d := newDiskTestFiles(t, 2*payload-1, true)
 	root := t.TempDir()
 	dest := filepath.Join(root, "ckpt")
 	p := diskCheckpointPlan(d.set)
 	_, err := downloadCheckpoint(context.Background(), p, checkpointMetadata{config: []byte(diskCheckpointConfig)}, dest, nil)
 	if err == nil {
-		t.Fatal("one byte short of the checkpoint size: want a refusal")
+		t.Fatal("one byte short of staging plus publication: want a refusal")
 	}
 	if n := d.hits.Load(); n != 0 {
 		t.Errorf("%d requests made before refusing, want 0", n)
@@ -194,13 +195,14 @@ func TestDownloadCheckpoint_refusesWhatWillNotFit_beforeAnyByte(t *testing.T) {
 	}
 }
 
-// A checkpoint's files live in subdirectories of its staging directory, and a partial in one counts: 1,001 bytes are left,
-// so 1,001 free proceeds and 1,000 is refused, naming the staging directory the probe reads.
+// The 499-byte partial reduces the remaining stage download to 1,001 bytes.
+// The candidate still needs room for the entire checkpoint.
 func TestDownloadCheckpoint_countsPartialsInSubdirectories(t *testing.T) {
+	const needed = 1001 + 1500 + int64(len(diskCheckpointConfig))
 	for _, tc := range []struct {
 		free int64
 		ok   bool
-	}{{1000, false}, {1001, true}} {
+	}{{needed - 1, false}, {needed, true}} {
 		t.Run(strconv.FormatInt(tc.free, 10), func(t *testing.T) {
 			d := newDiskTestFiles(t, tc.free, true)
 			d.set[1].Path = "sub/b.gguf"
@@ -212,11 +214,47 @@ func TestDownloadCheckpoint_countsPartialsInSubdirectories(t *testing.T) {
 			p := diskCheckpointPlan(d.set)
 			_, err := downloadCheckpoint(context.Background(), p, checkpointMetadata{config: []byte(diskCheckpointConfig)}, dest, nil)
 			if (err == nil) != tc.ok {
-				t.Fatalf("1,001 bytes left and %d free: err %v, want ok=%v", tc.free, err, tc.ok)
+				t.Fatalf("%d bytes needed and %d free: err %v, want ok=%v", needed, tc.free, err, tc.ok)
 			}
-			if len(d.asked) != 1 || d.asked[0] != stage {
-				t.Errorf("free space asked of %v, want once, of %s", d.asked, stage)
+			if len(d.asked) == 0 || d.asked[0] != stage {
+				t.Errorf("free space asked of %v, want first probe of %s", d.asked, stage)
+			}
+			if tc.ok && (len(d.asked) != 2 || d.asked[1] != filepath.Dir(stage)) {
+				t.Errorf("free space asked of %v, want publication probe of %s", d.asked, filepath.Dir(stage))
 			}
 		})
+	}
+}
+
+func TestDownloadCheckpointRechecksCopySpaceAfterStaging(t *testing.T) {
+	const payload = 1500 + int64(len(diskCheckpointConfig))
+	d := newDiskTestFiles(t, 2*payload, true)
+	plan := diskCheckpointPlan(d.set)
+	meta := checkpointMetadata{config: []byte(diskCheckpointConfig)}
+	dest := filepath.Join(t.TempDir(), "checkpoint")
+	stage := testCheckpointStagePath(dest)
+	probe := freeDiskBytes
+	freeDiskBytes = func(dir string) (int64, bool) {
+		free, ok := probe(dir)
+		if dir == filepath.Dir(stage) {
+			return payload - 1, true
+		}
+		return free, ok
+	}
+	if got, err := downloadCheckpoint(t.Context(), plan, meta, dest, nil); got != "" || err == nil || !strings.Contains(err.Error(), "more on disk") {
+		t.Fatalf("pull with no room left for the copy = %q, %v", got, err)
+	}
+	if matches, err := filepath.Glob(filepath.Join(filepath.Dir(stage), "publish-*")); err != nil || len(matches) != 0 {
+		t.Errorf("publication allocated a candidate without enough space: %v, %v", matches, err)
+	}
+	if n := d.hits.Load(); n != 2 {
+		t.Fatalf("stage downloads = %d, want 2", n)
+	}
+	freeDiskBytes = probe
+	if got, err := downloadCheckpoint(t.Context(), plan, meta, dest, nil); got != dest || err != nil {
+		t.Fatalf("retry after restoring disk space = %q, %v", got, err)
+	}
+	if n := d.hits.Load(); n != 2 {
+		t.Errorf("retry re-fetched staged files: %d requests", n)
 	}
 }

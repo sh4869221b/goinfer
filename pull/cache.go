@@ -142,7 +142,7 @@ func repoEntries(repo, dir string) []CacheEntry {
 			for _, f := range m.Files {
 				inMarker[filepath.Base(f.Path)] = true
 				if complete {
-					complete = verifyCheckpointFile(root, f, false) == nil
+					complete = verifyCheckpointFile(root, f, checkpointSizeOnly) == nil
 				}
 			}
 			out = append(out, CacheEntry{Repo: repo, Path: dir, Kind: "checkpoint", Bytes: dirBytes(dir), Complete: complete})

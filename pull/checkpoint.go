@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path"
@@ -417,7 +418,7 @@ func checkCompletedCheckpoint(ctx context.Context, dir string, p Plan, metadata 
 	}) {
 		return nil, nil
 	}
-	if verified, err := verifyCachedCheckpoint(dir, root, m, metadata); !verified || err != nil {
+	if verified, err := verifyCachedCheckpoint(dir, root, m, metadata, checkpointFreshDigest); !verified || err != nil {
 		return nil, err
 	}
 	for i, f := range p.Files {
@@ -438,13 +439,21 @@ func checkCompletedCheckpoint(ctx context.Context, dir string, p Plan, metadata 
 // comparison with the current CDN file, without replacing the existing files.
 func checkCompletedRemoteFile(ctx context.Context, root *os.Root, repo string, f File, localDigest string) error {
 	if localDigest == "" {
-		file, err := checkpoint.OpenRootFile(root, filepath.FromSlash(f.Path))
+		name := filepath.FromSlash(f.Path)
+		file, err := checkpoint.OpenRootFile(root, name)
 		if err != nil {
 			return fmt.Errorf("reading %s: %w", f.Path, err)
 		}
-		localDigest, err = hashCheckpointFile(f, file)
-		file.Close()
+		defer file.Close()
+		info, err := file.Stat()
 		if err != nil {
+			return err
+		}
+		localDigest, err = hashCheckpointFile(f, file)
+		if err != nil {
+			return err
+		}
+		if err := confirmCheckpointFile(root, name, file, info); err != nil {
 			return err
 		}
 	}
@@ -486,7 +495,7 @@ func checkCachedCheckpoint(dir string) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	return verifyCachedCheckpoint(dir, root, m, checkpointMetadata{})
+	return verifyCachedCheckpoint(dir, root, m, checkpointMetadata{}, checkpointCachedDigest)
 }
 
 func readCheckpointMarker(root *os.Root) (markerDoc, bool) {
@@ -501,7 +510,7 @@ func readCheckpointMarker(root *os.Root) (markerDoc, bool) {
 	return m, true
 }
 
-func verifyCachedCheckpoint(dir string, root *os.Root, m markerDoc, metadata checkpointMetadata) (bool, error) {
+func verifyCachedCheckpoint(dir string, root *os.Root, m markerDoc, metadata checkpointMetadata, check checkpointDigestCheck) (bool, error) {
 	config, err := checkpoint.ReadRootConfig(root)
 	if err != nil {
 		return false, fmt.Errorf("cached checkpoint %s: config.json must be a readable regular file inside the checkpoint directory: %w", dir, err)
@@ -534,7 +543,7 @@ func verifyCachedCheckpoint(dir string, root *os.Root, m markerDoc, metadata che
 		case checkpointIndex, checkpoint.GenerationConfigName:
 			// The metadata readers verify the same bytes used for the layout or generation checks.
 		default:
-			if err := verifyCheckpointFile(root, f, true); err != nil {
+			if err := verifyCheckpointFile(root, f, check); err != nil {
 				return false, fmt.Errorf("cached checkpoint %s: %w", dir, err)
 			}
 		}
@@ -690,8 +699,12 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 		defer root.Close()
 		probe = staging
 	}
-	var need int64
+	var need, publicationBytes int64
 	for _, f := range p.Files {
+		if f.Size < 0 || f.Size > math.MaxInt64-publicationBytes {
+			return "", fmt.Errorf("invalid checkpoint size for %s", f.Path)
+		}
+		publicationBytes += f.Size
 		if planned := metadata.contents(f.Path); planned != nil {
 			if raw, err := readCheckpointMetadata(staging, f.Path); err != nil || !bytes.Equal(raw, planned) {
 				need += f.Size // replacements are written beside the stale file before rename
@@ -708,7 +721,10 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 			}
 		}
 	}
-	if err := checkDiskSpace(p.Repo, need, probe); err != nil {
+	if need > math.MaxInt64-publicationBytes {
+		return "", fmt.Errorf("staging and publication of %s exceed the supported disk budget", p.Repo)
+	}
+	if err := checkDiskSpace(p.Repo, need+publicationBytes, probe); err != nil {
 		return "", err
 	}
 	if root == nil {
@@ -732,7 +748,7 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 	if !sameCheckpointDirectory(parent, parentInfo) {
 		return "", fmt.Errorf("checkpoint destination directory changed during download")
 	}
-	if err := publishCheckpoint(parent, work, root, destName, p, metadata, publication); err != nil {
+	if err := publishCheckpoint(parent, work, root, destName, p, metadata, publication, publicationBytes); err != nil {
 		return "", fmt.Errorf("publishing %s: %w", dest, err)
 	}
 	return dest, nil

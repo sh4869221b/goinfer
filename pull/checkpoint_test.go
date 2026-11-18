@@ -1624,14 +1624,26 @@ func TestCheckpointResumeUsesPlannedIndex(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if path, err := download(t.Context(), dest, nil); path != dest || err != nil {
+			var readyIndex os.FileInfo
+			if path, err := download(t.Context(), dest, func(_, _ int64, name string) {
+				if name == checkpointIndex {
+					var err error
+					readyIndex, err = os.Stat(filepath.Join(staging, checkpointIndex))
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+			}); path != dest || err != nil {
 				t.Fatalf("resume = %q, %v; want %s", path, err, dest)
 			}
 			if raw, err := os.ReadFile(filepath.Join(dest, checkpointIndex)); err != nil || !bytes.Equal(raw, original) {
 				t.Errorf("published index differs from the planned bytes: %v", err)
 			}
-			if info, err := os.Stat(filepath.Join(dest, checkpointIndex)); err != nil || os.SameFile(stagedIndex, info) != tc.matching {
-				t.Errorf("published index should reuse the staged file only when it matches: %v", err)
+			if readyIndex == nil || os.SameFile(stagedIndex, readyIndex) != tc.matching {
+				t.Error("staging should reuse the index only when its contents match")
+			}
+			if info, err := os.Stat(filepath.Join(dest, checkpointIndex)); err != nil || os.SameFile(readyIndex, info) {
+				t.Errorf("published index should be independent of staging: %v", err)
 			}
 			model, err := decoder.Load(dest, decoder.Options{Backend: "cpu"})
 			if err != nil {
