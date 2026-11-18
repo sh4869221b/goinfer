@@ -168,7 +168,10 @@ transfer starts. A plain path still means a plain path — only the `hf:` and `d
 special.
 
 For safetensors pulls, `.<destination>.pull2` is a private sibling workspace for each output
-directory. Retry the same destination after an interruption to resume its verified staging data.
+directory. Retry the same destination after an interruption to resume its verified staging data
+or finish cleanup after publication. Resuming an existing `.part` requires a transfer record
+with a matching hard link. If the pull reports an unverified partial, inspect the file or choose
+a different destination.
 Each publication builds a clean directory from the plan. A process killed during publication
 can leave a `publish-*` directory in the workspace while the staging data remains resumable.
 On filesystems with hard links, successful publication reclaims old staged files and partial

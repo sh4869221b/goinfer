@@ -36,6 +36,7 @@ type fakeHF struct {
 	requests     int
 	failOnce     string // a path whose next transfer is cut midway
 	pausePartial bool   // hold the interrupted response open until the client disconnects
+	beforeSend   func(string)
 }
 
 func (h *fakeHF) serve(t *testing.T, repo string) {
@@ -69,6 +70,9 @@ func (h *fakeHF) serve(t *testing.T, repo string) {
 			}
 			h.hits[p]++
 			h.ranges[p] = r.Header.Get("Range")
+			if h.beforeSend != nil {
+				h.beforeSend(p)
+			}
 			if p == h.failOnce {
 				h.failOnce = ""
 				w.Header().Set("Content-Length", "999999999")
@@ -1606,8 +1610,8 @@ func TestCheckpointResumeUsesPlannedIndex(t *testing.T) {
 				h.mu.Unlock()
 			}
 			dest := filepath.Join(t.TempDir(), "checkpoint")
-			staging := createTestCheckpointStage(t, dest)
-			for name, raw := range map[string][]byte{checkpointIndex: stale, shard: files[shard], interrupted + ".part": files[interrupted][:32]} {
+			staging := createTestCheckpointStage(t, dest, testCheckpointPartial{interrupted + ".part", files[interrupted][:32]})
+			for name, raw := range map[string][]byte{checkpointIndex: stale, shard: files[shard]} {
 				if err := os.WriteFile(filepath.Join(staging, name), raw, 0o644); err != nil {
 					t.Fatal(err)
 				}
@@ -1984,12 +1988,11 @@ func TestDownloadCheckpointRevalidatesRestoredConfigPlan(t *testing.T) {
 				t.Fatalf("restored metadata lost its tree pin: %v", err)
 			}
 			dest := filepath.Join(t.TempDir(), "checkpoint")
-			staging := createTestCheckpointStage(t, dest)
-			staged := map[string][]byte{"config.json": original, shardPart: files["model-00001-of-00002.safetensors"][:32]}
-			for name, raw := range staged {
-				if err := os.WriteFile(filepath.Join(staging, name), raw, 0o644); err != nil {
-					t.Fatal(err)
-				}
+			partial := files["model-00001-of-00002.safetensors"][:32]
+			staging := createTestCheckpointStage(t, dest, testCheckpointPartial{shardPart, partial})
+			staged := map[string][]byte{"config.json": original, shardPart: partial}
+			if err := os.WriteFile(filepath.Join(staging, "config.json"), original, 0o644); err != nil {
+				t.Fatal(err)
 			}
 			h.mu.Lock()
 			requests := h.requests

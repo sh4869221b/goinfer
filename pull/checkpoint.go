@@ -382,23 +382,23 @@ type markerDoc struct {
 
 // reuseCheckpointDestination distinguishes an absent destination from one that has completed.
 // An existing directory whose files differ from the plan is preserved for the caller.
-func reuseCheckpointDestination(ctx context.Context, dir string, p Plan, metadata checkpointMetadata) (bool, error) {
+func reuseCheckpointDestination(ctx context.Context, dir string, p Plan, metadata checkpointMetadata) (os.FileInfo, error) {
 	if _, err := os.Lstat(dir); err != nil {
 		if os.IsNotExist(err) {
-			return false, nil
+			return nil, nil
 		}
-		return false, err
+		return nil, err
 	}
-	if ok, err := checkCompletedCheckpoint(ctx, dir, p, metadata); ok || err != nil {
-		return ok, err
+	if info, err := checkCompletedCheckpoint(ctx, dir, p, metadata); info != nil || err != nil {
+		return info, err
 	}
-	return false, fmt.Errorf("%s exists but is not a complete checkpoint of %s pulled by goinfer: move it aside, or pull with -o <dir>", dir, p.Repo)
+	return nil, fmt.Errorf("%s exists but is not a complete checkpoint of %s pulled by goinfer: move it aside, or pull with -o <dir>", dir, p.Repo)
 }
 
-func checkCompletedCheckpoint(ctx context.Context, dir string, p Plan, metadata checkpointMetadata) (bool, error) {
+func checkCompletedCheckpoint(ctx context.Context, dir string, p Plan, metadata checkpointMetadata) (os.FileInfo, error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
-		return false, nil
+		return nil, nil
 	}
 	defer root.Close()
 	m, ok := readCheckpointMarker(root)
@@ -409,19 +409,19 @@ func checkCompletedCheckpoint(ctx context.Context, dir string, p Plan, metadata 
 		}
 		return got == want
 	}) {
-		return false, nil
+		return nil, nil
 	}
 	if verified, err := verifyCachedCheckpoint(dir, root, m, metadata); !verified || err != nil {
-		return false, err
+		return nil, err
 	}
 	for i, f := range p.Files {
 		if f.SHA256 == "" && metadata.contents(f.Path) == nil {
 			if err := checkCompletedRemoteFile(ctx, root, p.Repo, f, m.Files[i].SHA256); err != nil {
-				return false, fmt.Errorf("checkpoint %s: %w; use -o <dir> to keep the existing checkpoint", dir, err)
+				return nil, fmt.Errorf("checkpoint %s: %w; use -o <dir> to keep the existing checkpoint", dir, err)
 			}
 		}
 	}
-	return true, nil
+	return root.Stat(".")
 }
 
 // A legacy marker can lack a digest. A complete directory can be reused after a full
@@ -644,7 +644,8 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 	}
 	if complete, err := reuseCheckpointDestination(ctx, dest, p, metadata); err != nil {
 		return "", err
-	} else if complete {
+	} else if complete != nil {
+		recoverCheckpointTransfers(dest, complete)
 		return dest, nil
 	}
 	parentDir := filepath.Dir(filepath.Clean(dest))
@@ -664,7 +665,8 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 	defer work.Close()
 	if complete, err := reuseCheckpointDestination(ctx, dest, p, metadata); err != nil {
 		return "", err
-	} else if complete {
+	} else if complete != nil {
+		work.reclaimCompletedStage(parent, destName, complete)
 		return dest, nil
 	}
 	root, err := work.openStage(false)
@@ -744,9 +746,7 @@ func stageCheckpoint(ctx context.Context, work *checkpointWorkspace, root *os.Ro
 					if progress != nil {
 						progress(base+d, p.Bytes, f.Path)
 					}
-				}, func(part string, info os.FileInfo) {
-					work.recordPartial(root, part, info)
-				})
+				}, work)
 				if err == nil {
 					work.recordTransfer(root, f)
 				}

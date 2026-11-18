@@ -205,14 +205,7 @@ func TestDownloadCheckpoint_countsPartialsInSubdirectories(t *testing.T) {
 			d := newDiskTestFiles(t, tc.free, true)
 			d.set[1].Path = "sub/b.gguf"
 			dest := filepath.Join(t.TempDir(), "ckpt")
-			stage := createTestCheckpointStage(t, dest)
-			sub := filepath.Join(stage, "sub")
-			if err := os.MkdirAll(sub, 0o755); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(sub, "b.gguf.part"), bytes.Repeat([]byte("b"), 499), 0o644); err != nil {
-				t.Fatal(err)
-			}
+			stage := createTestCheckpointStage(t, dest, testCheckpointPartial{"sub/b.gguf.part", bytes.Repeat([]byte("b"), 499)})
 			if err := os.WriteFile(filepath.Join(stage, "config.json"), []byte(diskCheckpointConfig), 0o644); err != nil {
 				t.Fatal(err)
 			}

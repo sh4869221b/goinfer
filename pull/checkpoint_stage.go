@@ -21,10 +21,11 @@ const (
 func checkpointWorkspaceName(dest string) string { return "." + dest + checkpointWorkSuffix }
 
 type checkpointWorkspace struct {
-	root  *os.Root
-	lock  *os.File
-	name  string
-	owner checkpointWorkspaceOwner
+	root     *os.Root
+	lock     *os.File
+	name     string
+	owner    checkpointWorkspaceOwner
+	receipts map[string][]checkpointReceipt
 }
 
 type checkpointWorkspaceOwner struct {
@@ -56,11 +57,17 @@ func validateCheckpointDestination(dest string) error {
 // A lock file stays in place so all writers use the same inode. Closing its handle
 // (including on process death) releases the lock. The claim belongs to the same destination.
 func lockCheckpointDestination(parent *os.Root, dest string) (*checkpointWorkspace, error) {
+	return lockCheckpointWorkspace(parent, dest, true)
+}
+
+func lockCheckpointWorkspace(parent *os.Root, dest string, create bool) (*checkpointWorkspace, error) {
 	name := checkpointWorkspaceName(dest)
-	owner := checkpointWorkspaceOwner{Destination: dest, Token: rand.Text()}
-	if _, err := parent.Lstat(name); os.IsNotExist(err) {
-		if err := initializeCheckpointDirectory(parent, name, owner); err != nil && !os.IsExist(err) {
-			return nil, err
+	if create {
+		if _, err := parent.Lstat(name); os.IsNotExist(err) {
+			owner := checkpointWorkspaceOwner{Destination: dest, Token: rand.Text()}
+			if err := initializeCheckpointDirectory(parent, name, owner); err != nil && !os.IsExist(err) {
+				return nil, err
+			}
 		}
 	}
 	workspace, err := openCheckpointStaging(parent, name)
@@ -73,11 +80,15 @@ func lockCheckpointDestination(parent *os.Root, dest string) (*checkpointWorkspa
 			workspace.Close()
 		}
 	}()
-	owner, err = readCheckpointOwner(workspace)
+	owner, err := readCheckpointOwner(workspace)
 	if err != nil || owner.Destination != dest || owner.Token == "" {
 		return nil, fmt.Errorf("workspace %s has no verified owner for %s; existing data was kept", name, dest)
 	}
-	lock, err := openRegularDownloadFile(workspace, "lock", os.O_RDWR|os.O_CREATE)
+	flags := os.O_RDWR
+	if create {
+		flags |= os.O_CREATE
+	}
+	lock, err := openRegularDownloadFile(workspace, "lock", flags)
 	if err != nil {
 		return nil, err
 	}
@@ -91,6 +102,36 @@ func lockCheckpointDestination(parent *os.Root, dest string) (*checkpointWorkspa
 	}
 	ok = true
 	return &checkpointWorkspace{root: workspace, lock: lock, name: name, owner: owner}, nil
+}
+
+// A finished destination can be reused while its writer is still cleaning up.
+// Retry interrupted cleanup only when the existing workspace can be locked.
+func recoverCheckpointTransfers(dest string, complete os.FileInfo) {
+	parent, err := os.OpenRoot(filepath.Dir(filepath.Clean(dest)))
+	if err != nil {
+		return
+	}
+	defer parent.Close()
+	name := filepath.Base(dest)
+	work, err := lockCheckpointWorkspace(parent, name, false)
+	if err != nil {
+		return
+	}
+	defer work.Close()
+	work.reclaimCompletedStage(parent, name, complete)
+}
+
+func (w *checkpointWorkspace) reclaimCompletedStage(parent *os.Root, dest string, complete os.FileInfo) {
+	info, err := parent.Stat(dest)
+	if err != nil || !os.SameFile(info, complete) {
+		return
+	}
+	stage, err := w.openStage(false)
+	if err != nil || stage == nil {
+		return
+	}
+	defer stage.Close()
+	w.reclaimTransfers(stage)
 }
 
 // Keep the stable workspace or stage name absent until its owner is fully recorded.
@@ -286,7 +327,7 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 		}
 		return err
 	}
-	if err := parent.Rename(relativePublish, dest); err != nil {
+	if err := renameCheckpointPublication(parent, relativePublish, dest); err != nil {
 		return err
 	}
 	// Remove only the source files that were published. Unlisted data in the
@@ -302,6 +343,8 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 	work.reclaimTransfers(stage)
 	return nil
 }
+
+var renameCheckpointPublication = (*os.Root).Rename
 
 func preparePublishedFile(work, stage, publish *os.Root, publishName string, f File) (os.FileInfo, error) {
 	name := filepath.FromSlash(f.Path)

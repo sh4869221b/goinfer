@@ -17,7 +17,12 @@ func testCheckpointStagePath(dest string) string {
 	return filepath.Join(filepath.Dir(dest), checkpointWorkspaceName(filepath.Base(dest)), checkpointStageName)
 }
 
-func createTestCheckpointStage(t *testing.T, dest string) string {
+type testCheckpointPartial struct {
+	path string
+	data []byte
+}
+
+func createTestCheckpointStage(t *testing.T, dest string, partials ...testCheckpointPartial) string {
 	t.Helper()
 	parent, err := os.OpenRoot(filepath.Dir(dest))
 	if err != nil {
@@ -33,7 +38,23 @@ func createTestCheckpointStage(t *testing.T, dest string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stage.Close()
+	defer stage.Close()
+	for _, part := range partials {
+		if err := stage.MkdirAll(filepath.Dir(part.path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := stage.WriteFile(part.path, part.data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		info, err := stage.Lstat(part.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		work.recordPartial(stage, part.path, info)
+		if !work.ownsPartial(part.path, info) {
+			t.Fatalf("partial fixture %s was not recorded", part.path)
+		}
+	}
 	return testCheckpointStagePath(dest)
 }
 
@@ -300,11 +321,9 @@ func TestCheckpointRecoversStageAfterKilledPublisher(t *testing.T) {
 	}
 	dir := t.TempDir()
 	dest := filepath.Join(dir, name)
-	stagePath := createTestCheckpointStage(t, dest)
-	for filename, raw := range map[string][]byte{completed: files[completed], interrupted + ".part": files[interrupted][:32]} {
-		if err := os.WriteFile(filepath.Join(stagePath, filename), raw, 0o644); err != nil {
-			t.Fatal(err)
-		}
+	stagePath := createTestCheckpointStage(t, dest, testCheckpointPartial{interrupted + ".part", files[interrupted][:32]})
+	if err := os.WriteFile(filepath.Join(stagePath, completed), files[completed], 0o644); err != nil {
+		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()

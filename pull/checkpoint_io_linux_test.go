@@ -2,6 +2,7 @@ package pull
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -81,12 +82,17 @@ func TestCheckpointRebuildsMissingWeightSidecarInProcess(t *testing.T) {
 
 func checkpointReadBytes(t *testing.T) int64 {
 	t.Helper()
+	return checkpointIOCount(t, "rchar")
+}
+
+func checkpointIOCount(t *testing.T, field string) int64 {
+	t.Helper()
 	raw, err := os.ReadFile("/proc/self/io")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for line := range strings.SplitSeq(string(raw), "\n") {
-		if value, ok := strings.CutPrefix(line, "rchar:"); ok {
+		if value, ok := strings.CutPrefix(line, field+":"); ok {
 			n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
 			if err != nil {
 				t.Fatal(err)
@@ -94,6 +100,61 @@ func checkpointReadBytes(t *testing.T) int64 {
 			return n
 		}
 	}
-	t.Fatal("/proc/self/io omits rchar")
+	t.Fatalf("/proc/self/io omits %s", field)
 	return 0
+}
+
+func TestCheckpointReceiptReadsScaleLinearly(t *testing.T) {
+	for _, shards := range []int{16, 32} {
+		t.Run(strconv.Itoa(shards), func(t *testing.T) {
+			parent, err := os.OpenRoot(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer parent.Close()
+			const dest = "checkpoint"
+			work, err := lockCheckpointDestination(parent, dest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer work.Close()
+			stage, err := work.openStage(true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stage.Close()
+			before := checkpointIOCount(t, "syscr")
+			for i := range shards {
+				name := fmt.Sprintf("model-%05d-of-%05d.safetensors", i+1, shards)
+				part := name + ".part"
+				if err := stage.WriteFile(part, []byte("weight"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				info, err := stage.Lstat(part)
+				if err != nil {
+					t.Fatal(err)
+				}
+				work.recordPartial(stage, part, info)
+				if err := stage.Rename(part, name); err != nil {
+					t.Fatal(err)
+				}
+				work.recordTransfer(stage, File{Path: name, Size: info.Size()})
+			}
+			work.Close()
+			recovered, err := lockCheckpointDestination(parent, dest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer recovered.Close()
+			recovered.reclaimTransfers(stage)
+			reads := checkpointIOCount(t, "syscr") - before
+			t.Logf("%d shards, %d process read calls", shards, reads)
+			if reads > int64(3*shards+12) {
+				t.Errorf("expected linear receipt reads with fixed overhead, got %d", reads)
+			}
+			if names, err := fs.ReadDir(stage.FS(), "."); err != nil || len(names) != 1 || names[0].Name() != checkpointOwnerName {
+				t.Errorf("expected only the owner record in the stage, got %v, %v", names, err)
+			}
+		})
+	}
 }

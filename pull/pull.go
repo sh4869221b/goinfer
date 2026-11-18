@@ -762,21 +762,37 @@ func Download(ctx context.Context, repo string, f File, dir string, progress fun
 }
 
 // downloadFile performs all transfer operations in the already-open destination directory.
-func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File, resume bool, progress func(done, total int64), created func(string, os.FileInfo)) error {
+func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File, resume bool, progress func(done, total int64), work *checkpointWorkspace) error {
 
 	// Resume from a previous interrupted attempt when one is on disk: these files are multi-gigabyte,
 	// and losing 4 GB to a dropped connection is the difference between an annoyance and an unusable
 	// command on a flaky link.
 	part := final + ".part"
+	partInfo, err := root.Lstat(part)
+	newPart := os.IsNotExist(err)
+	if err != nil && !newPart {
+		return err
+	}
+	if !newPart {
+		if !partInfo.Mode().IsRegular() {
+			return fmt.Errorf("partial %s is not a regular file", part)
+		}
+		if work != nil && !work.ownsPartial(part, partInfo) {
+			return fmt.Errorf("partial %s has no verified transfer record in %s. Inspect it or choose another destination", part, root.Name())
+		}
+	}
 	var resumeFrom int64
 	var prefixInfo os.FileInfo
 	var prefixID string
 	h := sha256.New()
-	if st, err := root.Lstat(part); resume && err == nil && st.Mode().IsRegular() && st.Size() > 0 && (f.Size <= 0 || st.Size() < f.Size) {
+	if resume && !newPart && partInfo.Size() > 0 && (f.Size <= 0 || partInfo.Size() < f.Size) {
 		// The running digest has to cover the bytes already on disk, so re-read them through the hash. That
 		// is a local read, trivial beside re-fetching, and it keeps the end-to-end sha256 check covering the
 		// whole file rather than only the tail.
 		if info, id, err := hashPrefix(root, h, part); err == nil {
+			if !sameCheckpointFileState(partInfo, info) {
+				return fmt.Errorf("partial %s changed while preparing to resume", part)
+			}
 			resumeFrom, prefixInfo, prefixID = info.Size(), info, id
 		} else {
 			h.Reset()
@@ -821,14 +837,8 @@ func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File
 	if resumeFrom > 0 {
 		flags |= os.O_APPEND
 	}
-	partInfo, err := root.Lstat(part)
-	newPart := os.IsNotExist(err)
-	if newPart && resumeFrom == 0 {
+	if newPart {
 		flags |= os.O_CREATE | os.O_EXCL
-	} else if err != nil {
-		return err
-	} else if !partInfo.Mode().IsRegular() {
-		return fmt.Errorf("partial %s is not a regular file", part)
 	}
 	out, err := openRegularDownloadFile(root, part, flags)
 	if err != nil {
@@ -839,22 +849,18 @@ func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File
 		out.Close()
 		return err
 	}
-	if resumeFrom > 0 && !sameCheckpointFileState(prefixInfo, opened) {
+	if !newPart && !sameCheckpointFileState(partInfo, opened) {
 		out.Close()
-		return fmt.Errorf("partial %s changed while resuming", part)
+		return fmt.Errorf("partial %s changed before writing", part)
 	}
 	if resumeFrom == 0 && !newPart {
-		if !sameCheckpointFileState(partInfo, opened) {
-			out.Close()
-			return fmt.Errorf("partial %s changed before restarting", part)
-		}
 		if err := out.Truncate(0); err != nil {
 			out.Close()
 			return err
 		}
 	}
-	if newPart && created != nil {
-		created(part, opened)
+	if newPart && work != nil {
+		work.recordPartial(root, part, opened)
 	}
 	total := f.Size
 	if total <= 0 {
