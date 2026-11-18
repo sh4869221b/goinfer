@@ -108,7 +108,18 @@ func checkpointStagingBytes(dir, name, dest string) int64 {
 	if err != nil {
 		return 0
 	}
-	return dirBytes(stage.Name()) - info.Size()
+	metadata := info.Size()
+	if publication, err := readCheckpointPublication(stage); err == nil && publication.Owner == owner && publication.Token != "" {
+		if info, err := stage.Lstat(checkpointPublicationName); err == nil && info.Mode().IsRegular() {
+			metadata += info.Size()
+		}
+	}
+	if cleanup, err := readCheckpointCleanup(stage); err == nil && cleanup.Owner == owner && cleanup.Token != "" {
+		if info, err := stage.Lstat(checkpointCleanupName); err == nil && info.Mode().IsRegular() {
+			metadata += info.Size()
+		}
+	}
+	return max(dirBytes(stage.Name())-metadata, 0)
 }
 
 // repoEntries is one repo directory's models: a checkpoint (the directory itself, when it carries the marker), and the

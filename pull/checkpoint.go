@@ -615,7 +615,7 @@ func plannedCheckpointFiles(p Plan) (map[string]File, error) {
 	byPath := make(map[string]File, len(p.Files))
 	for _, f := range p.Files {
 		first, _, _ := strings.Cut(f.Path, "/")
-		if !safeRepoPath(f.Path) || !filepath.IsLocal(filepath.FromSlash(f.Path)) || f.Path == checkpointMarker || f.Path == checkpointOwnerName || strings.EqualFold(first, checkpointPublicationName) {
+		if !safeRepoPath(f.Path) || !filepath.IsLocal(filepath.FromSlash(f.Path)) || f.Path == checkpointMarker || f.Path == checkpointOwnerName || strings.EqualFold(first, checkpointPublicationName) || strings.EqualFold(first, checkpointCleanupName) {
 			return nil, fmt.Errorf("unsafe path %q in the plan for %s", f.Path, p.Repo)
 		}
 		if _, exists := byPath[f.Path]; exists {

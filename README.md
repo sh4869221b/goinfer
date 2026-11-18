@@ -169,8 +169,9 @@ special.
 
 For safetensors pulls, `.<destination>.pull2` is a private sibling workspace for each output
 directory. Retry the same destination after an interruption to resume its verified staging data
-or finish cleanup for the matching publication. Older completed checkpoints remain usable.
-Their markers omit the publication ID needed to resume cleanup. Resuming an existing `.part`
+or finish cleanup for the matching publication. Cleanup uses the transfer records sealed when
+that checkpoint was published. Older checkpoints remain usable, and recovery leaves their
+stage data in place when no matching cleanup record exists. Resuming an existing `.part`
 requires a transfer record with a matching hard link. On filesystems without hard links,
 interrupted transfers restart from the beginning. If the pull reports an unverified partial,
 inspect the file or choose a different destination.

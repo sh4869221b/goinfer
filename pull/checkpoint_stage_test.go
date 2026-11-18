@@ -25,7 +25,7 @@ type testCheckpointPartial struct {
 func (w *checkpointWorkspace) recordPartial(stage *os.Root, name string, info os.FileInfo) {
 	path := filepath.ToSlash(name)
 	w.recordReceipt(checkpointReceipt{Owner: w.owner, Path: path, Partial: true}, info)
-	w.pruneTransferReceipts(stage, path, false)
+	w.pruneTransferReceipts(stage, path, nil)
 }
 
 func createTestCheckpointStage(t *testing.T, dest string, partials ...testCheckpointPartial) string {

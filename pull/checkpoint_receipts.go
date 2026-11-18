@@ -14,15 +14,29 @@ import (
 const checkpointReceiptPrefix = ".goinfer-transfer-"
 
 type checkpointReceipt struct {
-	Owner   checkpointWorkspaceOwner `json:"owner"`
-	Path    string                   `json:"path"`
-	Size    int64                    `json:"size"`
-	ModTime int64                    `json:"mtime"`
-	SHA256  string                   `json:"sha256,omitempty"`
-	Partial bool                     `json:"partial,omitempty"`
+	Owner      checkpointWorkspaceOwner      `json:"owner"`
+	Path       string                        `json:"path"`
+	Size       int64                         `json:"size"`
+	ModTime    int64                         `json:"mtime"`
+	SHA256     string                        `json:"sha256,omitempty"`
+	Partial    bool                          `json:"partial,omitempty"`
+	Completion *checkpointTransferCompletion `json:"completion,omitempty"`
 
 	dirName string
 	dirInfo os.FileInfo
+}
+
+type checkpointTransferCompletion struct {
+	Size    int64  `json:"size"`
+	ModTime int64  `json:"mtime"`
+	SHA256  string `json:"sha256"`
+}
+
+type checkpointTransferSnapshot struct {
+	Path    string `json:"path,omitempty"`
+	Size    int64  `json:"size"`
+	ModTime int64  `json:"mtime"`
+	FileID  string `json:"file_id,omitempty"`
 }
 
 // Save a hard link as proof of the transferred inode. A missing receipt or
@@ -42,8 +56,8 @@ func (w *checkpointWorkspace) recordCompletedTransfer(stage *os.Root, file File,
 	w.recordReceipt(checkpointReceipt{
 		Owner: w.owner, Path: file.Path, Size: info.Size(), ModTime: info.ModTime().UnixNano(), SHA256: file.SHA256,
 	}, info)
-	w.pruneTransferReceipts(stage, file.Path, false)
-	w.pruneTransferReceipts(stage, file.Path+".part", false)
+	w.pruneTransferReceipts(stage, file.Path, nil)
+	w.pruneTransferReceipts(stage, file.Path+".part", nil)
 }
 
 var createCheckpointPartFile = openRegularDownloadFile
@@ -93,7 +107,7 @@ func (w *checkpointWorkspace) createPartial(stage *os.Root, name, digest string)
 		}
 		private = ""
 	}
-	w.pruneTransferReceipts(stage, receipt.Path, false)
+	w.pruneTransferReceipts(stage, receipt.Path, nil)
 	w.addTransferReceipt(receipt)
 	keep = true
 	return out, private, nil
@@ -147,6 +161,36 @@ func (w *checkpointWorkspace) addTransferReceipt(receipt checkpointReceipt) {
 	w.receipts[receipt.Path] = append(w.receipts[receipt.Path], receipt)
 }
 
+// Record the verified bytes before rename, while the partial still names the recorded inode.
+func (w *checkpointWorkspace) recordTransferCompletion(part string, info os.FileInfo, digest string) error {
+	for i, receipt := range w.receipts[filepath.ToSlash(part)] {
+		if !receipt.Partial {
+			continue
+		}
+		r := w.openTransferReceipt(receipt)
+		if r == nil {
+			continue
+		}
+		proof, err := r.Lstat("file")
+		if err != nil || !proof.Mode().IsRegular() || !sameCheckpointFileState(proof, info) {
+			r.Close()
+			continue
+		}
+		defer r.Close()
+		receipt.Completion = &checkpointTransferCompletion{Size: info.Size(), ModTime: info.ModTime().UnixNano(), SHA256: digest}
+		raw, err := json.Marshal(receipt)
+		if err != nil {
+			return err
+		}
+		if err := replaceRootFile(r, "transfer.json", raw); err != nil {
+			return err
+		}
+		w.receipts[receipt.Path][i] = receipt
+		return nil
+	}
+	return fmt.Errorf("partial %s has no verified transfer record at completion", part)
+}
+
 func (w *checkpointWorkspace) ownsPartial(name string, info os.FileInfo) bool {
 	w.indexTransferReceipts()
 	for _, receipt := range w.receipts[filepath.ToSlash(name)] {
@@ -167,16 +211,55 @@ func (w *checkpointWorkspace) matchesTransferProof(receipt checkpointReceipt, in
 	return err == nil && proof.Mode().IsRegular() && os.SameFile(proof, info)
 }
 
-func (w *checkpointWorkspace) reclaimTransfers(stage *os.Root) {
+func (w *checkpointWorkspace) snapshotTransfers(stage *os.Root) map[string]checkpointTransferSnapshot {
+	w.indexTransferReceipts()
+	result := make(map[string]checkpointTransferSnapshot)
+	for _, receipts := range w.receipts {
+		for _, receipt := range receipts {
+			if state, ok := w.captureTransferSnapshot(stage, receipt); ok {
+				result[receipt.dirName] = state
+			}
+		}
+	}
+	return result
+}
+
+func (w *checkpointWorkspace) captureTransferSnapshot(stage *os.Root, receipt checkpointReceipt) (checkpointTransferSnapshot, bool) {
+	r := w.openTransferReceipt(receipt)
+	if r == nil {
+		return checkpointTransferSnapshot{}, false
+	}
+	defer r.Close()
+	file, err := openRegularDownloadFile(r, "file", os.O_RDONLY)
+	if err != nil {
+		return checkpointTransferSnapshot{}, false
+	}
+	defer file.Close()
+	proof, err := file.Stat()
+	if err != nil {
+		return checkpointTransferSnapshot{}, false
+	}
+	path, _, err := transferStagePath(stage, receipt, proof)
+	return checkpointTransferSnapshot{Path: filepath.ToSlash(path), Size: proof.Size(), ModTime: proof.ModTime().UnixNano(), FileID: checkpointFileID(file, proof)}, err == nil
+}
+
+func (w *checkpointWorkspace) reclaimTransfers(stage *os.Root, sealed map[string]checkpointTransferSnapshot) {
+	if len(sealed) == 0 {
+		return
+	}
 	w.indexTransferReceipts()
 	for path := range w.receipts {
-		w.pruneTransferReceipts(stage, path, true)
+		w.pruneTransferReceipts(stage, path, sealed)
 	}
 }
 
-func (w *checkpointWorkspace) pruneTransferReceipts(stage *os.Root, path string, reclaim bool) {
+func (w *checkpointWorkspace) pruneTransferReceipts(stage *os.Root, path string, sealed map[string]checkpointTransferSnapshot) {
 	remaining := slices.DeleteFunc(w.receipts[path], func(receipt checkpointReceipt) bool {
-		return w.releaseTransfer(stage, receipt, reclaim)
+		if sealed == nil {
+			return w.releaseTransfer(stage, receipt, nil)
+		}
+		state, ok := sealed[receipt.dirName]
+		return ok && w.releaseTransfer(stage, receipt, &state)
 	})
 	if len(remaining) > 0 {
 		w.receipts[path] = remaining
@@ -222,12 +305,12 @@ func (w *checkpointWorkspace) readTransferReceipt(name string) (checkpointReceip
 	}
 	err = json.NewDecoder(io.LimitReader(f, 8192)).Decode(&receipt)
 	f.Close()
-	if err != nil || receipt.Owner != w.owner || !safeRepoPath(receipt.Path) || !filepath.IsLocal(filepath.FromSlash(receipt.Path)) || receipt.Path == checkpointOwnerName {
+	if err != nil || receipt.Owner != w.owner || !safeRepoPath(receipt.Path) || !filepath.IsLocal(filepath.FromSlash(receipt.Path)) || receipt.Path == checkpointOwnerName || receipt.Path == checkpointPublicationName || receipt.Path == checkpointCleanupName {
 		return receipt, false
 	}
 	if receipt.Partial {
 		final, ok := strings.CutSuffix(receipt.Path, ".part")
-		if !ok || !safeRepoPath(final) || final == checkpointOwnerName || final == checkpointPublicationName {
+		if !ok || !safeRepoPath(final) || final == checkpointOwnerName || final == checkpointPublicationName || final == checkpointCleanupName {
 			return receipt, false
 		}
 	}
@@ -248,7 +331,7 @@ func (w *checkpointWorkspace) openTransferReceipt(receipt checkpointReceipt) *os
 	return r
 }
 
-func (w *checkpointWorkspace) releaseTransfer(stage *os.Root, receipt checkpointReceipt, reclaim bool) bool {
+func (w *checkpointWorkspace) releaseTransfer(stage *os.Root, receipt checkpointReceipt, sealed *checkpointTransferSnapshot) bool {
 	r := w.openTransferReceipt(receipt)
 	if r == nil {
 		return false
@@ -257,43 +340,96 @@ func (w *checkpointWorkspace) releaseTransfer(stage *os.Root, receipt checkpoint
 	proof, err := r.Lstat("file")
 	switch {
 	case err == nil && proof.Mode().IsRegular():
-		path := filepath.FromSlash(receipt.Path)
-		sidecar := !receipt.Partial
-		info, err := stage.Lstat(path)
-		if err != nil && !os.IsNotExist(err) {
+		path, info, err := transferStagePath(stage, receipt, proof)
+		if err != nil {
 			return false
 		}
-		stillStaged := err == nil && info.Mode().IsRegular() && os.SameFile(info, proof)
-		if receipt.Partial && !stillStaged {
-			// A writer can die after renaming the partial but before recording the final file.
-			final := strings.TrimSuffix(path, ".part")
-			completed, err := stage.Lstat(final)
-			if err != nil && !os.IsNotExist(err) {
+		staged := path != ""
+		renamedPartial := staged && receipt.Partial && path != filepath.FromSlash(receipt.Path)
+		if sealed == nil && staged && (!renamedPartial || !w.hasCompletedTransfer(filepath.ToSlash(path), info)) {
+			return false
+		}
+		if sealed != nil {
+			if !sealed.matches(r, proof, path) {
 				return false
 			}
-			if err == nil && completed.Mode().IsRegular() && os.SameFile(completed, proof) {
-				if !reclaim && !w.hasCompletedTransfer(filepath.ToSlash(final), completed) {
+			if staged && receipt.canReclaim(stage, path, info, renamedPartial) {
+				current, err := stage.Lstat(path)
+				if err != nil || !sameCheckpointFileState(info, current) || stage.Remove(path) != nil {
 					return false
 				}
-				path, info, stillStaged = final, completed, reclaim
-				sidecar = true
-			}
-		}
-		if stillStaged && !reclaim {
-			return false
-		}
-		if stillStaged && (receipt.Partial || info.Size() == receipt.Size && info.ModTime().UnixNano() == receipt.ModTime) {
-			if err := stage.Remove(path); err != nil {
-				return false
-			}
-			if sidecar && receipt.SHA256 != "" && checkpointDigestSidecar(stage, path, info) == receipt.SHA256 {
-				_ = stage.Remove(sidecarPath(path))
+				if (!receipt.Partial || renamedPartial) && receipt.SHA256 != "" && checkpointDigestSidecar(stage, path, info) == receipt.SHA256 {
+					_ = stage.Remove(sidecarPath(path))
+				}
 			}
 		}
 	case !os.IsNotExist(err):
 		return false
 	}
 	return w.removeTransferReceipt(r, receipt)
+}
+
+func transferStagePath(stage *os.Root, receipt checkpointReceipt, proof os.FileInfo) (string, os.FileInfo, error) {
+	path := filepath.FromSlash(receipt.Path)
+	info, err := stage.Lstat(path)
+	if err == nil && info.Mode().IsRegular() && os.SameFile(info, proof) {
+		return path, info, nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return "", nil, err
+	}
+	if receipt.Partial {
+		final := strings.TrimSuffix(path, ".part")
+		info, err := stage.Lstat(final)
+		if err == nil && info.Mode().IsRegular() && os.SameFile(info, proof) {
+			return final, info, nil
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return "", nil, err
+		}
+	}
+	return "", nil, nil
+}
+
+func (s checkpointTransferSnapshot) matches(root *os.Root, proof os.FileInfo, path string) bool {
+	if (path != "" && filepath.ToSlash(path) != s.Path) || proof.Size() != s.Size || proof.ModTime().UnixNano() != s.ModTime {
+		return false
+	}
+	if s.FileID == "" {
+		return true
+	}
+	f, err := openRegularDownloadFile(root, "file", os.O_RDONLY)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	return err == nil && sameCheckpointFileState(proof, info) && checkpointFileID(f, info) == s.FileID
+}
+
+func (r checkpointReceipt) canReclaim(stage *os.Root, path string, info os.FileInfo, renamedPartial bool) bool {
+	if !r.Partial {
+		return info.Size() == r.Size && info.ModTime().UnixNano() == r.ModTime
+	}
+	if !renamedPartial {
+		return true
+	}
+	// The hard link proves identity, while the pre-rename record proves the contents at completion.
+	c := r.Completion
+	if c == nil || c.SHA256 == "" || info.Size() != c.Size || info.ModTime().UnixNano() != c.ModTime {
+		return false
+	}
+	f, err := openRegularDownloadFile(stage, path, os.O_RDONLY)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil || !sameCheckpointFileState(info, opened) {
+		return false
+	}
+	digest, err := hashCheckpointFile(File{Path: path, Size: c.Size}, f)
+	return err == nil && digest == c.SHA256 && confirmCheckpointFile(stage, path, f, info) == nil
 }
 
 func (w *checkpointWorkspace) hasCompletedTransfer(path string, info os.FileInfo) bool {

@@ -17,6 +17,7 @@ const (
 	checkpointOwnerName       = ".goinfer-owner.json"
 	checkpointWorkSuffix      = ".pull2"
 	checkpointPublicationName = ".goinfer-publication.json"
+	checkpointCleanupName     = ".goinfer-cleanup.json"
 )
 
 func checkpointWorkspaceName(dest string) string { return "." + dest + checkpointWorkSuffix }
@@ -37,6 +38,11 @@ type checkpointWorkspaceOwner struct {
 type checkpointPublication struct {
 	Owner checkpointWorkspaceOwner `json:"owner"`
 	Token string                   `json:"token"`
+}
+
+type checkpointCleanup struct {
+	checkpointPublication
+	Transfers map[string]checkpointTransferSnapshot `json:"transfers"`
 }
 
 func (w *checkpointWorkspace) Close() {
@@ -141,15 +147,16 @@ func (w *checkpointWorkspace) reclaimCompletedStage(parent *os.Root, dest string
 	}
 	defer stage.Close()
 	if w.matchesPublication(stage, complete.publication) {
-		w.reclaimTransfers(stage)
+		if cleanup, err := readCheckpointCleanup(stage); err == nil && cleanup.Owner == w.owner && cleanup.Token == complete.publication {
+			w.reclaimTransfers(stage, cleanup.Transfers)
+		}
 	}
 }
 
 // Rotate the stage token before mutating any files. A restored checkpoint from an earlier
 // publication cannot authorize cleanup of a later transfer at the same destination.
 func (w *checkpointWorkspace) beginPublication(stage *os.Root) (string, error) {
-	var old checkpointPublication
-	err := readCheckpointWorkspaceRecord(stage, checkpointPublicationName, &old)
+	old, err := readCheckpointPublication(stage)
 	if !os.IsNotExist(err) && (err != nil || old.Owner != w.owner || old.Token == "") {
 		return "", fmt.Errorf("%s has no verified owner", checkpointPublicationName)
 	}
@@ -162,8 +169,36 @@ func (w *checkpointWorkspace) beginPublication(stage *os.Root) (string, error) {
 }
 
 func (w *checkpointWorkspace) matchesPublication(stage *os.Root, token string) bool {
+	record, err := readCheckpointPublication(stage)
+	return token != "" && err == nil && record.Owner == w.owner && record.Token == token
+}
+
+func readCheckpointPublication(stage *os.Root) (checkpointPublication, error) {
 	var record checkpointPublication
-	return token != "" && readCheckpointWorkspaceRecord(stage, checkpointPublicationName, &record) == nil && record.Owner == w.owner && record.Token == token
+	err := readCheckpointWorkspaceRecord(stage, checkpointPublicationName, 4096, &record)
+	return record, err
+}
+
+func readCheckpointCleanup(stage *os.Root) (checkpointCleanup, error) {
+	var record checkpointCleanup
+	err := readCheckpointWorkspaceRecord(stage, checkpointCleanupName, maxIndexBytes, &record)
+	return record, err
+}
+
+func (w *checkpointWorkspace) sealCheckpointCleanup(stage *os.Root, token string) (checkpointCleanup, error) {
+	old, err := readCheckpointCleanup(stage)
+	if !os.IsNotExist(err) && (err != nil || old.Owner != w.owner || old.Token == "") {
+		return checkpointCleanup{}, fmt.Errorf("%s has no verified owner", checkpointCleanupName)
+	}
+	cleanup := checkpointCleanup{checkpointPublication: checkpointPublication{Owner: w.owner, Token: token}, Transfers: w.snapshotTransfers(stage)}
+	raw, err := json.Marshal(cleanup)
+	if err != nil {
+		return checkpointCleanup{}, err
+	}
+	if len(raw) > maxIndexBytes {
+		return checkpointCleanup{}, fmt.Errorf("checkpoint cleanup record is too large")
+	}
+	return cleanup, replaceRootFile(stage, checkpointCleanupName, raw)
 }
 
 // Keep the stable workspace or stage name absent until its owner is fully recorded.
@@ -211,21 +246,21 @@ func writeCheckpointOwner(root *os.Root, owner checkpointWorkspaceOwner) error {
 
 func readCheckpointOwner(root *os.Root) (checkpointWorkspaceOwner, error) {
 	var owner checkpointWorkspaceOwner
-	err := readCheckpointWorkspaceRecord(root, checkpointOwnerName, &owner)
+	err := readCheckpointWorkspaceRecord(root, checkpointOwnerName, 4096, &owner)
 	return owner, err
 }
 
-func readCheckpointWorkspaceRecord(root *os.Root, name string, value any) error {
+func readCheckpointWorkspaceRecord(root *os.Root, name string, limit int64, value any) error {
 	file, err := openRegularDownloadFile(root, name, os.O_RDONLY)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	raw, err := io.ReadAll(io.LimitReader(file, 4097))
+	raw, err := io.ReadAll(io.LimitReader(file, limit+1))
 	if err != nil {
 		return err
 	}
-	if len(raw) > 4096 {
+	if int64(len(raw)) > limit {
 		return fmt.Errorf("checkpoint workspace record %s is too large", name)
 	}
 	return json.Unmarshal(raw, value)
@@ -367,6 +402,14 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 		}
 		return err
 	}
+	if !work.matchesPublication(stage, publication) {
+		return fmt.Errorf("checkpoint publication record changed before rename")
+	}
+	// Seal exactly the receipts and file states this publication is allowed to reclaim.
+	cleanup, err := work.sealCheckpointCleanup(stage, publication)
+	if err != nil {
+		return err
+	}
 	if err := renameCheckpointPublication(parent, relativePublish, dest); err != nil {
 		return err
 	}
@@ -383,7 +426,7 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 			}
 		}
 	}
-	work.reclaimTransfers(stage)
+	work.reclaimTransfers(stage, cleanup.Transfers)
 	return nil
 }
 

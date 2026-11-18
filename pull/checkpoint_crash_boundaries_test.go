@@ -40,7 +40,7 @@ func TestCheckpointTransferCrashBoundaries(t *testing.T) {
 				}
 				return f, err
 			}
-		case "rename", "replaced":
+		case "rename", "replaced", "edited", "edited same stat":
 			renameCompletedDownload = func(root *os.Root, src, dest string) error {
 				if err := root.Rename(src, dest); err != nil {
 					return err
@@ -56,14 +56,14 @@ func TestCheckpointTransferCrashBoundaries(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err = download(t.Context(), dest, nil)
-		if mode == "other version" && err != nil && strings.Contains(err.Error(), checkpointCrashShard) {
+		if (mode == "other version" || mode == "older writer") && err != nil && strings.Contains(err.Error(), checkpointCrashShard) {
 			pause()
 			return
 		}
 		t.Fatalf("pull returned before the crash boundary: %v", err)
 	}
 
-	for _, mode := range []string{"other version", "create", "create collision", "rename", "replaced"} {
+	for _, mode := range []string{"other version", "older writer", "create", "create collision", "rename", "replaced", "edited", "edited same stat"} {
 		t.Run(mode, func(t *testing.T) {
 			split := shardedTinyRepo(t)
 			weights, err := os.ReadFile("../testdata/llama-tiny/model.safetensors")
@@ -79,16 +79,53 @@ func TestCheckpointTransferCrashBoundaries(t *testing.T) {
 			stage := testCheckpointStagePath(dest)
 			part := filepath.Join(stage, checkpointCrashShard+".part")
 			final := filepath.Join(stage, checkpointCrashShard)
-			if mode == "other version" {
+			legacy := os.Getenv("GOINFER_TEST_LEGACY_PULL_BINARY")
+			if mode == "older writer" && legacy != "" {
+				shared := filepath.Join(parent, "shared")
+				killCheckpointAtTransferBoundary(t, "older lock", shared, func() {
+					_, download, err := PrepareCheckpointFor(t.Context(), checkpointCrashRepo, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := download(t.Context(), shared, nil); err == nil || !strings.Contains(err.Error(), "another checkpoint pull") {
+						t.Fatalf("current writer was not excluded by old writer: %v", err)
+					}
+					t.Log("current writer was excluded by the legacy process")
+				})
+			}
+			var oldPublication []byte
+			if mode == "other version" || mode == "older writer" {
 				setCrashRepoFiles(h, single, "")
 				pullCrashCheckpoint(t, dest)
 				if err := os.Rename(dest, backup); err != nil {
 					t.Fatal(err)
 				}
+				if mode == "older writer" {
+					oldPublication, err = os.ReadFile(filepath.Join(stage, checkpointPublicationName))
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
 				setCrashRepoFiles(h, split, checkpointCrashShard)
 			}
-			killCheckpointAtTransferBoundary(t, mode, dest)
-			if mode == "other version" {
+			var contention func()
+			if mode == "create" && legacy != "" {
+				contention = func() {
+					cmd := checkpointCrashCommand(t.Context(), legacy, "legacy blocked", dest)
+					if out, err := cmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "locked") {
+						t.Fatalf("legacy writer was not excluded by current writer: %v\n%s", err, out)
+					}
+					t.Log("legacy writer was excluded by the current process")
+				}
+			}
+			killCheckpointAtTransferBoundary(t, mode, dest, contention)
+			if mode == "older writer" && legacy == "" {
+				// Older writers use the same lock and receipts but leave the publication record alone.
+				if err := os.WriteFile(filepath.Join(stage, checkpointPublicationName), oldPublication, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "other version" || mode == "older writer" {
 				before, err := os.ReadFile(part)
 				if err != nil || len(before) == 0 {
 					t.Fatalf("interrupted version B has no staged prefix: %v", err)
@@ -150,6 +187,20 @@ func TestCheckpointTransferCrashBoundaries(t *testing.T) {
 			}
 			replacement := bytes.Clone(split[checkpointCrashShard])
 			replacement[0] ^= 1
+			if mode == "edited" || mode == "edited same stat" {
+				if mode == "edited" {
+					replacement = []byte("local replacement written in place")
+				}
+				if err := os.WriteFile(final, replacement, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chtimes(final, info.ModTime(), info.ModTime()); err != nil {
+					t.Fatal(err)
+				}
+				if after, err := os.Stat(final); err != nil || !os.SameFile(after, info) {
+					t.Fatalf("edit did not preserve inode: %v", err)
+				}
+			}
 			if mode == "replaced" {
 				if err := os.WriteFile(final+".new", replacement, 0o600); err != nil {
 					t.Fatal(err)
@@ -172,6 +223,10 @@ func TestCheckpointTransferCrashBoundaries(t *testing.T) {
 				}
 				if raw, err := os.ReadFile(part); err != nil || string(raw) != "keep" {
 					t.Errorf("unrelated .part was not preserved: %q, %v", raw, err)
+				}
+			} else if mode == "edited" || mode == "edited same stat" {
+				if raw, err := os.ReadFile(final); err != nil || !bytes.Equal(raw, replacement) {
+					t.Errorf("edit of completed inode was not preserved: %v", err)
 				}
 			} else if _, err := os.Lstat(final); !os.IsNotExist(err) {
 				t.Errorf("%d obsolete bytes remained after format switch: %v", info.Size(), err)
@@ -209,12 +264,41 @@ func TestCheckpointPullWhenPartialLinkUnavailable(t *testing.T) {
 	}
 }
 
-func killCheckpointAtTransferBoundary(t *testing.T, mode, dest string) {
+func TestCheckpointCacheEntriesIgnorePublicationRecord(t *testing.T) {
+	withCacheRoot(t)
+	h := &fakeHF{files: shardedTinyRepo(t)}
+	h.serve(t, checkpointCrashRepo)
+	dest, err := CacheDir(checkpointCrashRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pullCrashCheckpoint(t, dest)
+	if err := os.Rename(dest, filepath.Join(t.TempDir(), "completed")); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := CacheEntries()
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("cache contains a record-only checkpoint: %+v, %v", entries, err)
+	}
+	notes := []byte("local file should count")
+	if err := os.WriteFile(filepath.Join(testCheckpointStagePath(dest), "notes.txt"), notes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = CacheEntries()
+	if err != nil || len(entries) != 1 || entries[0].Bytes != int64(len(notes)) || entries[0].Complete {
+		t.Errorf("cache should count only the staged data: %+v, %v", entries, err)
+	}
+}
+
+func killCheckpointAtTransferBoundary(t *testing.T, mode, dest string, during func()) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCheckpointTransferCrashBoundaries$")
-	cmd.Env = append(os.Environ(), checkpointCrashMode+"="+mode, checkpointCrashDest+"="+dest, "GOINFER_TEST_CHECKPOINT_API="+hfAPI, "GOINFER_TEST_CHECKPOINT_CDN="+hfCDN)
+	var legacy string
+	if mode == "older writer" || mode == "older lock" {
+		legacy = os.Getenv("GOINFER_TEST_LEGACY_PULL_BINARY")
+	}
+	cmd := checkpointCrashCommand(ctx, legacy, mode, dest)
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -236,12 +320,25 @@ func killCheckpointAtTransferBoundary(t *testing.T, mode, dest string) {
 	if line, err := bufio.NewReader(out).ReadString('\n'); line != "ready\n" || err != nil {
 		t.Fatalf("process did not reach %s: %q, %v", mode, line, err)
 	}
+	if during != nil {
+		during()
+	}
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
 	if err := cmd.Wait(); err == nil {
 		t.Fatal("writer exited normally")
 	}
+}
+
+func checkpointCrashCommand(ctx context.Context, legacy, mode, dest string) *exec.Cmd {
+	binary, test := os.Args[0], "-test.run=^TestCheckpointTransferCrashBoundaries$"
+	if legacy != "" {
+		binary, test = legacy, "-test.run=^TestLegacyCheckpointWriter$"
+	}
+	cmd := exec.CommandContext(ctx, binary, test)
+	cmd.Env = append(os.Environ(), checkpointCrashMode+"="+mode, checkpointCrashDest+"="+dest, "GOINFER_TEST_CHECKPOINT_API="+hfAPI, "GOINFER_TEST_CHECKPOINT_CDN="+hfCDN)
+	return cmd
 }
 
 func setCrashRepoFiles(h *fakeHF, files map[string][]byte, fail string) {

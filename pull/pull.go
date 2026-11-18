@@ -799,6 +799,11 @@ func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File
 		}
 	}
 	finish := func(transferRoot *os.Root, src, target string, verified os.FileInfo, id string) error {
+		if work != nil && transferRoot == root {
+			if err := work.recordTransferCompletion(src, verified, hex.EncodeToString(h.Sum(nil))); err != nil {
+				return err
+			}
+		}
 		if err := commitDownload(transferRoot, src, target, verified, id, f.SHA256); err != nil {
 			return err
 		}
