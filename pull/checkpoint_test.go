@@ -214,8 +214,22 @@ func TestPlanCheckpointRejectsPlamo3BeforeWeights(t *testing.T) {
 }
 
 func TestResolveLegacyCheckpointCache(t *testing.T) {
-	for _, modelType := range []string{"plamo3", "llama"} {
-		t.Run(modelType, func(t *testing.T) {
+	for _, tc := range []struct {
+		name, modelType string
+		link, wantErr   string
+	}{
+		{name: "PLaMo regular", modelType: "plamo3", wantErr: "tokenizer.jsonl"},
+		{name: "Llama regular", modelType: "llama"},
+		{name: "PLaMo relative link", modelType: "plamo3", link: "relative", wantErr: "tokenizer.jsonl"},
+		{name: "Llama relative link", modelType: "llama", link: "relative"},
+		{name: "PLaMo absolute local link", modelType: "plamo3", link: "absolute", wantErr: "tokenizer.jsonl"},
+		{name: "Llama absolute local link", modelType: "llama", link: "absolute"},
+		{name: "broken link", modelType: "llama", link: "broken", wantErr: "config.json"},
+		{name: "relative escape", modelType: "plamo3", link: "relative escape", wantErr: "config.json"},
+		{name: "absolute escape", modelType: "plamo3", link: "absolute escape", wantErr: "config.json"},
+		{name: "chained escape", modelType: "plamo3", link: "chained escape", wantErr: "config.json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			withCacheRoot(t)
 			const repo = "o/legacy"
 			dir, err := CacheDir(repo)
@@ -225,7 +239,7 @@ func TestResolveLegacyCheckpointCache(t *testing.T) {
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			config := []byte(fmt.Sprintf(`{"model_type":%q}`, modelType))
+			config := []byte(fmt.Sprintf(`{"model_type":%q}`, tc.modelType))
 			weights := []byte("legacy weights")
 			marker, err := json.Marshal(markerDoc{Repo: repo, Files: []File{
 				{Path: "config.json", Size: int64(len(config))},
@@ -234,19 +248,58 @@ func TestResolveLegacyCheckpointCache(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			files := map[string][]byte{"config.json": config, "model.safetensors": weights, checkpointMarker: marker}
+			configPath := filepath.Join(dir, "config.json")
+			configFile := configPath
+			var linkTarget string
+			switch tc.link {
+			case "relative", "absolute":
+				configFile = filepath.Join(dir, "model-config.json")
+				linkTarget = filepath.Base(configFile)
+				if tc.link == "absolute" {
+					linkTarget, err = filepath.EvalSymlinks(dir)
+					if err != nil {
+						t.Fatal(err)
+					}
+					linkTarget = filepath.Join(linkTarget, filepath.Base(configFile))
+				}
+			case "broken":
+				configFile, linkTarget = "", "missing.json"
+			case "relative escape", "absolute escape", "chained escape":
+				configFile = filepath.Join(t.TempDir(), "outside-config.json")
+				linkTarget = configFile
+				if tc.link == "relative escape" {
+					linkTarget, err = filepath.Rel(dir, configFile)
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else if tc.link == "chained escape" {
+					saveCheckpointConfigLink(t, configFile, filepath.Join(dir, "intermediate.json"))
+					linkTarget = "intermediate.json"
+				}
+			}
+			files := map[string][]byte{filepath.Join(dir, "model.safetensors"): weights, filepath.Join(dir, checkpointMarker): marker}
+			if configFile != "" {
+				files[configFile] = config
+			}
 			for name, data := range files {
-				if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
+				if err := os.WriteFile(name, data, 0o644); err != nil {
 					t.Fatal(err)
 				}
+			}
+			if linkTarget != "" {
+				saveCheckpointConfigLink(t, linkTarget, configPath)
 			}
 			h := &fakeHF{}
 			h.serve(t, repo)
 			resolved, err := Resolve(t.Context(), "hf:"+repo+":safetensors", nil)
 			cached, ok := CachedCheckpoint(dir)
-			if modelType == "plamo3" {
-				if resolved != "" || err == nil || !strings.Contains(err.Error(), "tokenizer.jsonl") || !strings.Contains(err.Error(), "local directory") {
-					t.Errorf("Resolve = %q, %v; want local-directory guidance", resolved, err)
+			if tc.wantErr != "" {
+				if resolved != "" || err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("Resolve = %q, %v; want refusal mentioning %q", resolved, err, tc.wantErr)
+				} else if tc.wantErr == "tokenizer.jsonl" && !strings.Contains(err.Error(), "local directory") {
+					t.Errorf("Resolve error lacks local-directory guidance: %v", err)
+				} else if tc.wantErr == "config.json" && strings.Contains(err.Error(), "tokenizer.jsonl") {
+					t.Errorf("Resolve diagnosed PLaMo through an unusable config link: %v", err)
 				}
 				if cached != "" || ok {
 					t.Errorf("CachedCheckpoint = %q, %v; want refusal", cached, ok)
@@ -261,12 +314,24 @@ func TestResolveLegacyCheckpointCache(t *testing.T) {
 				t.Errorf("cache lookup made %d network requests", requests)
 			}
 			for name, want := range files {
-				got, err := os.ReadFile(filepath.Join(dir, name))
+				got, err := os.ReadFile(name)
 				if err != nil || !bytes.Equal(got, want) {
 					t.Errorf("cache file %s changed: %v", name, err)
 				}
 			}
+			if linkTarget != "" {
+				if got, err := os.Readlink(configPath); err != nil || got != linkTarget {
+					t.Errorf("config link changed: got %q, %v; want %q", got, err, linkTarget)
+				}
+			}
 		})
+	}
+}
+
+func saveCheckpointConfigLink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -339,27 +340,14 @@ type markerDoc struct {
 }
 
 // checkpointComplete reports whether dir is a complete checkpoint for these files: the marker is there, names the same
-// files, and every file verifies (size and digest, through the digest sidecar cache).
+// files, and the files and layout verify.
 func checkpointComplete(dir string, files []File) bool {
-	b, err := os.ReadFile(filepath.Join(dir, checkpointMarker))
-	if err != nil {
+	m, ok := readCheckpointMarker(dir)
+	if !ok || !slices.Equal(m.Files, files) {
 		return false
 	}
-	var m markerDoc
-	if json.Unmarshal(b, &m) != nil || len(m.Files) != len(files) {
-		return false
-	}
-	for i := range files {
-		if m.Files[i] != files[i] {
-			return false
-		}
-	}
-	for _, f := range files {
-		if _, ok := cachedIntact(filepath.Join(dir, filepath.FromSlash(path.Dir(f.Path))), f); !ok {
-			return false
-		}
-	}
-	return true
+	ok, _ = verifyCachedCheckpoint(dir, m)
+	return ok
 }
 
 // CachedCheckpoint is a complete, supported checkpoint in dir, verified offline from its marker.
@@ -370,39 +358,112 @@ func CachedCheckpoint(dir string) (string, bool) {
 	return "", false
 }
 
-// checkCachedCheckpoint reports an unsupported layout separately from a cache miss.
+// checkCachedCheckpoint reports an unusable config or unsupported layout separately from a cache miss.
 func checkCachedCheckpoint(dir string) (bool, error) {
-	b, err := os.ReadFile(filepath.Join(dir, checkpointMarker))
-	if err != nil {
+	m, ok := readCheckpointMarker(dir)
+	if !ok {
 		return false, nil
 	}
-	var m markerDoc
-	if json.Unmarshal(b, &m) != nil || len(m.Files) == 0 {
-		return false, nil
-	}
-	if err := checkCheckpointLayout(m.Repo, cachedCheckpointModelType(dir)); err != nil {
-		return false, fmt.Errorf("cached checkpoint %s: %w", dir, err)
-	}
-	return checkpointComplete(dir, m.Files), nil
+	return verifyCachedCheckpoint(dir, m)
 }
 
-func cachedCheckpointModelType(dir string) string {
-	p := filepath.Join(dir, "config.json")
-	info, err := os.Lstat(p)
-	if err != nil || !info.Mode().IsRegular() || info.Size() > maxCheckpointConfigBytes {
-		return ""
+func readCheckpointMarker(dir string) (markerDoc, bool) {
+	var m markerDoc
+	b, err := os.ReadFile(filepath.Join(dir, checkpointMarker))
+	if err != nil || json.Unmarshal(b, &m) != nil || len(m.Files) == 0 {
+		return markerDoc{}, false
 	}
-	f, err := os.Open(p)
+	return m, true
+}
+
+func verifyCachedCheckpoint(dir string, m markerDoc) (bool, error) {
+	config, err := readCachedCheckpointConfig(dir)
 	if err != nil {
-		return ""
+		return false, fmt.Errorf("cached checkpoint %s: config.json must be a readable regular file inside the checkpoint directory: %w", dir, err)
+	}
+	if config != nil {
+		var cfg checkpointConfig
+		if err := json.Unmarshal(config, &cfg); err != nil {
+			return false, fmt.Errorf("cached checkpoint %s: parsing config.json: %w", dir, err)
+		}
+		if err := checkCheckpointLayout(m.Repo, cfg.ModelType); err != nil {
+			return false, fmt.Errorf("cached checkpoint %s: %w", dir, err)
+		}
+	}
+	for _, f := range m.Files {
+		if f.Path == "config.json" {
+			// Verify the same bytes used for the layout check without following the link again.
+			if config == nil || int64(len(config)) != f.Size || f.SHA256 != "" && fmt.Sprintf("%x", sha256.Sum256(config)) != f.SHA256 {
+				return false, nil
+			}
+		} else if _, ok := cachedIntact(filepath.Join(dir, filepath.FromSlash(path.Dir(f.Path))), f); !ok {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func readCachedCheckpointConfig(dir string) ([]byte, error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	name := "config.json"
+	info, err := root.Lstat(name)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		name, err = cachedConfigLinkName(root, name)
+		if err != nil {
+			return nil, err
+		}
+		info, err = root.Stat(name)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("config target is not a regular file")
+	}
+	if info.Size() > maxCheckpointConfigBytes {
+		return nil, fmt.Errorf("config exceeds %d bytes", maxCheckpointConfigBytes)
+	}
+	f, err := root.Open(name)
+	if err != nil {
+		return nil, err
 	}
 	defer f.Close()
 	raw, err := io.ReadAll(io.LimitReader(f, maxCheckpointConfigBytes+1))
-	var cfg checkpointConfig
-	if err != nil || len(raw) > maxCheckpointConfigBytes || json.Unmarshal(raw, &cfg) != nil {
-		return ""
+	if len(raw) > maxCheckpointConfigBytes {
+		return nil, fmt.Errorf("config exceeds %d bytes", maxCheckpointConfigBytes)
 	}
-	return cfg.ModelType
+	return raw, err
+}
+
+// Root follows confined relative links. Map a direct absolute link inside the checkpoint to a rooted name.
+func cachedConfigLinkName(root *os.Root, name string) (string, error) {
+	target, err := root.Readlink(name)
+	if err != nil || !filepath.IsAbs(target) {
+		return name, err
+	}
+	dir, err := filepath.EvalSymlinks(root.Name())
+	if err != nil {
+		return "", err
+	}
+	dir, err = filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(dir, target)
+	if err != nil || filepath.Clean(target) != target || !filepath.IsLocal(rel) {
+		return "", fmt.Errorf("absolute config link leaves the checkpoint directory or is not canonical")
+	}
+	return rel, nil
 }
 
 // DownloadCheckpoint fetches every file in p into dest and returns dest. The set is assembled in a staging directory
