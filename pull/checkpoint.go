@@ -478,14 +478,17 @@ func checkCompletedRemoteFile(ctx context.Context, root *os.Root, repo string, f
 
 // CachedCheckpoint is a complete, supported checkpoint in dir, verified offline from its marker.
 func CachedCheckpoint(dir string) (string, bool) {
-	if ok, _ := checkCachedCheckpoint(dir); ok {
+	if ok, _ := checkCachedCheckpoint(context.Background(), dir); ok {
 		return dir, true
 	}
 	return "", false
 }
 
 // checkCachedCheckpoint reports an unusable config or unsupported layout separately from a cache miss.
-func checkCachedCheckpoint(dir string) (bool, error) {
+func checkCachedCheckpoint(ctx context.Context, dir string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return false, nil
@@ -499,7 +502,7 @@ func checkCachedCheckpoint(dir string) (bool, error) {
 	if info, err := root.Stat("."); err != nil || info.Mode().Perm()&0o222 == 0 {
 		check = checkpointReadOnlyDigest
 	}
-	return verifyCachedCheckpoint(context.Background(), dir, root, m, checkpointMetadata{}, check)
+	return verifyCachedCheckpoint(ctx, dir, root, m, checkpointMetadata{}, check)
 }
 
 func readCheckpointMarker(root *os.Root) (markerDoc, bool) {

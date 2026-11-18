@@ -688,9 +688,9 @@ func TestCheckpointDefersCleanupForLegacyWriterReuse(t *testing.T) {
 }
 
 func TestCheckpointPullWhenPartialLinkUnavailable(t *testing.T) {
-	link := linkCheckpointPartial
-	linkCheckpointPartial = func(*os.Root, string, string) error { return os.ErrPermission }
-	t.Cleanup(func() { linkCheckpointPartial = link })
+	link := linkCheckpointTransfer
+	linkCheckpointTransfer = func(*os.Root, string, string) error { return os.ErrPermission }
+	t.Cleanup(func() { linkCheckpointTransfer = link })
 	h := &fakeHF{files: shardedTinyRepo(t), failOnce: checkpointCrashShard}
 	h.serve(t, checkpointCrashRepo)
 	dest := filepath.Join(t.TempDir(), "checkpoint")

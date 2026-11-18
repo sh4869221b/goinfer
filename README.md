@@ -177,7 +177,9 @@ on the next pull.
 Older checkpoints remain usable, and recovery leaves their
 stage data in place when no matching cleanup record exists. Resuming an existing `.part`
 requires a transfer record with a matching hard link. On filesystems without hard links,
-interrupted transfers restart from the beginning. If the pull reports an unverified partial,
+interrupted transfers restart from the beginning. Completed copies can still be reclaimed
+when the filesystem supplies a matching file ID and change time and the staged content matches
+its recorded digest. If the pull reports an unverified partial,
 inspect the file or choose a different destination.
 Publication writes a separate copy of the staged files and checks the planned digests against
 that copy. Allow space for the remaining downloads and one full copy, about twice the file

@@ -22,6 +22,7 @@ type checkpointReceipt struct {
 	SHA256     string                        `json:"sha256,omitempty"`
 	Partial    bool                          `json:"partial,omitempty"`
 	Completion *checkpointTransferCompletion `json:"completion,omitempty"`
+	Identity   *checkpointTransferIdentity   `json:"identity,omitempty"`
 
 	dirName string
 	dirInfo os.FileInfo
@@ -33,16 +34,22 @@ type checkpointTransferCompletion struct {
 	SHA256  string `json:"sha256"`
 }
 
-type checkpointTransferSnapshot struct {
-	Path    string `json:"path,omitempty"`
-	Size    int64  `json:"size"`
-	ModTime int64  `json:"mtime"`
-	FileID  string `json:"file_id,omitempty"`
-	NoProof bool   `json:"no_proof,omitempty"`
+type checkpointTransferIdentity struct {
+	FileID     string `json:"file_id"`
+	ChangeTime int64  `json:"change_time"`
 }
 
-// Save a hard link as proof of the transferred inode. A missing receipt or
-// unsupported hard links means the file will be left in staging.
+type checkpointTransferSnapshot struct {
+	Path       string `json:"path,omitempty"`
+	Size       int64  `json:"size"`
+	ModTime    int64  `json:"mtime"`
+	FileID     string `json:"file_id,omitempty"`
+	NoProof    bool   `json:"no_proof,omitempty"`
+	ChangeTime int64  `json:"change_time,omitempty"`
+	SHA256     string `json:"sha256,omitempty"`
+}
+
+// Record proof of the staged file so publication cleanup can be restarted.
 func (w *checkpointWorkspace) recordTransfer(stage *os.Root, file File) {
 	info, err := stage.Lstat(filepath.FromSlash(file.Path))
 	if err != nil {
@@ -63,13 +70,13 @@ func (w *checkpointWorkspace) recordCompletedTransfer(stage *os.Root, file File,
 		w.completed = make(map[string]checkpointReceipt)
 	}
 	w.completed[file.Path] = receipt
-	w.recordReceipt(receipt, info)
+	w.recordReceipt(stage, receipt, info)
 	w.pruneTransferReceipts(context.Background(), stage, file.Path, nil)
 	w.pruneTransferReceipts(context.Background(), stage, file.Path+".part", nil)
 }
 
 var createCheckpointPartFile = openRegularDownloadFile
-var linkCheckpointPartial = (*os.Root).Link
+var linkCheckpointTransfer = (*os.Root).Link
 
 // Create the inode at its recorded location first. Linking it into staging then exposes
 // the canonical partial atomically, without replacing an existing file.
@@ -97,7 +104,7 @@ func (w *checkpointWorkspace) createPartial(stage *os.Root, name, digest string)
 		return nil, "", err
 	}
 	private := filepath.Join(receipt.dirName, "file")
-	if err := linkCheckpointPartial(w.root, private, filepath.Join(checkpointStageName, name)); err != nil {
+	if err := linkCheckpointTransfer(w.root, private, filepath.Join(checkpointStageName, name)); err != nil {
 		if _, statErr := stage.Lstat(name); !os.IsNotExist(statErr) {
 			return nil, "", err
 		}
@@ -148,17 +155,18 @@ func (w *checkpointWorkspace) newTransferReceipt(receipt *checkpointReceipt) (*o
 	return r, nil
 }
 
-func (w *checkpointWorkspace) recordReceipt(receipt checkpointReceipt, info os.FileInfo) {
+func (w *checkpointWorkspace) recordReceipt(stage *os.Root, receipt checkpointReceipt, info os.FileInfo) {
 	r, err := w.newTransferReceipt(&receipt)
 	if err != nil {
 		return
 	}
 	defer r.Close()
-	if err := w.root.Link(filepath.Join(checkpointStageName, filepath.FromSlash(receipt.Path)), filepath.Join(receipt.dirName, "file")); err != nil {
-		w.removeTransferReceipt(r, receipt)
-		return
-	}
-	if proof, err := r.Lstat("file"); err != nil || !proof.Mode().IsRegular() || !sameCheckpointFileState(proof, info) {
+	if err := linkCheckpointTransfer(w.root, filepath.Join(checkpointStageName, filepath.FromSlash(receipt.Path)), filepath.Join(receipt.dirName, "file")); err != nil {
+		if !w.recordTransferIdentity(stage, r, &receipt, info) {
+			w.removeTransferRecord(r, receipt)
+			return
+		}
+	} else if proof, err := r.Lstat("file"); err != nil || !proof.Mode().IsRegular() || !sameCheckpointFileState(proof, info) {
 		w.removeTransferReceipt(r, receipt)
 		return
 	}
@@ -238,6 +246,10 @@ func (w *checkpointWorkspace) captureTransferSnapshot(stage *os.Root, receipt ch
 		return checkpointTransferSnapshot{}, false
 	}
 	defer r.Close()
+	if receipt.Identity != nil {
+		state, _, ok := receipt.identitySnapshot(stage, r)
+		return state, ok && (state.NoProof || state == receipt.recordedSnapshot())
+	}
 	file, err := openRegularDownloadFile(r, "file", os.O_RDONLY)
 	if os.IsNotExist(err) {
 		return checkpointTransferSnapshot{NoProof: true}, true
@@ -353,6 +365,9 @@ func (w *checkpointWorkspace) readTransferReceipt(name string) (checkpointReceip
 	if err != nil || receipt.Owner != w.owner || !safeRepoPath(receipt.Path) || !filepath.IsLocal(filepath.FromSlash(receipt.Path)) || receipt.Path == checkpointOwnerName || receipt.Path == checkpointPublicationName || receipt.Path == checkpointCleanupName {
 		return receipt, false
 	}
+	if receipt.Identity != nil && (receipt.Partial || receipt.SHA256 == "" || receipt.Identity.FileID == "" || receipt.Identity.ChangeTime == 0) {
+		return receipt, false
+	}
 	if receipt.Partial {
 		final, ok := strings.CutSuffix(receipt.Path, ".part")
 		if !ok || !safeRepoPath(final) || final == checkpointOwnerName || final == checkpointPublicationName || final == checkpointCleanupName {
@@ -385,6 +400,9 @@ func (w *checkpointWorkspace) releaseTransfer(ctx context.Context, stage *os.Roo
 		return false
 	}
 	defer r.Close()
+	if receipt.Identity != nil {
+		return w.releaseIdentityTransfer(ctx, stage, r, receipt, sealed)
+	}
 	proof, err := r.Lstat("file")
 	switch {
 	case err == nil && proof.Mode().IsRegular():
@@ -492,9 +510,15 @@ func (w *checkpointWorkspace) hasCompletedTransfer(path string, info os.FileInfo
 }
 
 func (w *checkpointWorkspace) removeTransferReceipt(r *os.Root, receipt checkpointReceipt) bool {
-	if err := r.Remove("file"); err != nil && !os.IsNotExist(err) {
-		return false
+	if receipt.Identity == nil {
+		if err := r.Remove("file"); err != nil && !os.IsNotExist(err) {
+			return false
+		}
 	}
+	return w.removeTransferRecord(r, receipt)
+}
+
+func (w *checkpointWorkspace) removeTransferRecord(r *os.Root, receipt checkpointReceipt) bool {
 	if err := r.Remove("transfer.json"); err != nil && !os.IsNotExist(err) {
 		return false
 	}
