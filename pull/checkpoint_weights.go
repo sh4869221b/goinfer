@@ -15,16 +15,20 @@ import (
 )
 
 func checkpointDigestSidecar(root *os.Root, name string, info os.FileInfo) string {
+	return readCheckpointDigest(root, name, info).SHA256
+}
+
+func readCheckpointDigest(root *os.Root, name string, info os.FileInfo) digestSidecar {
 	f, err := openRegularDownloadFile(root, sidecarPath(name), os.O_RDONLY)
 	if err != nil {
-		return ""
+		return digestSidecar{}
 	}
 	defer f.Close()
 	var stored digestSidecar
 	if err := json.NewDecoder(io.LimitReader(f, 4096)).Decode(&stored); err == nil && stored.Size == info.Size() && stored.ModTime == info.ModTime().UnixNano() {
-		return stored.SHA256
+		return stored
 	}
-	return ""
+	return digestSidecar{}
 }
 
 // Use the same confined regular-file open for size-only and digest checks.
@@ -42,7 +46,11 @@ func verifyCheckpointFile(root *os.Root, file File, verifyDigest bool) error {
 	if info.Size() != file.Size {
 		return fmt.Errorf("%s has size %d, want %d", file.Path, info.Size(), file.Size)
 	}
-	if !verifyDigest || file.SHA256 == "" || checkpointDigestSidecar(root, name, info) == file.SHA256 {
+	if !verifyDigest || file.SHA256 == "" {
+		return nil
+	}
+	id := checkpointFileID(f, info)
+	if cached := readCheckpointDigest(root, name, info); id != "" && cached.FileID == id && cached.SHA256 == file.SHA256 {
 		return nil
 	}
 	digest, err := hashCheckpointFile(file, f)
@@ -51,6 +59,30 @@ func verifyCheckpointFile(root *os.Root, file File, verifyDigest bool) error {
 	}
 	if digest != file.SHA256 {
 		return fmt.Errorf("%s does not match the checkpoint digest", file.Path)
+	}
+	if err := confirmCheckpointFile(root, name, f, info); err != nil {
+		return fmt.Errorf("checking %s: %w", file.Path, err)
+	}
+	if id != "" {
+		writeRootDigest(root, name, info, id, digest)
+	}
+	return nil
+}
+
+func confirmCheckpointFile(root *os.Root, name string, hashed *os.File, before os.FileInfo) error {
+	current, err := checkpoint.OpenRootFile(root, name)
+	if err != nil {
+		return err
+	}
+	defer current.Close()
+	for _, f := range []*os.File{hashed, current} {
+		info, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		if !os.SameFile(info, before) || info.Size() != before.Size() || !info.ModTime().Equal(before.ModTime()) {
+			return fmt.Errorf("file changed while verifying its digest")
+		}
 	}
 	return nil
 }

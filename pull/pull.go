@@ -868,11 +868,18 @@ func recordVerifiedDigest(root *os.Root, path, sum string) {
 	if sum == "" {
 		return
 	}
-	st, err := root.Lstat(path)
+	f, err := openRegularDownloadFile(root, path, os.O_RDONLY)
 	if err != nil {
 		return
 	}
-	if b, err := json.Marshal(digestSidecar{Size: st.Size(), ModTime: st.ModTime().UnixNano(), SHA256: sum}); err == nil {
+	defer f.Close()
+	if info, err := f.Stat(); err == nil {
+		writeRootDigest(root, path, info, checkpointFileID(f, info), sum)
+	}
+}
+
+func writeRootDigest(root *os.Root, path string, info os.FileInfo, id, sum string) {
+	if b, err := json.Marshal(digestSidecar{Size: info.Size(), ModTime: info.ModTime().UnixNano(), SHA256: sum, FileID: id}); err == nil {
 		_ = replaceRootFile(root, sidecarPath(path), b)
 	}
 }
@@ -931,6 +938,7 @@ type digestSidecar struct {
 	Size    int64  `json:"size"`
 	ModTime int64  `json:"mod_time_unix_nano"`
 	SHA256  string `json:"sha256"`
+	FileID  string `json:"file_id,omitempty"`
 }
 
 // sidecarPath is path's digest cache file — a dotfile so it doesn't clutter a directory listing

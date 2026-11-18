@@ -720,7 +720,13 @@ func TestCheckpointResumeAfterWeightLayoutChange(t *testing.T) {
 					if _, err := os.Stat(filepath.Join(dest, shard)); !os.IsNotExist(err) {
 						t.Errorf("cleanup retained the unplanned shard %s: %v", shard, err)
 					}
+					if info, err := os.Lstat(filepath.Join(staging, shard)); err == nil {
+						t.Errorf("superseded shard %s still occupies %d staged bytes", shard, info.Size())
+					} else if !os.IsNotExist(err) {
+						t.Fatal(err)
+					}
 				}
+				t.Logf("obsolete split weights before publication: %d bytes", len(old[firstShard])+len(old[secondShard]))
 			}
 			if listed := slices.ContainsFunc(marker.Files, func(f File) bool { return f.Path == checkpointWeights }); listed != (tc.toSingle || tc.reuseSingle) {
 				t.Errorf("single file manifest entry = %t", listed)

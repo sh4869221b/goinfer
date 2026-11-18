@@ -705,7 +705,7 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 		}
 		defer root.Close()
 	}
-	if err := stageCheckpoint(ctx, root, p, metadata, progress); err != nil {
+	if err := stageCheckpoint(ctx, work, root, p, metadata, progress); err != nil {
 		return "", err
 	}
 	parentInfo, err := os.Stat(parentDir)
@@ -721,7 +721,7 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 	return dest, nil
 }
 
-func stageCheckpoint(ctx context.Context, root *os.Root, p Plan, metadata checkpointMetadata, progress func(done, total int64, file string)) error {
+func stageCheckpoint(ctx context.Context, work *checkpointWorkspace, root *os.Root, p Plan, metadata checkpointMetadata, progress func(done, total int64, file string)) error {
 	var done int64
 	for _, f := range p.Files {
 		var err error
@@ -729,6 +729,9 @@ func stageCheckpoint(ctx context.Context, root *os.Root, p Plan, metadata checkp
 			info, statErr := root.Lstat(f.Path)
 			if raw, readErr := readRootCheckpointMetadata(root, f.Path); statErr != nil || !info.Mode().IsRegular() || readErr != nil || !bytes.Equal(raw, planned) {
 				err = replaceRootFile(root, f.Path, planned)
+				if err == nil {
+					work.recordTransfer(root, f)
+				}
 			}
 		} else {
 			name := filepath.FromSlash(f.Path)
@@ -742,6 +745,9 @@ func stageCheckpoint(ctx context.Context, root *os.Root, p Plan, metadata checkp
 						progress(base+d, p.Bytes, f.Path)
 					}
 				})
+				if err == nil {
+					work.recordTransfer(root, f)
+				}
 			}
 		}
 		if err != nil {

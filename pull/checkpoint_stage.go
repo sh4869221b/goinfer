@@ -57,9 +57,11 @@ func validateCheckpointDestination(dest string) error {
 // (including on process death) releases the lock. The claim belongs to the same destination.
 func lockCheckpointDestination(parent *os.Root, dest string) (*checkpointWorkspace, error) {
 	name := checkpointWorkspaceName(dest)
-	mkdirErr := parent.Mkdir(name, 0o700)
-	if mkdirErr != nil && !os.IsExist(mkdirErr) {
-		return nil, mkdirErr
+	owner := checkpointWorkspaceOwner{Destination: dest, Token: rand.Text()}
+	if _, err := parent.Lstat(name); os.IsNotExist(err) {
+		if err := initializeCheckpointDirectory(parent, name, owner); err != nil && !os.IsExist(err) {
+			return nil, err
+		}
 	}
 	workspace, err := openCheckpointStaging(parent, name)
 	if err != nil {
@@ -71,16 +73,9 @@ func lockCheckpointDestination(parent *os.Root, dest string) (*checkpointWorkspa
 			workspace.Close()
 		}
 	}()
-	owner := checkpointWorkspaceOwner{Destination: dest, Token: rand.Text()}
-	if mkdirErr == nil {
-		if err := writeCheckpointOwner(workspace, owner); err != nil {
-			return nil, err
-		}
-	} else {
-		owner, err = readCheckpointOwner(workspace)
-		if err != nil || owner.Destination != dest || owner.Token == "" {
-			return nil, fmt.Errorf("workspace %s has no verified owner for %s; existing data was kept", name, dest)
-		}
+	owner, err = readCheckpointOwner(workspace)
+	if err != nil || owner.Destination != dest || owner.Token == "" {
+		return nil, fmt.Errorf("workspace %s has no verified owner for %s; existing data was kept", name, dest)
 	}
 	lock, err := openRegularDownloadFile(workspace, "lock", os.O_RDWR|os.O_CREATE)
 	if err != nil {
@@ -97,6 +92,33 @@ func lockCheckpointDestination(parent *os.Root, dest string) (*checkpointWorkspa
 	ok = true
 	return &checkpointWorkspace{root: workspace, lock: lock, name: name, owner: owner}, nil
 }
+
+// Keep the stable workspace or stage name absent until its owner is fully recorded.
+// An interrupted initializer can leave a temporary name, which is never resumed.
+func initializeCheckpointDirectory(parent *os.Root, name string, owner checkpointWorkspaceOwner) error {
+	tmp := ".goinfer-init-" + rand.Text()
+	if err := mkdirCheckpointInit(parent, tmp); err != nil {
+		return err
+	}
+	root, err := openCheckpointStaging(parent, tmp)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if info, err := parent.Lstat(tmp); err == nil && sameCheckpointDirectory(root, info) {
+			_ = root.Remove(checkpointOwnerName)
+			_ = parent.Remove(tmp)
+		}
+		root.Close()
+	}()
+	if err := writeCheckpointOwner(root, owner); err != nil {
+		return err
+	}
+	return renameCheckpointInit(parent, tmp, name)
+}
+
+// Indirected so the process test can stop at the mkdir boundary.
+var mkdirCheckpointInit = func(root *os.Root, name string) error { return root.Mkdir(name, 0o700) }
 
 func writeCheckpointOwner(root *os.Root, owner checkpointWorkspaceOwner) error {
 	raw, err := json.Marshal(owner)
@@ -137,18 +159,9 @@ func (w *checkpointWorkspace) openStage(create bool) (*os.Root, error) {
 		if !create {
 			return nil, nil
 		}
-		if err := w.root.Mkdir(checkpointStageName, 0o700); err != nil {
+		if err := initializeCheckpointDirectory(w.root, checkpointStageName, w.owner); err != nil && !os.IsExist(err) {
 			return nil, err
 		}
-		stage, err := openCheckpointStaging(w.root, checkpointStageName)
-		if err != nil {
-			return nil, err
-		}
-		if err := writeCheckpointOwner(stage, w.owner); err != nil {
-			stage.Close()
-			return nil, err
-		}
-		return stage, nil
 	}
 	stage, err := openCheckpointStaging(w.root, checkpointStageName)
 	if err != nil {
@@ -282,6 +295,7 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 			}
 		}
 	}
+	work.reclaimTransfers(stage)
 	return nil
 }
 
