@@ -428,8 +428,12 @@ func checkCompletedCheckpoint(ctx context.Context, dir string, p Plan, metadata 
 // comparison with the current CDN file, without replacing the existing files.
 func checkCompletedRemoteFile(ctx context.Context, root *os.Root, repo string, f File, localDigest string) error {
 	if localDigest == "" {
-		var err error
-		localDigest, err = hashStagedFile(root, f)
+		file, err := checkpoint.OpenRootFile(root, filepath.FromSlash(f.Path))
+		if err != nil {
+			return fmt.Errorf("reading %s: %w", f.Path, err)
+		}
+		localDigest, err = hashCheckpointFile(f, file)
+		file.Close()
 		if err != nil {
 			return err
 		}

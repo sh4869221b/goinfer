@@ -14,26 +14,19 @@ import (
 	"strings"
 )
 
-const checkpointWorkDir = ".goinfer-pulls"
+func checkpointWorkspaceName(dest string) string { return "." + dest + ".pull" }
 
 // A lock file stays in place so all writers use the same inode. Closing its handle
 // (including on process death) releases the lock. The claim belongs to the same destination.
 func lockCheckpointDestination(parent *os.Root, dest string) (*os.File, string, error) {
-	if strings.EqualFold(dest, checkpointWorkDir) {
+	if strings.HasPrefix(dest, ".") && strings.HasSuffix(strings.ToLower(dest), ".pull") {
 		return nil, "", fmt.Errorf("%s is reserved for checkpoint downloads", dest)
 	}
-	if err := parent.Mkdir(checkpointWorkDir, 0o700); err != nil && !os.IsExist(err) {
+	name := checkpointWorkspaceName(dest)
+	if err := parent.Mkdir(name, 0o700); err != nil && !os.IsExist(err) {
 		return nil, "", err
 	}
-	work, err := openCheckpointStaging(parent, checkpointWorkDir)
-	if err != nil {
-		return nil, "", err
-	}
-	defer work.Close()
-	if err := work.Mkdir(dest, 0o700); err != nil && !os.IsExist(err) {
-		return nil, "", err
-	}
-	workspace, err := openCheckpointStaging(work, dest)
+	workspace, err := openCheckpointStaging(parent, name)
 	if err != nil {
 		return nil, "", err
 	}
@@ -50,7 +43,7 @@ func lockCheckpointDestination(parent *os.Root, dest string) (*os.File, string, 
 		}
 		return nil, "", fmt.Errorf("another checkpoint pull is running for %s", dest)
 	}
-	return lock, filepath.Join(checkpointWorkDir, dest, "checkpoint"), nil
+	return lock, filepath.Join(name, "checkpoint"), nil
 }
 
 func recoverCheckpointStage(parent *os.Root, staging, claim string) error {
@@ -98,8 +91,17 @@ func reusableStagedFile(root *os.Root, name string, f File) bool {
 }
 
 func hashStagedFile(root *os.Root, f File) (string, error) {
+	file, err := openRegularDownloadFile(root, filepath.FromSlash(f.Path), os.O_RDONLY)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	return hashCheckpointFile(f, file)
+}
+
+func hashCheckpointFile(f File, r io.Reader) (string, error) {
 	h := sha256.New()
-	n, err := hashPrefix(root, h, filepath.FromSlash(f.Path))
+	n, err := io.Copy(h, r)
 	if err != nil {
 		return "", err
 	}

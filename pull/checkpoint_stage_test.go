@@ -13,6 +13,59 @@ import (
 	"time"
 )
 
+func TestCheckpointPullIgnoresInaccessibleLegacyWorkspace(t *testing.T) {
+	const repo = "o/tiny"
+	shared := t.TempDir()
+	legacy := filepath.Join(shared, ".goinfer-pulls")
+	if err := os.Mkdir(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(legacy, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(legacy, 0o700) })
+	if _, err := os.Stat(filepath.Join(legacy, "other-user")); !os.IsPermission(err) {
+		t.Skipf("fixture requires a legacy workspace that cannot be traversed: %v", err)
+	}
+	h := &fakeHF{files: shardedTinyRepo(t)}
+	h.serve(t, repo)
+	_, download, err := PrepareCheckpointFor(t.Context(), repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(shared, "checkpoint")
+	if got, err := download(t.Context(), dest, nil); got != dest || err != nil {
+		t.Fatalf("pull with an inaccessible legacy workspace = %q, %v", got, err)
+	}
+	if _, ok := CachedCheckpoint(dest); !ok {
+		t.Error("the published checkpoint did not verify")
+	}
+}
+
+func TestCheckpointLocksAreIndependentAcrossDestinations(t *testing.T) {
+	parent, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	for _, dest := range []string{"first", "second"} {
+		lock, claim, err := lockCheckpointDestination(parent, dest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lock.Close()
+		if want := filepath.Join("."+dest+".pull", "checkpoint"); claim != want {
+			t.Errorf("claim for %s = %q, want %q", dest, claim, want)
+		}
+		if lock, _, err := lockCheckpointDestination(parent, dest); err == nil || !strings.Contains(err.Error(), "another checkpoint pull") {
+			if lock != nil {
+				lock.Close()
+			}
+			t.Errorf("second lock for %s = %v, want a lock conflict", dest, err)
+		}
+	}
+}
+
 func TestCheckpointParallelPullCannotWriteToPublishedDirectory(t *testing.T) {
 	const repo = "o/tiny"
 	const generation = "generation_config.json"
@@ -145,7 +198,7 @@ func TestCheckpointRecoversClaimAfterKilledProcess(t *testing.T) {
 	if got, err := download(t.Context(), dest, nil); got != dest || err != nil {
 		t.Fatalf("retry after killing the writer = %q, %v", got, err)
 	}
-	claim := filepath.Join(dir, checkpointWorkDir, name, "checkpoint")
+	claim := filepath.Join(dir, checkpointWorkspaceName(name), "checkpoint")
 	if _, err := os.Lstat(claim); !os.IsNotExist(err) {
 		t.Errorf("publish claim still present after retry: %v", err)
 	}

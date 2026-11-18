@@ -1110,6 +1110,95 @@ func TestCheckpointResumeRefreshesUnidentifiedTokenizer(t *testing.T) {
 	}
 }
 
+func TestCheckpointRepullLegacyTemplateSymlink(t *testing.T) {
+	const repo = "o/tiny"
+	const name = "chat_template.jinja"
+	const body = "{{ messages }}\n"
+	for _, tc := range []struct {
+		name            string
+		external, chain bool
+	}{
+		{name: "absolute inside cache"},
+		{name: "relative and absolute chain through cache alias", chain: true},
+		{name: "absolute outside cache", external: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withCacheRoot(t)
+			files := shardedTinyRepo(t)
+			files[name] = []byte(body)
+			h := &fakeHF{files: files}
+			h.serve(t, repo)
+			ctx := t.Context()
+			_, download, err := PrepareCheckpointFor(ctx, repo, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dest, err := CacheDir(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := download(ctx, dest, nil); err != nil {
+				t.Fatal(err)
+			}
+			marker := readTestCheckpointMarker(t, dest)
+			for i, f := range marker.Files {
+				if f.Path == name {
+					marker.Files[i].SHA256 = ""
+				}
+			}
+			legacy, err := json.Marshal(marker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dest, checkpointMarker), legacy, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			targetDir := dest
+			if tc.external {
+				targetDir = t.TempDir()
+			}
+			if err := os.Rename(filepath.Join(dest, name), filepath.Join(targetDir, "template.jinja")); err != nil {
+				t.Fatal(err)
+			}
+			link := filepath.Join(targetDir, "template.jinja")
+			if tc.chain {
+				alias := filepath.Join(t.TempDir(), "alias")
+				saveCheckpointConfigLink(t, dest, alias)
+				saveCheckpointConfigLink(t, filepath.Join(alias, "template.jinja"), filepath.Join(dest, "active.jinja"))
+				link = "active.jinja"
+			}
+			saveCheckpointConfigLink(t, link, filepath.Join(dest, name))
+			h.mu.Lock()
+			before := h.hits[name]
+			h.mu.Unlock()
+			if !tc.external {
+				if got, err := Resolve(ctx, "hf:"+repo+":safetensors", nil); got != dest || err != nil {
+					t.Fatalf("legacy offline Resolve = %q, %v", got, err)
+				}
+			}
+			got, err := download(ctx, dest, nil)
+			if tc.external {
+				if got != "" || err == nil || !strings.Contains(err.Error(), "leaves the checkpoint directory") {
+					t.Errorf("external template pull = %q, %v", got, err)
+				}
+			} else if got != dest || err != nil {
+				t.Errorf("legacy template pull = %q, %v", got, err)
+			}
+			if after, err := os.Readlink(filepath.Join(dest, name)); after != link || err != nil {
+				t.Errorf("pull modified the link: %q, %v", after, err)
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if !tc.external {
+				before++
+			}
+			if h.hits[name] != before {
+				t.Errorf("template fetch count = %d, want %d", h.hits[name], before)
+			}
+		})
+	}
+}
+
 func TestCheckpointRejectsUnverifiedGenerationConfig(t *testing.T) {
 	const repo = "o/tiny"
 	const generation = "generation_config.json"

@@ -43,6 +43,18 @@ func ReadRootFile(root *os.Root, name string, limit int64) ([]byte, error) {
 	return readCheckedRootFile(root, name, info, limit)
 }
 
+// OpenRootFile confines relative and absolute link chains to root and opens the checked regular file.
+func OpenRootFile(root *os.Root, name string) (*os.File, error) {
+	if !filepath.IsLocal(name) {
+		return nil, fmt.Errorf("file path %q is outside the checkpoint directory", name)
+	}
+	name, info, err := resolveRootFileLink(root, name)
+	if err != nil {
+		return nil, err
+	}
+	return openCheckedRootFile(root, name, info)
+}
+
 func rootFileInfo(root *os.Root, name string) (string, os.FileInfo, error) {
 	info, err := root.Lstat(name)
 	if err != nil || info.Mode()&os.ModeSymlink == 0 {
@@ -52,24 +64,14 @@ func rootFileInfo(root *os.Root, name string) (string, os.FileInfo, error) {
 }
 
 func readCheckedRootFile(root *os.Root, name string, info os.FileInfo, limit int64) ([]byte, error) {
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file", name)
-	}
 	if info.Size() > limit {
 		return nil, fmt.Errorf("%s exceeds %d bytes", name, limit)
 	}
-	f, err := root.OpenFile(name, readFlags, 0)
+	f, err := openCheckedRootFile(root, name, info)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	opened, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-		return nil, fmt.Errorf("%s changed while opening", name)
-	}
 	raw, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if int64(len(raw)) > limit {
 		return nil, fmt.Errorf("%s exceeds %d bytes", name, limit)
@@ -77,10 +79,30 @@ func readCheckedRootFile(root *os.Root, name string, info os.FileInfo, limit int
 	return raw, err
 }
 
+func openCheckedRootFile(root *os.Root, name string, info os.FileInfo) (*os.File, error) {
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", name)
+	}
+	f, err := root.OpenFile(name, readFlags, 0)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		f.Close()
+		return nil, fmt.Errorf("%s changed while opening", name)
+	}
+	return f, nil
+}
+
 // Expand each component through root so an absolute link can be converted to a rooted name at any hop.
 func resolveRootFileLink(root *os.Root, name string) (string, os.FileInfo, error) {
 	const maxLinks = 40
-	pending := []string{name}
+	pending := strings.Split(filepath.ToSlash(name), "/")
 	var parents []string
 	links := 0
 	for len(pending) != 0 {
