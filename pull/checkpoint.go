@@ -1,6 +1,7 @@
 package pull
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -43,6 +44,8 @@ type Plan struct {
 	ModelType string // config.json's model_type
 	Family    string // the capability-matrix family that loads it
 	Dtype     string // config.json's torch_dtype (or dtype), "" if absent
+
+	configJSON string // validated config bytes, separate from the remote tree metadata
 }
 
 // checkpointExtras are the non-weight files a checkpoint plan takes when the repo has them: the tokenizer in its several
@@ -212,12 +215,16 @@ func PlanCheckpointFor(ctx context.Context, repo string, loads func(modelType st
 	for _, f := range files {
 		byPath[f.Path] = f
 	}
-	if _, ok := byPath["config.json"]; !ok {
+	configFile, ok := byPath["config.json"]
+	if !ok {
 		return Plan{}, fmt.Errorf("repo %s has no config.json: not a safetensors (transformers) checkpoint", repo)
 	}
 	cfgRaw, err := fetchSmall(ctx, repo, "config.json", checkpoint.MaxConfigBytes)
 	if err != nil {
 		return Plan{}, err
+	}
+	if !checkpoint.ConfigMatches(cfgRaw, configFile.Size, configFile.SHA256) {
+		return Plan{}, fmt.Errorf("repo %s's config.json does not match the tree listing; re-run to refresh the plan", repo)
 	}
 	var cfg checkpointConfig
 	if err := json.Unmarshal(cfgRaw, &cfg); err != nil {
@@ -233,7 +240,7 @@ func PlanCheckpointFor(ctx context.Context, repo string, loads func(modelType st
 	if err := checkpoint.CheckLayout(repo, cfg.ModelType); err != nil {
 		return Plan{}, err
 	}
-	p := Plan{Repo: repo, ModelType: cfg.ModelType, Family: fam, Dtype: cfg.TorchDtype}
+	p := Plan{Repo: repo, ModelType: cfg.ModelType, Family: fam, Dtype: cfg.TorchDtype, configJSON: string(cfgRaw)}
 	if p.Dtype == "" {
 		p.Dtype = cfg.Dtype
 	}
@@ -421,7 +428,8 @@ func readCachedCheckpointConfig(dir string) ([]byte, error) {
 }
 
 // DownloadCheckpoint fetches every file in p into dest and returns dest. The set is assembled in a staging directory
-// beside dest (dest + ".partial"), each file through Download (its own .part, digest check and resume), and dest
+// beside dest (dest + ".partial"). Planned config bytes are staged directly; other files go through Download with
+// its own .part, digest check and resume. The destination
 // appears only when the whole set has verified: one rename, after a marker naming the set is written. So an interrupted
 // pull leaves no loadable-looking directory at dest, and a re-run resumes in the staging directory, skipping files
 // already verified there. A complete dest is a no-op. A dest that exists without a matching marker is refused rather than
@@ -437,10 +445,23 @@ func DownloadCheckpoint(ctx context.Context, p Plan, dest string, progress func(
 		return "", fmt.Errorf("%s exists but is not a complete checkpoint of %s pulled by goinfer: move it aside, or pull with -o <dir>", dest, p.Repo)
 	}
 	staging := dest + ".partial"
+	var plannedConfig []byte
+	if p.configJSON != "" {
+		plannedConfig = []byte(p.configJSON)
+	}
 	var need int64
 	for _, f := range p.Files {
 		if !safeRepoPath(f.Path) {
 			return "", fmt.Errorf("unsafe path %q in the plan for %s", f.Path, p.Repo)
+		}
+		if f.Path == "config.json" && plannedConfig != nil {
+			if !checkpoint.ConfigMatches(plannedConfig, f.Size, f.SHA256) {
+				return "", fmt.Errorf("planned config.json does not match the checkpoint files")
+			}
+			if raw, err := readCachedCheckpointConfig(staging); err != nil || !bytes.Equal(raw, plannedConfig) {
+				need += f.Size // the replacement is written beside any stale config before rename
+			}
+			continue
 		}
 		need += bytesLeft(f, filepath.Join(staging, filepath.FromSlash(path.Dir(f.Path))))
 	}
@@ -452,13 +473,19 @@ func DownloadCheckpoint(ctx context.Context, p Plan, dest string, progress func(
 	}
 	var done int64
 	for _, f := range p.Files {
-		dir := filepath.Join(staging, filepath.FromSlash(path.Dir(f.Path)))
-		base := done
-		if _, err := Download(ctx, p.Repo, f, dir, func(d, _ int64) {
-			if progress != nil {
-				progress(base+d, p.Bytes, f.Path)
-			}
-		}); err != nil {
+		var err error
+		if f.Path == "config.json" && plannedConfig != nil {
+			err = stageCheckpointConfig(staging, plannedConfig)
+		} else {
+			dir := filepath.Join(staging, filepath.FromSlash(path.Dir(f.Path)))
+			base := done
+			_, err = Download(ctx, p.Repo, f, dir, func(d, _ int64) {
+				if progress != nil {
+					progress(base+d, p.Bytes, f.Path)
+				}
+			})
+		}
+		if err != nil {
 			return "", fmt.Errorf("%s (file %s; re-run to resume, the files already verified are kept): %w", p.Repo, f.Path, err)
 		}
 		done += f.Size
@@ -475,7 +502,7 @@ func DownloadCheckpoint(ctx context.Context, p Plan, dest string, progress func(
 		if err != nil {
 			return "", fmt.Errorf("checking staged config.json: %w", err)
 		}
-		if !checkpoint.ConfigMatches(raw, file.Size, file.SHA256) {
+		if !checkpoint.ConfigMatches(raw, file.Size, file.SHA256) || plannedConfig != nil && !bytes.Equal(raw, plannedConfig) {
 			return "", fmt.Errorf("staged config.json does not match the checkpoint plan")
 		}
 		if err := checkpoint.ValidateConfig(p.Repo, raw); err != nil {
@@ -497,4 +524,21 @@ func DownloadCheckpoint(ctx context.Context, p Plan, dest string, progress func(
 		return "", fmt.Errorf("publishing %s: %w", dest, err)
 	}
 	return dest, nil
+}
+
+func stageCheckpointConfig(dir string, config []byte) error {
+	if raw, err := readCachedCheckpointConfig(dir); err == nil && bytes.Equal(raw, config) {
+		return nil
+	}
+	tmp, err := os.MkdirTemp(dir, ".config.json-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
+	staged := filepath.Join(tmp, "config.json")
+	defer os.Remove(staged)
+	if err := os.WriteFile(staged, config, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(staged, filepath.Join(dir, "config.json"))
 }

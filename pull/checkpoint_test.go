@@ -30,6 +30,7 @@ type fakeHF struct {
 	files    map[string][]byte
 	gated    any
 	hits     map[string]int
+	ranges   map[string]string
 	requests int
 	failOnce string // a path whose next transfer is cut midway
 }
@@ -37,6 +38,7 @@ type fakeHF struct {
 func (h *fakeHF) serve(t *testing.T, repo string) {
 	t.Helper()
 	h.hits = map[string]int{}
+	h.ranges = map[string]string{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -63,6 +65,7 @@ func (h *fakeHF) serve(t *testing.T, repo string) {
 				return
 			}
 			h.hits[p]++
+			h.ranges[p] = r.Header.Get("Range")
 			if p == h.failOnce {
 				h.failOnce = ""
 				w.Header().Set("Content-Length", "999999999")
@@ -602,6 +605,89 @@ func TestCheckpoint_interruptedSetNeverPublishes(t *testing.T) {
 	}
 	if _, ok := CachedCheckpoint(dir); !ok {
 		t.Fatal("the resumed set did not publish a complete checkpoint")
+	}
+}
+
+func TestCheckpointResumeUsesPlannedConfig(t *testing.T) {
+	const repo = "o/tiny"
+	const firstShard = "model-00001-of-00002.safetensors"
+	const resumedShard = "model-00002-of-00002.safetensors"
+	for _, malformed := range []bool{false, true} {
+		name := "different valid JSON"
+		if malformed {
+			name = "malformed JSON"
+		}
+		t.Run(name, func(t *testing.T) {
+			files := shardedTinyRepo(t)
+			original := files["config.json"]
+			updated := bytes.Replace(original, []byte(`"eos_token_id": 2`), []byte(`"eos_token_id": 3`), 1)
+			if bytes.Equal(original, updated) || len(original) != len(updated) || !json.Valid(updated) {
+				t.Fatal("fixture must have two different valid configs of equal size")
+			}
+			h := &fakeHF{files: files, failOnce: resumedShard}
+			h.serve(t, repo)
+			ctx := t.Context()
+			dest := filepath.Join(t.TempDir(), "checkpoint")
+			oldPlan, err := PlanCheckpoint(ctx, repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DownloadCheckpoint(ctx, oldPlan, dest, nil); err == nil {
+				t.Fatal("first download should stop on the interrupted shard")
+			}
+			staging := dest + ".partial"
+			part, err := os.Stat(filepath.Join(staging, resumedShard+".part"))
+			if err != nil || part.Size() <= 0 {
+				t.Fatalf("expected a partially downloaded shard, stat=%v (%v)", part, err)
+			}
+			if malformed {
+				bad := bytes.Clone(original)
+				bad[0] = '!'
+				if err := os.WriteFile(filepath.Join(staging, "config.json"), bad, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h.mu.Lock()
+			h.files["config.json"] = updated
+			firstHits := h.hits[firstShard]
+			h.mu.Unlock()
+			plan, err := PlanCheckpoint(ctx, repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pin := oldPlan.TreeDigest()
+			if err := plan.VerifyPin(pin); err != nil {
+				t.Fatalf("same-size non-LFS config changed the tree pin: %v", err)
+			}
+			h.mu.Lock()
+			configHits := h.hits["config.json"]
+			h.files["config.json"] = original // the plan still owns the bytes it validated
+			h.mu.Unlock()
+			if _, err := DownloadCheckpoint(ctx, plan, dest, nil); err != nil {
+				t.Fatalf("resume: %v", err)
+			}
+			got, err := os.ReadFile(filepath.Join(dest, "config.json"))
+			if err != nil || !bytes.Equal(got, updated) {
+				t.Fatalf("published config differs from the planned bytes (err %v)", err)
+			}
+			root, err := os.OpenRoot(dest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			marker, ok := readCheckpointMarker(root)
+			if !ok || marker.Files[0].Path != "config.json" || marker.Files[0].SHA256 != fmt.Sprintf("%x", sha256.Sum256(updated)) {
+				t.Fatalf("marker did not record the planned config's SHA-256: %+v", marker)
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if h.hits["config.json"] != configHits || h.hits[firstShard] != firstHits {
+				t.Errorf("re-fetched the planned config or completed shard: %v", h.hits)
+			}
+			if got, want := h.ranges[resumedShard], fmt.Sprintf("bytes=%d-", part.Size()); got != want {
+				t.Errorf("resumed shard request range = %q, want %q", got, want)
+			}
+		})
 	}
 }
 

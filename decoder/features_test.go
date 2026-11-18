@@ -75,7 +75,9 @@ var archFeatureProfile = map[string][]ResidentFeature{
 	// derived per-model at load (RequiredResidentFeatures), which is what admission uses. The
 	// table's job is to force a new arch to be classified, not to be the runtime check.
 	"phi3": {},
-	"gpt2": {FeatLayerNorm, FeatLearnedPos, FeatNonGatedMLP, FeatNonGatedGELUTanh, FeatOutBias},
+	// PLaMo 3 alternates sliding attention with full YaRN attention and uses four RMS norms.
+	"plamo3": {FeatPerLayerRoPE, FeatQKNorm, FeatRopeMscale, FeatSandwichNorm, FeatSlidingWindow},
+	"gpt2":   {FeatLayerNorm, FeatLearnedPos, FeatNonGatedMLP, FeatNonGatedGELUTanh, FeatOutBias},
 	// Cohere's rotation is GPT-J PAIRWISE (rope_gptj), not NeoX, so it needs FeatPairwiseRoPE: a resident backend that runs
 	// it on NeoX kernels is wrong on the real checkpoints (flat-fixture gates are blind to it). Backends without a pairwise
 	// rope variant decline these families.
@@ -267,6 +269,7 @@ var admissionGolden = map[string][]string{
 	"mixtral":    {"cuda", "metal", "webgpu"},
 	"nemotron_h": {"cuda", "metal", "webgpu"}, // Metal since OP2b step 2, CUDA since OP2b step 2d's declaration, int4 only (buildMamba declines int8 on both)
 	"phi3":       {"cuda", "metal", "webgpu"},
+	"plamo3":     {"cuda", "metal", "webgpu"}, // declared operation coverage for the representative config
 	"qwen2":      {"cuda", "metal", "webgpu"},
 	"qwen2_5_vl": {"cuda", "metal", "webgpu"},
 	"qwen3_vl":   {"cuda", "metal", "webgpu"}, // text-only (P8 Phase 0); same admission as plain qwen3
