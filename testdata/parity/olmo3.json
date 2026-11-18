@@ -10,7 +10,7 @@
   "programs": [
     "testdata/olmo3-tiny"
   ],
-  "deps_hash": "sha256:3e0e0fbac32802f52a2ec419e2c8b651d4af0ec6acfc9e152c1f01bf663f63b9",
+  "deps_hash": "sha256:7086b4042b106c0f5c4b55571c77e9e435a13bb7c9aa023d02381979e6b151a6",
   "status": "validated",
   "validated_at": "7b50947a",
   "date": "2026-10-05",

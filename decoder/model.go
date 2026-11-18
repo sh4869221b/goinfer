@@ -799,7 +799,15 @@ func Load(dir string, opts Options) (*Model, error) {
 	// The guard may return a smaller context to pin than requested (0 = unrequested, the common case); it is applied to opts here,
 	// before opts.ResidentContext is read again below (resCtxReq) and by the banner, so the user gets a working server with a
 	// visible, honest limit instead of swap on the first big request.
-	pinnedCtx, err := guardFit(fitCheckFor(dir, opts.Quant, quant, opts))
+	var cfg *Config
+	if !strings.HasSuffix(dir, ".gguf") && quant != quantInt4Mix && quant != quantQ4K {
+		cfg, err = loadDirConfig(dir)
+		if err != nil {
+			closeBackend(be)
+			return nil, err
+		}
+	}
+	pinnedCtx, err := guardFit(fitCheckForConfig(dir, opts.Quant, quant, opts, hostRAMAvailable, cfg))
 	if err != nil {
 		closeBackend(be)
 		return nil, err
@@ -808,7 +816,7 @@ func Load(dir string, opts Options) (*Model, error) {
 		opts.ResidentContext = pinnedCtx
 	}
 
-	w, err := loadWeights(dir, quant, opts.EmbedInt4, wantsCanonicalInt4(opts.Backend, be), !wantsRow4Fallback(opts.Backend), lora, opts.LoadAbort)
+	w, err := loadWeightsWithConfig(dir, quant, opts.EmbedInt4, wantsCanonicalInt4(opts.Backend, be), !wantsRow4Fallback(opts.Backend), lora, opts.LoadAbort, cfg)
 	if err != nil {
 		closeBackend(be)
 		return nil, err

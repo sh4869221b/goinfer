@@ -25,6 +25,9 @@ func TestPlamo3RealOracle(t *testing.T) {
 	if err := json.Unmarshal(raw, &cases); err != nil {
 		t.Fatal(err)
 	}
+	if len(cases) == 0 {
+		t.Fatal("real-checkpoint reference has no cases")
+	}
 	m, err := Load(dir, Options{Backend: "cpu", Quant: "bf16"})
 	if err != nil {
 		t.Fatal(err)
@@ -44,18 +47,18 @@ func TestPlamo3RealOracle(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if len(c.Hidden) != len(hidden) || len(c.Logits) != len(logits) {
-			t.Fatal("reference shape mismatch")
+		if len(hidden) != len(layers) || len(c.Hidden) != len(layers) {
+			t.Fatalf("case %d layer count mismatch: got %d, reference %d, want %d", ci, len(hidden), len(c.Hidden), len(layers))
 		}
 		for layer := range layers {
-			cos := logitCosine(hidden[layer], c.Hidden[layer])
-			if cos < 0.99999 {
+			cos, ok := plamo3OracleCosine(hidden[layer], c.Hidden[layer])
+			if !ok {
 				t.Fatalf("case %d layer %d cosine %g", ci, layer, cos)
 			}
 		}
-		cos := logitCosine(logits, c.Logits)
+		cos, ok := plamo3OracleCosine(logits, c.Logits)
 		t.Logf("case %d: %d prompt tokens; %d layers; final logit cosine %.9f; argmax %d/%d", ci, len(c.PromptIDs), len(layers), cos, argmax(logits), argmax(c.Logits))
-		if cos < 0.99999 || argmax(logits) != argmax(c.Logits) {
+		if !ok || argmax(logits) != argmax(c.Logits) {
 			t.Fatal("real-checkpoint logit parity failed")
 		}
 	}

@@ -2,9 +2,9 @@ package decoder
 
 import (
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/checkpoint"
 )
 
 // ActivationQuantHazard names why a family's output is unusable under int8 ACTIVATION quantization,
@@ -47,7 +47,7 @@ func PeekModelType(path string) string {
 		arch, _ := g.Str("general.architecture")
 		return arch
 	}
-	raw, err := os.ReadFile(filepath.Join(path, "config.json"))
+	raw, err := checkpoint.ReadConfig(path)
 	if err != nil {
 		return ""
 	}

@@ -297,7 +297,7 @@ func printPlan(p pull.Plan) {
 // pullCheckpoint fetches a repo's safetensors checkpoint (pull <owner/repo>:safetensors) as one verified set.
 func pullCheckpoint(ctx context.Context, ref pull.Ref, outDir string) int {
 	// AnyLoads, not PlanCheckpoint's generative check: the CLI fetches an embedding encoder too (serve --embed-model).
-	p, err := pull.PlanCheckpointFor(ctx, ref.Repo, pull.AnyLoads)
+	p, download, err := pull.PrepareCheckpointFor(ctx, ref.Repo, pull.AnyLoads)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "goinfer-chat pull: %v\n", err)
 		return 1
@@ -322,7 +322,7 @@ func pullCheckpoint(ctx context.Context, ref pull.Ref, outDir string) int {
 		interval = time.Second
 	}
 	var lastPrint time.Time
-	path, err := pull.DownloadCheckpoint(ctx, p, dir, func(done, total int64, file string) {
+	path, err := download(ctx, dir, func(done, total int64, file string) {
 		el := time.Since(start).Seconds()
 		if el <= 0 || time.Since(lastPrint) < interval {
 			return

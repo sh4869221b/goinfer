@@ -1,7 +1,7 @@
 package pull
 
 import (
-	"encoding/json"
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,10 +25,9 @@ type CacheEntry struct {
 	Sidecars int64
 }
 
-// CacheEntries lists what the pull cache holds, sorted by repo then path. It reads the cache layout and file sizes
-// only: a checkpoint counts as complete when its marker is there and every file it names has its recorded size, and no
-// digest is computed, so listing a cache of large models stays fast. Loading still verifies in full. A missing cache is
-// an empty list, not an error.
+// CacheEntries lists what the pull cache holds, sorted by repo then path. A checkpoint counts as complete when its
+// marker covers its weight layout and every file has its recorded size. Listing skips weight digests. A missing
+// cache is an empty list.
 func CacheEntries() ([]CacheEntry, error) {
 	root, err := CacheRoot()
 	if err != nil {
@@ -55,9 +54,19 @@ func CacheEntries() ([]CacheEntry, error) {
 				continue
 			}
 			dir := filepath.Join(root, o.Name(), r.Name())
+			if name, ok := strings.CutSuffix(strings.TrimPrefix(r.Name(), "."), checkpointWorkSuffix); ok && strings.HasPrefix(r.Name(), ".") {
+				dest := filepath.Join(root, o.Name(), name)
+				if bytes := checkpointStagingBytes(dir, name, dest); bytes > 0 {
+					out = append(out, CacheEntry{Repo: o.Name() + "/" + name, Path: dest, Kind: "checkpoint", Bytes: bytes})
+				}
+				continue
+			}
 			if name, ok := strings.CutSuffix(r.Name(), ".partial"); ok {
-				// A checkpoint still being assembled (DownloadCheckpoint's staging directory).
-				out = append(out, CacheEntry{Repo: o.Name() + "/" + name, Path: filepath.Join(root, o.Name(), name), Kind: "checkpoint", Bytes: dirBytes(dir)})
+				// Legacy resumable checkpoints used a sibling .partial directory.
+				dest := filepath.Join(root, o.Name(), name)
+				if _, err := os.Lstat(dest); os.IsNotExist(err) && checkpointStagingBytes(filepath.Join(root, o.Name(), checkpointWorkspaceName(name)), name, dest) == 0 {
+					out = append(out, CacheEntry{Repo: o.Name() + "/" + name, Path: dest, Kind: "checkpoint", Bytes: dirBytes(dir)})
+				}
 				continue
 			}
 			out = append(out, repoEntries(o.Name()+"/"+r.Name(), dir)...)
@@ -72,6 +81,48 @@ func CacheEntries() ([]CacheEntry, error) {
 	return out, nil
 }
 
+func checkpointStagingBytes(dir, name, dest string) int64 {
+	if _, err := os.Lstat(dest); !os.IsNotExist(err) {
+		return 0
+	}
+	parent, err := os.OpenRoot(filepath.Dir(dir))
+	if err != nil {
+		return 0
+	}
+	defer parent.Close()
+	root, err := openCheckpointStaging(parent, filepath.Base(dir))
+	if err != nil {
+		return 0
+	}
+	defer root.Close()
+	owner, err := readCheckpointOwner(root)
+	if err != nil || owner.Destination != name || owner.Token == "" {
+		return 0
+	}
+	workspace := checkpointWorkspace{root: root, owner: owner}
+	stage, err := workspace.openStage(false)
+	if err != nil || stage == nil {
+		return 0
+	}
+	defer stage.Close()
+	info, err := stage.Lstat(checkpointOwnerName)
+	if err != nil {
+		return 0
+	}
+	metadata := info.Size()
+	if publication, err := readCheckpointPublication(stage); err == nil && publication.Owner == owner && publication.Token != "" {
+		if info, err := stage.Lstat(checkpointPublicationName); err == nil && info.Mode().IsRegular() {
+			metadata += info.Size()
+		}
+	}
+	if cleanup, err := readCheckpointCleanup(stage); err == nil && cleanup.Owner == owner && cleanup.Token != "" {
+		if info, err := stage.Lstat(checkpointCleanupName); err == nil && info.Mode().IsRegular() {
+			metadata += info.Size()
+		}
+	}
+	return max(dirBytes(stage.Name())-metadata, 0)
+}
+
 // repoEntries is one repo directory's models: a checkpoint (the directory itself, when it carries the marker), and the
 // GGUF files in it, a split set folded into one entry, with each model's .giw sidecars counted against it.
 func repoEntries(repo, dir string) []CacheEntry {
@@ -81,14 +132,18 @@ func repoEntries(repo, dir string) []CacheEntry {
 	}
 	var out []CacheEntry
 	inMarker := map[string]bool{}
-	if b, err := os.ReadFile(filepath.Join(dir, checkpointMarker)); err == nil {
-		var m markerDoc
-		if json.Unmarshal(b, &m) == nil && len(m.Files) > 0 {
-			complete := true
+	if root, err := os.OpenRoot(dir); err == nil {
+		defer root.Close()
+		if m, ok := readCheckpointMarker(root); ok {
+			complete := verifyCheckpointWeights(root, m.Files, nil) == nil
+			if complete {
+				_, err := readCachedGeneration(root, m.Files)
+				complete = err == nil && verifyCheckpointExtras(root, m.Files) == nil
+			}
 			for _, f := range m.Files {
 				inMarker[filepath.Base(f.Path)] = true
-				if st, err := os.Stat(filepath.Join(dir, filepath.FromSlash(f.Path))); err != nil || st.Size() != f.Size {
-					complete = false
+				if complete {
+					complete = verifyCheckpointFile(context.Background(), root, f, checkpointSizeOnly) == nil
 				}
 			}
 			out = append(out, CacheEntry{Repo: repo, Path: dir, Kind: "checkpoint", Bytes: dirBytes(dir), Complete: complete})

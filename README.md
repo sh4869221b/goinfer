@@ -9,7 +9,7 @@ cross-compile it like anything else. No Python, no llama.cpp, no C toolchain, no
 - **Output your types guarantee** — constrain generation to a Go struct or a JSON Schema; an
   invalid token is unreachable, not retried.
 - **One static binary** — and, if you want, the model baked into it.
-- **43 model families**, each behind a HuggingFace logit-parity gate.
+- **44 model families**, with HuggingFace logit-parity coverage tracked in the [capability matrix](docs/capability-matrix.md).
 - Experimental [PLaMo 3 Translate](docs/plamo3.md) support, with a dedicated translation example and CPU tests.
 - **CPU, CUDA and Metal**, cgo-free; **WebGPU** as an opt-in cgo build.
 - **Runs offline** — no telemetry, no update check, no account. The one thing that reaches the network is fetching a
@@ -166,6 +166,46 @@ command to run them; `goinfer-chat cache` lists what is there. A family that shi
 of config, tokenizer and weight shards; nothing lands until every file has checked out. Access is anonymous only; a gated repo is detected and named before the
 transfer starts. A plain path still means a plain path — only the `hf:` and `demo:` prefixes are
 special.
+
+For safetensors pulls, `.<destination>.pull2` is a private sibling workspace for each output
+directory. Retry the same destination after an interruption to resume its verified staging data
+or finish cleanup for the matching publication. Recovery compares the sealed transfer records
+and staging file identities with the current workspace. New or changed stage files defer
+cleanup, as do missing transfer records for files still in staging.
+Cancelling before the final directory rename keeps the staged downloads for a retry. Once the
+rename has succeeded, the published checkpoint is usable and any interrupted cleanup can resume
+on the next pull.
+Older checkpoints remain usable. Recovery leaves their stage data in place when the matching
+cleanup record lacks a verifiable staging inventory. Resuming an existing `.part`
+requires a transfer record with a matching hard link. On filesystems without hard links,
+interrupted transfers restart from the beginning. Completed copies can still be reclaimed
+when the filesystem supplies a matching file ID and change time and the staged content matches
+its recorded digest. If the pull reports an unverified partial,
+inspect the file or choose a different destination.
+Publication writes a separate copy of the staged files and checks the planned digests against
+that copy. Allow space for the remaining downloads and one full copy, about twice the file
+payload for a fresh pull. Copying and verification add local disk reads and writes. An explicit
+pull into an existing checkpoint rehashes its contents and reports any mismatch without
+replacing the files. It invalidates a digest sidecar contradicted by the check. Cache checks
+also rehash files in read-only checkpoint directories. Elsewhere they reuse a sidecar only
+when its recorded identity and filesystem change time still match. A process killed
+during publication can leave a `publish-*` directory while the staging data remains resumable.
+Repeated `SIGKILL` interruptions can accumulate up to one extra copy per attempt and exceed
+twice the checkpoint payload. A retry reclaims a sealed abandoned candidate when its identity
+and contents, including the complete sidecar files, can be verified. Unsealed or changed
+candidates remain for inspection.
+On filesystems with hard links, successful publication reclaims old staged files and partial
+transfers whose records still match the original file. Completed transfers also need a matching
+content digest. Unrecorded files stay in place, and staging digest sidecars are reclaimed only
+when their file identity and full contents still match the sealed record. A process
+killed during initialization can leave a `.goinfer-init-*` directory that requires manual
+inspection. The next pull can initialize its workspace independently. On Linux, creating a
+workspace or stage requires filesystem support for `RENAME_NOREPLACE` so a concurrent directory
+creation cannot be overwritten. If the operation is unsupported, choose a destination on a
+filesystem that supports it.
+For older `.partial`, `.pull`, or `.goinfer-pulls/<destination>` layouts, recovery uses the
+version that created the workspace. Older `.goinfer-publish-*` directories lack destination
+information and require manual identification before recovery or removal.
 
 To see the checkpoints this project has actually run:
 
@@ -352,7 +392,7 @@ in-process. Longer form: [docs/positioning.md](docs/positioning.md).
 
 ## What it runs
 
-- **43 model families** — Gemma 1/2/3/4 (and CodeGemma), the Qwen line (Qwen2, Qwen2.5, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5-MoE, Qwen3.8, Qwen2.5-VL,
+- **44 model families** — Gemma 1/2/3/4 (and CodeGemma), the Qwen line (Qwen2, Qwen2.5, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5-MoE, Qwen3.8, Qwen2.5-VL,
   Qwen3-VL and its MoE, Qwen3-ASR), Llama, Mistral, Mixtral, Phi-3, DeepSeek/MLA,
   GLM, Kimi, Granite, Nemotron, Mellum, Olmo 3, Olmo Hybrid (on Metal at `int4` only; on WebGPU read only on the M1 Pro's adapter) and more; one page each at
   [goinfer.dev/models](https://goinfer.dev/models/), generated from the `decoder` registry

@@ -267,6 +267,7 @@
       "decoder/fit",
       "internal/cost",
       "internal/runtime/adapter",
+      "internal/runtime/checkpoint",
       "internal/runtime/diskfree",
       "internal/runtime/f16",
       "internal/runtime/giw",
@@ -458,6 +459,7 @@
       "tokenizer"
     ],
     "pull": [
+      "internal/runtime/checkpoint",
       "internal/runtime/diskfree"
     ],
     "server": [

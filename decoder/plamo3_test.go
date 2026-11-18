@@ -3,9 +3,11 @@ package decoder
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -37,28 +39,19 @@ func TestPlamo3Parity(t *testing.T) {
 	}
 	cache := m.NewCache(len(g.PromptIDs) + len(g.Continuation))
 	var logits []float32
-	check := func(label string, got, want []float32) {
-		t.Helper()
-		if len(got) != len(want) {
-			t.Fatalf("%s shape mismatch %d vs %d", label, len(got), len(want))
-		}
-		maxDiff := 0.0
-		for i := range got {
-			maxDiff = math.Max(maxDiff, math.Abs(float64(got[i]-want[i])))
-		}
-		if maxDiff > 2e-5 {
-			t.Fatalf("%s maximum absolute difference %g exceeds 2e-5", label, maxDiff)
-		}
-	}
 	for pos, id := range g.PromptIDs {
 		var hidden [][]float32
 		logits, hidden, err = m.ForwardCapture(id, cache, []int{0, 1})
 		if err != nil {
 			t.Fatal(err)
 		}
-		check("logits", logits, g.Logits[pos])
+		if err := checkPlamo3TinyParity(logits, g.Logits[pos]); err != nil {
+			t.Fatalf("position %d logits: %v", pos, err)
+		}
 		for layer := range hidden {
-			check("hidden state", hidden[layer], g.Hidden[layer][pos])
+			if err := checkPlamo3TinyParity(hidden[layer], g.Hidden[layer][pos]); err != nil {
+				t.Fatalf("position %d layer %d hidden state: %v", pos, layer, err)
+			}
 		}
 	}
 	for _, want := range g.Continuation {
@@ -84,6 +77,44 @@ func TestPlamo3Parity(t *testing.T) {
 	t.Log("all prompt positions, both layers, sliding-window wrap, YaRN and greedy generation match PFN fp32")
 }
 
+func checkPlamo3TinyParity(got, want []float32) error {
+	if len(got) != len(want) {
+		return fmt.Errorf("shape mismatch %d vs %d", len(got), len(want))
+	}
+	maxDiff := 0.0
+	for i := range got {
+		diff := math.Abs(float64(got[i]) - float64(want[i]))
+		if math.IsNaN(diff) || math.IsInf(diff, 0) {
+			return fmt.Errorf("non-finite value at index %d: got %g, reference %g", i, got[i], want[i])
+		}
+		maxDiff = math.Max(maxDiff, diff)
+	}
+	if maxDiff > 2e-5 {
+		return fmt.Errorf("maximum absolute difference %g exceeds 2e-5", maxDiff)
+	}
+	return nil
+}
+
+func TestPlamo3TinyParityRejectsNonFiniteValues(t *testing.T) {
+	nan, posInf, negInf := float32(math.NaN()), float32(math.Inf(1)), float32(math.Inf(-1))
+	for _, tc := range []struct {
+		name      string
+		got, want []float32
+	}{
+		{"non-maximal logit NaN", []float32{3, nan, 1}, []float32{3, 2, 1}},
+		{"reference NaN", []float32{3, 2, 1}, []float32{3, nan, 1}},
+		{"positive infinity", []float32{3, posInf, 1}, []float32{3, 2, 1}},
+		{"negative infinity", []float32{3, 2, 1}, []float32{3, negInf, 1}},
+		{"matching infinities", []float32{3, posInf, 1}, []float32{3, posInf, 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := checkPlamo3TinyParity(tc.got, tc.want); err == nil || !strings.Contains(err.Error(), "non-finite") {
+				t.Errorf("comparison error = %v; want a non-finite value error", err)
+			}
+		})
+	}
+}
+
 func TestPlamo3RejectsUnsupportedConfig(t *testing.T) {
 	raw, err := os.ReadFile("../testdata/plamo3-tiny/config.json")
 	if err != nil {
@@ -103,5 +134,36 @@ func TestPlamo3RejectsUnsupportedConfig(t *testing.T) {
 		if _, _, err := resolveArchitecture(&c); err == nil {
 			t.Fatal("unsupported config accepted")
 		}
+	}
+}
+
+func plamo3OracleCosine(got, want []float32) (float64, bool) {
+	if len(got) != len(want) {
+		return math.NaN(), false
+	}
+	cos := logitCosine(got, want)
+	return cos, !math.IsInf(cos, 0) && cos >= 0.99999
+}
+
+func TestPlamo3OracleCosine(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		got, want []float32
+		pass      bool
+	}{
+		{"matching", []float32{1, 2}, []float32{2, 4}, true},
+		{"orthogonal", []float32{1, 0}, []float32{0, 1}, false},
+		{"zero actual", []float32{0, 0}, []float32{1, 2}, false},
+		{"zero reference", []float32{1, 2}, []float32{0, 0}, false},
+		{"both zero", []float32{0, 0}, []float32{0, 0}, false},
+		{"non-finite", []float32{float32(math.Inf(1)), 1}, []float32{1, 1}, false},
+		{"empty", nil, nil, false},
+		{"different lengths", []float32{1, 2}, []float32{1}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if cos, pass := plamo3OracleCosine(tc.got, tc.want); pass != tc.pass {
+				t.Errorf("cosine %g passed = %v; want %v", cos, pass, tc.pass)
+			}
+		})
 	}
 }

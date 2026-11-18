@@ -382,6 +382,10 @@ func parallelLayers(n int, abort <-chan struct{}, fn func(i int) error) error {
 // the load-everything-then-quantize path needed. The forward output is identical
 // to quantizing after load; only the peak memory differs.
 func loadWeights(dir string, quant quantMode, embedInt4, needCanonical, skipRow4 bool, lora *loraAdapter, abort <-chan struct{}) (*Weights, error) {
+	return loadWeightsWithConfig(dir, quant, embedInt4, needCanonical, skipRow4, lora, abort, nil)
+}
+
+func loadWeightsWithConfig(dir string, quant quantMode, embedInt4, needCanonical, skipRow4 bool, lora *loraAdapter, abort <-chan struct{}, cfg *Config) (*Weights, error) {
 	// One atomic add per model load, so the fit guard's test can observe that a refused load allocated nothing rather than
 	// infer it from an error string (a guard that fires after the allocation still looks correct that way).
 	weightAllocs.Add(1)
@@ -395,9 +399,12 @@ func loadWeights(dir string, quant quantMode, embedInt4, needCanonical, skipRow4
 	if quant == quantQ4K {
 		return nil, fmt.Errorf("decoder: q4k keeps a GGUF's Q4_K tensors as they are, so it is GGUF-only (got safetensors %s)", dir)
 	}
-	cfg, err := loadConfig(os.DirFS(dir), "config.json")
-	if err != nil {
-		return nil, err
+	if cfg == nil {
+		var err error
+		cfg, err = loadDirConfig(dir)
+		if err != nil {
+			return nil, err
+		}
 	}
 	arch, schema, err := resolveArchitecture(cfg) // selects + validates the family descriptor
 	if err != nil {

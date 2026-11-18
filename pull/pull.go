@@ -38,6 +38,8 @@ import (
 	"time"
 
 	"github.com/townsendmerino/goinfer/internal/runtime/diskfree"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/checkpoint"
 )
 
 // hfAPI and hfCDN are split because they are different services with different failure
@@ -707,11 +709,7 @@ func render(files []File) string {
 // CacheRoot is the directory every pulled model lands under: <user cache>/goinfer/models. The serve
 // web UI confines its load route to it, so CacheDir must stay a subdirectory of this.
 func CacheRoot() (string, error) {
-	base, err := os.UserCacheDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(base, "goinfer", "models"), nil
+	return checkpoint.CacheRoot()
 }
 
 // CacheHelp is the sentence --help prints about where `pull` puts models and what moves it
@@ -747,35 +745,83 @@ func Download(ctx context.Context, repo string, f File, dir string, progress fun
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	final := filepath.Join(dir, filepath.Base(f.Path))
-
 	// Already present and intact ⇒ nothing to do.
 	if path, ok := cachedIntact(dir, f); ok {
 		return path, nil
 	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	name := filepath.Base(f.Path)
+	if err := downloadFile(ctx, root, name, repo, f, true, progress, nil); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, name), nil
+}
+
+// downloadFile performs all transfer operations in the already-open destination directory.
+func downloadFile(ctx context.Context, root *os.Root, final, repo string, f File, resume bool, progress func(done, total int64), work *checkpointWorkspace) error {
 
 	// Resume from a previous interrupted attempt when one is on disk: these files are multi-gigabyte,
 	// and losing 4 GB to a dropped connection is the difference between an annoyance and an unusable
 	// command on a flaky link.
 	part := final + ".part"
+	partInfo, err := root.Lstat(part)
+	newPart := os.IsNotExist(err)
+	if err != nil && !newPart {
+		return err
+	}
+	if !newPart {
+		if !partInfo.Mode().IsRegular() {
+			return fmt.Errorf("partial %s is not a regular file", part)
+		}
+		if work != nil && !work.ownsPartial(part, partInfo) {
+			return fmt.Errorf("partial %s has no verified transfer record in %s. Inspect it or choose another destination", part, root.Name())
+		}
+	}
 	var resumeFrom int64
+	var prefixInfo os.FileInfo
+	var prefixID string
 	h := sha256.New()
-	if st, err := os.Stat(part); err == nil && st.Size() > 0 && (f.Size <= 0 || st.Size() < f.Size) {
+	if resume && !newPart && partInfo.Size() > 0 && (f.Size <= 0 || partInfo.Size() < f.Size) {
 		// The running digest has to cover the bytes already on disk, so re-read them through the hash. That
 		// is a local read, trivial beside re-fetching, and it keeps the end-to-end sha256 check covering the
 		// whole file rather than only the tail.
-		if n, err := hashPrefix(h, part); err == nil {
-			resumeFrom = n
+		if info, id, err := hashPrefix(root, h, part); err == nil {
+			if !sameCheckpointFileState(partInfo, info) {
+				return fmt.Errorf("partial %s changed while preparing to resume", part)
+			}
+			resumeFrom, prefixInfo, prefixID = info.Size(), info, id
 		} else {
 			h.Reset()
 		}
 	}
+	finish := func(transferRoot *os.Root, src, target string, verified os.FileInfo, id string) error {
+		digest := hex.EncodeToString(h.Sum(nil))
+		if work != nil && transferRoot == root {
+			if err := work.recordTransferCompletion(src, verified, digest); err != nil {
+				return err
+			}
+		}
+		if err := commitDownload(transferRoot, src, target, verified, id, f.SHA256); err != nil {
+			return err
+		}
+		if work != nil {
+			work.recordCompletedTransfer(root, f, verified, digest)
+		}
+		return nil
+	}
 
 	resp, err := getRange(ctx, hfCDN+"/"+repo+"/resolve/main/"+f.Path, resumeFrom)
 	if err != nil {
-		return "", fmt.Errorf("downloading %s: %w", f.Path, err)
+		return fmt.Errorf("downloading %s: %w", f.Path, err)
 	}
 	defer resp.Body.Close()
+	if resumeFrom == 0 && (resp.StatusCode == http.StatusPartialContent || resp.StatusCode == http.StatusRequestedRangeNotSatisfiable) {
+		return fmt.Errorf("downloading %s: unexpected Range response (%s) to a full request", f.Path, resp.Status)
+	}
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
 		// Server honoured the Range: append.
@@ -793,28 +839,46 @@ func Download(ctx context.Context, repo string, f File, dir string, progress fun
 		// .part (hashPrefix, above); verify it directly instead of copying a body a 416 response does not have.
 		if f.SHA256 != "" {
 			if got := hex.EncodeToString(h.Sum(nil)); got != f.SHA256 {
-				os.Remove(part)
-				return "", fmt.Errorf("checksum mismatch for %s:\n  want %s (declared by HuggingFace)\n  got  %s\nthe local partial download was already complete but corrupt; removed, re-run to refetch", f.Path, f.SHA256, got)
+				removeUnchangedDownloadFile(root, part, prefixInfo)
+				return fmt.Errorf("checksum mismatch for %s:\n  want %s (declared by HuggingFace)\n  got  %s\nthe local partial download was already complete but corrupt; removed, re-run to refetch", f.Path, f.SHA256, got)
 			}
 		}
-		if err := os.Rename(part, final); err != nil {
-			return "", err
-		}
-		recordVerifiedDigest(final, f.SHA256)
-		return final, nil
+		return finish(root, part, final, prefixInfo, prefixID)
 	default:
-		return "", fmt.Errorf("downloading %s: HuggingFace returned %s", f.Path, resp.Status)
+		return fmt.Errorf("downloading %s: HuggingFace returned %s", f.Path, resp.Status)
 	}
 
-	flags := os.O_CREATE | os.O_WRONLY
+	flags := os.O_WRONLY
 	if resumeFrom > 0 {
 		flags |= os.O_APPEND
-	} else {
-		flags |= os.O_TRUNC
 	}
-	out, err := os.OpenFile(part, flags, 0o644)
+	if newPart {
+		flags |= os.O_CREATE | os.O_EXCL
+	}
+	var out *os.File
+	var privatePart string
+	if newPart && work != nil {
+		out, privatePart, err = work.createPartial(root, part, f.SHA256)
+	} else {
+		out, err = openRegularDownloadFile(root, part, flags)
+	}
 	if err != nil {
-		return "", err
+		return err
+	}
+	opened, err := out.Stat()
+	if err != nil {
+		out.Close()
+		return err
+	}
+	if !newPart && !sameCheckpointFileState(partInfo, opened) {
+		out.Close()
+		return fmt.Errorf("partial %s changed before writing", part)
+	}
+	if resumeFrom == 0 && !newPart {
+		if err := out.Truncate(0); err != nil {
+			out.Close()
+			return err
+		}
 	}
 	total := f.Size
 	if total <= 0 {
@@ -822,41 +886,74 @@ func Download(ctx context.Context, repo string, f File, dir string, progress fun
 	}
 	pw := &progressWriter{w: io.MultiWriter(out, h), done: resumeFrom, total: total, report: progress, last: time.Now()}
 	_, copyErr := io.Copy(pw, resp.Body)
+	verified, statErr := out.Stat()
+	var fileID string
+	if statErr == nil {
+		fileID = checkpointFileID(out, verified)
+	}
 	closeErr := out.Close()
 	if copyErr != nil {
 		// Deliberately NOT removed: the bytes already fetched are the whole point of resume.
 		// A digest mismatch below still deletes, because that partial is known-bad.
-		return "", fmt.Errorf("downloading %s (%s fetched; re-run to resume): %w", f.Path, humanBytes(pw.done), copyErr)
+		return fmt.Errorf("downloading %s (%s fetched; re-run to resume): %w", f.Path, humanBytes(pw.done), copyErr)
 	}
 	if closeErr != nil {
-		return "", closeErr
+		return closeErr
+	}
+	if statErr != nil {
+		return statErr
+	}
+	if verified.Size() != pw.done {
+		return fmt.Errorf("partial %s changed size during transfer", part)
+	}
+	transferRoot := root
+	if privatePart != "" {
+		if err := work.checkStageIdentity(root); err != nil {
+			return err
+		}
+		transferRoot, part, final = work.root, privatePart, filepath.Join(checkpointStageName, final)
 	}
 	if f.SHA256 != "" {
 		if got := hex.EncodeToString(h.Sum(nil)); got != f.SHA256 {
-			os.Remove(part)
-			return "", fmt.Errorf("checksum mismatch for %s:\n  want %s (declared by HuggingFace)\n  got  %s\nthe download was corrupted or the file changed upstream; nothing was written", f.Path, f.SHA256, got)
+			removeUnchangedDownloadFile(transferRoot, part, verified)
+			return fmt.Errorf("checksum mismatch for %s:\n  want %s (declared by HuggingFace)\n  got  %s\nthe download was corrupted or the file changed upstream; nothing was written", f.Path, f.SHA256, got)
 		}
 	}
-	if err := os.Rename(part, final); err != nil {
-		return "", err
-	}
-	recordVerifiedDigest(final, f.SHA256)
-	return final, nil
+	return finish(transferRoot, part, final, verified, fileID)
 }
 
-// recordVerifiedDigest writes path's digest sidecar from a digest Download has JUST verified against
-// the streamed bytes, so the first Resolve after a pull (cachedIntact) does not read the whole file
-// again to arrive at it. A no-op when no digest was declared (sum == ""), so nothing unverified is ever
-// recorded. Best-effort like cachedFileSHA256's own write: a failure only costs the next call a re-hash.
-func recordVerifiedDigest(path, sum string) {
-	if sum == "" {
-		return
+func removeUnchangedDownloadFile(root *os.Root, name string, verified os.FileInfo) {
+	if info, err := root.Lstat(name); err == nil && sameCheckpointFileState(info, verified) {
+		_ = root.Remove(name)
 	}
-	st, err := os.Stat(path)
-	if err != nil {
-		return
+}
+
+var renameCompletedDownload = (*os.Root).Rename
+
+func commitDownload(root *os.Root, part, final string, verified os.FileInfo, id, digest string) error {
+	if info, err := root.Lstat(part); err != nil || !sameCheckpointFileState(info, verified) {
+		return fmt.Errorf("partial %s changed before completion", part)
 	}
-	writeDigestSidecar(path, st, sum)
+	if err := renameCompletedDownload(root, part, final); err != nil {
+		return err
+	}
+	if info, err := root.Lstat(final); err != nil || !sameCheckpointFileState(info, verified) {
+		return fmt.Errorf("file %s changed while completing the transfer", final)
+	}
+	if digest != "" {
+		writeRootDigest(root, final, verified, id, digest)
+	}
+	return nil
+}
+
+// The caller supplies the identity of the opened file whose bytes produced sum.
+func writeRootDigest(root *os.Root, path string, info os.FileInfo, id, sum string) string {
+	b, err := json.Marshal(digestSidecar{Size: info.Size(), ModTime: info.ModTime().UnixNano(), SHA256: sum, FileID: id, ChangeTime: checkpointChangeTime(info)})
+	if err != nil || replaceRootFile(root, sidecarPath(path), b) != nil {
+		return ""
+	}
+	digest := sha256.Sum256(b)
+	return hex.EncodeToString(digest[:])
 }
 
 func writeDigestSidecar(path string, st os.FileInfo, sum string) {
@@ -865,14 +962,29 @@ func writeDigestSidecar(path string, st os.FileInfo, sum string) {
 	}
 }
 
-// hashPrefix feeds path's current contents into h and returns how many bytes it covered.
-func hashPrefix(h io.Writer, path string) (int64, error) {
-	fh, err := os.Open(path)
+// hashPrefix binds the partial digest to the exact file whose bytes it read.
+func hashPrefix(root *os.Root, h io.Writer, path string) (os.FileInfo, string, error) {
+	fh, err := openRegularDownloadFile(root, path, os.O_RDONLY)
 	if err != nil {
-		return 0, err
+		return nil, "", err
 	}
 	defer fh.Close()
-	return io.Copy(h, fh)
+	before, err := fh.Stat()
+	if err != nil {
+		return nil, "", err
+	}
+	n, err := io.Copy(h, fh)
+	if err != nil {
+		return nil, "", err
+	}
+	after, err := fh.Stat()
+	if err != nil {
+		return nil, "", err
+	}
+	if n != before.Size() || !sameCheckpointFileState(before, after) {
+		return nil, "", fmt.Errorf("partial %s changed while hashing", path)
+	}
+	return after, checkpointFileID(fh, after), nil
 }
 
 // cachedIntact reports whether dir already holds f, verified: it re-checks the digest rather than
@@ -910,9 +1022,11 @@ func fileSHA256(path string) (string, error) {
 // digestSidecar records path's SHA-256 alongside the (size, mtime) it was computed against: a
 // sidecar cache for the hash, as the .giw is for the transcode.
 type digestSidecar struct {
-	Size    int64  `json:"size"`
-	ModTime int64  `json:"mod_time_unix_nano"`
-	SHA256  string `json:"sha256"`
+	Size       int64  `json:"size"`
+	ModTime    int64  `json:"mod_time_unix_nano"`
+	SHA256     string `json:"sha256"`
+	FileID     string `json:"file_id,omitempty"`
+	ChangeTime int64  `json:"change_time_unix_nano,omitempty"`
 }
 
 // sidecarPath is path's digest cache file — a dotfile so it doesn't clutter a directory listing

@@ -20,7 +20,9 @@ go run ./demo/plamo-translate \
   -text 'The meeting has been moved to next Monday.'
 ```
 
-The example uses CPU inference, runtime int4 quantization, greedy decoding and the checkpoint's generation stop tokens. `-quant bf16` keeps the original weight precision; `-quant f32` widens it. Python is only needed to fetch weights with the example download command and reproduce the reference fixtures, not for Go inference. The Go model/tokenizer loaders execute no Python checkpoint code.
+The example uses CPU inference, runtime int4 quantization, greedy decoding and the checkpoint's generation stop tokens. Use `-target-lang 'ja(easy)'` for easy Japanese. `-quant bf16` keeps the original weight precision; `-quant f32` widens it. Python is only needed to fetch weights with the example download command and reproduce the reference fixtures, not for Go inference. The Go model/tokenizer loaders execute no Python checkpoint code.
+
+Language codes follow the official template. Use two or three lowercase ASCII letters, optionally followed by a hyphen and four lowercase script letters, or use `ja(easy)`. The source language may be omitted. For English, use `en` in place of `EN` or `en-US`.
 
 The model directory must contain `config.json`, the original safetensors file(s), `generation_config.json`, `tokenizer.jsonl` and `tokenizer_config.json`. `chat_template.jinja` is optional for the example, which explicitly renders the translation prompt. General chat templates and server chat endpoints are not part of this change. Input content is encoded separately from structural markers using `EncodeSegments`.
 
@@ -63,7 +65,9 @@ The downloaded safetensors SHA-256 was `7c9f0066d166c075bdbe83ada3d444e08bd7a6ee
 
 ## Scope and remaining validation
 
-Supported input is the original unquantized safetensors layout. Pre-quantized FP8/W4/NVFP4 checkpoints and PLaMo GGUF files are unsupported. Standalone tokenizer packaging inside `.giw` and the built-in Hugging Face `pull` workflow are not implemented for tokenizer.jsonl; use the local directory and dedicated example.
+Supported input is the original unquantized safetensors layout. Pre-quantized FP8/W4/NVFP4 checkpoints and PLaMo GGUF files are unsupported. Standalone tokenizer packaging inside `.giw` is unavailable for `tokenizer.jsonl`. The built-in Hugging Face `pull` rejects PLaMo 3 during planning, before fetching weights. An `hf:` reference to an older PLaMo 3 cache also returns an error with local download instructions. Use the local directory and dedicated example.
+
+For other safetensors checkpoints downloaded by goinfer, the decoder reads `config.json` inside the checkpoint directory at load time and checks the bytes it will parse against the cache marker. New downloads record a local SHA-256 for that file. Older markers without a config digest still check the size and model layout. A checkpoint in the built-in model cache requires its marker. For an unmanaged local checkpoint, use a directory outside that cache. The marker is local metadata, and the weights and tokenizer are opened separately from the config check. On Unix the config is opened without waiting for a FIFO writer and checked for regular-file status before reading.
 
 The shared descriptor can express the other PLaMo 3 sizes, but 2B, 8B and 31B have not been run here. CUDA, Metal, the user's RTX 4070, long-context limits and translation quality benchmarks have not been validated. No performance or VRAM-fit claim is made. The capability matrix's parity status remains pending until full model oracle validation.
 

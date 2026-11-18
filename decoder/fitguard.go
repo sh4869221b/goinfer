@@ -644,6 +644,10 @@ func fitCheckFor(path, quantName string, quant quantMode, opts Options) fitCheck
 
 // fitCheckForAt is fitCheckFor with the available-memory reading passed in (read is called once, first).
 func fitCheckForAt(path, quantName string, quant quantMode, opts Options, read func() int64) fitCheck {
+	return fitCheckForConfig(path, quantName, quant, opts, read, nil)
+}
+
+func fitCheckForConfig(path, quantName string, quant quantMode, opts Options, read func() int64, cfg *Config) fitCheck {
 	if quantName == "" {
 		quantName = "f32"
 	}
@@ -687,9 +691,12 @@ func fitCheckForAt(path, quantName string, quant quantMode, opts Options, read f
 	// openCheckpointMmap/loadConfig fail cleanly on anything that is not a plain safetensors
 	// checkpoint, which is "unknown ⇒ proceed", same as every other unreadable source here.
 	f.weightBytes = estimateSafetensorsWeightBytes(path, quant)
-	cfg, cerr := loadConfig(os.DirFS(path), "config.json")
-	if cerr != nil {
-		return f
+	if cfg == nil {
+		var err error
+		cfg, err = loadDirConfig(path)
+		if err != nil {
+			return f
+		}
 	}
 	return f.priceCtxAndKV(cfg, opts)
 }

@@ -176,10 +176,12 @@ type webPullReq struct {
 // The HuggingFace calls the list and pull routes make, as seams: the tests stand in a repo without the network, the
 // way webLoadDecoder stands in a load.
 var (
-	webCheckAccess     = pull.CheckAccess
-	webListFiles       = pull.List
-	webPlanCheckpoint  = pull.PlanCheckpoint
-	webFetchCheckpoint = pull.DownloadCheckpoint
+	webCheckAccess       = pull.CheckAccess
+	webListFiles         = pull.List
+	webPlanCheckpoint    = pull.PlanCheckpoint
+	webPrepareCheckpoint = func(ctx context.Context, repo string) (pull.Plan, pull.CheckpointDownload, error) {
+		return pull.PrepareCheckpointFor(ctx, repo, nil)
+	}
 )
 
 // checkpointJSON is a checkpoint plan as the page shows it before the transfer: what it costs, and which family will
@@ -473,11 +475,11 @@ func pullProgress(start time.Time, done, total int64) map[string]any {
 }
 
 // webPullCheckpoint is handleWebPull for a whole safetensors checkpoint: plan it (declining an unsupported family before
-// any weight byte), then fetch the set into the repo's cache directory through pull.DownloadCheckpoint, which publishes
+// any weight byte), then fetch the prepared set into the repo's cache directory. The downloader publishes
 // the directory only once every file has verified. Progress is over the whole set and names the file in flight. A
 // cancelled pull keeps the staging directory, so the next pull of the same repo resumes it.
 func webPullCheckpoint(ctx context.Context, repo string, send func(string, any)) {
-	p, err := webPlanCheckpoint(ctx, repo)
+	p, download, err := webPrepareCheckpoint(ctx, repo)
 	if err != nil {
 		send("error", map[string]string{"message": err.Error()})
 		return
@@ -495,7 +497,7 @@ func webPullCheckpoint(ctx context.Context, repo string, send func(string, any))
 	}
 	send("start", map[string]any{"checkpoint": checkpointJSON(p), "size": p.Bytes, "human": pull.HumanBytes(p.Bytes), "dir": dir})
 	start := time.Now()
-	path, err := webFetchCheckpoint(ctx, p, dir, func(done, total int64, file string) {
+	path, err := download(ctx, dir, func(done, total int64, file string) {
 		ev := pullProgress(start, done, total)
 		ev["file"] = file
 		send("progress", ev)
