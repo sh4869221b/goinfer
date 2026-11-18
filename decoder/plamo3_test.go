@@ -105,3 +105,34 @@ func TestPlamo3RejectsUnsupportedConfig(t *testing.T) {
 		}
 	}
 }
+
+func plamo3OracleCosine(got, want []float32) (float64, bool) {
+	if len(got) != len(want) {
+		return math.NaN(), false
+	}
+	cos := logitCosine(got, want)
+	return cos, !math.IsInf(cos, 0) && cos >= 0.99999
+}
+
+func TestPlamo3OracleCosine(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		got, want []float32
+		pass      bool
+	}{
+		{"matching", []float32{1, 2}, []float32{2, 4}, true},
+		{"orthogonal", []float32{1, 0}, []float32{0, 1}, false},
+		{"zero actual", []float32{0, 0}, []float32{1, 2}, false},
+		{"zero reference", []float32{1, 2}, []float32{0, 0}, false},
+		{"both zero", []float32{0, 0}, []float32{0, 0}, false},
+		{"non-finite", []float32{float32(math.Inf(1)), 1}, []float32{1, 1}, false},
+		{"empty", nil, nil, false},
+		{"different lengths", []float32{1, 2}, []float32{1}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if cos, pass := plamo3OracleCosine(tc.got, tc.want); pass != tc.pass {
+				t.Errorf("cosine %g passed = %v; want %v", cos, pass, tc.pass)
+			}
+		})
+	}
+}

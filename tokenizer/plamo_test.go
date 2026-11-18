@@ -13,7 +13,7 @@ import (
 func TestPlamoTokenizer(t *testing.T) {
 	dir := t.TempDir()
 	var rows strings.Builder
-	vocab := [][]any{{"<|plamo:bos|>", 0, "CONTROL"}, {"<|plamo:pad|>", 0, "CONTROL"}, {"a", -1, "NORMAL"}, {"aa", -2, "NORMAL"}, {"▁", -1, "NORMAL"}, {" ", -1, "NORMAL"}, {"a  a", 0, "NORMAL"}}
+	vocab := [][]any{{"<|plamo:bos|>", 0, "CONTROL"}, {"<|plamo:pad|>", 0, "CONTROL"}, {"a", -1, "NORMAL"}, {"aa", -2, "NORMAL"}, {"▁", -1, "NORMAL"}, {" ", -1, "NORMAL"}, {"a  a", 0, "NORMAL"}, {"<|plamo:unk|>", 0, "UNKNOWN"}}
 	for i := range 256 {
 		vocab = append(vocab, []any{fmt.Sprintf("<0x%02X>", i), -100, "BYTE"})
 	}
@@ -67,9 +67,17 @@ func TestPlamoTokenizer(t *testing.T) {
 			t.Fatalf("stream: %q != %q", got.String(), text)
 		}
 	}
-	ids, err := tk.EncodeSegments([]Segment{{Text: "<|plamo:bos|>", Special: false}}, false)
-	if err != nil || slices.Contains(ids, 0) {
-		t.Fatalf("content forged control token: %v (%v)", ids, err)
+	const text = "a<|plamo:bos|><|plamo:unk|>a"
+	ids, err := tk.EncodeSegments([]Segment{{Text: "<|plamo:bos|>", Special: true}, {Text: text}}, false)
+	if err != nil || len(ids) < 2 || ids[0] != 0 || slices.Contains(ids[1:], 0) || slices.Contains(ids[1:], 7) {
+		t.Fatalf("want a control BOS followed by ordinary content IDs, got %v (%v)", ids, err)
+	}
+	if got, err := tk.Decode(ids[1:]); err != nil || got != text {
+		t.Fatalf("content decoded to %q (%v); want %q", got, err, text)
+	}
+	ids, err = tk.EncodeSegments([]Segment{{Text: "<|plamo:unk|>", Special: true}}, false)
+	if err != nil || !slices.Equal(ids, []int{7}) || !tk.IsAdded(7) {
+		t.Fatalf("want trusted UNKNOWN token 7, got %v (%v)", ids, err)
 	}
 }
 

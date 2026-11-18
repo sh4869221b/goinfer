@@ -9,7 +9,7 @@ cross-compile it like anything else. No Python, no llama.cpp, no C toolchain, no
 - **Output your types guarantee** — constrain generation to a Go struct or a JSON Schema; an
   invalid token is unreachable, not retried.
 - **One static binary** — and, if you want, the model baked into it.
-- **43 model families**, each behind a HuggingFace logit-parity gate.
+- **44 model families**, with HuggingFace logit-parity coverage tracked in the [capability matrix](docs/capability-matrix.md).
 - Experimental [PLaMo 3 Translate](docs/plamo3.md) support, with a dedicated translation example and CPU tests.
 - **CPU, CUDA and Metal**, cgo-free; **WebGPU** as an opt-in cgo build.
 - **Runs offline** — no telemetry, no update check, no account. The one thing that reaches the network is fetching a
@@ -352,7 +352,7 @@ in-process. Longer form: [docs/positioning.md](docs/positioning.md).
 
 ## What it runs
 
-- **43 model families** — Gemma 1/2/3/4 (and CodeGemma), the Qwen line (Qwen2, Qwen2.5, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5-MoE, Qwen3.8, Qwen2.5-VL,
+- **44 model families** — Gemma 1/2/3/4 (and CodeGemma), the Qwen line (Qwen2, Qwen2.5, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5-MoE, Qwen3.8, Qwen2.5-VL,
   Qwen3-VL and its MoE, Qwen3-ASR), Llama, Mistral, Mixtral, Phi-3, DeepSeek/MLA,
   GLM, Kimi, Granite, Nemotron, Mellum, Olmo 3, Olmo Hybrid (on Metal at `int4` only; on WebGPU read only on the M1 Pro's adapter) and more; one page each at
   [goinfer.dev/models](https://goinfer.dev/models/), generated from the `decoder` registry

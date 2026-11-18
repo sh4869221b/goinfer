@@ -182,6 +182,7 @@ func FamilyForModelType(mt string) (family string, ok bool) {
 // tree and two small files (config.json, and the shard index when there is one), and refuses:
 //   - a repo with no config.json or no safetensors weights;
 //   - a model_type this build cannot load (declined before the first weight byte);
+//   - PLaMo 3, whose tokenizer.jsonl layout this pull workflow does not package;
 //   - a shard index that names a file the repo does not have, or an unsafe path.
 //
 // The caller runs CheckAccess first, as for a GGUF pull.
@@ -223,6 +224,9 @@ func PlanCheckpointFor(ctx context.Context, repo string, loads func(modelType st
 	fam, err := loads(cfg.ModelType)
 	if err != nil {
 		return Plan{}, fmt.Errorf("repo %s is %w; nothing was downloaded", repo, err)
+	}
+	if cfg.ModelType == "plamo3" {
+		return Plan{}, fmt.Errorf("repo %s uses PLaMo 3, which requires tokenizer.jsonl: built-in checkpoint pull does not support this layout; download the official checkpoint to a local directory and use demo/plamo-translate (docs/plamo3.md)", repo)
 	}
 	p := Plan{Repo: repo, ModelType: cfg.ModelType, Family: fam, Dtype: cfg.TorchDtype}
 	if p.Dtype == "" {

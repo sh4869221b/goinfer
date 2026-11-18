@@ -15,7 +15,7 @@ type plamoNode struct {
 	next    map[rune]*plamoNode
 	id      int
 	score   int64
-	control bool
+	special bool
 }
 type plamoTokenizer struct {
 	root            plamoNode
@@ -76,8 +76,8 @@ func loadPlamo(path string) (*Tokenizer, error) {
 			}
 			node = node.next[r]
 		}
-		node.id, node.score, node.control = id, int64(math.RoundToEven(score*1e4)), kind == "CONTROL"
-		if node.control {
+		node.id, node.score, node.special = id, int64(math.RoundToEven(score*1e4)), kind == "CONTROL" || kind == "UNKNOWN"
+		if node.special {
 			t.markAdded(id)
 		}
 	}
@@ -172,7 +172,7 @@ func (t *Tokenizer) plamoDP(out []int, rs []rune, special bool) []int {
 			if node == nil {
 				break
 			}
-			if node.id < 0 || node.score <= -20000000 || node.control && !special {
+			if node.id < 0 || node.score <= -20000000 || node.special && !special {
 				continue
 			}
 			candidate := node.score + scores[j+1]

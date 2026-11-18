@@ -163,6 +163,54 @@ func withCacheRoot(t *testing.T) string {
 	return root
 }
 
+func TestPlanCheckpointRejectsPlamo3BeforeWeights(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		tokenizer bool
+	}{
+		{name: "missing tokenizer"},
+		{name: "with tokenizer", tokenizer: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := map[string][]byte{
+				"config.json":                      []byte(`{"model_type":"plamo3"}`),
+				"generation_config.json":           []byte(`{}`),
+				"tokenizer_config.json":            []byte(`{}`),
+				"model.safetensors.index.json":     []byte(`{"weight_map":{"w":"model-00001-of-00001.safetensors"}}`),
+				"model-00001-of-00001.safetensors": []byte("weights"),
+			}
+			if tc.tokenizer {
+				files["tokenizer.jsonl"] = []byte(`["<|plamo:unk|>",0,"UNKNOWN"]`)
+			}
+			const repo = "o/plamo"
+			h := &fakeHF{files: files}
+			h.serve(t, repo)
+			for _, plan := range []struct {
+				name string
+				run  func(context.Context, string) (Plan, error)
+			}{
+				{"generative", PlanCheckpoint},
+				{"pull CLI", func(ctx context.Context, repo string) (Plan, error) {
+					return PlanCheckpointFor(ctx, repo, AnyLoads)
+				}},
+			} {
+				p, err := plan.run(t.Context(), repo)
+				if err == nil || !strings.Contains(err.Error(), "tokenizer.jsonl") || !strings.Contains(err.Error(), "local directory") {
+					t.Errorf("%s plan = %+v, %v; want a local-directory error", plan.name, p, err)
+				}
+				if len(p.Files) != 0 {
+					t.Errorf("%s planned files despite rejection: %v", plan.name, p.Files)
+				}
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if len(h.hits) != 1 || h.hits["config.json"] != 2 {
+				t.Errorf("requested files = %v; only config.json should be fetched", h.hits)
+			}
+		})
+	}
+}
+
 // TestCheckpoint_shardedRoundTrip is P9's first gate (docs/tasks/task-checkpoint-fetch-2026-09.md): a safetensors
 // repo with a shard index goes plan -> fetch -> load -> one token. The plan takes config, index and both shards and
 // leaves the README and the legacy .bin out; the fetched directory is what decoder.Load opens; a second Resolve is
