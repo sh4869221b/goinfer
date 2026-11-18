@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -224,10 +225,17 @@ func TestResolveLegacyCheckpointCache(t *testing.T) {
 		{name: "Llama relative link", modelType: "llama", link: "relative"},
 		{name: "PLaMo absolute local link", modelType: "plamo3", link: "absolute", wantErr: "tokenizer.jsonl"},
 		{name: "Llama absolute local link", modelType: "llama", link: "absolute"},
+		{name: "Llama chained absolute local link", modelType: "llama", link: "chained absolute"},
+		{name: "PLaMo chained absolute local link", modelType: "plamo3", link: "chained absolute", wantErr: "tokenizer.jsonl"},
+		{name: "Llama cache root alias", modelType: "llama", link: "cache alias"},
+		{name: "PLaMo cache root alias", modelType: "plamo3", link: "cache alias", wantErr: "tokenizer.jsonl"},
+		{name: "Llama absolute directory link", modelType: "llama", link: "absolute directory"},
+		{name: "Llama absolute link to checkpoint directory", modelType: "llama", link: "absolute checkpoint directory"},
 		{name: "broken link", modelType: "llama", link: "broken", wantErr: "config.json"},
 		{name: "relative escape", modelType: "plamo3", link: "relative escape", wantErr: "config.json"},
 		{name: "absolute escape", modelType: "plamo3", link: "absolute escape", wantErr: "config.json"},
 		{name: "chained escape", modelType: "plamo3", link: "chained escape", wantErr: "config.json"},
+		{name: "escape and reentry", modelType: "plamo3", link: "reentry", wantErr: "config.json"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			withCacheRoot(t)
@@ -252,16 +260,46 @@ func TestResolveLegacyCheckpointCache(t *testing.T) {
 			configFile := configPath
 			var linkTarget string
 			switch tc.link {
-			case "relative", "absolute":
+			case "relative", "absolute", "chained absolute":
 				configFile = filepath.Join(dir, "model-config.json")
 				linkTarget = filepath.Base(configFile)
-				if tc.link == "absolute" {
+				if tc.link != "relative" {
 					linkTarget, err = filepath.EvalSymlinks(dir)
 					if err != nil {
 						t.Fatal(err)
 					}
 					linkTarget = filepath.Join(linkTarget, filepath.Base(configFile))
 				}
+				if tc.link == "chained absolute" {
+					saveCheckpointConfigLink(t, linkTarget, filepath.Join(dir, "active.json"))
+					linkTarget = "active.json"
+				}
+			case "cache alias":
+				cache, err := CacheRoot()
+				if err != nil {
+					t.Fatal(err)
+				}
+				alias := filepath.Join(t.TempDir(), "models-alias")
+				saveCheckpointConfigLink(t, cache, alias)
+				configFile = filepath.Join(dir, "model-config.json")
+				linkTarget = filepath.Join(alias, filepath.FromSlash(repo), filepath.Base(configFile))
+			case "absolute directory", "absolute checkpoint directory":
+				dataDir := dir
+				if tc.link == "absolute directory" {
+					dataDir = filepath.Join(dir, "data")
+					if err := os.Mkdir(dataDir, 0o755); err != nil {
+						t.Fatal(err)
+					}
+				}
+				saveCheckpointConfigLink(t, dataDir, filepath.Join(dir, "active"))
+				configFile = filepath.Join(dataDir, "model-config.json")
+				linkTarget = filepath.Join("active", filepath.Base(configFile))
+			case "reentry":
+				outside := t.TempDir()
+				saveCheckpointConfigLink(t, outside, filepath.Join(dir, "outside"))
+				saveCheckpointConfigLink(t, dir, filepath.Join(outside, "reentry"))
+				configFile = filepath.Join(dir, "model-config.json")
+				linkTarget = filepath.Join(dir, "outside", "reentry", filepath.Base(configFile))
 			case "broken":
 				configFile, linkTarget = "", "missing.json"
 			case "relative escape", "absolute escape", "chained escape":
@@ -325,6 +363,59 @@ func TestResolveLegacyCheckpointCache(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestReadCachedCheckpointConfigWhileAliasChanges(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires renaming over an existing symlink")
+	}
+	dir, outside := t.TempDir(), t.TempDir()
+	const insideConfig = `{"model_type":"llama"}`
+	const outsideConfig = `{"model_type":"plamo3"}`
+	for dest, config := range map[string]string{dir: insideConfig, outside: outsideConfig} {
+		if err := os.WriteFile(filepath.Join(dest, "model-config.json"), []byte(config), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	aliasDir := t.TempDir()
+	alias := filepath.Join(aliasDir, "checkpoint-alias")
+	saveCheckpointConfigLink(t, dir, alias)
+	saveCheckpointConfigLink(t, filepath.Join(alias, "model-config.json"), filepath.Join(dir, "active.json"))
+	saveCheckpointConfigLink(t, "active.json", filepath.Join(dir, "config.json"))
+	if got, err := readCachedCheckpointConfig(dir); err != nil || string(got) != insideConfig {
+		t.Fatalf("initial config = %q, %v; want in-checkpoint data", got, err)
+	}
+
+	const attempts = 200
+	done := make(chan error, 1)
+	go func() {
+		next := filepath.Join(aliasDir, "next")
+		for i := range attempts {
+			target := outside
+			if i%2 == 1 {
+				target = dir
+			}
+			if err := os.Symlink(target, next); err != nil {
+				done <- err
+				return
+			}
+			if err := os.Rename(next, alias); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	for range attempts {
+		got, err := readCachedCheckpointConfig(dir)
+		if err == nil && string(got) != insideConfig {
+			t.Errorf("read config outside checkpoint while its alias changed: %q", got)
+			break
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 
