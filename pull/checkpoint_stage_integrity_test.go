@@ -3,6 +3,7 @@ package pull
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,61 @@ import (
 	"testing"
 	"time"
 )
+
+func TestCheckpointDigestInvalidationKeepsChangedRecords(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replace=%t", replace), func(t *testing.T) {
+			dir := t.TempDir()
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			const name = "model.safetensors"
+			if err := root.WriteFile(name, []byte("weight"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			f, err := openRegularDownloadFile(root, name, os.O_RDONLY)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			info, err := f.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeRootDigest(root, name, info, checkpointFileID(f, info), strings.Repeat("a", 64))
+			cached, record := readCheckpointDigestRecord(root, name, info)
+			if record == nil {
+				t.Fatal("missing sidecar snapshot")
+			}
+			changed := cached
+			changed.SHA256 = strings.Repeat("b", 64)
+			raw, err := json.Marshal(changed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := sidecarPath(name)
+			if replace {
+				err = replaceRootFile(root, path, raw)
+			} else {
+				err = root.WriteFile(path, raw, 0o600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(filepath.Join(dir, path), record.ModTime(), record.ModTime()); err != nil {
+				t.Fatal(err)
+			}
+			if err := invalidateCheckpointDigest(root, name, f, info, cached, record); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := root.ReadFile(path); err != nil || !bytes.Equal(got, raw) {
+				t.Errorf("invalidation discarded a changed sidecar: %q, %v", got, err)
+			}
+		})
+	}
+}
 
 func TestCheckpointRejectsReplacedStagedWeight(t *testing.T) {
 	const repo = "o/tiny"

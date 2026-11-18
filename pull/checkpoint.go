@@ -698,6 +698,7 @@ func downloadCheckpoint(ctx context.Context, p Plan, metadata checkpointMetadata
 	if root != nil {
 		defer root.Close()
 		probe = staging
+		work.reclaimAbandonedPublication(root)
 	}
 	var need, publicationBytes int64
 	for _, f := range p.Files {
@@ -864,11 +865,7 @@ func checkpointMarkerFiles(root *os.Root, p Plan, metadata checkpointMetadata) (
 			}
 			files[i].SHA256 = checkpoint.ConfigDigest(planned)
 		} else if f.SHA256 == "" {
-			digest, err := hashPublishedFile(root, f)
-			if err != nil {
-				return nil, err
-			}
-			files[i].SHA256 = digest
+			return nil, fmt.Errorf("missing verified digest for %s", f.Path)
 		}
 	}
 	return files, nil

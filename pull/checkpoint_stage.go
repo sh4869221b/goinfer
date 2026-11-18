@@ -10,7 +10,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/checkpoint"
 )
 
 const (
@@ -24,11 +27,12 @@ const (
 func checkpointWorkspaceName(dest string) string { return "." + dest + checkpointWorkSuffix }
 
 type checkpointWorkspace struct {
-	root     *os.Root
-	lock     *os.File
-	name     string
-	owner    checkpointWorkspaceOwner
-	receipts map[string][]checkpointReceipt
+	root      *os.Root
+	lock      *os.File
+	name      string
+	owner     checkpointWorkspaceOwner
+	receipts  map[string][]checkpointReceipt
+	completed map[string]checkpointReceipt
 }
 
 type checkpointWorkspaceOwner struct {
@@ -44,6 +48,7 @@ type checkpointPublication struct {
 type checkpointCleanup struct {
 	checkpointPublication
 	Transfers map[string]checkpointTransferSnapshot `json:"transfers"`
+	Candidate *checkpointPublicationCandidate       `json:"candidate,omitempty"`
 }
 
 func (w *checkpointWorkspace) Close() {
@@ -186,12 +191,12 @@ func readCheckpointCleanup(stage *os.Root) (checkpointCleanup, error) {
 	return record, err
 }
 
-func (w *checkpointWorkspace) sealCheckpointCleanup(stage *os.Root, token string) (checkpointCleanup, error) {
+func (w *checkpointWorkspace) sealCheckpointCleanup(stage *os.Root, token string, candidate *checkpointPublicationCandidate) (checkpointCleanup, error) {
 	old, err := readCheckpointCleanup(stage)
 	if !os.IsNotExist(err) && (err != nil || old.Owner != w.owner || old.Token == "") {
 		return checkpointCleanup{}, fmt.Errorf("%s has no verified owner", checkpointCleanupName)
 	}
-	cleanup := checkpointCleanup{checkpointPublication: checkpointPublication{Owner: w.owner, Token: token}, Transfers: w.snapshotTransfers(stage)}
+	cleanup := checkpointCleanup{checkpointPublication: checkpointPublication{Owner: w.owner, Token: token}, Transfers: w.snapshotTransfers(stage), Candidate: candidate}
 	raw, err := json.Marshal(cleanup)
 	if err != nil {
 		return checkpointCleanup{}, err
@@ -309,29 +314,22 @@ func reusableStagedFile(root *os.Root, name string, f File) bool {
 	return err == nil && info.Size() == f.Size && verifyOpenCheckpointDigest(root, name, f, opened, info) == nil
 }
 
-func hashPublishedFile(root *os.Root, f File) (string, error) {
+func verifyPublishedFile(root *os.Root, f File) error {
 	name := filepath.FromSlash(f.Path)
 	file, err := openRegularDownloadFile(root, name, os.O_RDONLY)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
-		return "", err
+		return err
 	}
-	digest, err := hashCheckpointFile(f, file)
-	if err != nil {
-		return "", err
+	if err := checkOpenCheckpointDigest(root, name, f, file, info); err != nil {
+		return err
 	}
-	if f.SHA256 != "" && digest != f.SHA256 {
-		return "", fmt.Errorf("%s: %w", f.Path, errCheckpointDigestMismatch)
-	}
-	if err := confirmCheckpointFile(root, name, file, info); err != nil {
-		return "", err
-	}
-	writeRootDigest(root, name, info, checkpointFileID(file, info), digest)
-	return digest, nil
+	writeRootDigest(root, name, info, checkpointFileID(file, info), f.SHA256)
+	return nil
 }
 
 func hashCheckpointFile(f File, r io.Reader) (string, error) {
@@ -377,7 +375,17 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 		}
 	}()
 	sources := make(map[string]os.FileInfo, len(p.Files))
-	for _, f := range p.Files {
+	// Keep learned digests local to publication. The remote tree pin stays independent.
+	p.Files = slices.Clone(p.Files)
+	for i, f := range p.Files {
+		if f.SHA256 == "" && metadata.contents(f.Path) == nil {
+			transfer := work.completed[f.Path]
+			if transfer.SHA256 == "" || transfer.Size != f.Size {
+				return fmt.Errorf("publishing %s: missing digest from this transfer", f.Path)
+			}
+			f.SHA256 = transfer.SHA256
+			p.Files[i] = f
+		}
 		info, err := preparePublishedFile(stage, publish, f)
 		if err != nil {
 			return fmt.Errorf("publishing %s: %w", f.Path, err)
@@ -413,7 +421,11 @@ func publishCheckpoint(parent *os.Root, work *checkpointWorkspace, stage *os.Roo
 		return fmt.Errorf("checkpoint publication record changed before rename")
 	}
 	// Seal exactly the receipts and file states this publication is allowed to reclaim.
-	cleanup, err := work.sealCheckpointCleanup(stage, publication)
+	var candidate *checkpointPublicationCandidate
+	if id := checkpointPublicationDirectoryID(publish); id != "" {
+		candidate = &checkpointPublicationCandidate{Name: name, FileID: id, MarkerSHA256: checkpoint.ConfigDigest(marker)}
+	}
+	cleanup, err := work.sealCheckpointCleanup(stage, publication, candidate)
 	if err != nil {
 		return err
 	}
@@ -464,7 +476,7 @@ func preparePublishedFile(stage, publish *os.Root, f File) (os.FileInfo, error) 
 		return nil, closeErr
 	}
 	if f.SHA256 != "" {
-		if _, err := hashPublishedFile(publish, f); err != nil {
+		if err := verifyPublishedFile(publish, f); err != nil {
 			if errors.Is(err, errCheckpointDigestMismatch) {
 				discardStagedDigest(stage, name, in, source, f.SHA256)
 			}

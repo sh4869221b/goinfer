@@ -15,11 +15,12 @@ import (
 )
 
 const (
-	checkpointCrashRepo  = "o/tiny"
-	checkpointCrashShard = "model-00001-of-00002.safetensors"
-	checkpointCrashTail  = "model-00002-of-00002.safetensors"
-	checkpointCrashMode  = "GOINFER_TEST_CHECKPOINT_CRASH_MODE"
-	checkpointCrashDest  = "GOINFER_TEST_CHECKPOINT_CRASH_DEST"
+	checkpointCrashRepo     = "o/tiny"
+	checkpointCrashShard    = "model-00001-of-00002.safetensors"
+	checkpointCrashTail     = "model-00002-of-00002.safetensors"
+	checkpointCrashTemplate = "chat_template.jinja"
+	checkpointCrashMode     = "GOINFER_TEST_CHECKPOINT_CRASH_MODE"
+	checkpointCrashDest     = "GOINFER_TEST_CHECKPOINT_CRASH_DEST"
 )
 
 func TestCheckpointTransferCrashBoundaries(t *testing.T) {
@@ -27,6 +28,15 @@ func TestCheckpointTransferCrashBoundaries(t *testing.T) {
 		hfAPI = os.Getenv("GOINFER_TEST_CHECKPOINT_API")
 		hfCDN = os.Getenv("GOINFER_TEST_CHECKPOINT_CDN")
 		dest := os.Getenv(checkpointCrashDest)
+		if mode == "damaged cache" {
+			if _, ok := CachedCheckpoint(dest); ok {
+				t.Error("cached checkpoint accepted a rejected digest")
+			}
+			if got, err := Resolve(t.Context(), "hf:"+checkpointCrashRepo+":safetensors", nil); got != "" || err == nil {
+				t.Errorf("Resolve accepted a rejected digest: %q, %v", got, err)
+			}
+			return
+		}
 		pause := func() {
 			fmt.Println("ready")
 			_, _ = io.Copy(io.Discard, os.Stdin)
@@ -70,7 +80,7 @@ func TestCheckpointTransferCrashBoundaries(t *testing.T) {
 			t.Fatal(err)
 		}
 		got, err := download(t.Context(), dest, func(_, _ int64, name string) {
-			if mode == "after shard" && name == checkpointCrashShard {
+			if mode == "after shard" && name == checkpointCrashShard || mode == "after template" && name == checkpointCrashTemplate {
 				path := filepath.Join(testCheckpointStagePath(dest), name)
 				if _, err := os.Stat(path); err == nil {
 					pause()
@@ -83,6 +93,12 @@ func TestCheckpointTransferCrashBoundaries(t *testing.T) {
 		if mode == "explicit repull" {
 			if got != "" || err == nil || !strings.Contains(err.Error(), "digest") {
 				t.Fatalf("explicit repull accepted modified weight: %q, %v", got, err)
+			}
+			return
+		}
+		if mode == "after template" {
+			if got != "" || err == nil || !strings.Contains(err.Error(), "digest") || !strings.Contains(err.Error(), checkpointCrashTemplate) {
+				t.Fatalf("publication accepted a modified template: %q, %v", got, err)
 			}
 			return
 		}
@@ -328,16 +344,19 @@ func TestCheckpointPublicationIsIndependentOfLateStageWrites(t *testing.T) {
 }
 
 func TestCheckpointExplicitRepullRehashesExistingWeight(t *testing.T) {
+	withCacheRoot(t)
 	files := shardedTinyRepo(t)
 	h := &fakeHF{files: files}
 	h.serve(t, checkpointCrashRepo)
-	dest := filepath.Join(t.TempDir(), "checkpoint")
+	dest, err := CacheDir(checkpointCrashRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
 	pullCrashCheckpoint(t, dest)
 	weight := filepath.Join(dest, checkpointCrashShard)
 	info, edited := rewriteCheckpointWeightInPlace(t, weight, files[checkpointCrashShard])
 	sidecar := sidecarPath(weight)
-	saved, err := os.ReadFile(sidecar)
-	if err != nil {
+	if _, err := os.Stat(sidecar); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -351,13 +370,118 @@ func TestCheckpointExplicitRepullRehashesExistingWeight(t *testing.T) {
 	if raw, err := os.ReadFile(weight); err != nil || !bytes.Equal(raw, edited) {
 		t.Errorf("repull changed the existing contents: %v", err)
 	}
-	if raw, err := os.ReadFile(sidecar); err != nil || !bytes.Equal(raw, saved) {
-		t.Errorf("repull changed the existing sidecar: %v", err)
+	if out, err := checkpointCrashCommand(ctx, "", "damaged cache", dest).CombinedOutput(); err != nil {
+		t.Errorf("offline consumers accepted the modified checkpoint: %v\n%s", err, out)
+	}
+	if _, err := os.Lstat(sidecar); !os.IsNotExist(err) {
+		t.Errorf("contradicted sidecar is still present: %v", err)
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.hits[checkpointCrashShard] != 1 {
 		t.Errorf("repull downloaded the existing shard again: %v", h.hits)
+	}
+}
+
+func TestCheckpointPublicationUsesCurrentTemplateReceipt(t *testing.T) {
+	files := shardedTinyRepo(t)
+	files[checkpointCrashTemplate] = []byte("{{ messages }}\n")
+	h := &fakeHF{files: files}
+	h.serve(t, checkpointCrashRepo)
+	dest := filepath.Join(t.TempDir(), "checkpoint")
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cmd := checkpointCrashCommand(ctx, "", "after template", dest)
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+	reader := bufio.NewReader(out)
+	if line, err := reader.ReadString('\n'); line != "ready\n" || err != nil {
+		t.Fatalf("writer did not finish the template: %q, %v", line, err)
+	}
+	_, edited := rewriteCheckpointWeightInPlace(t, filepath.Join(testCheckpointStagePath(dest), checkpointCrashTemplate), files[checkpointCrashTemplate])
+	if err := in.Close(); err != nil {
+		t.Fatal(err)
+	}
+	childOutput, _ := io.ReadAll(reader)
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("writer did not reject the modified template: %v\n%s", err, childOutput)
+	}
+	if _, err := os.Lstat(dest); !os.IsNotExist(err) {
+		t.Errorf("writer left a published checkpoint: %v", err)
+	}
+	path := filepath.Join(testCheckpointStagePath(dest), checkpointCrashTemplate)
+	if raw, err := os.ReadFile(path); err != nil || !bytes.Equal(raw, edited) {
+		t.Errorf("failed publication changed staging: %q, %v", raw, err)
+	}
+	pullCrashCheckpoint(t, dest)
+	if raw, err := os.ReadFile(filepath.Join(dest, checkpointCrashTemplate)); err != nil || !bytes.Equal(raw, files[checkpointCrashTemplate]) {
+		t.Errorf("repull published wrong template: %q, %v", raw, err)
+	}
+}
+
+func TestCheckpointReclaimsOnlyVerifiedAbandonedPublication(t *testing.T) {
+	for _, mode := range []string{"unchanged", "extra file", "edited payload"} {
+		t.Run(mode, func(t *testing.T) {
+			files := shardedTinyRepo(t)
+			h := &fakeHF{files: files}
+			h.serve(t, checkpointCrashRepo)
+			dest := filepath.Join(t.TempDir(), "checkpoint")
+			work := filepath.Dir(testCheckpointStagePath(dest))
+			killCheckpointAtTransferBoundary(t, "before publish", dest, nil)
+			first, err := filepath.Glob(filepath.Join(work, "publish-*"))
+			if err != nil || len(first) != 1 {
+				t.Fatalf("expected one abandoned candidate: %v, %v", first, err)
+			}
+			unowned := filepath.Join(work, "publish-unrecorded")
+			if err := os.Mkdir(unowned, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			preserved := map[string][]byte{filepath.Join(unowned, "notes.txt"): []byte("keep")}
+			if mode == "extra file" {
+				preserved[filepath.Join(first[0], "local.txt")] = []byte("keep")
+			}
+			for path, data := range preserved {
+				if err := os.WriteFile(path, data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "edited payload" {
+				path := filepath.Join(first[0], checkpointCrashShard)
+				_, preserved[path] = rewriteCheckpointWeightInPlace(t, path, files[checkpointCrashShard])
+			}
+			killCheckpointAtTransferBoundary(t, "before publish", dest, nil)
+			if mode == "unchanged" {
+				if _, err := os.Lstat(first[0]); !os.IsNotExist(err) {
+					t.Errorf("first verified copy remains after second interruption: %v", err)
+				}
+			}
+			pullCrashCheckpoint(t, dest)
+			for path, data := range preserved {
+				if raw, err := os.ReadFile(path); err != nil || !bytes.Equal(raw, data) {
+					t.Errorf("unowned contents changed: %d bytes, %v", len(raw), err)
+				}
+			}
+			left, err := filepath.Glob(filepath.Join(work, "publish-*"))
+			if err != nil || len(left) != len(preserved) {
+				t.Errorf("unexpected candidates left after recovery: %v, %v", left, err)
+			}
+		})
 	}
 }
 

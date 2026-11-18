@@ -54,9 +54,15 @@ func (w *checkpointWorkspace) recordCompletedTransfer(stage *os.Root, file File,
 	if !info.Mode().IsRegular() || info.Size() != file.Size {
 		return
 	}
-	w.recordReceipt(checkpointReceipt{
+	receipt := checkpointReceipt{
 		Owner: w.owner, Path: file.Path, Size: info.Size(), ModTime: info.ModTime().UnixNano(), SHA256: digest,
-	}, info)
+	}
+	// Publication can use the streamed digest even when hard links are unavailable.
+	if w.completed == nil {
+		w.completed = make(map[string]checkpointReceipt)
+	}
+	w.completed[file.Path] = receipt
+	w.recordReceipt(receipt, info)
 	w.pruneTransferReceipts(stage, file.Path, nil)
 	w.pruneTransferReceipts(stage, file.Path+".part", nil)
 }

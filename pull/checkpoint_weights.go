@@ -20,16 +20,23 @@ func checkpointDigestSidecar(root *os.Root, name string, info os.FileInfo) strin
 }
 
 func readCheckpointDigest(root *os.Root, name string, info os.FileInfo) digestSidecar {
+	stored, _ := readCheckpointDigestRecord(root, name, info)
+	return stored
+}
+
+func readCheckpointDigestRecord(root *os.Root, name string, info os.FileInfo) (digestSidecar, os.FileInfo) {
 	f, err := openRegularDownloadFile(root, sidecarPath(name), os.O_RDONLY)
 	if err != nil {
-		return digestSidecar{}
+		return digestSidecar{}, nil
 	}
 	defer f.Close()
 	var stored digestSidecar
 	if err := json.NewDecoder(io.LimitReader(f, 4096)).Decode(&stored); err == nil && stored.Size == info.Size() && stored.ModTime == info.ModTime().UnixNano() {
-		return stored
+		if stat, err := f.Stat(); err == nil {
+			return stored, stat
+		}
 	}
-	return digestSidecar{}
+	return digestSidecar{}, nil
 }
 
 type checkpointDigestCheck uint8
@@ -59,9 +66,36 @@ func verifyCheckpointFile(root *os.Root, file File, check checkpointDigestCheck)
 		return nil
 	}
 	if check == checkpointFreshDigest {
-		return checkOpenCheckpointDigest(root, name, file, f, info)
+		cached, record := readCheckpointDigestRecord(root, name, info)
+		err := checkOpenCheckpointDigest(root, name, file, f, info)
+		if errors.Is(err, errCheckpointDigestMismatch) && record != nil && cached.SHA256 == file.SHA256 && cached.FileID != "" && cached.FileID == checkpointFileID(f, info) {
+			return errors.Join(err, invalidateCheckpointDigest(root, name, f, info, cached, record))
+		}
+		return err
 	}
 	return verifyOpenCheckpointDigest(root, name, file, f, info)
+}
+
+// Invalidate only the sidecar observed before checking the same checkpoint file.
+func invalidateCheckpointDigest(root *os.Root, name string, file *os.File, before os.FileInfo, rejected digestSidecar, record os.FileInfo) error {
+	if err := confirmCheckpointFile(root, name, file, before); err != nil {
+		return err
+	}
+	if cached, info := readCheckpointDigestRecord(root, name, before); info == nil || !sameCheckpointFileState(record, info) || cached != rejected {
+		return nil
+	}
+	path := sidecarPath(name)
+	current, err := root.Lstat(path)
+	if os.IsNotExist(err) || err == nil && !sameCheckpointFileState(record, current) {
+		return nil
+	}
+	if err == nil {
+		err = root.Remove(path)
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("invalidating checkpoint digest for %s: %w", name, err)
+	}
+	return nil
 }
 
 // Verify the opened inode, never a digest associated with a coincidentally

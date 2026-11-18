@@ -180,8 +180,11 @@ Publication writes a separate copy of the staged files and checks the planned di
 that copy. Allow space for the remaining downloads and one full copy, about twice the file
 payload for a fresh pull. Copying and verification add local disk reads and writes. An explicit
 pull into an existing checkpoint rehashes its contents and reports any mismatch without
-replacing the files. A process killed during publication can leave a `publish-*` directory
-with a partial or full copy while the staging data remains resumable.
+replacing the files. It invalidates a digest sidecar contradicted by the check. A process killed
+during publication can leave a `publish-*` directory while the staging data remains resumable.
+Repeated `SIGKILL` interruptions can accumulate up to one extra copy per attempt and exceed
+twice the checkpoint payload. A retry reclaims a sealed abandoned candidate when its identity
+and contents can be verified. Unsealed or changed candidates remain for inspection.
 On filesystems with hard links, successful publication reclaims old staged files and partial
 transfers whose records still match the original file. Completed transfers also need a matching
 content digest. Unrecorded files stay in place. A process
