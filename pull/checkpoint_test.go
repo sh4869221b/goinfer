@@ -161,6 +161,15 @@ func shardedTinyRepo(t *testing.T) map[string][]byte {
 	}
 }
 
+func configWithDifferentEOS(t *testing.T, original []byte) []byte {
+	t.Helper()
+	updated := bytes.Replace(original, []byte(`"eos_token_id": 2`), []byte(`"eos_token_id": 3`), 1)
+	if bytes.Equal(original, updated) || len(original) != len(updated) || !json.Valid(updated) {
+		t.Fatal("fixture must have two different valid configs of equal size")
+	}
+	return updated
+}
+
 func withCacheRoot(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
@@ -620,10 +629,7 @@ func TestCheckpointResumeUsesPlannedConfig(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			files := shardedTinyRepo(t)
 			original := files["config.json"]
-			updated := bytes.Replace(original, []byte(`"eos_token_id": 2`), []byte(`"eos_token_id": 3`), 1)
-			if bytes.Equal(original, updated) || len(original) != len(updated) || !json.Valid(updated) {
-				t.Fatal("fixture must have two different valid configs of equal size")
-			}
+			updated := configWithDifferentEOS(t, original)
 			h := &fakeHF{files: files, failOnce: resumedShard}
 			h.serve(t, repo)
 			ctx := t.Context()
@@ -686,6 +692,147 @@ func TestCheckpointResumeUsesPlannedConfig(t *testing.T) {
 			}
 			if got, want := h.ranges[resumedShard], fmt.Sprintf("bytes=%d-", part.Size()); got != want {
 				t.Errorf("resumed shard request range = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestDownloadCheckpointRejectsCompletedConfigDrift(t *testing.T) {
+	const repo = "o/tiny"
+	withCacheRoot(t)
+	files := shardedTinyRepo(t)
+	original := files["config.json"]
+	h := &fakeHF{files: files}
+	h.serve(t, repo)
+	ctx := t.Context()
+	dest, err := CacheDir(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPlan, err := PlanCheckpoint(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DownloadCheckpoint(ctx, oldPlan, dest, nil); err != nil {
+		t.Fatal(err)
+	}
+	marker, err := os.ReadFile(filepath.Join(dest, checkpointMarker))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := configWithDifferentEOS(t, original)
+	h.mu.Lock()
+	h.files["config.json"] = updated
+	h.mu.Unlock()
+	plan, err := PlanCheckpoint(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.VerifyPin(oldPlan.TreeDigest()); err != nil {
+		t.Fatalf("same-size config changed the tree pin: %v", err)
+	}
+	h.mu.Lock()
+	requests := h.requests
+	h.mu.Unlock()
+	if got, err := DownloadCheckpoint(ctx, oldPlan, dest, nil); err != nil || got != dest {
+		t.Errorf("matching plan should reuse the completed checkpoint: %q, %v", got, err)
+	}
+	if got, err := DownloadCheckpoint(ctx, plan, dest, nil); got != "" || err == nil || !strings.Contains(err.Error(), "differs from the current checkpoint plan") {
+		t.Errorf("changed config should refuse the completed destination: %q, %v", got, err)
+	}
+	if got, err := Resolve(ctx, "hf:"+repo+":safetensors", nil); err != nil || got != dest {
+		t.Errorf("offline Resolve should still open the verified cache: %q, %v", got, err)
+	}
+	if _, err := os.Stat(dest + ".partial"); !os.IsNotExist(err) {
+		t.Errorf("refusal left a staging directory: %v", err)
+	}
+	for _, f := range oldPlan.Files {
+		want := files[f.Path]
+		if f.Path == "config.json" {
+			want = original
+		}
+		if got, err := os.ReadFile(filepath.Join(dest, f.Path)); err != nil || !bytes.Equal(got, want) {
+			t.Errorf("refusal changed %s: %v", f.Path, err)
+		}
+	}
+	if got, err := os.ReadFile(filepath.Join(dest, checkpointMarker)); err != nil || !bytes.Equal(got, marker) {
+		t.Errorf("refusal changed the marker: %v", err)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.requests != requests {
+		t.Errorf("completed destination checks made %d network requests", h.requests-requests)
+	}
+}
+
+func TestDownloadCheckpointRejectsRestoredConfigPlan(t *testing.T) {
+	const repo = "o/tiny"
+	const shardPart = "model-00001-of-00002.safetensors.part"
+	files := shardedTinyRepo(t)
+	original := files["config.json"]
+	h := &fakeHF{files: files}
+	h.serve(t, repo)
+	ctx := t.Context()
+	oldPlan, err := PlanCheckpoint(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := configWithDifferentEOS(t, original)
+	h.mu.Lock()
+	h.files["config.json"] = updated
+	h.mu.Unlock()
+	plan, err := PlanCheckpoint(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		initial Plan
+	}{
+		{"zero receiver", Plan{}},
+		{"receiver with an older config", oldPlan},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			restored := tc.initial
+			if err := json.Unmarshal(data, &restored); err != nil {
+				t.Fatal(err)
+			}
+			if err := restored.VerifyPin(plan.TreeDigest()); err != nil {
+				t.Fatalf("restored metadata lost its tree pin: %v", err)
+			}
+			dest := filepath.Join(t.TempDir(), "checkpoint")
+			staging := dest + ".partial"
+			if err := os.Mkdir(staging, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			staged := map[string][]byte{"config.json": original, shardPart: files["model-00001-of-00002.safetensors"][:32]}
+			for name, raw := range staged {
+				if err := os.WriteFile(filepath.Join(staging, name), raw, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h.mu.Lock()
+			requests := h.requests
+			h.mu.Unlock()
+			if got, err := DownloadCheckpoint(t.Context(), restored, dest, nil); got != "" || err == nil || !strings.Contains(err.Error(), "re-plan") {
+				t.Errorf("restored plan should request replanning: %q, %v", got, err)
+			}
+			if _, err := os.Stat(dest); !os.IsNotExist(err) {
+				t.Errorf("restored plan published a checkpoint: %v", err)
+			}
+			for name, want := range staged {
+				if got, err := os.ReadFile(filepath.Join(staging, name)); err != nil || !bytes.Equal(got, want) {
+					t.Errorf("refusal changed staged %s: %v", name, err)
+				}
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if h.requests != requests {
+				t.Errorf("restored plan made %d network requests", h.requests-requests)
 			}
 		})
 	}
