@@ -7,9 +7,11 @@ import (
 	"math"
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
-// G3 (docs/completed/task-families-2026-09.md, batch 2) Ministral 3 parity (mistralai/Ministral-3-{3b,8b,
+// G3 Ministral 3 parity (mistralai/Ministral-3-{3b,8b,
 // 14b}, model_type "mistral3" — the outer VL wrapper's type, "ministral3" nested): Mistral's GQA
 // skeleton plus YaRN RoPE with a DeepSeek-style mscale/mscale_all_dim override and Llama4-style
 // attention-temperature tuning on every layer (AttnTempBeta/AttnTempOrigMaxPos). The fixture's
@@ -91,7 +93,7 @@ func TestMinistral3_forwardParity(t *testing.T) {
 		t.Fatalf("got %d logits, want vocab %d", len(logits), g.Vocab)
 	}
 
-	if got := argmax(logits); got != g.Argmax {
+	if got := sampling.Argmax(logits); got != g.Argmax {
 		t.Errorf("argmax = %d, want %d (logit[got]=%.4f logit[want]=%.4f)",
 			got, g.Argmax, logits[got], logits[g.Argmax])
 	}
@@ -117,7 +119,7 @@ func TestMinistral3_forwardParity(t *testing.T) {
 
 	cos := fullCosine(t, logits, ministral3ForwardFullPath)
 	t.Logf("mistral3: argmax=%d (want %d) | maxSampleΔ=%.5f | cosine=%v",
-		argmax(logits), g.Argmax, maxSampleΔ, cos)
+		sampling.Argmax(logits), g.Argmax, maxSampleΔ, cos)
 	emitParityRow(t, "mistral3", "tiny-golden", "HF f32 (ministral3-tiny seeded fixture, prompt > original_max_position_embeddings to exercise attn-temp)", 100.0, cos, cos)
 }
 
@@ -183,8 +185,8 @@ func TestMinistral3_batchedMatchesSequential(t *testing.T) {
 	t.Logf("mistral3 batched==sequential: %d logits bit-identical", len(seqLogits))
 }
 
-// TestAttnTempScale_matchesSequentialFormula is G5's real gate for FeatAttnTemp
-// (docs/tasks/task-gpu-paths-2026-09.md): a resident backend calls Model.AttnTempScale(pos) (decode) or
+// TestAttnTempScale_matchesSequentialFormula is G5's real gate for FeatAttnTemp:
+// a resident backend calls Model.AttnTempScale(pos) (decode) or
 // Model.AttnTempParams() (CUDA's batched prefill, which recomputes the formula PER ROW device-side) instead of a new
 // per-model constant, so this is a pure, backend-agnostic check that both give exactly the formula
 // decoder/attention.go's sequential path applies: scale = 1 + beta·ln(1 + floor(pos/origMaxPos)). No GPU and no
@@ -203,7 +205,7 @@ func TestAttnTempScale_matchesSequentialFormula(t *testing.T) {
 			"exercises FeatAttnTemp; if the fixture changed, this test no longer gates what it claims")
 	}
 
-	beta, origMaxPos := m.AttnTempParams()
+	beta, origMaxPos := m.BackendView().AttnTempParams()
 	if beta != m.w.arch.AttnTempBeta || origMaxPos != m.w.arch.AttnTempOrigMaxPos {
 		t.Fatalf("AttnTempParams() = (%v, %v), want (%v, %v)", beta, origMaxPos, m.w.arch.AttnTempBeta, m.w.arch.AttnTempOrigMaxPos)
 	}
@@ -213,7 +215,7 @@ func TestAttnTempScale_matchesSequentialFormula(t *testing.T) {
 	// comment warns about), 8-15 give floor=1, 16-23 give floor=2. Covers both.
 	for pos := range 24 {
 		want := float32(1 + m.w.arch.AttnTempBeta*math.Log1p(math.Floor(float64(pos)/m.w.arch.AttnTempOrigMaxPos)))
-		got := m.AttnTempScale(pos)
+		got := m.BackendView().AttnTempScale(pos)
 		if got != want {
 			t.Errorf("AttnTempScale(%d) = %v, want %v (sequential formula)", pos, got, want)
 		}
@@ -224,7 +226,7 @@ func TestAttnTempScale_matchesSequentialFormula(t *testing.T) {
 			t.Errorf("formula from AttnTempParams() at pos %d = %v, want %v", pos, gotFromParams, want)
 		}
 	}
-	if s := m.AttnTempScale(3); s != 1 {
+	if s := m.BackendView().AttnTempScale(3); s != 1 {
 		t.Errorf("AttnTempScale(3) = %v, want exactly 1 (pos < origMaxPos=8 ⇒ floor==0 ⇒ identity)", s)
 	}
 }

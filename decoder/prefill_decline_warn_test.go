@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// B20 (docs/queue-engineering.md) gate: residentPrefillSeed's decline must actually reach an operator-visible log naming
+// B20 gate: residentPrefillSeed's decline must actually reach an operator-visible log naming
 // the reason, not merely be read internally. warnPrefillDeclined logs it, and these tests assert the log line's CONTENT:
 // an unasserted log line is a coverage claim, not coverage (CLAUDE.md § Tests).
 
@@ -15,9 +15,13 @@ import (
 // forcing residentPrefillSeed onto the sequential per-token fallback every time.
 type decliningPrefiller struct {
 	fakeResident
-	reason string
-	calls  int
+	fakeSubsystems // the contract defaults stay reachable when the embedded fake is left nil
+	reason         string
+	calls          int
 }
+
+func (f *decliningPrefiller) ResidentSubsystems() ResidentSubsystems { return selfSubsystems(f) }
+func (f *decliningPrefiller) PrefillAvailable() bool                 { return true }
 
 func (d *decliningPrefiller) PrefillLast(_ context.Context, embeddings [][]float32, startPos int) ([]float32, error) {
 	d.calls++

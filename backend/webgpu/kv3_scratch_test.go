@@ -72,9 +72,9 @@ func TestKV3_residentReportsItsChunks(t *testing.T) {
 	if !ok || rd == nil {
 		t.Skip("no WebGPU resident")
 	}
-	pc, ok := any(rd).(decoder.ResidentPrefillChunks)
-	if !ok {
-		t.Fatal("residentDecoder does not satisfy decoder.ResidentPrefillChunks")
+	pc := decoder.SubsystemsOf(rd).Prefill
+	if !pc.PrefillChunksAvailable() {
+		t.Fatal("residentDecoder's prefill subsystem does not report prefill chunks")
 	}
 	if c := pc.PrefillChunkRows(); c != 512 || c%64 != 0 {
 		t.Errorf("PrefillChunkRows %d, want 512 (a multiple of the block size 64)", c)
@@ -102,7 +102,7 @@ func TestKV3_admissionPricesTheChunk(t *testing.T) {
 	}
 	const prompt, maxTok = 20954, 8
 	whole := m.WholePromptScratchBytesForTest(prompt)
-	chunk := rd.PrefillScratchBytes(rd.PrefillChunkRows()) + int64(prompt)*4*int64(m.ResidentEmbedLen())
+	chunk := rd.PrefillScratchBytes(rd.PrefillChunkRows()) + int64(prompt)*4*int64(m.BackendView().EmbedLen())
 	const frac = 0.7 // decoder.prefillAvailFraction
 	t.Logf("whole-prompt price %.2f GB, per-chunk price %.3f GB", float64(whole)/(1<<30), float64(chunk)/(1<<30))
 	if chunk*4 > whole {

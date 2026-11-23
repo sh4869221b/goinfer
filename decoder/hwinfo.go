@@ -6,7 +6,7 @@ import (
 	"sync"
 )
 
-// Hardware information for `check --hardware` (docs/tasks/task-hardware-coverage-2026-10.md, H3). A backend registers a function that returns the device facts a bug report needs, one line each
+// Hardware information for `check --hardware`. A backend registers a function that returns the device facts a bug report needs, one line each
 // ("device: NVIDIA GeForce RTX 2070 SUPER", "compute capability: 7.5"), the same register-from-init shape as RegisterBackend and RegisterMemoryProbe so decoder stays free of the GPU packages.
 var (
 	hwInfoMu sync.RWMutex
@@ -47,7 +47,7 @@ func RegisteredBackends() []string {
 	return names
 }
 
-// Backend self-tests (H2). A GPU backend registers the function that runs its own self-test on its device, once, the same register-from-init shape as the memory probe; the backend itself calls it at
+// Backend self-tests. A GPU backend registers the function that runs its own self-test on its device, once, the same register-from-init shape as the memory probe; the backend itself calls it at
 // BuildResident, and a hardware report calls RunSelfTests to run them all on demand.
 var (
 	selfTestFnMu sync.RWMutex

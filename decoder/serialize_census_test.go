@@ -73,7 +73,7 @@ var censusList = []string{
 	// tinyllama-awq / tinyllama-gptq, none tiny). scripts/pin_llama_tiny.py regenerates it.
 	"../testdata/llama-tiny",
 	// qwen3moe-tiny / granite-dense-tiny: QK-norm + MoE with no shared expert, and llama + scalar multipliers; no other
-	// censused fixture exercises either combination (docs/completed/task-families-2026-09.md, F1/F3).
+	// censused fixture exercises either combination.
 	"../testdata/qwen3moe-tiny", "../testdata/granite-dense-tiny",
 	// ministral3-tiny: AttnTempBeta/AttnTempOrigMaxPos are per-Architecture scalars, not per-layer state, so this repeats the
 	// llama field set every dense fixture covers; listed per the census's own default.
@@ -98,7 +98,7 @@ var censusList = []string{
 	// bailing_hybrid-tiny: a third hybrid-cache shape (KDA's per-head conv-window triple + matrix state, alongside MLA's
 	// latent cache on the same family's other layers); listed per the census's own default.
 	"../testdata/bailing_hybrid-tiny",
-	// spark2-5-tiny (docs/tasks/task-spark-x2-5.md): the fused q_k_v_proj split (buildSpark25Weights) and the generic
+	// spark2-5-tiny: the fused q_k_v_proj split (buildSpark25Weights) and the generic
 	// (non-MLA) sigmoid attention-output gate (GProj under Architecture.AttnGate/GateSigmoid, not the MLA-only
 	// GatedAttentionProjGranularity path laguna/bailing_hybrid exercise) are real per-layer state no other censused
 	// fixture covers.
@@ -106,6 +106,9 @@ var censusList = []string{
 	// gemma1-tiny / gemma2-tiny: Gemma 1's Pre2 + (1+w) RMSNorm + MQA and Gemma 2's Sandwich4 without QK-norm, sliding/full
 	// alternating, both softcaps; and their GGUF copies, whose loader derives what the file omits.
 	"../testdata/gemma1-tiny", "../testdata/gemma2-tiny", "../testdata/gemma1-tiny.gguf", "../testdata/gemma2-hd-tiny.gguf",
+	// flint-tiny: generic-path AttnSinks (LayerWeights.AttnSinks on a non-gptoss family) +
+	// per-layer NoPE + dense prefix + sigmoid-routed MoE + ungated shared expert.
+	"../testdata/flint-tiny",
 }
 
 // censusExcluded names a committed model fixture the census deliberately does NOT round-trip, with the reason. Every
@@ -120,16 +123,16 @@ var censusExcluded = map[string]string{
 	"gpt2":                   "529 MB — the real GPT-2, not a tiny fixture. Its per-layer fields are the generic dense set every *-tiny fixture here covers, and its distinctive state (learned PosEmbed) is MODEL-level, which this per-layer census does not reflect over at all.",
 	"gemma4-dense-scaled":    "449 MB. gemma4's per-layer state (PLE, the dense‖MoE sub-block, two-geometry head dims) is covered by four other gemma4 fixtures on the list.",
 	"mellum-mellum2-slice":   "4.0 GB — a real-weight 4-layer slice. Measured: still running after 90s while all 29 listed fixtures together take 0.27s. mellum's per-layer fields are the generic set.",
-	"mellum21-config":        "a config.json and generation_config.json ONLY (the real Mellum2.1 files, no weights) — decoder.Load cannot build LayerWeights from it, so there is nothing to census. Its test is TestMellum21_configResolves; the weights-bearing mellum coverage is the real-checkpoint gates (docs/tasks/task-mellum21-2026-10.md).",
+	"mellum21-config":        "a config.json and generation_config.json ONLY (the real Mellum2.1 files, no weights) — decoder.Load cannot build LayerWeights from it, so there is nothing to census. Its test is TestMellum21_configResolves; the weights-bearing mellum coverage is the real-checkpoint gates.",
 	"siglip-tiny":            "a vision encoder, not a decoder — Load refuses it, so there are no LayerWeights to census.",
-	"glm-ocr-vision-tiny":    "a GLM-OCR vision encoder (the S2 tower fixture), not a decoder — decoder.Load never builds LayerWeights from it, same as siglip-tiny and gemma4-vision-tiny. Its gates are multimodal/grid_towers and the Metal and CUDA tower tests (docs/tasks/task-multimodal-support-2026-10.md, S2).",
+	"glm-ocr-vision-tiny":    "a GLM-OCR vision encoder (the S2 tower fixture), not a decoder — decoder.Load never builds LayerWeights from it, same as siglip-tiny and gemma4-vision-tiny. Its gates are multimodal/grid_towers and the Metal and CUDA tower tests.",
 	"gemma4-vision-tiny":     "a vision encoder (Gemma4VisionModel), not a decoder — same as siglip-tiny: no LayerWeights to census.",
-	"pixtral-projector-tiny": "a Mistral 3 multimodal projector alone (the S10 Pixtral fixture: RMSNorm, patch merger, two linears; no text model, no tower), not a decoder — no LayerWeights to census, same as qwen3vl-vision-tiny. Its gate is multimodal/pixtral_test.go, which reads the weights from its golden (docs/tasks/task-multimodal-support-2026-10.md, S10 Ministral 3).",
-	"qwen3vl-vision-tiny":    "a Qwen3-VL vision tower with DeepStack (the S10 fixture: vision_config only, no text model), not a decoder — no LayerWeights to census, same as glm-ocr-vision-tiny. Its gates are metal/grid_vision_deepstack_test.go and the serve Qwen3-VL tests (docs/tasks/task-multimodal-support-2026-10.md, S10).",
+	"pixtral-projector-tiny": "a Mistral 3 multimodal projector alone (the S10 Pixtral fixture: RMSNorm, patch merger, two linears; no text model, no tower), not a decoder — no LayerWeights to census, same as qwen3vl-vision-tiny. Its gate is multimodal/pixtral_test.go, which reads the weights from its golden.",
+	"qwen3vl-vision-tiny":    "a Qwen3-VL vision tower with DeepStack (the S10 fixture: vision_config only, no text model), not a decoder — no LayerWeights to census, same as glm-ocr-vision-tiny. Its gates are metal/grid_vision_deepstack_test.go and the serve Qwen3-VL tests.",
 	"whisper-tiny-rand":      "a Whisper encoder (WhisperForConditionalGeneration weights, random-init; the G-S14d fixture), loaded by aikit's audio package (audio.LoadWhisperEncoder), never by decoder.Load — no LayerWeights to census, same as gemma4-audio-tiny. Its gate is multimodal/whisper_encoder_test.go.",
 	"whisper-tiny-ts":        "a Whisper encoder-decoder with the real vocabulary layout in miniature (3,110 ids; the G-S14g/h fixture for timestamps, long-form and the decode policy), loaded by internal/runtime/whisper (whisper.Load, audio.LoadWhisperEncoder), never by decoder.Load — no LayerWeights to census, same as whisper-tiny-rand. Its gates are internal/runtime/whisper/timestamps_test.go and policy_test.go.",
-	"gemma4-audio-tiny":      "an audio encoder (Gemma4AudioModel, gemma4_audio), loaded by aikit's audio package, never by decoder.Load — no LayerWeights to census, same as gemma4-vision-tiny. Its gate is embeddinggemma2/audio_tiny_test.go (docs/tasks/task-embeddinggemma2.md, Phase A gate A2t).",
-	"embeddinggemma2-tiny":   "a bidirectional text encoder (EmbeddingGemma 2), loaded by the embeddinggemma2 package, never by decoder.Load — so no LayerWeights to census and no .giw to round-trip. Its own gates are embeddinggemma2/model_test.go (docs/tasks/task-embeddinggemma2.md, Gate 1).",
+	"gemma4-audio-tiny":      "an audio encoder (Gemma4AudioModel, gemma4_audio), loaded by aikit's audio package, never by decoder.Load — no LayerWeights to census, same as gemma4-vision-tiny. Its gate is embeddinggemma2/audio_tiny_test.go.",
+	"embeddinggemma2-tiny":   "a bidirectional text encoder (EmbeddingGemma 2), loaded by the embeddinggemma2 package, never by decoder.Load — so no LayerWeights to census and no .giw to round-trip. Its own gates are embeddinggemma2/model_test.go.",
 	"llama-attnfa-tiny":      "plain llama arch, same per-layer field set llama-tiny already covers (GQA, SwiGLU, RMSNorm) — it differs only in geometry (hidden_size 512, head_dim 128, vs llama-tiny's 64/16), chosen to clear Metal's canUseAttnFA hd==128 dispatch guard. Its job is metal/snapshot_golden_test.go's attention_fa coverage, not this census.",
 	"qwen35vl-tiny":          "a Qwen3_5ForConditionalGeneration fixture (P8a): a 4-layer qwen3_5_text decoder (3 linear_attention + 1 full_attention, hidden 64) plus a `visual.*` vision tower. The decoder half has exactly the per-layer field set qwen3_5-tiny already covers (Gated DeltaNet + gated attention), and the tower is an encoder — no LayerWeights to census, same as siglip-tiny and gemma4-vision-tiny. Its job is the P8a image-seam and tower tests, not this census.",
 	"gemma2-hd-tiny":         "gemma2-tiny with query_pre_attn_scalar == head_dim, the rule a GGUF can express (its .gguf copy is on the list); the same per-layer fields as gemma2-tiny, which is on the list.",
@@ -144,7 +147,7 @@ var censusExcluded = map[string]string{
 	//  2. NO NEW FIELDS. Eight of the nine are an architecture the census already round-trips, and the field set it
 	//     compares is a function of the ARCHITECTURE. A second gemma4 or a third laguna adds bytes, not coverage.
 	//
-	// The ninth is different (docs/QUEUE.md): llama3.2-1b, tinyllama-awq and tinyllama-gptq are the only fixtures for the
+	// The ninth is different: llama3.2-1b, tinyllama-awq and tinyllama-gptq are the only fixtures for the
 	// plain `llama` arch besides llama-tiny, and none is tiny.
 	"gptoss120-slice":        "8.7 GB; gpt_oss is round-tripped by decoder/testdata/gptoss_tiny.gguf, same arch, same field set.",
 	"laguna-xs2-slice":       "5.7 GB; laguna is round-tripped by laguna-xs2-tiny, laguna-xs21-tiny and laguna-m1-tiny.",
@@ -153,8 +156,8 @@ var censusExcluded = map[string]string{
 	"gemma4-moe-scaled":      "1.9 GB; gemma4_text is round-tripped by four gemma4 tiny fixtures already.",
 	"gemma-3-270m":           "549 MB; gemma3 is round-tripped by gemma3-vl-tiny.",
 	"llama3.2-1b":            "2.4 GB. It is a REAL llama checkpoint, not a tiny fixture — the census gets the llama arch from llama-tiny instead.",
-	"tinyllama-awq":          "731 MB. The AWQ loader has no tiny fixture and no census coverage; recorded in docs/QUEUE.md rather than paid for at this size.",
-	"tinyllama-gptq":         "733 MB. The GPTQ loader has no tiny fixture and no census coverage; recorded in docs/QUEUE.md rather than paid for at this size.",
+	"tinyllama-awq":          "731 MB. The AWQ loader has no tiny fixture and no census coverage; not paid for at this size.",
+	"tinyllama-gptq":         "733 MB. The GPTQ loader has no tiny fixture and no census coverage; not paid for at this size.",
 }
 
 func TestSerializeCensus_noSilentFieldDrop(t *testing.T) {

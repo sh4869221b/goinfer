@@ -13,9 +13,9 @@ import (
 	"github.com/townsendmerino/goinfer/internal/guard/paritykey"
 )
 
-// gate shadow: VK5's shadow mode (docs/tasks/task-subsystems-2026-10.md §5.8). For one push, from before to after, it
-// classes every parity family by today's key and by the shadow key (the program builders out, the family's program
-// fingerprints in; paritykey.ShadowKey) and gives each disagreement its reason. Both keys read only committed files, so
+// gate shadow: the parity key's shadow mode. For one push, from before to after, it
+// classes every parity family by today's key (paritykey.TodayKey) and by the shadow key (today's plus the loader rule;
+// paritykey.ShadowKey) and gives each disagreement its reason. Both keys read only committed files, so
 // any runner gives the same answer.
 //
 // Exit: 0 no unexplained disagreement (or VOID, which it prints), 1 an unexplained one, 2 misuse.

@@ -15,14 +15,14 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// G-PR2 and G-PR3 (docs/tasks/task-metal-pairwise-rope-2026-10.md): the GPT-J pairwise families on the Metal resident
+// G-PR2 and G-PR3: the GPT-J pairwise families on the Metal resident
 // against the CPU, with attention PEAKED so a wrong rotation shows. The committed tiny fixtures are ~0.02-std, where
 // attention is nearly uniform and the NeoX kernels on a pairwise model read cosine 0.9997; CUDA's gate
 // (cuda/pairwise_rope_resident_parity_test.go) scales every 2-D weight by 12.5 at test time, and so does this one.
 //
 // References, as registered: the CPU int4 at per-row activation scales for every DECODE path (Metal decode's own W4A8
 // arithmetic), and the CPU int4 at per-32 scales for the BATCHED-PREFILL logits (the batched pass runs f16 activations,
-// which Step 0 of docs/completed/task-metal-prefill-precision-2026-10.md measured as closer to that arm). Bars:
+// which Step 0 measured as closer to that arm). Bars:
 // cosine >= 0.995 and relL2 <= 0.15 on every path. Every run then rebinds the NeoX kernels into the same resident, and
 // every path must read below the cosine bar, or the gate has gone blind.
 //
@@ -222,7 +222,7 @@ func TestPairwiseRoPEResidentParityMetal(t *testing.T) {
 				}
 				a.Reset()
 				if _, err := a.PrefillLast(context.Background(), embs, 0); err != nil {
-					// Cohere takes the batched pass since Part B of docs/tasks/task-metal-pairwise-followups-2026-10.md.
+					// Cohere takes the batched pass since Part B.
 					t.Fatalf("batched prefill declined: %v", err)
 				}
 				pre.add(func() []float32 { l, _ := a.PrefillLast(context.Background(), embs, 0); return l }(), last32)
@@ -293,9 +293,10 @@ func TestGlmOcrResidentParityMetal(t *testing.T) {
 	// int8int8: glm-ocr-tiny's hidden size (48) is not a multiple of 32, which Metal's int4 needs; CUDA's gate runs it at
 	// int8int8 too. On Metal that is the native int8 resident.
 	mRes, cpuRow, cpu32, a := pwLoad(t, ckpt, "int8int8")
-	rmp, ok := mRes.ResidentForwardForTest().(decoder.ResidentMRoPEPrefill)
+	rmp := decoder.SubsystemsOf(mRes.ResidentForwardForTest()).Prefill
+	ok := rmp.MRoPEPrefillAvailable()
 	if !ok {
-		t.Fatal("the Metal resident is not a decoder.ResidentMRoPEPrefill")
+		t.Fatal("the Metal resident is not a decoder.ResidentPrefillSubsystem")
 	}
 	_, _, _, _, _, _, vocab := cpuRow.Dims()
 	text := make([]int, 48)
@@ -365,8 +366,7 @@ func TestGlmOcrResidentParityMetal(t *testing.T) {
 		out["text decode, 48 positions"] = dec
 		a.Reset()
 		// glm-ocr-tiny cannot take the batched pass: hidden 48 and FFN 144 are not multiples of 32, which its GEMMs need
-		// (resident.prefillUnaligned). The decline must name that; the real checkpoint grades the batched paths
-		// (TestPairwiseRoPERealMetal; amendment in docs/tasks/task-metal-pairwise-followups-2026-10.md, Part A).
+		// (resident.prefillUnaligned). The decline must name that; the real checkpoint grades the batched paths.
 		if l, err := a.PrefillLast(ctx, embs, 0); err != nil {
 			if !strings.Contains(err.Error(), "multiple of 32") {
 				t.Fatalf("text batched prefill declined for a reason other than the 32-alignment: %v", err)
@@ -381,7 +381,7 @@ func TestGlmOcrResidentParityMetal(t *testing.T) {
 		// this family, else the CPU prefill uploaded; then decode past the image through ForwardMRoPE.
 		a.Reset()
 		gpuPos := len(g.PromptIDs)
-		if li, gp, err := mRes.ResidentMRoPEPrefillForTest(ctx, rmp, g.PromptIDs, feats, g.ImageStart, g.NImage, mropePos); err != nil {
+		if li, gp, err := mRes.ResidentMRoPEPrefillForTest(ctx, a, g.PromptIDs, feats, g.ImageStart, g.NImage, mropePos); err != nil {
 			if !strings.Contains(err.Error(), "multiple of 32") {
 				t.Fatalf("image m-RoPE prefill declined for a reason other than the 32-alignment: %v", err)
 			}
@@ -438,7 +438,7 @@ func TestPairwiseRoPE_neoxFamiliesUnchanged(t *testing.T) {
 	if !ok {
 		t.Skipf("llama-tiny not Metal-resident: %s", m.ResidentDecline())
 	}
-	if m.PairwiseRoPEResident() || a.r.pairwiseRoPE {
-		t.Fatalf("a NeoX family (llama) reads pairwise: model %v, resident %v", m.PairwiseRoPEResident(), a.r.pairwiseRoPE)
+	if m.BackendView().PairwiseRoPE() || a.r.pairwiseRoPE {
+		t.Fatalf("a NeoX family (llama) reads pairwise: model %v, resident %v", m.BackendView().PairwiseRoPE(), a.r.pairwiseRoPE)
 	}
 }

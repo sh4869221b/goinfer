@@ -671,8 +671,8 @@ func TestLimitInflight_M01(t *testing.T) {
 	}
 }
 
-// TestConstrainToolUnion_wiring pins the tool-grammar union's routing decisions
-// (docs/tasks/task-tool-grammar-union-2026-09.md): 2+ tools under auto arm the union LAZILY (a LogitProcessor,
+// TestConstrainToolUnion_wiring pins the tool-grammar union's routing decisions:
+// 2+ tools under auto arm the union LAZILY (a LogitProcessor,
 // never the fused-spec masker, which assumes a grammar live from token 1); required forces it from token 1
 // (masker set, so fused spec applies); a family with no opener (llama3) stays unconstrained under auto but is
 // still constrained under required; GOINFER_TOOL_UNION=0 restores the behaviour before the union exactly.
@@ -726,11 +726,12 @@ func TestConstrainToolUnion_wiring(t *testing.T) {
 	if err := constrainForcedTool(chatml, gr0, nil, false, "auto", tools[:1]); err != nil || gr0.sp.LogitProcessor == nil || gr0.masker != nil {
 		t.Errorf("Anthropic-auto lone tool: err=%v proc=%v masker=%v — want the lazy union only", err, gr0.sp.LogitProcessor != nil, gr0.masker != nil)
 	}
-	// a speculative server keeps its auto behaviour from before the union (its drafter), but still gets required
+	// a speculative server keeps its drafter under auto (no processor, which every speculative path refuses) and gets the lazy union
+	// as gr.lazy, which the engine takes from the call's opener on; required still gets the forced union
 	specLM := &loadedModel{tmpl: chat.ChatML(), vocab: 32, tk: &tokenizer.Tokenizer{}, spec: true}
 	grS := &genRequest{}
-	if err := constrainForcedTool(specLM, grS, nil, false, "auto", tools); err != nil || grS.sp.LogitProcessor != nil {
-		t.Errorf("spec server, auto: err=%v proc=%v — want unconstrained (keep the drafter)", err, grS.sp.LogitProcessor != nil)
+	if err := constrainForcedTool(specLM, grS, nil, false, "auto", tools); err != nil || grS.sp.LogitProcessor != nil || grS.lazy == nil {
+		t.Errorf("spec server, auto: err=%v proc=%v lazy=%v — want no processor (keep the drafter) and the lazy union on gr.lazy", err, grS.sp.LogitProcessor != nil, grS.lazy != nil)
 	}
 	grR := &genRequest{}
 	if err := constrainForcedTool(specLM, grR, nil, false, "required", tools); err != nil || grR.masker == nil {

@@ -14,16 +14,19 @@ import (
 	"github.com/townsendmerino/goinfer/internal/audio"
 	"github.com/townsendmerino/goinfer/multimodal"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// G-S14c1 (real, the text path) and G-S14c3 (real, the composition) of docs/tasks/task-multimodal-support-2026-10.md: Qwen3-ASR-0.6B, goinfer float32 on the
+// G-S14c1 (real, the text path) and G-S14c3 (real, the composition): Qwen3-ASR-0.6B, goinfer float32 on the
 // CPU, against transformers float32 (scripts/pin_qwen3asr_real.py: the checkpoint converted by a pure rename and proved by transcribing the clip). c1: logits for a fixed token sequence,
 // cosine >= 0.9999, argmax and a 6-token continuation equal. c3: the LibriSpeech clip through the Go front end, encoder, projector, soft-token splice and decoder: the prompt ids equal the
 // processor's, the greedy transcription equals transformers' token for token, and with transformers' path forced every generated position's logits have cosine >= 0.9999.
 //
 //	GOINFER_HEAVY_TESTS=1 GOINFER_QWEN3ASR_REF=<pin output dir> [GOINFER_QWEN3ASR_DIR=<checkpoint, with tokenizer.json>] go test -tags realckpt ./decoder/ -run TestQwen3ASRReal -v -timeout 30m
 func TestQwen3ASRReal_gate(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ref := os.Getenv("GOINFER_QWEN3ASR_REF")
 	if ref == "" {
 		t.Skip("set GOINFER_QWEN3ASR_REF to scripts/pin_qwen3asr_real.py's output directory")
@@ -77,8 +80,8 @@ func TestQwen3ASRReal_gate(t *testing.T) {
 	want := rd("text.logits.f32")
 	cos := q3aCos(tl, want)
 	cont := q3aGreedy(t, m, cache, tl, len(meta.Text.Continuation))
-	t.Logf("c1 text path: last-row cosine %.9f, argmax %d (HF %d), continuation %v (HF %v)", cos, argmax(tl), argmax(want), cont, meta.Text.Continuation)
-	if cos < 0.9999 || argmax(tl) != argmax(want) || !slices.Equal(cont, meta.Text.Continuation) {
+	t.Logf("c1 text path: last-row cosine %.9f, argmax %d (HF %d), continuation %v (HF %v)", cos, sampling.Argmax(tl), sampling.Argmax(want), cont, meta.Text.Continuation)
+	if cos < 0.9999 || sampling.Argmax(tl) != sampling.Argmax(want) || !slices.Equal(cont, meta.Text.Continuation) {
 		t.Errorf("c1: text path differs from transformers (cosine %.9f, continuation %v against %v)", cos, cont, meta.Text.Continuation)
 	}
 
@@ -125,7 +128,7 @@ func TestQwen3ASRReal_gate(t *testing.T) {
 	for k, id := range hf {
 		c := q3aCos(lg, tf[k*V:(k+1)*V])
 		worst = min(worst, c)
-		if argmax(lg) != id {
+		if sampling.Argmax(lg) != id {
 			argmaxMiss++
 		}
 		if k < len(hf)-1 {

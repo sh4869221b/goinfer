@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
 // mc3Fake is a fake MC3 resident: several KV slots, each holding a positional history, and a batched step. A forward
@@ -32,7 +34,7 @@ type mc3Fake struct {
 	delay     time.Duration
 	stepDraws int    // rows a StepBatch drew on-device
 	events    []byte // P: a PrefillLast call, S: a StepBatch, F: a single-sequence Forward
-	// topK makes the fake a ResidentTopK. last is the resident's ONE logits buffer, written by every forward and every
+	// topK makes the fake a TopKAvailable. last is the resident's ONE logits buffer, written by every forward and every
 	// step whatever slot it serves, as on the device, and a TopKRow's Full reads it when CALLED: so a Full called after
 	// another generation's step returns that generation's row, which is the hazard MC3 must avoid.
 	topK      bool
@@ -40,6 +42,21 @@ type mc3Fake struct {
 	writes    int // writes to last; a TopKRow's Full fails if any happened after its row
 	topKCap   int // > 0: return at most this many candidates, so a row can fail to cover the retained set
 	topKCalls int
+	// greedyDraw makes the fake report ResidentCaps.BatchGreedyDraw, so a greedy generation's batched row carries a Greedy
+	// draw and StepBatch returns its argmax id; greedyDraws counts those rows.
+	greedyDraw  bool
+	greedyDraws int
+}
+
+func (f *mc3Fake) ResidentSubsystems() ResidentSubsystems { return selfSubsystems(f) }
+func (f *mc3Fake) PrefillAvailable() bool                 { return true }
+func (f *mc3Fake) BatchStepperAvailable() bool            { return true }
+func (f *mc3Fake) KVSlotterAvailable() bool               { return true }
+
+func (f *mc3Fake) ResidentCaps() ResidentCaps {
+	c := f.fakeResident.ResidentCaps()
+	c.BatchGreedyDraw = f.greedyDraw
+	return c
 }
 
 // ForwardN overrides fakeResident's own (which calls ITS Forward, not this type's guarded/slot-aware one, since Go
@@ -142,7 +159,13 @@ func (f *mc3Fake) StepBatch(seqs []ResidentBatchSeq) ([]ResidentBatchOut, error)
 		lg := f.fwd(q.Slot, q.Emb, q.Pos)
 		f.last = append(f.last[:0], lg...)
 		f.writes++
-		if q.Draw != nil {
+		if q.Draw != nil && q.Draw.Greedy {
+			if !f.greedyDraw {
+				return nil, fmt.Errorf("mc3Fake: a Greedy draw sent to a resident that does not report BatchGreedyDraw")
+			}
+			f.greedyDraws++
+			out[i] = ResidentBatchOut{ID: sampling.Argmax(lg)}
+		} else if q.Draw != nil {
 			f.stepDraws++
 			out[i] = ResidentBatchOut{ID: fakeDraw(lg, q.Draw.Seed, q.Draw.Draw)}
 		} else {
@@ -152,7 +175,7 @@ func (f *mc3Fake) StepBatch(seqs []ResidentBatchSeq) ([]ResidentBatchOut, error)
 	return out, nil
 }
 
-// SampleAvailable / ForwardSample make mc3Fake a device sampler (ResidentSample), so temperature-only generations take
+// SampleAvailable / ForwardSample make mc3Fake a device sampler (SampleAvailable), so temperature-only generations take
 // the device-draw path; fakeDraw is its draw, a function of the row and (seed, draw) only, as the real one is.
 func (f *mc3Fake) SampleAvailable() bool { return true }
 func (f *mc3Fake) ForwardSample(emb []float32, pos int, temperature float64, seed, draw uint64) (int, error) {
@@ -163,7 +186,7 @@ func (f *mc3Fake) ForwardSample(emb []float32, pos int, temperature float64, see
 	return fakeDraw(f.fwd(f.bound, emb, pos), seed, draw), nil
 }
 
-// TopKAvailable / ForwardTopK make mc3Fake a ResidentTopK when topK is set. The row is exact (sorted, with Z), so the
+// TopKAvailable / ForwardTopK make mc3Fake a TopKAvailable when topK is set. The row is exact (sorted, with Z), so the
 // sampler's draw from it must equal its draw from the full row; Full reads the shared buffer at call time.
 func (f *mc3Fake) TopKAvailable() bool { return f.topK }
 func (f *mc3Fake) ForwardTopK(emb []float32, pos, k int, temperature float64, wantZ bool) (TopKRow, error) {
@@ -513,7 +536,7 @@ func TestMC3_longPrefillChunksWhileOthersDecode(t *testing.T) {
 
 	m, rf := loadWithMC3Fake(t, 4)
 	rf.delay = 3 * time.Millisecond
-	m.prefillChunk = 256 // Options.ResidentPrefillChunk
+	m.opts.ResidentPrefillChunk = 256 // Options.ResidentPrefillChunk
 	m.EnableResidentConcurrency(4)
 	var got0, got1, gotNew []int
 	var wg sync.WaitGroup
@@ -663,4 +686,47 @@ func TestMC3_topPConcurrentMatchesAlone(t *testing.T) {
 			t.Logf("alone under MC3: top-K rows %d (served %d, fell back %d); concurrent: top-K rows %d, steps %d", rf1.topKCalls, g1.TopKServed, g1.TopKFallbacks, rf.topKCalls, rf.steps)
 		})
 	}
+}
+
+// TestMC3_batchGreedyDrawAsksForTheID: a resident that reports ResidentCaps.BatchGreedyDraw gets a Greedy draw on each batched
+// row of a greedy generation and returns its argmax id, and the generations emit exactly the ids they emit alone.
+func TestMC3_batchGreedyDrawAsksForTheID(t *testing.T) {
+	const nConv, turns, maxTok = 3, 2, 20
+	mAlone, _ := loadWithMC3Fake(t, nConv)
+	alone := make([][]mc3Turn, nConv)
+	for c := range nConv {
+		alone[c] = mc3Conversation(t, mAlone, c, turns, maxTok)
+	}
+	m, rf := loadWithMC3Fake(t, nConv)
+	rf.delay = 3 * time.Millisecond
+	rf.greedyDraw = true
+	m.EnableResidentConcurrency(nConv)
+	concurrent := make([][]mc3Turn, nConv)
+	var wg sync.WaitGroup
+	for c := range nConv {
+		wg.Add(1)
+		go func(c int) {
+			defer wg.Done()
+			concurrent[c] = mc3Conversation(t, m, c, turns, maxTok)
+		}(c)
+	}
+	wg.Wait()
+	for c := range nConv {
+		for tn := range alone[c] {
+			if tn >= len(concurrent[c]) {
+				t.Fatalf("conversation %d: %d turns concurrently, %d alone", c, len(concurrent[c]), len(alone[c]))
+			}
+			if !slices.Equal(alone[c][tn].ids, concurrent[c][tn].ids) {
+				t.Fatalf("conversation %d turn %d: concurrent %v, alone %v", c, tn, concurrent[c][tn].ids, alone[c][tn].ids)
+			}
+		}
+	}
+	if rf.steps == 0 || rf.greedyDraws == 0 {
+		t.Fatalf("%d batched steps, %d Greedy draws: a BatchGreedyDraw resident's batched greedy rows did not ask for the id", rf.steps, rf.greedyDraws)
+	}
+	// Every batched row of these greedy generations asks for the id: none returns logits or takes a sampled draw.
+	if rf.greedyDraws != rf.stepSeqs || rf.stepDraws != 0 {
+		t.Fatalf("%d batched rows, %d of them Greedy draws and %d sampled draws: every row should be a Greedy draw", rf.stepSeqs, rf.greedyDraws, rf.stepDraws)
+	}
+	t.Logf("batched steps %d, Greedy draws %d", rf.steps, rf.greedyDraws)
 }

@@ -169,6 +169,9 @@ func TestKernelLocalMemoryCensus(t *testing.T) {
 		"moe_route":       4416, // two float[MOE_MAX_E] at MOE_MAX_E=512, plus the group scratch
 		"rope_kv":         32,
 		"rope_kv_batched": 32,
+		// The ragged step's twin of rope_kv_batched (prefill_batched.cu): the same 28 B cosf/sinf slow-path scratch, so the same
+		// 1.2 MiB at full occupancy, and no larger than the largest kernel already pinned.
+		"rope_kv_ragged": 32,
 		// The next two come from modules the census reads only because ptxModules() is derived from
 		// kernels.go's embeds.
 		"route_gptoss":          4608, // gptoss_act.ptx; larger than moe_route, so backend.go forces it too
@@ -181,12 +184,12 @@ func TestKernelLocalMemoryCensus(t *testing.T) {
 		"mla_q_rope":               32, // mla.ptx (FeatMLA)
 		"mla_latent_store":         32, // mla.ptx (FeatMLA)
 		"mamba_conv":               32, // mamba.ptx (Mamba-2 conv); the same 1.2 MiB at full occupancy as the 32 B rope kernels above
-		// deltanet.ptx, the batched Gated-DeltaNet prefill (docs/tasks/task-cuda-deltanet-prefill-2026-09.md): the
+		// deltanet.ptx, the batched Gated-DeltaNet prefill: the
 		// scan holds its 128-float state row in registers across the rows and spills 24 floats of it at 255
 		// registers (launch_bounds(128, 1) gives the same 96 B). That is 3.8 MiB at full occupancy, accepted
 		// for the speed over the no-spill generic scan.
 		"delta_rule_rows_128": 96,
-		// Its verify twin (docs/tasks/task-forward-architecture-2026-10.md §6a, "SP2 on nobara") runs the same row body over
+		// Its verify twin runs the same row body over
 		// the folded rows and its own, and spills the same 96 B: the backing store, sized by the largest kernel launched, does
 		// not grow.
 		"delta_rule_rows_128_spec": 96,
@@ -200,7 +203,7 @@ func TestKernelLocalMemoryCensus(t *testing.T) {
 	for fn, want := range pinned {
 		if g, ok := got[fn]; !ok {
 			t.Errorf("PINNED: %s no longer declares local memory (was %d B/thread) — its deferred "+
-				"first-launch reservation has changed and the figures in docs/QUEUE.md A9 are stale", fn, want)
+				"first-launch reservation has changed and the recorded figures are stale", fn, want)
 		} else if g != want {
 			t.Errorf("PINNED: %s local memory %d B/thread, pinned at %d. A change here moves a "+
 				"deferred first-launch reservation that the expert-cache sizing does not account "+

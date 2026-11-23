@@ -18,7 +18,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// The "What's different" writeups (docs/tasks/task-site-2026-09.md S8c): one Markdown file each in site/different/, with
+// The "What's different" writeups: one Markdown file each in site/different/, with
 // YAML front matter. A writeup is published only when its front matter carries a `reviewed` date, which is the
 // owner's; an unreviewed one is a draft, built only for a preview (Config.Drafts) and never linked from the site.
 
@@ -201,7 +201,7 @@ func (w *Writeup) validate() error {
 	return nil
 }
 
-// CheckWriteups is S7's "no claim not in the repo" for the writeups: every figure a writeup lists must appear in its
+// CheckWriteups is the "no claim not in the repo" check for the writeups: every figure a writeup lists must appear in its
 // body and in the record it names, and every source it cites must exist. Drafts are checked too, so a draft that could
 // not be reviewed is caught before the owner spends time on it.
 func CheckWriteups(root string, ws []*Writeup) error {

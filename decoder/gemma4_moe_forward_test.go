@@ -7,6 +7,8 @@ import (
 	"math"
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
 // gemma4MoEForwardParity is the whole-model gemma4 forward gate shared by the
@@ -61,7 +63,7 @@ func gemma4MoEForwardParity(t *testing.T, goldenPath, ckpt, pinner string) {
 		t.Fatalf("got %d logits, want %d", len(logits), len(g.LastLogits))
 	}
 
-	got := argmax(logits)
+	got := sampling.Argmax(logits)
 	t.Logf("argmax: got %d (logit %.4f) | want %d (golden logit %.4f)",
 		got, logits[got], g.Argmax, logits[g.Argmax])
 	if got != g.Argmax {
@@ -102,7 +104,7 @@ func gemma4MoEForwardParity(t *testing.T, goldenPath, ckpt, pinner string) {
 		if err != nil {
 			t.Fatalf("continuation forward: %v", err)
 		}
-		nxt := argmax(lg)
+		nxt := sampling.Argmax(lg)
 		cont = append(cont, nxt)
 		cur = append(cur, nxt)
 	}
@@ -154,7 +156,7 @@ func TestGemma4DenseTwoGeom_forwardParity(t *testing.T) {
 // TestGemma4DenseScaled_forwardParity is the SCALED dense oracle (hidden 1024, 12 layers, 5:1
 // sliding/full, REAL head dims local 256 / global 512, K=V globals). It is goinfer's CPU forward's
 // FIRST exercise of a 256-local head_dim — the tiny Split-A fixture's local layer is hd=16, a
-// documented coverage gap (docs/completed/gemma4-resident-scope.md). The CPU forward must reproduce the HF
+// documented coverage gap. The CPU forward must reproduce the HF
 // golden here before the resident kernel is asked to carry it (cuda/TestGemma4DenseScaled_residentParity).
 func TestGemma4DenseScaled_forwardParity(t *testing.T) {
 	gemma4MoEForwardParity(t,

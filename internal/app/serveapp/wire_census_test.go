@@ -21,7 +21,7 @@ import (
 	"github.com/townsendmerino/goinfer/internal/app/inproc"
 )
 
-// The wire census (docs/tasks/task-subsystems-2026-10.md § "SB7 — the wire census"): what a client receives from each
+// The wire census: what a client receives from each
 // scripted request, byte for byte after normalizing ids and times, compared with goldens under testdata/wire/golden/, so
 // a move of the serving shell onto an engine interface can show it changed nothing a client sees. -wire.update rewrites
 // the goldens.
@@ -82,7 +82,7 @@ var wireNorms = []struct {
 		return m[:strings.Index(m, ":")+1] + `"<time>"`
 	}},
 	{"logprob", regexp.MustCompile(`"logprob":\s*-?[0-9.]+(e-?[0-9]+)?`), func(string) string { return `"logprob":0` }},
-	// A turn's timings (turn_timings.go): which fields are present is the record; their values are wall time.
+	// A turn's timings (jobs/turn_timings.go): which fields are present is the record; their values are wall time.
 	{"timings", regexp.MustCompile(`"(queue_wait_ms|prefill_ms|decode_ms|ttft_ms)":\s*[0-9.]+(e-?[0-9]+)?`), func(m string) string {
 		return m[:strings.Index(m, ":")+1] + `"<ms>"`
 	}},
@@ -191,6 +191,7 @@ func wireServer(t *testing.T, flags ...string) (*http.Client, *loadedModel, io.C
 	tiny := srv.models["tiny"]
 	sc := &loadedModel{tk: tiny.tk, tmpl: tiny.tmpl, stopIDs: tiny.stopIDs, eosIDs: tiny.eosIDs, vocab: tiny.vocab,
 		sampling: tiny.sampling, name: "scripted", scripted: []int{}}
+	sc.fakeEngine = scriptedEngine{sc}
 	srv.models["scripted"] = sc
 	srv.regMu.Unlock()
 	return &http.Client{Transport: inproc.Transport(h)}, sc, closer

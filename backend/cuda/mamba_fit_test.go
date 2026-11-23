@@ -12,16 +12,19 @@ import (
 	"time"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/decoder/fit"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// OP2b on CUDA, gate F (docs/tasks/task-forward-architecture-2026-10.md §4.7): the resident's own fit plan for the real Nemotron-H checkpoints, read once and
+// OP2b on CUDA, gate F: the resident's own fit plan for the real Nemotron-H checkpoints, read once and
 // alone before any tier 1 run, against the predictions committed before a resident existed. A refused load is VOID for its cell, not a FAIL, and no guard is
 // bypassed. Reports the free VRAM before and after, the planned and final context, the KV slots and bytes, and the Mamba state, for a default load and for the
 // context the prediction names.
 //
 //	GOINFER_HEAVY_TESTS=1 NEMOTRON_FIT_BUNDLE=<path to a CUDA int4 .giw> go test -count=1 -timeout 20m -tags 'cuda goinfer_testhooks' -run '^TestNemotronResidentCUDA_fitPlan$' -v ./cuda/
 func TestNemotronResidentCUDA_fitPlan(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	requireCUDADevice(t)
 	defer nemotronFeaturesForTest()()
 	path := os.Getenv("NEMOTRON_FIT_BUNDLE")
@@ -55,7 +58,7 @@ func TestNemotronResidentCUDA_fitPlan(t *testing.T) {
 		kv := kvBytesForCap(r.ctxCap, r.layers)
 		t.Logf("F ctx request %d: RESIDENT (%s), load %.1fs; planned ctx %d, final ctx %d, %d KV slot(s), KV %.1f MiB a slot; Mamba state %.1f MiB (%d layers); "+
 			"free VRAM %.0f MiB before, %.0f MiB after (the load took %.0f MiB)", ctx, m.DecodePath(), took.Seconds(), r.ctxPlanned, r.ctxCap, r.KVSlots(), float64(kv)/(1<<20),
-			float64(m.Plan("cuda", 1<<40, decoder.PlanRequest{Ctx: r.ctxCap}).StateBytes)/(1<<20), nMamba, float64(freeBefore)/(1<<20), float64(freeAfter)/(1<<20), float64(freeBefore-freeAfter)/(1<<20))
+			float64(m.Plan("cuda", 1<<40, fit.PlanRequest{Ctx: r.ctxCap}).StateBytes)/(1<<20), nMamba, float64(freeBefore)/(1<<20), float64(freeAfter)/(1<<20), float64(freeBefore-freeAfter)/(1<<20))
 		m.Close()
 	}
 }
@@ -144,8 +147,7 @@ func nemotronLockstep(t *testing.T, path string, steps int, embedInt4 bool, ctx 
 }
 
 // nemotronTier1Cells resolves NEMOTRON_TIER1 into the dense control cell followed by each named Nemotron-H cell, and
-// reports whether the caller set NEMOTRON_TIER1 explicitly. When spec is empty (unset), it defaults to "4b"
-// (docs/tasks/task-forward-architecture-2026-10.md §4.7).
+// reports whether the caller set NEMOTRON_TIER1 explicitly. When spec is empty (unset), it defaults to "4b".
 func nemotronTier1Cells(spec string, ctrl, c4b, c9bslice, c9b nemotronCell) (cells []nemotronCell, explicit bool, err error) {
 	all := map[string]nemotronCell{
 		"4b":      c4b,
@@ -233,7 +235,7 @@ func TestNemotronTier1Cells(t *testing.T) {
 	}
 }
 
-// TestNemotronResidentCUDA_tier1 is OP2b's tier 1 on CUDA (docs/tasks/task-forward-architecture-2026-10.md §4.7): whole real Nemotron-H checkpoints resident on
+// TestNemotronResidentCUDA_tier1 is OP2b's tier 1 on CUDA: whole real Nemotron-H checkpoints resident on
 // the card against the CPU model at the same int4, 32 steps of greedy lockstep, G2-R's bars (min logit cosine >= 0.88 from position 2, argmax equal on at
 // least 50% of steps, no NaN). The dense Qwen2.5-Coder 1.5B runs first through the same harness; under min cosine 0.95 the session is VOID. A refused load is VOID
 // for its cell. NEMOTRON_TIER1 names the cells, comma separated: 4b (the 4B whole, the default when NEMOTRON_TIER1 is unset), 9bslice (layers 0, 1 and 14 of
@@ -242,7 +244,7 @@ func TestNemotronTier1Cells(t *testing.T) {
 //
 //	GOINFER_HEAVY_TESTS=1 NEMOTRON_TIER1=4b go test -count=1 -timeout 40m -tags 'cuda goinfer_testhooks' -run '^TestNemotronResidentCUDA_tier1$' -v ./cuda/
 func TestNemotronResidentCUDA_tier1(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	requireCUDADevice(t)
 	defer nemotronFeaturesForTest()()
 	home := os.ExpandEnv("$HOME/models")

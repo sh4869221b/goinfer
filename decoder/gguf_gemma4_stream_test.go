@@ -12,9 +12,11 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/aikit/embed"
+
+	"github.com/townsendmerino/goinfer/decoder/config"
 )
 
-// S2 (docs/tasks/task-never-swap-2026-09.md): gemma4 transcodes by streaming (build -> write -> release per layer), not by
+// S2: gemma4 transcodes by streaming (build -> write -> release per layer), not by
 // building the whole model resident and serializing it once (34.7 GB RSS for the 26B-A4B, which no 16 GB Mac can build).
 // These gates pin that the streamed bundle is byte-identical to the resident one on synthetic gemma4 GGUFs shaped like the
 // two real layouts:
@@ -160,7 +162,7 @@ func residentGemma4GIW(t *testing.T, path, quant string, target GIWTarget) []byt
 	if err != nil {
 		t.Fatalf("ggufConfig: %v", err)
 	}
-	if raw, jerr := json.Marshal(resolveEOSIDs(filepath.Dir(path), cfg)); jerr == nil {
+	if raw, jerr := json.Marshal(config.ResolveEOSIDs(filepath.Dir(path), cfg)); jerr == nil {
 		cfg.EOSTokenID = raw
 	}
 	arch, _, err := resolveArchitecture(cfg)

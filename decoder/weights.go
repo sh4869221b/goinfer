@@ -14,6 +14,9 @@ import (
 
 	"github.com/townsendmerino/aikit/embed"
 	"github.com/townsendmerino/aikit/linalg"
+	"github.com/townsendmerino/goinfer/decoder/quant"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/hybridattn"
 )
 
 // LayerWeights bundles one decoder block's tensors. Matrices follow
@@ -292,11 +295,11 @@ func (w *Weights) bodyMatmulWeights() []*linalg.WeightMat {
 // Use LoadWeightsFromFS for fs.FS-backed paths (MapFS, embed.FS); those stay heap-backed because fs.FS exposes no file
 // descriptor.
 func LoadWeights(dir string) (*Weights, error) {
-	return loadWeights(dir, quantNone, false, true, false, nil, nil)
+	return loadWeights(dir, weightLoadOpts{needCanonical: true})
 }
 
-// errLoadAborted is parallelLayers' sentinel when abort closes mid-build, the swap tripwire's load-time consumer
-// (docs/tasks/task-never-swap-2026-09.md). decoder.Load does not know why abort closed (a swap watch it neither owns nor
+// errLoadAborted is parallelLayers' sentinel when abort closes mid-build, the swap tripwire's load-time consumer.
+// decoder.Load does not know why abort closed (a swap watch it neither owns nor
 // imports); the caller that armed the watch checks errors.Is(err, errLoadAborted) and wraps it with its own reason and
 // pricing detail (see Options.LoadAbort).
 var errLoadAborted = errors.New("decoder: load aborted")
@@ -381,18 +384,15 @@ func parallelLayers(n int, abort <-chan struct{}, fn func(i int) error) error {
 // big quantized checkpoint load in a quarter (int8) or eighth (int4) of the RAM
 // the load-everything-then-quantize path needed. The forward output is identical
 // to quantizing after load; only the peak memory differs.
-func loadWeights(dir string, quant quantMode, embedInt4, needCanonical, skipRow4 bool, lora *loraAdapter, abort <-chan struct{}) (*Weights, error) {
-	return loadWeightsWithConfig(dir, quant, embedInt4, needCanonical, skipRow4, lora, abort, nil)
-}
-
-func loadWeightsWithConfig(dir string, quant quantMode, embedInt4, needCanonical, skipRow4 bool, lora *loraAdapter, abort <-chan struct{}, cfg *Config) (*Weights, error) {
+func loadWeights(dir string, o weightLoadOpts) (*Weights, error) {
+	quant, embedInt4, needCanonical, skipRow4, lora, abort := o.quant, o.embedInt4, o.needCanonical, o.skipRow4, o.lora, o.abort
+	cfg := o.cfg
 	// One atomic add per model load, so the fit guard's test can observe that a refused load allocated nothing rather than
 	// infer it from an error string (a guard that fires after the allocation still looks correct that way).
 	weightAllocs.Add(1)
 	if strings.HasSuffix(dir, ".gguf") {
-		return loadGGUFWeights(dir, quant, embedInt4, needCanonical, skipRow4, abort) // quantized llama.cpp checkpoint (G7); LoRA guarded in Load
+		return loadGGUFWeights(dir, quant, embedInt4, needCanonical, skipRow4, abort) // quantized llama.cpp checkpoint; LoRA guarded in Load
 	}
-	// Limitation: the safetensors direct-build path does not check abort; it is unused past this point for a safetensors dir.
 	if quant == quantInt4Mix {
 		return nil, fmt.Errorf("decoder: int4mix is GGUF-only (got safetensors %s)", dir)
 	}
@@ -417,7 +417,7 @@ func loadWeightsWithConfig(dir string, quant quantMode, embedInt4, needCanonical
 	// buildWeightsFromSafetensors retains st (the WeightMats may alias its mmap) only on success; on any error return st
 	// would leak the mapping and fd. A serve process probing candidate dirs, or retrying a load of a checkpoint with one
 	// missing tensor, would accumulate address space, the leak Model.Close exists to avoid.
-	w, err := buildWeightsFromSafetensors(cfg, arch, schema, st, quant, embedInt4, needCanonical, skipRow4, lora)
+	w, err := buildWeightsFromSafetensors(cfg, arch, schema, st, o)
 	if err == nil {
 		// Every family's loader, not only the generic one, answers for the adapter here: a delta the load never merged is
 		// refused, which covers the loaders that take no lora at all.
@@ -533,7 +533,7 @@ func loadWeightsFromFS(fsys fs.FS, dir string, quant quantMode) (*Weights, error
 	if err != nil {
 		return nil, err
 	}
-	w, err := buildWeightsFromSafetensors(cfg, arch, schema, st, quant, false, true, false, nil)
+	w, err := buildWeightsFromSafetensors(cfg, arch, schema, st, weightLoadOpts{quant: quant, needCanonical: true})
 	if err != nil {
 		_ = st.Close() // st is retained only on success; close it on error so the mapping/fd doesn't leak
 		return nil, err
@@ -562,13 +562,23 @@ func openCheckpointFromFS(fsys fs.FS, dir string) (*embed.SafetensorsFile, error
 // buildWeightsFromSafetensors fills a *Weights from an already-opened SafetensorsFile, shape-validating every tensor
 // against Cfg through the family's tensor schema. The heap (fs.FS) and mmap paths share it so the tensor-name and shape
 // contract is one edit, not two.
-func buildWeightsFromSafetensors(cfg *Config, arch *Architecture, s *tensorSchema, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, lora *loraAdapter) (*Weights, error) {
-	return buildWeightsFromSafetensorsTo(cfg, arch, s, st, quant, embedInt4, needCanonical, skipRow4, lora, nil, "")
+func buildWeightsFromSafetensors(cfg *Config, arch *Architecture, s *tensorSchema, st *embed.SafetensorsFile, o weightLoadOpts) (*Weights, error) {
+	return buildWeightsFromSafetensorsTo(cfg, arch, s, st, o.quant, o.embedInt4, o.needCanonical, o.skipRow4, o.lora, nil, "", o.abort)
+}
+
+// weightLoadOpts is how loadWeights and buildWeightsFromSafetensors build a checkpoint's weights: the quantization,
+// whether the embedding goes int4, whether the canonical int4 layout is kept beside a repacked one (needCanonical) or
+// the row4 fallback skipped (skipRow4), the LoRA adapter to merge, and the load's abort channel.
+type weightLoadOpts struct {
+	quant                              quantMode
+	embedInt4, needCanonical, skipRow4 bool
+	lora                               *loraAdapter
+	abort                              <-chan struct{}
+	cfg                                *Config
 }
 
 // errDirNoStream is buildWeightsFromSafetensorsTo's answer, given a sink, for a family whose dedicated builder does not
-// stream yet; StreamTranscodeDir's caller then takes the resident transcode instead
-// (docs/tasks/task-prequant-dir-streaming-2026-10.md).
+// stream yet; StreamTranscodeDir's caller then takes the resident transcode instead.
 type errDirNoStream struct{ family string }
 
 func (e errDirNoStream) Error() string {
@@ -583,7 +593,7 @@ func IsDirNoStream(err error) bool {
 
 // loadEmbedTable loads a [rows, cols] logit table (the token embedding or an untied head) at the embedding precision mode:
 // whole and then quantized for the resident build, a row at a time when streaming (a 256k x 4096 table is 4.2 GB as f32,
-// the largest single allocation of a transcode). Both give the same bytes (G-DS1, docs/tasks/task-prequant-dir-streaming-2026-10.md).
+// the largest single allocation of a transcode). Both give the same bytes.
 func loadEmbedTable(st *embed.SafetensorsFile, name string, rows, cols int, mode quantMode, needCanonical bool, sink *giwWriter) (linalg.WeightMat, error) {
 	if sink == nil {
 		m, err := loadMat(st, name, rows, cols)
@@ -591,6 +601,24 @@ func loadEmbedTable(st *embed.SafetensorsFile, name string, rows, cols int, mode
 			return m, err
 		}
 		return quantizeEmbedWM(m, mode, needCanonical), nil
+	}
+	if r := quant.ForTensor(st, nil, name); r != nil {
+		if rs, ok := r.(quant.RowStreamReconstructor); ok {
+			rowInto, err := rs.RowReader2D(st, name, rows, cols)
+			if err != nil {
+				return linalg.WeightMat{}, err
+			}
+			return streamQuantizedEmbed(rows, cols, mode, needCanonical, !repackForDecode(sink), 1, func() rowReader { return rowInto })
+		}
+		data, err := r.ReconstructMat2D(st, name, rows, cols)
+		if err != nil {
+			return linalg.WeightMat{}, err
+		}
+		readRow := func(r int, dst []float32) error {
+			copy(dst, data[r*cols:(r+1)*cols])
+			return nil
+		}
+		return streamQuantizedEmbed(rows, cols, mode, needCanonical, !repackForDecode(sink), 1, func() rowReader { return readRow })
 	}
 	t, err := st.Tensor(name)
 	if err != nil {
@@ -622,10 +650,10 @@ func loadEmbedTable(st *embed.SafetensorsFile, name string, rows, cols int, mode
 // finishLayers runs a builder's per-layer loads. Resident (sink nil): in parallel. Streaming: the bundle head (every
 // global exists by now), then the layers through streamLayers, a window at a time, so the model is never resident at
 // once; the head records no quant label, as StreamTranscodeGGUF's does.
-func finishLayers(w *Weights, arch *Architecture, loadLayer func(i int) error, sink *giwWriter, id string) (*Weights, error) {
+func finishLayers(w *Weights, arch *Architecture, loadLayer func(i int) error, sink *giwWriter, id string, abort <-chan struct{}) (*Weights, error) {
 	n := len(w.Layers)
 	if sink == nil {
-		if err := parallelLayers(n, nil, loadLayer); err != nil { // abort is not wired through the safetensors build (see loadWeights)
+		if err := parallelLayers(n, abort, loadLayer); err != nil {
 			return nil, err
 		}
 		return w, nil
@@ -647,7 +675,7 @@ func finishLayers(w *Weights, arch *Architecture, loadLayer func(i int) error, s
 // writes and frees one layer at a time, and loads the embedding (and an untied head) a row at a time, so peak memory is
 // about the globals plus one layer rather than the whole model. The dedicated builders stream their layers the same way
 // (their embedding still loads whole); a family whose builder does not stream returns errDirNoStream.
-func buildWeightsFromSafetensorsTo(cfg *Config, arch *Architecture, s *tensorSchema, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, lora *loraAdapter, sink *giwWriter, id string) (*Weights, error) {
+func buildWeightsFromSafetensorsTo(cfg *Config, arch *Architecture, s *tensorSchema, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, lora *loraAdapter, sink *giwWriter, id string, abort <-chan struct{}) (*Weights, error) {
 	skipRow4 = skipRow4 || !repackForDecode(sink) // every builder below takes it from here
 	if sink != nil {
 		switch {
@@ -665,31 +693,31 @@ func buildWeightsFromSafetensorsTo(cfg *Config, arch *Architecture, s *tensorSch
 		if lora != nil {
 			return nil, fmt.Errorf("decoder: LoRA merge unsupported for the granitemoehybrid (Mamba-2 + fused-MoE) layout")
 		}
-		return buildGraniteWeights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id) // per-layer mamba/attention + fused experts
+		return buildGraniteWeights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id, abort) // per-layer mamba/attention + fused experts
 	}
 	if arch.nemotron != nil {
 		if lora != nil {
 			return nil, fmt.Errorf("decoder: LoRA merge unsupported for the nemotron_h (single-op-block) layout")
 		}
-		return buildNemotronWeights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id) // per-layer mamba | attention | mlp
+		return buildNemotronWeights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id, abort) // per-layer mamba | attention | mlp
 	}
 	if arch.Name == "plamo3" {
 		if lora != nil {
 			return nil, fmt.Errorf("decoder: LoRA merge unsupported for plamo3")
 		}
-		return buildPlamo3Weights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id)
+		return buildPlamo3Weights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id, abort)
 	}
 	if arch.Name == "phi3" {
 		if lora != nil {
 			return nil, fmt.Errorf("decoder: LoRA merge unsupported for the phi3 (fused qkv/gate_up) layout")
 		}
-		return buildPhi3Weights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id) // split fused qkv_proj + gate_up_proj → generic forward
+		return buildPhi3Weights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id, abort) // split fused qkv_proj + gate_up_proj → generic forward
 	}
 	if arch.Name == "glm_ocr" {
 		if lora != nil {
 			return nil, fmt.Errorf("decoder: LoRA merge unsupported for the glm_ocr (fused gate_up) layout")
 		}
-		return buildGlmOcrWeights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id) // split fused gate_up_proj; the MTP layer is never requested
+		return buildGlmOcrWeights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id, abort) // split fused gate_up_proj; the MTP layer is never requested
 	}
 	if arch.Name == "internlm2" {
 		return buildInternLM2Weights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4) // renamed tensors + GROUPED fused wqkv
@@ -698,13 +726,13 @@ func buildWeightsFromSafetensorsTo(cfg *Config, arch *Architecture, s *tensorSch
 		if lora != nil {
 			return nil, fmt.Errorf("decoder: LoRA merge unsupported for the spark2_5 (fused qkv) layout")
 		}
-		return buildSpark25Weights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id) // split fused q_k_v_proj → generic forward
+		return buildSpark25Weights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id, abort) // split fused q_k_v_proj → generic forward
 	}
 	if arch.llama4 != nil {
 		if lora != nil {
 			return nil, fmt.Errorf("decoder: LoRA merge unsupported for the llama4_text (iRoPE + fused-expert) layout")
 		}
-		return buildLlama4Weights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id) // per-layer dense/MoE + transposed fused experts
+		return buildLlama4Weights(cfg, arch, st, quant, embedInt4, needCanonical, skipRow4, sink, id, abort) // per-layer dense/MoE + transposed fused experts
 	}
 	if arch.gptoss != nil {
 		// gpt-oss safetensors: MXFP4 experts as paired U8 *_blocks/*_scales tensors with
@@ -757,7 +785,7 @@ func buildWeightsFromSafetensorsTo(cfg *Config, arch *Architecture, s *tensorSch
 	// architectures: ["Qwen3ForCausalLM"], so the naming is the only tell.) Detect it from the
 	// index and strip the prefix off the canonical names. tie_word_embeddings is true on these, so
 	// the absent lm_head is expected — the embedding doubles as the head, which an embedder never
-	// runs anyway. See docs/completed/task-decoder-as-embedder.md.
+	// runs anyway.
 	stripModel := !have["model.embed_tokens.weight"] && have["embed_tokens.weight"]
 	mp := func(n string) string { // inject the prefix after the leading "model."
 		if modelPrefix != "" && strings.HasPrefix(n, "model.") {
@@ -774,7 +802,8 @@ func buildWeightsFromSafetensorsTo(cfg *Config, arch *Architecture, s *tensorSch
 		}
 		return topPrefix + fmt.Sprintf("model.%slayers.%d.%s", modelPrefix, i, suf)
 	}
-	fusedExperts := arch.MoE != nil && have[tn(0, "mlp.experts.gate_up_proj")]
+	fusedExperts := arch.MoE != nil && arch.FirstKDense < arch.NumLayers && have[tn(arch.FirstKDense, "mlp.experts.gate_up_proj")]
+	switchMLPExperts := arch.MoE != nil && arch.FirstKDense < arch.NumLayers && have[tn(arch.FirstKDense, "mlp.switch_mlp.gate_proj.weight")]
 
 	// LoRA merge-at-load validation, deferred to here so it sees tn: the same prefixed name (language_model.* or
 	// model.language_model.* on VL checkpoints, or model.-stripped) that loadProj looks the delta up by. It closes two
@@ -796,9 +825,9 @@ func buildWeightsFromSafetensorsTo(cfg *Config, arch *Architecture, s *tensorSch
 		}
 	}
 
-	// GPTQ/AWQ checkpoints ship their projections as packed int4 (qweight/…);
+	// Pre-quantized safetensors checkpoints (GPTQ/AWQ/FP8/NVFP4/MLX);
 	// resolve the params once. nil ⇒ a normal f32/bf16 checkpoint.
-	qc, err := parseQuantConfig(cfg.QuantizationConfig)
+	qc, err := parseCheckpointQuantConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -813,34 +842,21 @@ func buildWeightsFromSafetensorsTo(cfg *Config, arch *Architecture, s *tensorSch
 		}
 		return m, merr
 	}
-	// loadProj loads a per-layer attention/MLP projection to f32 (a GPTQ/AWQ/fp8 reconstruction when the checkpoint is
+	// loadProj loads a per-layer attention/MLP projection to f32 (a GPTQ/AWQ/fp8/nvfp4/mlx reconstruction when the checkpoint is
 	// pre-quantized, else a plain load), merges any LoRA delta into it, then quantizes to the requested resident format,
 	// freeing the f32 before the next tensor. The LoRA merge must happen here, on the f32, before quantization. batched marks
 	// a projection reached through the batched W4A8 dispatch (attention Q/K/V, MLP gate/up): quantizeBatchedProjWM instead of
 	// quantizeWM, so it may build repacked-only int4 when this load's backend allows it. See that function for the safety
 	// argument and why o_proj/down_proj are not marked this way.
 	loadProj := func(name string, out, in int, batched bool) (linalg.WeightMat, error) {
-		var data []float32
-		var derr error
-		switch {
-		case qc == nil:
-			data, derr = st.TensorF32(name, out, in)
-			// TensorF32 may alias the read-only mmap for F32 tensors; the in-place
-			// merge needs a writable copy (only for the targeted tensors).
-			if derr == nil && lora.has(name) {
-				data = append([]float32(nil), data...)
-			}
-		case qc.method == "fp8":
-			// Block-quantized fp8 keeps the full tensor NAME (scales are name+"_scale_inv"),
-			// unlike gptq/awq which trim ".weight" and rebuild from a family of suffixes.
-			data, derr = fp8Reconstruct(st, name, in, out, qc.blockR, qc.blockC)
-		case qc.method == "awq":
-			data, derr = awqReconstruct(st, strings.TrimSuffix(name, ".weight"), in, out)
-		default:
-			data, derr = gptqReconstruct(st, strings.TrimSuffix(name, ".weight"), in, out)
-		}
+		data, fresh, derr := reconstructSafetensorsMat2D(st, qc, name, out, in)
 		if derr != nil {
 			return linalg.WeightMat{}, derr
+		}
+		// TensorF32 may alias the read-only mmap for F32 tensors; the in-place
+		// merge needs a writable copy (only for the targeted tensors).
+		if !fresh && lora.has(name) {
+			data = append([]float32(nil), data...)
 		}
 		if derr = lora.merge(name, data, out, in); derr != nil {
 			return linalg.WeightMat{}, derr
@@ -918,363 +934,8 @@ func buildWeightsFromSafetensorsTo(cfg *Config, arch *Architecture, s *tensorSch
 		return st.TensorF32(tn(i, suffix), hd)
 	}
 
-	// Layers load in parallel — each is independent over the read-only mmap, and
-	// the per-tensor dequant/re-quant is the cost.
-	loadLayer := func(i int) error {
-		l := &w.Layers[i]
-		var err error
-		// qwen3_5_moe: per-layer kind decides the attention tensor set (Gated
-		// DeltaNet vs gated softmax); both share the MoE FFN loaded below. Stored
-		// f32 (parity-first forward). Other families take the generic path.
-		if arch.lfm2 != nil && arch.isConvLayer(i) {
-			// LFM2 conv layer: the gated short-conv mixer REPLACES attention, so there is
-			// no q/k/v/o and no QK-norm to load — reading them would fail on tensors the
-			// checkpoint does not contain. The FFN below is shared with the attention
-			// layers and still loads. Attention layers fall through to the generic path,
-			// which lfm2TensorSchema already describes.
-			if err = loadLFM2Conv(st, i, l, arch, hd, tn); err != nil {
-				return err
-			}
-		} else if arch.qwen35 != nil && (arch.isLinearLayer(i) || !arch.qwen35.PlainFullAttn) {
-			// PlainFullAttn (Olmo Hybrid): its full-attention layers are NOT
-			// qwen3.5's own double-width gated softmax attention, so only the
-			// linear (DeltaNet) layers come through here; the rest fall through
-			// to the generic tensorSchema-driven path below (olmo3's own shape).
-			if err = loadQwen35Attn(i, l, arch, hd, tn, loadMatMerged, loadF32Merged, quant, needCanonical, skipRow4); err != nil {
-				return err
-			}
-		} else if arch.kda != nil && arch.isLinearLayer(i) {
-			// Bailing Hybrid (Ling 3.0): KDA linear layers. Non-linear layers of the SAME
-			// family fall through to the arch.mla branch below (bailingHybridArchitecture
-			// sets both kda and mla; this check must come first so the else-if chain
-			// dispatches KDA-vs-MLA per layer, not by family alone).
-			if err = loadBailingKDA(st, i, l, arch, hd, tn, loadMatQ); err != nil {
-				return err
-			}
-		} else if arch.mla != nil {
-			if err = loadDeepseekAttn(st, i, l, arch, hd, tn); err != nil {
-				return err
-			}
-			if mlaProjInt8(quant) {
-				l.mla.quantizeProjections(arch)
-			}
-		} else if arch.gemma4 != nil {
-			// Gemma 4 attention has PER-LAYER widths: the global (full-attention) layers
-			// use a wider head (global_head_dim, e.g. 512 vs 16 local) and their own KV
-			// head count, so qDim/kvDim/head_dim differ by layer. attention_k_eq_v makes
-			// the 12B global layers reuse K as V (no v_proj → VFromK); the E-models and
-			// the MoE tiny carry v_proj on every layer.
-			ahd := arch.headDimAt(i)
-			aKV := arch.kvHeadsAt(i)
-			aqDim, akvDim := arch.NumHeads*ahd, aKV*ahd
-			if l.QProj, err = loadProj(tn(i, s.QProj), aqDim, hd, true); err != nil {
-				return err
-			}
-			if l.QNorm, err = st.TensorF32(tn(i, s.QNorm), ahd); err != nil {
-				return err
-			}
-			// Cross-layer KV sharing (num_kv_shared_layers): the last N layers carry no k_proj/k_norm/v_proj tensors in the
-			// checkpoint; they reuse an earlier layer's KV at forward time (runLayersFromEmbedPLE's kvSrc). The GGUF loader
-			// (loadG4) does the same. l.KVShared is the per-layer "reuses an earlier layer's KV" flag (LayerWeights.KVShared), not
-			// arch.gemma4.KVShared, which is attention_k_eq_v (V reuses K's projection on global layers): same field name, different
-			// struct, different meaning (see arch.go).
-			firstShared := arch.NumLayers - arch.gemma4.SharedKVLayers
-			l.KVShared = i >= firstShared
-			if !l.KVShared {
-				if l.KProj, err = loadProj(tn(i, s.KProj), akvDim, hd, true); err != nil {
-					return err
-				}
-				if arch.gemma4.KVShared && arch.isGlobalLayer(i) {
-					l.VFromK = true // V = v_norm(k_proj output); no v_proj tensor
-				} else if l.VProj, err = loadProj(tn(i, s.VProj), akvDim, hd, true); err != nil {
-					return err
-				}
-				if l.KNorm, err = st.TensorF32(tn(i, s.KNorm), ahd); err != nil {
-					return err
-				}
-			}
-			// OProj is per-layer regardless of KVShared — a shared-KV layer still has its
-			// own attention output projection over the (shared-K/V-derived) attention result.
-			if l.OProj, err = loadProj(tn(i, s.OProj), hd, aqDim, false); err != nil {
-				return err
-			}
-		} else {
-			// Attention projections ([out, in] row-major). qDim is per layer: some families (Laguna) vary the query head count by
-			// layer type, so q_proj differs between layers. headsAt collapses to NumHeads for every other family, leaving
-			// lqDim == qDim.
-			lqDim := arch.headsAt(i) * headDim
-			if l.QProj, err = loadProj(tn(i, s.QProj), lqDim, hd, true); err != nil {
-				return err
-			}
-			if l.KProj, err = loadProj(tn(i, s.KProj), kvDim, hd, true); err != nil {
-				return err
-			}
-			if l.VProj, err = loadProj(tn(i, s.VProj), kvDim, hd, true); err != nil {
-				return err
-			}
-			if l.OProj, err = loadProj(tn(i, s.OProj), hd, lqDim, false); err != nil {
-				return err
-			}
-			// Laguna attention output gate. Its row count SELECTS the granularity —
-			// arch.headsAt(i) rows is per-head, headsAt(i)*headDim is per-element — so
-			// both valid shapes are accepted and anything else is a hard error rather
-			// than a silently mis-shaped gate. See applyGateRow for why the checkpoint,
-			// not config.gating, is authoritative here.
-			if s.GProj != "" {
-				perHead, perElem := arch.headsAt(i), lqDim
-				rows := perHead
-				if arch.laguna != nil && !arch.laguna.GatePerHead {
-					rows = perElem
-				}
-				if l.GProj, err = loadProj(tn(i, s.GProj), rows, hd, false); err != nil {
-					if rows == perHead {
-						rows = perElem
-					} else {
-						rows = perHead
-					}
-					if l.GProj, err = loadProj(tn(i, s.GProj), rows, hd, false); err != nil {
-						return fmt.Errorf("decoder(laguna): layer %d g_proj is neither per-head [%d,%d] nor per-element [%d,%d]: %w", i, perHead, hd, perElem, hd, err)
-					}
-				}
-			}
-			// Projection bias (Qwen2 q/k/v; o_proj stays biasless). Gated on QKVBias so
-			// a family whose schema lists the bias suffix but whose config disables it
-			// (GLM's attention_bias) doesn't demand the absent tensor.
-			if arch.QKVBias && s.QBias != "" {
-				if l.QBias, err = st.TensorF32(tn(i, s.QBias), qDim); err != nil {
-					return err
-				}
-				if l.KBias, err = st.TensorF32(tn(i, s.KBias), kvDim); err != nil {
-					return err
-				}
-				if l.VBias, err = st.TensorF32(tn(i, s.VBias), kvDim); err != nil {
-					return err
-				}
-			}
-			// QK-norm (Gemma 3, Qwen3): RMSNorm over head_dim. Gated on arch.QKNorm so a
-			// family whose schema lists the suffix but whose config disables it (GLM's
-			// use_qk_norm=false) doesn't demand the absent tensor. QKNormWhole (Olmo 3/Olmo
-			// Hybrid) normalizes the FULL projected vector, so its weight tensor is
-			// per-layer-query-dim/kv-dim wide instead of head_dim wide.
-			if arch.QKNorm && s.QNorm != "" {
-				qNormLen, kNormLen := headDim, headDim
-				if arch.QKNormWhole {
-					qNormLen, kNormLen = lqDim, kvDim
-				}
-				if l.QNorm, err = st.TensorF32(tn(i, s.QNorm), qNormLen); err != nil {
-					return err
-				}
-				if l.KNorm, err = st.TensorF32(tn(i, s.KNorm), kNormLen); err != nil {
-					return err
-				}
-			}
-		}
-		// Block norms — Pre2 has only Pre*; Sandwich4 adds Post*. A hybrid whose norm
-		// tensor NAMES (not just placement) differ between linear and full-attention
-		// layers — Olmo Hybrid — uses the *Linear suffixes on isLinearLayer(i)
-		// layers instead (see their own comment on tensorSchema).
-		preAttn, postAttn, preMLP, postMLP := s.PreAttnNorm, s.PostAttnNorm, s.PreMLPNorm, s.PostMLPNorm
-		hasLinearNormOverride := s.PreAttnNormLinear != "" || s.PostAttnNormLinear != "" || s.PreMLPNormLinear != "" || s.PostMLPNormLinear != ""
-		if hasLinearNormOverride && arch.isLinearLayer(i) {
-			preAttn, postAttn, preMLP, postMLP = s.PreAttnNormLinear, s.PostAttnNormLinear, s.PreMLPNormLinear, s.PostMLPNormLinear
-		}
-		if l.PreAttnNorm, err = optNorm(i, preAttn); err != nil {
-			return err
-		}
-		if l.PostAttnNorm, err = optNorm(i, postAttn); err != nil {
-			return err
-		}
-		if l.PreMLPNorm, err = optNorm(i, preMLP); err != nil {
-			return err
-		}
-		if l.PostMLPNorm, err = optNorm(i, postMLP); err != nil {
-			return err
-		}
-		// Gemma 4 FFN: the dense gated MLP is always present (the parallel dense
-		// branch), plus — when enable_moe_block — the MoE sub-block (own router/
-		// experts/norms). layer_scalar is a per-layer output multiplier. This owns
-		// gemma4's FFN load because its MoE shape doesn't fit the generic Router/
-		// Experts path below. The PLE branch's per-layer tensors load here too; the
-		// model-level PLE inputs load once, before the layer loop.
-		if arch.gemma4 != nil {
-			// Per-layer FFN width: arch.gemma4.FFNPerLayer is seeded (safetensors
-			// checkpoints) below, right before this loop starts, from each layer's own
-			// on-disk tensor shape — see that seeding step's comment for why.
-			ffn := arch.ffnAt(i)
-			if l.GateProj, err = loadProj(tn(i, s.GateProj), ffn, hd, true); err != nil {
-				return err
-			}
-			if l.UpProj, err = loadProj(tn(i, s.UpProj), ffn, hd, true); err != nil {
-				return err
-			}
-			if l.DownProj, err = loadProj(tn(i, s.DownProj), hd, ffn, false); err != nil {
-				return err
-			}
-			// layer_scalar (a [1] buffer). Absent ⇒ 1.0 (no scaling).
-			if ls, lerr := st.TensorF32(tn(i, "layer_scalar"), 1); lerr == nil {
-				l.LayerScalar = ls[0]
-			} else {
-				l.LayerScalar = 1
-			}
-			if pleDim := arch.gemma4.HiddenSizePerLayerInput; pleDim > 0 {
-				if l.PLEGate, err = loadProj(tn(i, "per_layer_input_gate.weight"), pleDim, hd, false); err != nil {
-					return err
-				}
-				if l.PLEProj, err = loadProj(tn(i, "per_layer_projection.weight"), hd, pleDim, false); err != nil {
-					return err
-				}
-				if l.PostPLENorm, err = st.TensorF32(tn(i, "post_per_layer_input_norm.weight"), hd); err != nil {
-					return err
-				}
-			}
-			if arch.MoE != nil {
-				if l.gemma4moe, err = loadGemma4MoE(st, i, cfg, arch, hd, l, quant, tn, needCanonical, skipRow4, sink); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-		// FFN: sparse MoE (Mixtral) or dense gated MLP. The schema's MoE name
-		// templates carry a %d for the expert index. GLM's first_k_dense_replace
-		// prefix layers (i < FirstKDense) are dense and fall through to the gated MLP
-		// below — leaving l.Experts nil, which the forward path keys off.
-		if arch.MoE != nil && i >= arch.FirstKDense {
-			if l.Router, err = loadMat(st, tn(i, s.Router), arch.MoE.NumExperts, hd); err != nil {
-				return err
-			}
-			// DeepSeek/GLM e_score_correction_bias: steers the top-k selection. Only
-			// the sigmoid-scored (noaux_tc) routers carry it — GLM and DeepSeek-V3.
-			// DeepSeek-V2 (softmax/greedy, e.g. V2-Lite) has no such tensor, so gate
-			// the load on RouterSigmoid even though the schema lists the suffix.
-			if s.RouterBias != "" && arch.MoE.RouterSigmoid {
-				if l.RouterBias, err = st.TensorF32(tn(i, s.RouterBias), arch.MoE.NumExperts); err != nil {
-					return err
-				}
-			}
-			expInter := arch.MoE.IntermediateDim // expert FFN width (Mellum: moe_intermediate_size)
-			if fusedExperts {
-				// Real qwen3_5_moe: all experts in two stacked 3-D tensors.
-				if l.Experts, err = loadFusedExperts(st, tn(i, "mlp.experts.gate_up_proj"), tn(i, "mlp.experts.down_proj"), arch.MoE.NumExperts, expInter, hd, quant, needCanonical, skipRow4, sink); err != nil {
-					return err
-				}
-			} else {
-				l.Experts = make([]expertWeights, arch.MoE.NumExperts)
-				if err = forExperts(arch.MoE.NumExperts, sink, func(e int) error {
-					ex := &l.Experts[e]
-					var err error
-					if ex.Gate, err = loadMatQ(tn(i, fmt.Sprintf(s.ExpertGate, e)), expInter, hd); err != nil {
-						return err
-					}
-					if ex.Up, err = loadMatQ(tn(i, fmt.Sprintf(s.ExpertUp, e)), expInter, hd); err != nil {
-						return err
-					}
-					ex.Down, err = loadMatQ(tn(i, fmt.Sprintf(s.ExpertDown, e)), hd, expInter)
-					return err
-				}); err != nil {
-					return err
-				}
-			}
-			// Shared expert (Qwen2-MoE): an always-on gated MLP + a scalar sigmoid
-			// gate. s.SharedGate/Up/Down are the expert's gate/up/down_proj;
-			// s.SharedExpertGate is the [1, hidden] sigmoid gate.
-			if arch.MoE.SharedIntermediateDim > 0 {
-				sInter := arch.MoE.SharedIntermediateDim
-				if l.SharedExpert.Gate, err = loadMatQ(tn(i, s.SharedGate), sInter, hd); err != nil {
-					return err
-				}
-				if l.SharedExpert.Up, err = loadMatQ(tn(i, s.SharedUp), sInter, hd); err != nil {
-					return err
-				}
-				if l.SharedExpert.Down, err = loadMatQ(tn(i, s.SharedDown), hd, sInter); err != nil {
-					return err
-				}
-				// Sigmoid gate (Qwen2-MoE). GLM/DeepSeek add the shared expert ungated
-				// (SharedExpertGate empty); moeMLP reads moe.SharedUngated, not l.SharedGate.
-				if s.SharedExpertGate != "" {
-					if l.SharedGate, err = loadMat(st, tn(i, s.SharedExpertGate), 1, hd); err != nil {
-						return err
-					}
-				}
-			}
-			return nil
-		}
-		// Gated MLP (GeGLU / SwiGLU — same weights, activation differs).
-		if l.GateProj, err = loadProj(tn(i, s.GateProj), cfg.IntermediateDim, hd, true); err != nil {
-			return err
-		}
-		if l.UpProj, err = loadProj(tn(i, s.UpProj), cfg.IntermediateDim, hd, true); err != nil {
-			return err
-		}
-		if l.DownProj, err = loadProj(tn(i, s.DownProj), hd, cfg.IntermediateDim, false); err != nil {
-			return err
-		}
-		return nil
-	}
-	// Gemma 4 per-layer FFN width: a safetensors checkpoint can vary intermediate_size by layer, but config.json carries one
-	// scalar (GGUF stores an explicit per-layer array: ggufIntArray -> cfg.FFNPerLayer). The forward calls arch.ffnAt(i) per
-	// layer, so it is seeded here, sequentially, before the parallel loop above reads it: each layer's width comes from its
-	// own GateProj tensor's on-disk shape (a header lookup; Tensor() does not decode data), not from a rule guessed from the
-	// KV-shared boundary, which is correlated on one checkpoint but is not something the config asserts.
-	if arch.gemma4 != nil {
-		// Per-Layer-Embedding (PLE) model-level inputs: the same three tensors GGUF loads, at the same precisions. The token
-		// table takes the embedding policy and streams a row at a time; the projection is a plain matmul weight; the norm is
-		// taken as-is (safetensors norms carry the HF convention already, where GGUF's vnorm has to undo llama.cpp's baked +1).
-		// Leaving them nil would crash runLayersFromEmbedPLE's rmsNorm on an E-model.
-		if pleDim := arch.gemma4.HiddenSizePerLayerInput; pleDim > 0 {
-			pleVocab := arch.gemma4.VocabSizePerLayerInput
-			if pleVocab == 0 {
-				pleVocab = cfg.VocabSize
-			}
-			// The forward indexes the table by the main-vocab token id (forward_gemma4.go), with no
-			// HF-style "ids past vocab_size_per_layer_input read row 0" mask, so a smaller table would
-			// read past its end. Every released E-model has the two equal.
-			if pleVocab != cfg.VocabSize {
-				return nil, fmt.Errorf("gemma4: vocab_size_per_layer_input %d != vocab_size %d is not supported", pleVocab, cfg.VocabSize)
-			}
-			pleTotal := cfg.NumLayers * pleDim
-			name := mp("model.embed_tokens_per_layer.weight")
-			t, terr := st.Tensor(name)
-			if terr != nil {
-				return nil, terr
-			}
-			if len(t.Shape) != 2 || t.Shape[0] != pleVocab || t.Shape[1] != pleTotal {
-				return nil, fmt.Errorf("gemma4: %q shape %v, want [%d %d]", name, t.Shape, pleVocab, pleTotal)
-			}
-			readPLE := func(r int, dst []float32) error { // keeps no state: every row range shares it
-				row, rerr := t.SubF32(r*pleTotal, pleTotal)
-				copy(dst, row)
-				return rerr
-			}
-			if w.PerLayerTokenEmbed, err = streamQuantizedEmbed(pleVocab, pleTotal, quant.gatherTable(), needCanonical, !repackForDecode(sink), 1, func() rowReader { return readPLE }); err != nil {
-				return nil, err
-			}
-			if w.PerLayerModelProj, err = loadProj(mp("model.per_layer_model_projection.weight"), pleTotal, hd, false); err != nil {
-				return nil, err
-			}
-			if w.PerLayerProjNorm, err = st.TensorF32(mp("model.per_layer_projection_norm.weight"), pleDim); err != nil {
-				return nil, err
-			}
-		}
-		ffnPerLayer := make([]int, cfg.NumLayers)
-		varies := false
-		for i := range ffnPerLayer {
-			ffnPerLayer[i] = cfg.IntermediateDim
-			if gt, terr := st.Tensor(tn(i, s.GateProj)); terr == nil && len(gt.Shape) == 2 {
-				ffnPerLayer[i] = gt.Shape[0]
-			}
-			if ffnPerLayer[i] != cfg.IntermediateDim {
-				varies = true
-			}
-		}
-		// Record it only when it genuinely varies: FeatGemma4EModel (features.go) reads "FFNPerLayer is non-empty" as "this
-		// checkpoint declared real per-layer FFN metadata", as GGUF's ggufIntArray does only for a checkpoint that carries the
-		// key. Setting it unconditionally would make every safetensors gemma4 checkpoint, including a uniform-width dense or MoE
-		// fixture, report FeatGemma4EModel.
-		if varies {
-			arch.gemma4.FFNPerLayer = ffnPerLayer
-		}
-	}
-	return finishLayers(w, arch, loadLayer, sink, id)
+	b := &stBuild{cfg: cfg, arch: arch, s: s, st: st, quant: quant, needCanonical: needCanonical, skipRow4: skipRow4, sink: sink, abort: abort, hd: hd, headDim: headDim, qDim: qDim, kvDim: kvDim, w: w, have: have, tn: tn, fusedExperts: fusedExperts, switchMLPExperts: switchMLPExperts, loadMatQ: loadMatQ, loadProj: loadProj, loadF32Merged: loadF32Merged, loadMatMerged: loadMatMerged, optNorm: optNorm, mp: mp, id: id}
+	return b.finish()
 }
 
 // loadQwen35Attn loads one qwen3_5_moe layer's attention tensors as f32 (the parity-first forward uses plain matvec): the
@@ -1394,7 +1055,7 @@ func loadQwen35Attn(i int, l *LayerWeights, arch *Architecture, hidden int,
 		if aerr != nil {
 			return aerr
 		}
-		d.negExpA = negExpAFromLog(aLog) // store −exp(A_log) (GGUF bakes this; here we compute it)
+		d.negExpA = hybridattn.NegExpAFromLog(aLog) // store −exp(A_log) (GGUF bakes this; here we compute it)
 		// DeltaNetNormSuffix/DeltaNetOutProjSuffix (Olmo Hybrid: o_norm/o_proj instead of
 		// qwen3.5's norm/out_proj) — see their own comment on qwen35Params.
 		normSuffix := "linear_attn.norm.weight"
@@ -1443,7 +1104,7 @@ func loadQwen35Attn(i int, l *LayerWeights, arch *Architecture, hidden int,
 // "attention." prefix (BailingMoeV3DecoderLayer assigns BOTH its MLA and KDA mixers to
 // self.attention, not self.self_attn — see mlaParams.AttnPrefix's own comment). Only the
 // no_kda_lora path (a single f_proj/g_proj linear per gate) is implemented — see kdaArchitecture's
-// own "what was deliberately not done" for the LoRA'd a/b-split variant, which validateBailingHybrid
+// own "what was deliberately not done" for the LoRA'd a/b-split variant, which ValidateBailingHybrid
 // refuses before this is ever reached.
 func loadBailingKDA(st *embed.SafetensorsFile, i int, l *LayerWeights, arch *Architecture, hidden int,
 	tn func(int, string) string, mkQ func(string, int, int) (linalg.WeightMat, error)) error {
@@ -1756,7 +1417,7 @@ func streamExperts(t embed.Tensor, nExpert, rows, cols int, quant quantMode, nee
 // embed.SafetensorsFile.TensorF32 typed read — F32/BF16/F16 dispatch + shape
 // check) and wraps it as a (f32) linalg.WeightMat ready for matmul/quantization.
 func loadMat(st *embed.SafetensorsFile, name string, rows, cols int) (linalg.WeightMat, error) {
-	data, err := st.TensorF32(name, rows, cols)
+	data, _, err := reconstructSafetensorsMat2D(st, nil, name, rows, cols)
 	if err != nil {
 		return linalg.WeightMat{}, err
 	}
@@ -1786,7 +1447,10 @@ type tensorSchema struct {
 	// per-layer suffixes passed to tensorName(layer, suffix); "" = absent
 	QProj, KProj, VProj, OProj string
 	// GProj is Laguna's attention output gate (g_proj). "" = the family has none.
-	GProj                      string
+	GProj string
+	// AttnSinks is Flint's per-query-head attention sink logit (self_attn.softmax_offset,
+	// with AttnSinksAlt = self_attn.sinks for older checkpoints). "" = none.
+	AttnSinks, AttnSinksAlt    string
 	QBias, KBias, VBias        string // "" = no projection bias (Qwen2 sets q/k/v)
 	QNorm, KNorm               string // "" = no QK-norm
 	PreAttnNorm, PostAttnNorm  string
@@ -2459,7 +2123,7 @@ func buildGPT2Weights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile
 // [E, hidden, inter] = down) are exactly the loadFusedExperts layout, so the routed
 // FFN reuses moeMLP unchanged once split; the ungated shared_mlp loads into
 // SharedExpert. Embeddings/experts/attention quantize; the Mamba-2 mixer stays f32.
-func buildGraniteWeights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, sink *giwWriter, id string) (*Weights, error) {
+func buildGraniteWeights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, sink *giwWriter, id string, abort <-chan struct{}) (*Weights, error) {
 	hidden, vocab, inter := arch.HiddenDim, arch.VocabSize, arch.IntermediateDim
 	g := arch.granite
 	w := &Weights{Cfg: *cfg, arch: arch, st: st, Layers: make([]LayerWeights, arch.NumLayers)}
@@ -2563,14 +2227,14 @@ func buildGraniteWeights(cfg *Config, arch *Architecture, st *embed.SafetensorsF
 		lw.SharedExpert.Down = q(linalg.WrapF32(append([]float32(nil), dn...), hidden, sInter))
 		return nil
 	}
-	return finishLayers(w, arch, loadLayer, sink, id)
+	return finishLayers(w, arch, loadLayer, sink, id, abort)
 }
 
 // buildNemotronWeights loads a Nemotron-H (nemotron_h) checkpoint: a single-op-per-
 // block stack where each layer (under a "mixer" prefix) is a Mamba-2 mixer (f32,
 // parity-first, reusing the Granite conventions), a NoPE GQA attention, or a
 // non-gated relu² MLP — keyed by arch.nemotron.blockKind. Plain RMSNorm per layer.
-func buildNemotronWeights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, sink *giwWriter, id string) (*Weights, error) {
+func buildNemotronWeights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, sink *giwWriter, id string, abort <-chan struct{}) (*Weights, error) {
 	hidden, vocab, inter := arch.HiddenDim, arch.VocabSize, arch.IntermediateDim
 	np := arch.nemotron
 	w := &Weights{Cfg: *cfg, arch: arch, st: st, Layers: make([]LayerWeights, arch.NumLayers)}
@@ -2711,7 +2375,7 @@ func buildNemotronWeights(cfg *Config, arch *Architecture, st *embed.Safetensors
 		}
 		return nil
 	}
-	return finishLayers(w, arch, loadLayer, sink, id)
+	return finishLayers(w, arch, loadLayer, sink, id, abort)
 }
 
 // buildPhi3Weights loads a Phi-3 / Phi-4 (phi3) checkpoint. Phi-3 is the llama skeleton
@@ -2721,7 +2385,7 @@ func buildNemotronWeights(cfg *Config, arch *Architecture, st *embed.Safetensors
 // output rows (split at NumHeads*HeadDim, then +NumKVHeads*HeadDim), and mlp.gate_up_proj
 // is gate‖up (split in half). The fused tensors load to f32, slice by rows, and quantize
 // per the resident mode (the GPT-2 fused-QKV precedent).
-func buildPhi3Weights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, sink *giwWriter, id string) (*Weights, error) {
+func buildPhi3Weights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, sink *giwWriter, id string, abort <-chan struct{}) (*Weights, error) {
 	hidden, inter, vocab := arch.HiddenDim, arch.IntermediateDim, arch.VocabSize
 	hd := arch.HeadDim
 	qDim, kvDim := arch.NumHeads*hd, arch.NumKVHeads*hd
@@ -2779,7 +2443,7 @@ func buildPhi3Weights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile
 		l.DownProj = q(l.DownProj)
 		return nil
 	}
-	return finishLayers(w, arch, loadLayer, sink, id)
+	return finishLayers(w, arch, loadLayer, sink, id, abort)
 }
 
 // buildGlmOcrWeights loads the GLM-OCR text decoder (model_type glm_ocr / glm_ocr_text; the vision
@@ -2794,7 +2458,7 @@ func buildPhi3Weights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile
 // NumLayers, so it is skipped by construction; the vision tower (model.visual.*) is never requested
 // either. The head is untied on the real checkpoint but finalized from lm_head.weight presence, like
 // phi3, so a tied re-save would still load.
-func buildGlmOcrWeights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, sink *giwWriter, id string) (*Weights, error) {
+func buildGlmOcrWeights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, sink *giwWriter, id string, abort <-chan struct{}) (*Weights, error) {
 	s := &glmOcrTensorSchema
 	hidden, inter, vocab := arch.HiddenDim, arch.IntermediateDim, arch.VocabSize
 	hd := arch.HeadDim
@@ -2861,7 +2525,7 @@ func buildGlmOcrWeights(cfg *Config, arch *Architecture, st *embed.SafetensorsFi
 		l.DownProj = q(l.DownProj)
 		return nil
 	}
-	return finishLayers(w, arch, loadLayer, sink, id)
+	return finishLayers(w, arch, loadLayer, sink, id, abort)
 }
 
 // buildSpark25Weights loads Spark-X2.5 (model_type spark2_5): fused q_k_v_proj splits by
@@ -2875,7 +2539,7 @@ func buildGlmOcrWeights(cfg *Config, arch *Architecture, st *embed.SafetensorsFi
 // as Laguna's own GProj (see the generic loader's own comment on why: deliberately excluded from
 // quantization). No bias tensors: spark25Architecture rejects attention_bias=true before this
 // runs, so every released config's shape is the only one this function needs to handle.
-func buildSpark25Weights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, sink *giwWriter, id string) (*Weights, error) {
+func buildSpark25Weights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, sink *giwWriter, id string, abort <-chan struct{}) (*Weights, error) {
 	hidden, inter, vocab := arch.HiddenDim, arch.IntermediateDim, arch.VocabSize
 	hd, nH := arch.HeadDim, arch.NumHeads
 	qDim, kvDim := nH*hd, arch.NumKVHeads*hd
@@ -2938,7 +2602,7 @@ func buildSpark25Weights(cfg *Config, arch *Architecture, st *embed.SafetensorsF
 		l.DownProj = q(l.DownProj)
 		return nil
 	}
-	return finishLayers(w, arch, loadLayer, sink, id)
+	return finishLayers(w, arch, loadLayer, sink, id, abort)
 }
 
 // buildLlama4Weights loads a Llama 4 text decoder (llama4_text). Attention is separate
@@ -2949,7 +2613,7 @@ func buildSpark25Weights(cfg *Config, arch *Architecture, st *embed.SafetensorsF
 // FUSED and TRANSPOSED for a bmm — gate_up_proj is [nE, hidden, 2*inter] and down_proj is
 // [nE, inter, hidden] ([in, out] per expert) — so each expert is transposed to goinfer's
 // [out, in] WeightMat and the gate‖up halves split out.
-func buildLlama4Weights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, sink *giwWriter, id string) (*Weights, error) {
+func buildLlama4Weights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, sink *giwWriter, id string, abort <-chan struct{}) (*Weights, error) {
 	hidden, vocab := arch.HiddenDim, arch.VocabSize
 	hd := arch.HeadDim
 	qDim, kvDim := arch.NumHeads*hd, arch.NumKVHeads*hd
@@ -3069,7 +2733,7 @@ func buildLlama4Weights(cfg *Config, arch *Architecture, st *embed.SafetensorsFi
 		}
 		return nil
 	}
-	return finishLayers(w, arch, loadLayer, sink, id)
+	return finishLayers(w, arch, loadLayer, sink, id, abort)
 }
 
 // lagunaTensorSchema: Laguna (poolside). The names follow the real Laguna-XS.2 checkpoint index, not modeling_laguna.py,
@@ -3116,4 +2780,42 @@ var lagunaTensorSchema = tensorSchema{
 	SharedUp:   "mlp.shared_expert.up_proj.weight",
 	SharedDown: "mlp.shared_expert.down_proj.weight",
 	// SharedExpertGate empty: Laguna adds the shared expert with no outer sigmoid gate.
+}
+
+// flintTensorSchema: Flint (RecursiveSI/flint). Qwen3-shaped attention (per-head
+// q_norm/k_norm, no biases on the released checkpoint) with a learned
+// per-query-head attention sink (self_attn.sinks, or self_attn.softmax_offset),
+// a dense MLP prefix (mlp_only_layers), and a sigmoid-routed MoE (both per-expert
+// 2D mlp.experts.%d.{gate,up,down}_proj.weight and fused 3D
+// mlp.experts.{gate_up,down}_proj are handled by buildWeightsFromSafetensorsTo)
+// plus an always-on ungated SwiGLU shared expert (mlp.shared_expert.*).
+var flintTensorSchema = tensorSchema{
+	Embed:        "model.embed_tokens.weight",
+	LMHead:       "lm_head.weight",
+	FinalNorm:    "model.norm.weight",
+	QProj:        "self_attn.q_proj.weight",
+	KProj:        "self_attn.k_proj.weight",
+	VProj:        "self_attn.v_proj.weight",
+	OProj:        "self_attn.o_proj.weight",
+	QNorm:        "self_attn.q_norm.weight",
+	KNorm:        "self_attn.k_norm.weight",
+	AttnSinks:    "self_attn.sinks",
+	AttnSinksAlt: "self_attn.softmax_offset",
+	QBias:        "self_attn.q_proj.bias",
+	KBias:        "self_attn.k_proj.bias",
+	VBias:        "self_attn.v_proj.bias",
+	PreAttnNorm:  "input_layernorm.weight",
+	PreMLPNorm:   "post_attention_layernorm.weight",
+	// dense prefix (mlp_only_layers) layers
+	GateProj: "mlp.gate_proj.weight",
+	UpProj:   "mlp.up_proj.weight",
+	DownProj: "mlp.down_proj.weight",
+	// MoE layers
+	Router:     "mlp.gate.weight",
+	ExpertGate: "mlp.experts.%d.gate_proj.weight",
+	ExpertUp:   "mlp.experts.%d.up_proj.weight",
+	ExpertDown: "mlp.experts.%d.down_proj.weight",
+	SharedGate: "mlp.shared_expert.gate_proj.weight",
+	SharedUp:   "mlp.shared_expert.up_proj.weight",
+	SharedDown: "mlp.shared_expert.down_proj.weight",
 }

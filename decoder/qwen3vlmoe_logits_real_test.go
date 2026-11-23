@@ -1,6 +1,6 @@
 //go:build realckpt
 
-// G-S10q-c of docs/tasks/task-multimodal-support-2026-10.md ("S10, Qwen3-VL MoE", registered before this code): goinfer's
+// G-S10q-c: goinfer's
 // half, step (b')'s design (g31b_logits_real_test.go) on image prompts. Run once for the 30B and once for the dense
 // Qwen3-VL-2B sibling the bar is read against.
 //
@@ -33,6 +33,8 @@ import (
 	"github.com/townsendmerino/goinfer/internal/vision"
 	"github.com/townsendmerino/goinfer/multimodal"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 var q3mImages = []string{"gemma3_preprocess_image.png", "qwen25vl_preprocess_image.png", "glm_ocr/formula.png", "glm_ocr/table.png"}
@@ -57,7 +59,7 @@ type q3mImage struct {
 }
 
 func TestQwen3VLMoe_goinferLogits(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	dir, out, step := os.Getenv("GOINFER_Q3M_DIR"), os.Getenv("GOINFER_Q3M_OUT"), os.Getenv("GOINFER_Q3M_STEP")
 	if dir == "" || out == "" || (step != "paths" && step != "logits") {
 		t.Skip("set GOINFER_Q3M_DIR, GOINFER_Q3M_OUT and GOINFER_Q3M_STEP (paths | logits)")

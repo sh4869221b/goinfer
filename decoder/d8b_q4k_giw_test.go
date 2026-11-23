@@ -21,7 +21,7 @@ import (
 	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 )
 
-// D8B-G (docs/tasks/task-memory-campaign-2026-10.md, §4 MEM13, "D8b-build gates"): a q4k load's Q4_K tensors as .giw kind 8.
+// D8B-G: a q4k load's Q4_K tensors as .giw kind 8.
 
 type ggufRawTensor struct {
 	name string
@@ -284,7 +284,7 @@ func TestFitRefusal_streamableOnlyWhereItPages(t *testing.T) {
 }
 
 // TestGIW_f32WeightsAreMapped: an f32 bundle's weight matrices alias the mapping, as every other quant's do, so what
-// guardGIWFit assumes of a bundle's weights holds at f32 too (docs/queue-engineering.md, B42). The bar on heap growth is the
+// guardGIWFit assumes of a bundle's weights holds at f32 too. The bar on heap growth is the
 // registered one. Its output is bit-identical to the direct load and to a kind-1 bundle, which still loads, copied. The
 // mapping is read-only, so a forward that wrote through a weight would fault here.
 func TestGIW_f32WeightsAreMapped(t *testing.T) {
@@ -854,5 +854,36 @@ func TestPublishGIW_restoresTheOldBundleOnFailure(t *testing.T) {
 	}
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Errorf("a leftover was not swept: %v", err)
+	}
+}
+
+// TestPlan_metalAdmitsAQ4KLoadThroughItsSidecar: a q4k .gguf is admitted to Metal's resident path whether it loads directly or
+// through its sidecar .giw (serve's and chat's default on darwin). Both loads carry the per-32 activation group, and Metal's q4k
+// lane quantizes no activation, so the group's gate exempts both; it reads the loaded weights' quant, which a .giw records, not the
+// --quant option, which only a direct load keeps.
+func TestPlan_metalAdmitsAQ4KLoadThroughItsSidecar(t *testing.T) {
+	mem1NeedsSidecarPlatform(t)
+	src := q4kGGUF(t, t.TempDir(), 2)
+	direct, err := Load(src, Options{Backend: "cpu", Quant: "q4k", DirectLoad: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer direct.Close()
+	sidecarDefaultOn(t)
+	viaGIW, err := Load(src, Options{Backend: "cpu", Quant: "q4k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer viaGIW.Close()
+	if viaGIW.mmap == nil {
+		t.Fatalf("the load opened %q, not a sidecar .giw", viaGIW.srcPath)
+	}
+	for name, m := range map[string]*Model{"direct": direct, "sidecar": viaGIW} {
+		if m.Quant() != "q4k" || m.ActQuantGroup() != 32 {
+			t.Fatalf("%s: quant %q, activation group %d; want q4k at 32", name, m.Quant(), m.ActQuantGroup())
+		}
+		if p := m.Plan("metal", 1<<40, PlanRequest{Ctx: 256, CtxPinned: true}); p.Placement != PlacementResident {
+			t.Errorf("%s: Plan(\"metal\") is %v: %s", name, p.Placement, p.Reason)
+		}
 	}
 }

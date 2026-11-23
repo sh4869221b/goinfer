@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -25,7 +26,7 @@ import (
 	"github.com/townsendmerino/goinfer/internal/guard/paritykey"
 )
 
-// `gate quick`'s SELECTION (docs/tasks/task-test-efficiency-2026-09.md, TE7(a)): changed files -> their
+// `gate quick`'s SELECTION: changed files -> their
 // packages -> every test binary, in any of the five modules, that can observe them.
 //
 // THREE TIERS, because "imports the change" is not the only way a test here observes one:
@@ -189,9 +190,9 @@ func realQuickConfig(root string) (*quickConfig, error) {
 			// that need nothing from decoder live in metal/kernels, where the test cache alone keeps them off a decoder diff.
 			Slow: `^(TestWeightAlias_closeCycles|TestProfileKernels)$`,
 			Lint: []lintSpec{
-				{"build", nil, "darwin/arm64", "affected", "metal-darwin: go build ./metal/..."},
-				{"vet", nil, "darwin/arm64", "affected", "metal-darwin: go vet ./metal/..."},
-				{"vet", testhooks, "darwin/arm64", "affected", "metal-darwin: go vet -tags goinfer_testhooks ./metal/..."},
+				{"build", nil, "darwin/arm64", "affected", "gpu-darwin (metal part): go build ./metal/..."},
+				{"vet", nil, "darwin/arm64", "affected", "gpu-darwin (metal part): go vet ./metal/..."},
+				{"vet", testhooks, "darwin/arm64", "affected", "gpu-darwin (metal part): go vet -tags goinfer_testhooks ./metal/..."},
 				// Not a CI step. Run because a local staticcheck is the only one this module gets.
 				{"staticcheck", testhooks, "darwin/arm64", "changed", "(not in CI) staticcheck -tags goinfer_testhooks ./metal/..."},
 			},
@@ -488,12 +489,12 @@ func loadGraph(qc *quickConfig, overlay string) (*quickGraph, error) {
 		cmd.Stderr = &stderr
 		out, err := cmd.Output()
 		if err != nil {
-			return nil, fmt.Errorf("go list in %s (%s): %v\n%s", m.Name, m.Dir, err, strings.TrimSpace(stderr.String()))
+			return nil, fmt.Errorf("go list in %s (%s): %w\n%s", m.Name, m.Dir, err, strings.TrimSpace(stderr.String()))
 		}
 		dec := json.NewDecoder(bytes.NewReader(out))
 		for {
 			var p goListPkg
-			if err := dec.Decode(&p); err == io.EOF {
+			if err := dec.Decode(&p); errors.Is(err, io.EOF) {
 				break
 			} else if err != nil {
 				return nil, fmt.Errorf("go list in %s: decoding: %w", m.Name, err)
@@ -1030,7 +1031,7 @@ func needle(rel string) string {
 //
 // A read by a path assembled at run time outside the module root, including a walk of the whole parent from
 // a computed root, stays the cache's blind spot, exactly as it is for a hand-typed `go test`; that is the
-// risk TE7(b) accepted for day loops.
+// risk accepted for day loops.
 func (r *testRoot) crossModuleReader(root, rel string) string {
 	modRel := r.Mod.Dir
 	if modRel == "." || rel == modRel || strings.HasPrefix(rel, modRel+"/") {
@@ -1090,14 +1091,14 @@ func changedFiles(root, base string) (files []string, baseDesc string, err error
 		cmd.Stderr = &stderr
 		out, err := cmd.Output()
 		if err != nil {
-			return "", fmt.Errorf("git %s: %v %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+			return "", fmt.Errorf("git %s: %w %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 		}
 		return string(out), nil
 	}
 	if base == "" {
 		mb, mbErr := git("merge-base", "HEAD", "origin/main")
 		if mbErr != nil {
-			return nil, "", fmt.Errorf("no base: %v (pass -base REF)", mbErr)
+			return nil, "", fmt.Errorf("no base: %w (pass -base REF)", mbErr)
 		}
 		base = strings.TrimSpace(mb)
 		baseDesc = "merge-base(HEAD, origin/main) = " + shortSHA(base)

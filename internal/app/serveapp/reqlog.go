@@ -20,7 +20,7 @@ import (
 )
 
 // -log-requests: one line per generation request on stderr: route, model, status, prompt and completion tokens, time to first
-// token, total time. Off by default, so a quiet server stays quiet (docs/tasks/task-first-hour.md).
+// token, total time. Off by default, so a quiet server stays quiet.
 //
 // The middleware owns the status and the clock; the token counts and the first-token time can only be known where tokens are
 // read, which is streamTokens, the shared tail of every generation (drive and driveVL). A request that makes several
@@ -32,8 +32,9 @@ import (
 // slot's record length before the request, PrefillSlot), div (the first position the prompt left that record, when it left
 // it before its end, else -), canon (1 when every generation's ids are, run by run between added tokens, the tokenizer's
 // own encoding of their text), ids=<used>/<carried> and ids_fallback (carried_ids.go). prefill_fallback=<path> follows when
-// the batched prefill declined and another path ran the prompt (decoder.PrefillReport); the reason is on stderr. No content
-// is written.
+// the batched prefill declined and another path ran the prompt (decoder.PrefillReport); the reason is on stderr. spec=<drafted>/
+// <accepted> follows on a request that speculated (summed over its generations), and lazy=armed when a lazy tool-union turn on a
+// speculating server armed at its call opener (engine.Report). No content is written.
 //
 // --log-token-ids writes one JSON line per generation to its file, for measurement runs: time, route, response id, prompt
 // length and SHA-256 (idsSHA256), reused, slot, the generated ids and canon.
@@ -53,11 +54,16 @@ type reqTrace struct {
 	reuseKnown          bool
 	reused, slot, match int
 	canon               bool
-	ids                 idsOutcome
-	idsSeen             bool
-	fast                bool // the request named the fast alias (fast_alias.go)
-	snapRows            int  // rows a host snapshot restored for the first generation (decoder.Generation.KVSnapRestored)
-	// the first generation's recurrent checkpoint (KV8a): whether its prompt's end was saved and the copy's time, the position it
+	// specDrafted and specAccepted sum the request's generations' speculation (specSeen when any speculated); lazyArmed is a lazy
+	// tool-union turn on a speculating server whose call opener armed.
+	specSeen                  bool
+	specDrafted, specAccepted int
+	lazyArmed                 bool
+	ids                       idsOutcome
+	idsSeen                   bool
+	fast                      bool // the request named the fast alias (fast_alias.go)
+	snapRows                  int  // rows a host snapshot restored for the first generation (decoder.Generation.KVSnapRestored)
+	// the first generation's recurrent checkpoint: whether its prompt's end was saved and the copy's time, the position it
 	// restored from and that copy's time, or why a checkpoint hit prefilled cold (decoder.Generation's Checkpoint fields)
 	ckptSaved    bool
 	ckptSave     time.Duration
@@ -107,6 +113,14 @@ func (t *reqTrace) generated(lm *loadedModel, gr genRequest, rep *genReport, ids
 	}
 	t.completion += len(ids)
 	t.canon = t.canon && canon
+	if rep != nil {
+		if rep.SpecDrafted > 0 {
+			t.specSeen = true
+			t.specDrafted += rep.SpecDrafted
+			t.specAccepted += rep.SpecAccepted
+		}
+		t.lazyArmed = t.lazyArmed || rep.LazyArmed
+	}
 	t.mu.Unlock()
 	if t.tl != nil {
 		line := map[string]any{"t": time.Now().UTC().Format(time.RFC3339Nano), "route": t.route, "id": gr.id,
@@ -291,6 +305,12 @@ func (t *reqTrace) line(route string, status int, end time.Time) string {
 	if t.kv != "" {
 		line += " kv=" + t.kv // the precision the request's KV cache holds; absent when the route reports no model
 	}
+	if t.specSeen {
+		line += fmt.Sprintf(" spec=%d/%d", t.specDrafted, t.specAccepted) // drafted/accepted, on a request that speculated
+	}
+	if t.lazyArmed {
+		line += " lazy=armed" // a lazy tool-union turn on a speculating server took the constrained path at its call opener
+	}
 	if t.fast {
 		line += " fast=1" // only a request that named the alias carries the field, so every other line keeps its shape
 	}
@@ -301,7 +321,7 @@ func (t *reqTrace) line(route string, status int, end time.Time) string {
 		line += fmt.Sprintf(" ckpt_restore=%d ckpt_restore_ms=%.3f", t.ckptRestored, float64(t.ckptRestore.Microseconds())/1000)
 	}
 	if t.ckptSaved {
-		line += fmt.Sprintf(" ckpt_save_ms=%.3f", float64(t.ckptSave.Microseconds())/1000) // the save's own time, every request that saved (KV8a gate 4)
+		line += fmt.Sprintf(" ckpt_save_ms=%.3f", float64(t.ckptSave.Microseconds())/1000) // the save's own time, every request that saved
 	}
 	if t.ckptDeclined != "" {
 		line += fmt.Sprintf(" ckpt_declined=%q", t.ckptDeclined)

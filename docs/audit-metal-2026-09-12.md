@@ -75,7 +75,7 @@ precedent says isolated GEMV wins can vanish end to end.
 **Memory: a Metal-backed int4 load keeps three copies of every dense projection** — host canonical,
 host row4 repack (read by nothing once resident), and the Metal buffer — 889.6 MB of dead host
 memory on the 1.5B by commit `3931ae1`'s own measurement, ~4 GB at 7B, on the box whose 26B cell
-misses the budget by 3.75 GB (M-07). This is L4 of `docs/tasks/task-int4-layout-2026-09.md`, now with
+misses the budget by 3.75 GB (M-07). This is L4 of a private task doc, now with
 its number.
 
 **The paged path (26B/35B/gpt-oss on the Mac) is opt-in, serialised, and measured against the wrong
@@ -171,7 +171,7 @@ re-baked by the code it checks (G-04).
   Verified: `go test ./metal/...` (79 pass) and `-tags goinfer_testhooks` (129 pass, 52 skip) both
   green, `go test ./decoder/...` (488 pass), gofmt clean, staticcheck clean (same pre-existing
   U1000s as `main`, none new).
-- **Follow-up, 2026-09-20 (R3, `docs/tasks/red-october.md`).** The floor moved again: 256 → 64.
+- **Follow-up, 2026-09-20 (R3, `docs/completed/red-october.md`).** The floor moved again: 256 → 64.
   §3.2 pooled gate ships at K=64 alone and at K=64+128 pooled (S model); the batched arm beats
   sequential TTFT by 3.83× at K=64 and 4.66× at K=128, both past the ≥2× ships band. Full record:
   [`metal-prefill-floor-2026-09-20.md`](measurements/metal-prefill-floor-2026-09-20.md).
@@ -251,7 +251,7 @@ re-baked by the code it checks (G-04).
 - **Where:** `metal/prefill.go:1813-1821` (`for m := range M { … r.encodeMoEExperts(e, L, moeDst) }`),
   `metal/moe.go:1018-983`; `metal/model.go:1273-1161` (paged/g4moe/DeltaNet → `prefillOK=false`);
   `metal/backend.go:796-585` (`PrefillPath` reports "batched f16-MMA" for it);
-  `docs/tasks/task-gpu-paths-2026-09.md:1184-1191` (G8: "Mirrors CUDA's own established shape exactly").
+  `docs/completed/task-gpu-paths-2026-09.md:1184-1191` (G8: "Mirrors CUDA's own established shape exactly").
 - **Mechanism and bound (counted):** non-paged: per row per MoE layer (5 + 3k [+3–5 shared])
   dispatches and a full read of the k routed experts — bytes ≈ M × L × k·3·H·I/2: Qwen1.5-MoE-class
   (24 L, k=4, H=2048, I=1408) ≈ 0.83 GB per row → 1.7 TB at M=2048 (≥8.5 s at 200 GB/s) plus ~0.84 M
@@ -270,7 +270,7 @@ re-baked by the code it checks (G-04).
 - **Prior:** audit-2026-09-10 P-15 (dispatch count only); queue-performance P20/P18 (CPU
   expert-major 4.36×, bit-identical); CUDA `prefill-moe-m26` (batching worth 8%, expert DMA 59.5%).
 - **NOT CLOSED — interim step done 2026-09-13, the real fix not attempted.** The bound this
-  finding computed is now recorded beside G8 (`docs/tasks/task-gpu-paths-2026-09.md`, dated
+  finding computed is now recorded beside G8 (`docs/completed/task-gpu-paths-2026-09.md`, dated
   2026-09-13 entry, exactly the ask this Fix line makes for the interim), so "batched" is no
   longer undocumented as a TTFT promise. The layer-major/expert-major dispatch restructuring
   itself is a real, multi-file kernel-design project (a new batched-K GEMM shape, not a parameter
@@ -355,7 +355,7 @@ re-baked by the code it checks (G-04).
   the row4 repack — the CPU fallback then runs the canonical kernel, ~1.1–1.3× slower on a path that
   is already the slow one); after `BuildResident` succeeds, release the layer projections' host
   `WeightMat`s (keep `Embed`/`LMHead` for the host lookup). This is **L4 of
-  `docs/tasks/task-int4-layout-2026-09.md`**, now with its number and a second half (drop after upload).
+  a private task doc**, now with its number and a second half (drop after upload).
 - **Confidence:** confirmed (three allocation sites traced; the 889.6 MB is the commit's own
   measurement). **Prior:** audit-2026-09-10 M-24 (the guard's 2× double-count — the real footprint
   is 3×); aikit M-22; task-int4-layout L4 (filed, not scheduled — schedule it).
@@ -459,7 +459,7 @@ re-baked by the code it checks (G-04).
   (`docs/measurements/s6-alias-2026-09-24.md`, "Build step 2"; `docs/completed/task-never-swap-2026-09.md`, S6).
   <br>**What remains of M-07:** a direct `.gguf` or safetensors load on Metal still keeps two copies (host canonical +
   Metal buffer; the host-release half stays declined, above), and its default int4 lane builds a full staging copy of
-  each projection before the upload, which is MEM13 in `docs/tasks/task-memory-campaign-2026-10.md` (owner, 2026-10-21:
+  each projection before the upload, which is MEM13 in `docs/completed/task-memory-campaign-2026-10.md` (owner, 2026-10-21:
   remove it). On a `.giw` load, a build with aliasing off, a file written for another target (its fused groups and
   scales), and the two fused pairs the writer does not lay out as groups (the shared-expert gate|up, qwen35's K‖V; MEM9)
   still take the copy path.
@@ -1145,7 +1145,7 @@ re-baked by the code it checks (G-04).
 #### G-04 · The absolute snapshot golden is re-baked by the code it checks after each accepted kernel round; the autoresearch ledger is outside the tree
 - **Where:** `metal/snapshot_golden_test.go:21,200-207` ("the ABSOLUTE STORED REFERENCE";
   `GOINFER_UPDATE_GOLDENS` writes whatever current code produces), `metal/kernels.go:37-29` ("only
-  deep-mantissa sha bits move — see the round's own commit"); `docs/tasks/task-autoresearch-loop.md:3`
+  deep-mantissa sha bits move — see the round's own commit"); a private task doc
   ("not started") and §3 ("Do NOT point it at Metal") vs `metal/kernels.go:135,147,1041-1066` (Metal rounds
   ran on the norm-class kernels); `scripts/autoresearch_rmsnorm_results.tsv` not in
   `docs/measurements/`.
@@ -1156,7 +1156,7 @@ re-baked by the code it checks (G-04).
   golden is declared an OS-drift detector only; move the tsv into `docs/measurements/`; fix the
   autoresearch doc's status. **Confidence:** plausible (the tsv is not here).
 - **PARTIALLY CLOSED 2026-09-13 — doc corrected, tsv/gate-line not done.** Fixed
-  `docs/tasks/task-autoresearch-loop.md`'s stale "not started" status to note the contradiction directly
+  a private task doc's stale "not started" status to note the contradiction directly
   (kernels.go's own comments cite the tsv as a real Metal experiment) rather than restate the
   wrong claim. The tsv itself could not be moved into `docs/measurements/` — it is not anywhere in
   the tree, not merely misplaced; whatever generated it either never committed the file or it was
@@ -1294,7 +1294,7 @@ re-baked by the code it checks (G-04).
   runs `ForwardEmbPipe` → full head + host argmax. Labelling defect (fused argmax is a recorded
   speed-neutral on UMA), but the curve measures a path serve never takes. **FIXED 2026-09-13**: a
   caveat now names which path production actually calls. **SUPERSEDED 2026-09-18** (R2 step 0,
-  `docs/tasks/red-october.md`): the caveat's own argument is now moot rather than merely noted —
+  `docs/completed/red-october.md`): the caveat's own argument is now moot rather than merely noted —
   `scripts/bench_peer.py` drives goinfer over its real HTTP server, measuring the production path
   directly instead of arguing the internal one should be representative of it.
 - N-04 `docs/gpu-residency-coverage.md:19-25` — "in int8 W8A8": Metal has no int8 GEMV and
@@ -1308,7 +1308,7 @@ re-baked by the code it checks (G-04).
   archived every Critical/Gate/Major finding, C-08 included.
   **FIXED 2026-09-13**: the doc's own "what remains" summary line corrected (C-08 fully closed,
   G-08 partially) — the per-finding entries themselves already carried accurate closure notes.
-- N-06 `docs/tasks/task-autoresearch-loop.md:3` "not started" / §3 "do NOT point it at Metal" — it ran on
+- N-06 a private task doc / §3 "do NOT point it at Metal" — it ran on
   Metal (norm-class kernels); ledger tsv outside the tree (G-04). Already resolved independently
   (a further doc-review pass corrected the doc's status beyond even G-04's own scope) — no action
   needed.
@@ -1435,7 +1435,7 @@ re-baked by the code it checks (G-04).
   memory leaked through anywhere, the staged-content checks in these would have caught it.
 - N-22 `metal/moe.go:1189`, `metal/gemma4_moe.go:666-566` — phase 2 of layer l and phase 1 of l+1 have no
   host dependency and could share one command buffer (2L+1 → L+1); superseded by M-11. **Since 2026-10-04 phase 2 is
-  committed without a wait** (`pagedAsyncPhase2On`, 1.132x on M26; `docs/tasks/task-m26-mac-2026-10.md`).
+  committed without a wait** (`pagedAsyncPhase2On`, 1.132x on M26; `docs/completed/task-m26-mac-2026-10.md`).
 - N-23 `metal/moe.go:1121` — a hybrid's dense layers each get their own `Begin/End` in
   `forwardLogitsMoEPaged`. **FIXED 2026-09-13**: consecutive dense layers now share ONE command
   buffer (`Begin()` on first use, closed only when the next MoE-paged layer's router readback needs
@@ -1755,7 +1755,7 @@ Ordered by TTFT-on-the-Mac per hour of work; each lands with its own gate line a
    benchmark (`BenchmarkForwardNoLogits_SyncVsPipe`, ~4% wall-time win on a trivial trunk, too
    small to carry meaningful CPU encode time) — so treat the headline number as unverified, not
    confirmed. The TTFT ladder re-run this item called for **ran 2026-09-20/21**
-   (`docs/tasks/red-october.md` R3, [`metal-prefill-floor-2026-09-20.md`](measurements/metal-prefill-floor-2026-09-20.md) +
+   (`docs/completed/red-october.md` R3, [`metal-prefill-floor-2026-09-20.md`](measurements/metal-prefill-floor-2026-09-20.md) +
    [`r3-startpos-speed-2026-09-21.md`](measurements/r3-startpos-speed-2026-09-21.md)) — floor moved
    256→64, batched beats sequential 3.83-4.66× at `startPos=0` and 4.01-4.13× at the realistic
    `startPos=512` prefix-reuse shape. Note R3's own floor drop (512→64) shrank the population that
@@ -1764,7 +1764,7 @@ Ordered by TTFT-on-the-Mac per hour of work; each lands with its own gate line a
    this against a 512-token floor.
 2. **M-03** — **CLOSED 2026-09-13** (`f6c222ee`). 32×32 per-simdgroup block, all-lane dequant, A
    staged per threadgroup, exactly as scoped. §3.2 pooled gate SHIPS (see M-03's own closure note);
-   the P=256 TTFT re-measurement this item called for **ran 2026-09-18** (`docs/tasks/red-october.md`
+   the P=256 TTFT re-measurement this item called for **ran 2026-09-18** (`docs/completed/red-october.md`
    R4 step 0, [`metal-prefill-ladder-2026-09-18.md`](measurements/metal-prefill-ladder-2026-09-18.md)) —
    K=512 came in at 2.54× behind Ollama, improved from the 3.33× pre-fix baseline but short of this
    item's own ≤1.8× ship projection; the further GEMM-tile change (R4 step 2) that projection would

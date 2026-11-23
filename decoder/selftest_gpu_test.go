@@ -82,7 +82,7 @@ func TestSelfTestFixtures_matchTestdataAndFitTheirWindow(t *testing.T) {
 }
 
 // The calling convention under test is withResidency's: the probe is reached from a real Load, runs once per backend and quant before the model's own build, and a decline skips that
-// build (H6C-S2, docs/tasks/task-kernel-survey-2026-10.md, "KS-H6 build, amendment"). A resident that answers with a one-hot row (fakeResident) cannot agree with the CPU's logits on any
+// build. A resident that answers with a one-hot row (fakeResident) cannot agree with the CPU's logits on any
 // fixture.
 func TestGPUProbe_declinesAWrongResidentThroughLoad(t *testing.T) {
 	t.Cleanup(resetSelfTestCaches)
@@ -162,7 +162,7 @@ func TestGPUProbe_declinesAWrongResidentThroughLoad(t *testing.T) {
 	}
 }
 
-// TestGPUProbe_runsBeforeTheBuild is H6C-S1 and H6C-S3 (docs/tasks/task-kernel-survey-2026-10.md, "KS-H6 build, amendment"): on a first load
+// TestGPUProbe_runsBeforeTheBuild is H6C-S1 and H6C-S3: on a first load
 // the probe's fixture builds all come before the model's own, a probe that does not decline keeps the model's resident, a second load builds the
 // model once and no fixture, and with self-tests skipped no fixture is built. The fixtures decline to go resident here, so the probe reads
 // skipped, not declined, and the order is all that is under test.
@@ -234,9 +234,9 @@ type orderedBuild struct {
 
 func (o *orderedBuild) BuildResident(m *Model) (ResidentForward, bool, error) {
 	o.mu.Lock()
-	*o.seq = append(*o.seq, m.noSelfTest)
+	*o.seq = append(*o.seq, m.opts.noSelfTest)
 	o.mu.Unlock()
-	if m.noSelfTest {
+	if m.opts.noSelfTest {
 		return nil, false, nil
 	}
 	return o.fakeNamedResidency.BuildResident(m)
@@ -361,7 +361,7 @@ func TestGPUProbe_aReQuantizingResidentIsNotJudgedAtTheLoadQuant(t *testing.T) {
 	} {
 		var rf ResidentForward = &fakeResident{}
 		if c.report != "" {
-			rf = quantReporting{rf, c.report}
+			rf = quantReporting{ResidentForward: rf, q: c.report}
 		}
 		if got := residentPrecision(c.backend, c.quant, rf); got != c.want {
 			t.Errorf("residentPrecision(%s, %s, reports %q) = %q, want %q", c.backend, c.quant, c.report, got, c.want)

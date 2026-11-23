@@ -1,4 +1,4 @@
-// Package memgate is MM7's gate (docs/tasks/task-subsystems-2026-10.md): what a resident build leased on each plan line, against
+// Package memgate is the memory gate: what a resident build leased on each plan line, against
 // the plan's figure for that line. A lease over plan, a lease on an unknown line, or a lease open after Close is red. Each backend
 // brings its rows and its allocator's named rounding; a known red lives in the backend's table of Gaps, which names the fix that
 // removes it and may only shrink. It imports testing because tests are its only callers.
@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/decoder/fit"
 	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 )
 
@@ -50,7 +51,7 @@ func Snap(label string, l *mem.Ledger, facts map[string]int64) Snapshot {
 // Reading is one row: a build's ledger, and the plan for the same load.
 type Reading struct {
 	Row     string // fixture, quant, options: what Gap.Row matches
-	Plan    decoder.Plan
+	Plan    fit.Plan
 	KVSlots int // the slots the build holds: the plan's KV and state lines are one slot's
 	// Open is the account while the model is loaded: after the build, and after whatever the row ran.
 	Open []Snapshot
@@ -99,7 +100,7 @@ func (f Finding) String() string {
 
 // Planned is the plan's figure for each line it prices, with this build's KV slots: KV and recurrent state are per slot, and the state line
 // also holds the load's checkpoints: at most one a slot, and at most what the plan says fits.
-func Planned(p decoder.Plan, kvSlots int) map[mem.LineID]int64 {
+func Planned(p fit.Plan, kvSlots int) map[mem.LineID]int64 {
 	n := int64(max(kvSlots, 1))
 	checkpoints := min(n, int64(p.CheckpointCopies))
 	return map[mem.LineID]int64{
@@ -118,7 +119,7 @@ func Check(r Reading, a Allowance) []Finding {
 	add := func(kind Kind, line mem.LineID, excess int64, facts map[string]int64, format string, args ...any) {
 		out = append(out, Finding{Row: r.Row, Kind: kind, Line: line, Excess: excess, Facts: facts, What: fmt.Sprintf(format, args...)})
 	}
-	if r.Plan.Placement == decoder.PlacementDecline {
+	if r.Plan.Placement == fit.PlacementDecline {
 		add(Invariant, "", 0, nil, "the build went resident, and the plan declines it: %s", r.Plan.Reason)
 	}
 	planned := Planned(r.Plan, r.KVSlots)
@@ -196,14 +197,13 @@ type Geometry struct {
 	// its mirror). KVScaleUnder is what one scale a head adds over the formula's 1/8 of a byte an element at int8: negative on a wide head. They
 	// can net within one row, so each is its own figure.
 	KVWindowOver, KVScaleUnder int64
-	// MambaTail is what a Mamba-2 CPU window keeps past its rows: a view into the projection's output, whose last NHeads floats follow each row.
-	MambaTail int64
 }
 
 // GeometryOf reads g for m at ctx positions and the KV precision kv, one slot's worth times slots. rings is whether the backend keeps a sliding
 // layer's K/V in a ring.
 func GeometryOf(m *decoder.Model, ctx, slots int, kv string, rings bool) Geometry {
-	_, layers, _, _, headDim, _, _ := m.Dims()
+	shape := m.Shape()
+	layers, headDim := shape.Layers, shape.HeadDim
 	g := Geometry{DenseTables: int64(layers) * int64(headDim*2+64)}
 	elem := map[string]float64{mem.KVF16: 2, mem.KVI8: 1}[kv]
 	if elem == 0 {
@@ -231,26 +231,19 @@ func GeometryOf(m *decoder.Model, ctx, slots int, kv string, rings bool) Geometr
 			}
 			window += 2 * width * formula * (float64(ctx) - rows)
 			if kv == mem.KVI8 {
-				scale += 2 * rows * (width*elem + 4*float64(m.KVHeadsAtResident(l)) - width*formula)
+				scale += 2 * rows * (width*elem + 4*float64(m.BackendView().Layer(l).KVHeads()) - width*formula)
 			}
 		}
 	}
 	n := int64(max(slots, 1))
 	g.KVFormula, g.KVWindowOver, g.KVScaleUnder = int64(f)*n, int64(window)*n, int64(scale)*n
 	g.KVHeld = g.KVFormula - g.KVWindowOver + g.KVScaleUnder
-	if nh, _, _, _, k, _, _, ok := m.NemotronResidentParams(); ok {
-		for l := range layers {
-			if m.NemotronBlockKind(l) == 0 {
-				g.MambaTail += int64((k-1)*nh) * 4
-			}
-		}
-	}
 	return g
 }
 
 // Facts is g as a Snapshot's facts.
 func (g Geometry) Facts() map[string]int64 {
-	return map[string]int64{"tables": g.DenseTables, "kvFormula": g.KVFormula, "kvHeld": g.KVHeld, "mambaTail": g.MambaTail}
+	return map[string]int64{"tables": g.DenseTables, "kvFormula": g.KVFormula, "kvHeld": g.KVHeld}
 }
 
 // HoldRows fails t unless built is exactly the rows path names, one a line: a row that stopped building is as red as one over plan, and a new
@@ -296,7 +289,7 @@ type Gap struct {
 	// over what it holds; otherwise it is a line over its figure. None accounts for another.
 	Built, OverPriced bool
 	What              string // the gap, in a sentence
-	Item              string // the MM8 item, or the row of docs/tasks/task-subsystems-2026-10.md, that removes it
+	Item              string // the tracker item, or the row, that removes it
 	// Bytes is the most this gap accounts for at a snapshot, from that snapshot's facts. It must come from the build's shape, not from
 	// the ledger it is checked against. A gap without one forgives nothing and fails Finish.
 	Bytes func(facts map[string]int64) int64

@@ -15,7 +15,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// TestKSB8_widthChooser is B8-G1 (docs/tasks/task-kernel-survey-2026-10.md, "KS-B8 build"): prefillWidthFor on a table of rooms, then
+// TestKSB8_widthChooser is B8-G1: prefillWidthFor on a table of rooms, then
 // the knob and the learned cap over the chosen width through prefillBaseRows. The planted chooser ignores the margin and must pick
 // a wider pass than the rule at the row whose room exists only inside the margin.
 func TestKSB8_widthChooser(t *testing.T) {
@@ -378,7 +378,7 @@ func TestKSB8_admissionPricesTheChosenPass(t *testing.T) {
 		t.Helper()
 		rows := min(p, w)
 		dev = r.PrefillScratchBytes(rows) + r.PrefillSpanScratchBytes(rows, p)
-		want := dev + int64(p)*4*int64(m.ResidentEmbedLen())
+		want := dev + int64(p)*4*int64(m.BackendView().EmbedLen())
 		if got, ok := m.ResidentPrefillScratchForTest(p); !ok || got != want {
 			t.Errorf("a %d-token prompt: admission prices %d B (ok %v), want %d (a %d-row pass, %d B of span bound, the embeddings)", p, got, ok, want, rows, dev-r.PrefillScratchBytes(rows))
 		}

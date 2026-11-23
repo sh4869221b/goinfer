@@ -64,6 +64,24 @@ survives to a tag unless caught here.
 
 **`go run ./cmd/gate release vX.Y.Z` runs the reads below as rows** (pending gates, the module pins, the cold-user record, both GPU-gate records, the hardware matrix and its never-executed diff, unmerged fix branches, the CHANGELOG check, gofmt, the citation lint, CI at HEAD, the §C1 parity sweep's record, the deferred tests' record from each box): each is `done`, `OWED` or `UNKNOWN`, with the record that proves it or is missing, and the exit code is 0 only when all twelve are done. It refuses off `main`, on a dirty tree, or for a tag that exists. The list below is what each row reads and why; the command is the check, so read the rows, not this list, to learn what is owed. (Reads 1 and 2, the API blockers and the audit's "before the tag" set, are historical and are not rows.)
 
+**A red gate record the owner has read and accepted: `docs/releases/vX.Y.Z-accepted.json`.** The GPU-gate, `quick -full` and parity rows are OWED while their newest
+record at HEAD's code is not a PASS. If Francis has read that record's failures and accepted them, the file says so, and the row prints `accepted` with the entries
+instead of `OWED`; it does not count against the tag, it is never `done`, and the report counts it apart ("n of m done, k accepted"). Schema 1:
+
+```json
+{"schema": 1, "release": "vX.Y.Z", "accepted": [
+  {"record": "cuda-20261105T022250Z-ccdfb3ad.json", "item": "cuda-heavy-kernels: TestAttnBatchedBandwidth",
+   "class": "test-bug", "evidence": "docs/measurements/.../README.md", "accepted_by": "Francis", "accepted_on": "2026-11-05"}]}
+```
+
+One entry per accepted failure. `record` is the record's file name; the row builds it from the failing record it judged (backend or system, time, commit), so an entry for a
+different record, or for a rerun, does not match. `class` is one of `test-bug`, `gate-definition`, `fixture`, `toolchain-artifact`, `environment`, `stale-golden`: a product
+defect is not a class, it is fixed or the tag waits. `accepted_by` must read `Francis` and `accepted_on` be a date; an entry that is not complete leaves the row OWED and says why.
+**A record is accepted only when its entries name as many distinct items as it has reds**: a GPU record's failed groups plus its vacuous and empty cells, a `quick -full` record's failed
+tests, a parity record's blockers (a record that is not a PASS with none of those, a dirty tree or a narrowed run, has one). Fewer entries leave the row OWED and name how many are unlisted, so a new red
+is never hidden behind an accepted one. Records hold counts, not the names of what failed, so the gate compares counts and cannot match the items to the failures: the entries are what the reader of
+the report is shown. Only Francis adds an entry, as with `swap_guard_approved_by`; the commit that adds one cites where he gave the word. Code: `cmd/gate/grade_release_accepted.go`.
+
 1. All §1 API blockers are in (B-08…B-14 — see `docs/completed/audit-2026-08-05.md`; B-09/B-10/B-11/B-13
    landed 2555edc; B-08/B-12 must be done first — they are breaking-to-fix-after-tag).
 2. `docs/completed/audit-2026-08-05.md` §9 "before the tag" set (C-18/C-19 in; confirm nothing regressed).
@@ -103,6 +121,10 @@ survives to a tag unless caught here.
    section does not name; exit 1 means something is owed. A whole-string match (a route's `{id}` placeholders read as `{}`, a new route's sub-routes ride with it); anything that is not release-note material
    goes in `docs/changelog-waivers.txt` as `<kind> <name> <reason>` (a route's name is its method and path), the reason mandatory. aikit has the same rule for exported API
    (`tools/releasegate`, "changelog-api"). `-base` and `-head` run it against a past release.
+10. **The CPU suites under Intel SDE, when this release moved a kernel or the decoder, or bumped aikit** (hardware-followups item 2):
+   queue `docs/measurements/sde-2026-10-04/run-sde-goldens.sh` on nobara (the night queue's `sde-goldens`) and read its `summary.txt` before tagging.
+   It runs aikit's `linalg` suite and goinfer's tiny-fixture goldens under `-hsw` (the control), `-icx` and `-spr`; a difference under the
+   VNNI targets is arithmetic, not emulation noise. Not a CI job: SDE is a click-through-license download. The same item applies at every aikit bump.
 
 ## The two-step tag (post-M-19)
 
@@ -248,7 +270,7 @@ regenerate it) both have to move with it.
 ## Queue-gated follow-ups — consult QUEUE.md at each tag (B5)
 
 A tag is the natural checkpoint to review what is outstanding, and the release process is read at
-exactly the moment those triggers fire. **After pushing the tags, open the four queues — `docs/queue-release.md` first, then
+exactly the moment those triggers fire. **After pushing the tags, open the four queues — a private queue first, then
 performance/correctness/engineering (`docs/QUEUE.md` indexes them) — and action any
 item whose trigger is a release or an aikit bump.** The queue is the list; this line is what makes a
 tagger look at it — a file nothing reads is inert the first week nobody opens it.
@@ -375,7 +397,7 @@ path, gemma4_text merges) and the audit fixes touched hashed-core files. Before 
 paravirtual Metal/objc layer SIGSEGVs inside purego's `objc_msgSend` the moment a test touches the
 device (measured: a near-null crash in `objc.ID.Send`), and the abort takes the whole test binary
 down — so the package's device tests cannot even attempt-and-skip. `.github/workflows/ci.yml`'s
-`metal-darwin` job therefore runs **build + vet + one device-free test**
+`gpu-darwin` job's Metal part therefore runs **build + vet + one device-free test**
 (`TestParity_NaNCosineFailsTheGate`) and nothing else. Everything device-bound rests on a human
 running it on a real Metal box. Writing that down is the point of this section: at 1.0 the run is a
 ritual with a stated meaning, not a habit someone remembers.
@@ -423,7 +445,7 @@ has been green on the Mac since. Re-confirmed green again 2026-09-06
 ## §C1-C — the CUDA device gate (manual, the other half of the same command)
 
 **CI cannot run this one either, for the other reason: it has no GPU.** `ci.yml` only BUILDS and VETS under `-tags cuda`; every CUDA correctness claim rests on a human running the gate on the Linux/NVIDIA box.
-It is the SAME command as §C1-M and was left unnamed here. v0.21.0 and v0.22.0 were tagged with a recorded Metal run and no recorded CUDA one (found 2026-10-06, `docs/queue-release.md` R1), so this
+It is the SAME command as §C1-M and was left unnamed here. v0.21.0 and v0.22.0 were tagged with a recorded Metal run and no recorded CUDA one, so this
 section exists to stop that happening a third time.
 
 **The exact command**, on the Linux box with the checkpoints in `$HOME/models` and an IDLE GPU (it refuses to run beside a stray goinfer process):
@@ -435,7 +457,7 @@ GOINFER_GATE_BACKEND=cuda go run ./cmd/gate gpu    # explicit
 
 **As a night job** (the timing lock, an idle GPU and about 2 h 20 min rule out running it by day): `docs/measurements/gate-gpu-night-2026-10-06/run-gate-gpu.sh` tests a detached worktree of `origin/main` with the
 gitignored fixtures linked in and a `go.work` (the cuda module must build against THIS tree's root, not the last published tag), counts a missing PASS verdict as a failure, and writes `provenance.txt`
-and the log to `~/goinfer-logs/gate-gpu-night-<date>/`. Queue it with `python3 scripts/night.py add gate-gpu-cuda --est 150 --by "<who>, <release>" --doc docs/queue-release.md -- bash docs/measurements/gate-gpu-night-2026-10-06/run-gate-gpu.sh`.
+and the log to `~/goinfer-logs/gate-gpu-night-<date>/`. Queue it with `python3 scripts/night.py add gate-gpu-cuda --est 150 --by "<who>, <release>" --doc a private queue -- bash docs/measurements/gate-gpu-night-2026-10-06/run-gate-gpu.sh`.
 
 **What it costs, measured:** everything outside the heavy real-model tier took **4 min 54 s** on 2026-10-06; the heavy tier (`GOINFER_HEAVY_TESTS=1`, set by the gate itself) is now about 2 h 15 min. Its main group runs as two
 processes split by test name, each about an hour under its own 120 m timeout, then the fresh-process tests (about 11 min) and the drain

@@ -6,17 +6,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/decoder/fit"
 	"github.com/townsendmerino/goinfer/pull"
 )
 
@@ -25,14 +28,14 @@ import (
 // /v1/chat/completions routes any other client uses. It adds no second inference path to keep in sync and cannot drift from
 // the API, because it IS a client of it. Being asset-free keeps the offline story intact: a CDN reference would make the UI of
 // an offline-capable engine require the network. A native desktop app was rejected: every realistic toolkit needs cgo or a
-// bundled webview runtime, which this project is built to avoid (docs/completed/task-model-pull.md §4).
+// bundled webview runtime, which this project is built to avoid.
 //
 // OFF BY DEFAULT (-web). The page itself is static and harmless; the pull route is not: it triggers an outbound download of a
 // caller-named repo and writes it to disk. It therefore sits behind the same two gates -allow-admin uses: an explicit opt-in
 // flag, and the startup rule that a non-loopback bind must carry an -api-key. Loopback stays key-free so the single-user
 // desktop case has no auth friction.
 
-// The page is index.html plus webui/ui/app.css and webui/ui/app.js, not one file (docs/tasks/task-web-ui-2026-09.md §6.1).
+// The page is index.html plus webui/ui/app.css and webui/ui/app.js, not one file.
 // There is deliberately still no build step, bundler or toolchain: plain files, embedded verbatim, one binary, fully offline.
 // The assets live under ui/ and are referenced relatively ("ui/app.js"), so the same page also loads from file:// with no
 // server, which is how a headless browser can check it on a box whose sandbox blocks loopback HTTP.
@@ -90,7 +93,7 @@ func (p *pullState) release() {
 // browser can send a cross-origin POST (browsers block reading the response, not sending the request). A browser's own
 // fetch()/XHR from the web UI's page always carries a same-origin Origin header; a cross-origin POST carries a foreign one
 // (refused here) or, for a plain form post from outside a browser, none at all, which is why this only checks an Origin header
-// that IS present rather than requiring one (docs/completed/review-2026-09-04.md, V-20).
+// that IS present rather than requiring one.
 func sameOrigin(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if o := r.Header.Get("Origin"); o != "" {
@@ -169,7 +172,7 @@ type webPullReq struct {
 	Quant string `json:"quant"`
 	File  string `json:"file"`
 	// Checkpoint names the repo's whole safetensors checkpoint (pull's ":safetensors" selector) rather than one GGUF file: the
-	// shape a family with no GGUF loader is published in (docs/tasks/task-checkpoint-fetch-2026-09.md).
+	// shape a family with no GGUF loader is published in.
 	Checkpoint bool `json:"checkpoint"`
 }
 
@@ -208,12 +211,12 @@ func (s *server) freeBytesForActiveBackend() (int64, bool) {
 }
 
 // fitEstimate is a COARSE per-file verdict for the file listing, using only the file's own on-disk size against free memory
-// for the backend this server actually runs: no header parsing, no model load (docs/tasks/task-fit-to-hardware.md §3). NOT
+// for the backend this server actually runs: no header parsing, no model load. NOT
 // exact, and the UI note beside this field says so: a GGUF's size only approximates its resident bytes when the file is
 // already at roughly the quant this server loads at, since `-quant` re-quantizes at load (decoder/gguf.go's buildGGUFWeights),
 // so a Q8_0 file pulled onto an int4 server loads far smaller than its size suggests and the reverse overshoots. Correcting
 // for that by parsing the quant out of the file name would need a real quant-name table this coarse check has no business
-// building (docs/tasks/task-web-ui-2026-09.md, W33 part 2).
+// building.
 //
 // Bands are deliberately conservative (fewer false "fits"): a resident load also needs KV cache and context on top of raw
 // weight bytes, so "file size == everything free" already does not fit.
@@ -523,7 +526,7 @@ type webLoadReq struct {
 
 // webLoadPath decides whether the page may load p, and returns the resolved file to load.
 //
-// THIS IS THE WHOLE POLICY OF THE LOAD ROUTE (docs/tasks/task-web-ui-2026-09.md). The admin load takes any caller-named path
+// THIS IS THE WHOLE POLICY OF THE LOAD ROUTE. The admin load takes any caller-named path
 // and is gated behind -allow-admin for exactly that reason; the web UI is not widened into it. The page can load only what the
 // pull flow can put on disk: a regular .gguf file under pull.CacheRoot(), or a directory there that is a complete checkpoint
 // the pull flow published (its marker present and every file it names verified: pull.CachedCheckpoint). A checkpoint still
@@ -658,6 +661,12 @@ func (s *server) handleWebLoad(w http.ResponseWriter, r *http.Request) {
 	doneCh := make(chan result, 1)
 	ctx := context.WithoutCancel(r.Context())
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "serve: web load of %q panicked: %v\n%s", name, r, debug.Stack())
+				doneCh <- result{err: fmt.Errorf("loading %q failed: internal error", name)}
+			}
+		}()
 		lm, err := webLoadDecoder(ctx, modelSpec{name: name, path: file}, s.cfg)
 		doneCh <- result{lm, err}
 	}()
@@ -682,7 +691,7 @@ func (s *server) handleWebLoad(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleWebCache answers the page's "On disk" card (docs/tasks/task-checkpoint-fetch-2026-09.md): every model the pull cache
+// handleWebCache answers the page's "On disk" card: every model the pull cache
 // holds, with its size, its .giw sidecars, whether its pull finished, and the name it is loaded under, if it is. On disk and
 // loaded are different questions, and this is the one the Resident card does not answer: what a pull put here that nothing has
 // loaded, or loaded since. Sizes only (pull.CacheEntries), so it is fast on a large cache; a load still verifies in full.
@@ -741,7 +750,7 @@ type webUnloadReq struct {
 // nothing is resident to suggest freeing (a fresh server's first load is a real refusal with no fix on this page, and the
 // message should not imply one exists).
 func (s *server) unloadSuggestion(err error) string {
-	if !errors.Is(err, decoder.ErrWontFitResident) {
+	if !errors.Is(err, fit.ErrWontFitResident) {
 		return ""
 	}
 	s.regMu.RLock()
@@ -763,7 +772,7 @@ func (s *server) unloadSuggestion(err error) string {
 	// Prose, not a line break: the caller appends this straight onto res.err.Error(), which the page
 	// renders as plain textContent with no white-space:pre-line — a literal "\n" would just collapse
 	// to a space, so the sentence has to read correctly either way.
-	return fmt.Sprintf(" Unload %q (%.1f GB) to make room.", biggest, float64(biggestBytes)/(1<<30))
+	return fmt.Sprintf(" Unload %q (%s) to make room.", biggest, mem.GiB(biggestBytes))
 }
 
 // handleWebUnload unloads a model the page itself can already see. UNLIKE LOAD, THIS NEEDS NO PATH POLICY: webLoadPath exists
@@ -771,7 +780,7 @@ func (s *server) unloadSuggestion(err error) string {
 // key, and the only keys that exist are the ones GET /v1/models already publishes to every client. s.models[req.Name] under
 // regMu (the lookup unloadByName does) IS the whole policy: a name not currently loaded is a 404. No new containment logic, no
 // -allow-admin, no widening of the admin surface: unloadByName is the function the admin route calls, so a model unloaded from
-// the page drains exactly as one unloaded through /admin does (docs/tasks/task-web-ui-2026-09.md).
+// the page drains exactly as one unloaded through /admin does.
 func (s *server) handleWebUnload(w http.ResponseWriter, r *http.Request) {
 	if !s.webEnabled(w) {
 		return

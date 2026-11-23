@@ -169,6 +169,13 @@ type Architecture struct {
 	// interleaved-SwiGLU expert (gate·sigmoid(α·gate) · (up+1), clamped, with per-expert biases) + a router-logit bias. Own
 	// forward (forward_gptoss.go); a resident backend admits it by declaring FeatAttnSink. nil for every other family.
 	gptoss *gptOssParams
+
+	// AttnSinks marks a generic-path family that carries a learned per-query-head
+	// attention sink logit in the softmax denominator on every layer (LayerWeights.AttnSinks,
+	// shape [NumHeads]; Flint's self_attn.softmax_offset / self_attn.sinks). Separate from
+	// gptoss, which also sets per-head sinks alongside its clamped interleaved-SwiGLU MoE;
+	// hasAttnSinks() unifies both for loader validation, residency, and FeatAttnSink.
+	AttnSinks bool
 }
 
 // gptOssParams carries gpt-oss's expert-activation knobs. The sink weights and
@@ -278,8 +285,8 @@ type graniteParams struct {
 	EmbMul, ResidMul                        float32 // embedding scale, residual-add scale (attention scale is Architecture.AttnScale)
 }
 
-// qwen35Params carries the Gated DeltaNet geometry for a qwen3_5_moe model's linear-attention layers
-// (docs/completed/qwen3_5_moe.md). The softmax layers use the uniform Architecture attention fields; only the linear layers
+// qwen35Params carries the Gated DeltaNet geometry for a qwen3_5_moe model's linear-attention layers.
+// The softmax layers use the uniform Architecture attention fields; only the linear layers
 // read these.
 type qwen35Params struct {
 	ConvKernel    int // depthwise causal conv width over [q;k;v] (linear_conv_kernel_dim)
@@ -358,7 +365,7 @@ func (a *Architecture) headDimAt(i int) int {
 }
 
 // lagunaParams describes how Laguna (poolside) departs from an otherwise Qwen2-MoE-shaped decoder; both fields are read
-// straight from the released configs (docs/completed/task-laguna.md).
+// straight from the released configs.
 type lagunaParams struct {
 	// HeadsPerLayer is num_attention_heads_per_layer: layer i's QUERY head count,
 	// which varies with the layer's attention type on the XS generations (48 on
@@ -444,41 +451,64 @@ func (a *Architecture) kvPositionsAt(i, ctx int) int {
 	return ctx
 }
 
-// kvBytesForCtx sums the real per-layer KV cost at ctx positions over the whole architecture: kvDimAt (width) times
-// kvPositionsAt (count). Used by fitguard.go's load-time host-RAM guard and prefill_budget.go's request-time guard, both
-// Config-only via resolveArchitecture. Not used by fitplan.go's device-VRAM Plan(), which needs only the width and
-// deliberately skips the sliding-window count cap (see kvBytesPerPositionAllLayers there). Do not replace it with a flat
-// NumLayers*NumKVHeads*headDim formula: that overprices hybrid, sliding-window and MLA models, which cache far less.
-func kvBytesForCtx(arch *Architecture, ctx int, kvF16, kvI8 bool) int64 {
-	if arch == nil || ctx <= 0 || arch.NumLayers <= 0 {
+// kvBytesForCtx is the K/V a CPU cache (NewCache) holds for ctx positions of arch, at the precision NewCache takes for the request
+// (int8 or f16 only where the family accepts it, else f32). An append-forever layer holds ctx rows. A ring layer (ringLayerAt) holds
+// its window's W rows from its first write, and at f32 twice that once a read wraps, which any context past W reaches. An int8 row is
+// one byte an element plus one f32 scale a KV head; an MLA layer holds one f32 latent row a position; a layer that reads another's
+// cache, or has no attention, holds none. Both host-RAM guards price the CPU's KV with it (estimateKVBytes), and Model.cpuKVBytes
+// is it, so the guard and the plan cannot price one cache two ways. Do not replace it with a flat NumLayers*NumKVHeads*headDim
+// formula: that overprices hybrid, sliding-window and MLA models, which cache far less.
+func kvBytesForCtx(a *Architecture, ctx int, f16, i8 bool) int64 {
+	if a == nil || ctx <= 0 || a.NumLayers <= 0 {
 		return 0
 	}
-	perElem := 4.0
-	switch {
-	case kvI8:
-		perElem = 1.125 // int8 payload + per-row f32 scale
-	case kvF16:
-		perElem = 2
+	quant := kvqF32
+	if i8 && a.kvInt8OK() {
+		quant = kvI8
+	} else if f16 && a.kvF16OK() {
+		quant = kvqF16
 	}
-	var total float64
-	for l := 0; l < arch.NumLayers; l++ {
-		dim := arch.kvDimAt(l)
-		if dim == 0 || arch.gemma4KVSrcAt(l) != l { // a Gemma 4 E-model's shared layer reads its source's cache
+	return kvBytesForRows(a, ctx, quant, layerBuffersOf(a))
+}
+
+// layerBuffersOf is layerBuffers over a, as the per-layer source kvBytesForRows takes.
+func layerBuffersOf(a *Architecture) func(l int) []program.Buf {
+	return func(l int) []program.Buf { return layerBuffers(a, l) }
+}
+
+// kvBytesForRows prices a CPU cache from the per-position rows each layer declares (bufsOf) at the precision quant: a K, V or latent
+// row of b.Elems elements. A window is a ring, which holds its window's rows from the first write and at f32 twice that once a read
+// wraps (ctx past the window). An MLA latent is declared f32 and stays f32 at any KV precision; an int8 K or V row is one byte an
+// element plus one f32 scale a KV head. A layer that declares no row (it reads another's KV, or keeps none) adds nothing.
+func kvBytesForRows(a *Architecture, ctx int, quant kvQuant, bufsOf func(l int) []program.Buf) int64 {
+	var total int64
+	for l := range a.NumLayers {
+		if a.hasNoAttentionKVAt(l) { // an architecture that marks a layer recurrent holds no row for it, whatever its operation list says
 			continue
 		}
-		positions := arch.kvPositionsAt(l, ctx)
-		// A local layer's f32 ring keeps a mirror copy of its window once wrapped (decode reads it in place), so it holds 2*W
-		// positions, not W; the int8 ring has no mirror. Priced here so the fit guard counts what is resident.
-		if !kvI8 && arch.SlidingWindow > 0 && !arch.isGlobalLayer(l) && ctx > arch.SlidingWindow {
-			positions += arch.SlidingWindow
+		for _, b := range bufsOf(l) {
+			if b.Unit != program.PerPosition {
+				continue
+			}
+			rows := int64(ctx)
+			if b.Window > 0 && a.ringLayerAt(l) { // a window is a ring only where the CPU keeps one (Gemma 4's local layers hold the whole context)
+				rows = int64(b.Window)
+				if quant == kvqF32 && ctx > b.Window {
+					rows *= 2
+				}
+			}
+			row := 4 * int64(b.Elems)
+			switch {
+			case b.Prec != program.PrecKV:
+			case quant == kvI8:
+				row = int64(b.Elems) + 4*int64(b.Heads)
+			case quant == kvqF16:
+				row = 2 * int64(b.Elems)
+			}
+			total += rows * row
 		}
-		if arch.mla != nil { // one latent row, f32 whatever K/V precision the load names
-			total += 4 * float64(dim) * float64(positions)
-			continue
-		}
-		total += 2 * perElem * float64(dim) * float64(positions) // ×2 for K and V
 	}
-	return int64(total)
+	return total
 }
 
 func (a *Architecture) ffnAt(i int) int {
@@ -700,18 +730,24 @@ func (a *Architecture) ropeInvFreq(i int) []float64 {
 // and the resident features derived from it (FeatAttnOutputGateSoftplus, FeatAttnOutputGateSigmoid).
 func (a *Architecture) hasAttnOutputGate() bool { return a.laguna != nil || a.AttnGate == GateSigmoid }
 
+// hasAttnSinks reports whether this architecture carries a learned per-query-head attention sink logit in the softmax
+// denominator on every layer (LayerWeights.AttnSinks): either gpt-oss (a.gptoss != nil) or a generic-path sink family
+// (a.AttnSinks, such as Flint).
+func (a *Architecture) hasAttnSinks() bool { return a.gptoss != nil || a.AttnSinks }
+
 // kvInt8OK reports whether NewCache may store this architecture's K/V as int8: a family whose attention is the batched kernel
-// (attnOrder), which reads K/V through the int8-aware path, except for MoE, where attention runs the acc64 kernel so expert
-// routing stays bit-stable and a quantized cache would reopen that.
+// (attnOrder) on the generic loop, which reads K/V through the int8-aware path, MoE included. A family with its own forward loop
+// (ownLoopFamily; gpt-oss's runs the batched kernel) keeps f32 until that loop is checked. What a quantized cache does to expert
+// routing is a published quality reading, not a refusal.
 func (a *Architecture) kvInt8OK() bool {
-	return a.MoE == nil && a.attnOrder() == attnBatchedAcc64
+	return !a.ownLoopFamily() && a.attnOrder() == attnBatchedAcc64
 }
 
 // kvF16OK reports whether NewCache may store this architecture's KV at f16 (Options.KVQuant == "f16"): a family whose
-// attention is the batched kernel (attnOrder), without MoE, the set the gates were registered on
-// (docs/tasks/task-cpu-kv-f16-2026-10.md, decision 1). Another family keeps f32 until it is checked on its own.
+// attention is the batched kernel (attnOrder) on the generic loop, MoE included, held to the f16 exactness gate (TestKVF16_F1Exactness). A family
+// with its own forward loop keeps f32 until it is checked on its own.
 func (a *Architecture) kvF16OK() bool {
-	return a.MoE == nil && a.attnOrder() == attnBatchedAcc64
+	return !a.ownLoopFamily() && a.attnOrder() == attnBatchedAcc64
 }
 
 // ringLayerAt reports whether NewCache stores layer i as a ring: a sliding-window (local) layer of a family kvRingsOK admits.

@@ -1,15 +1,14 @@
 package decoder
 
 import (
-	"fmt"
-	"os"
 	"path/filepath"
 
+	"github.com/townsendmerino/goinfer/internal/runtime/logs"
 	"github.com/townsendmerino/goinfer/internal/runtime/mem/probe"
 )
 
 // What a .giw load does about the page cache before it walks the bundle's matrix headers. Two systems, two reasons
-// (docs/completed/task-giw-cold-load-2026-10.md has the measurements and the gates):
+// ( has the measurements and the gates):
 //
 //   - Linux reads megabytes around every page fault, so on a bundle of thousands of small matrices (an MoE's experts)
 //     the walk is a scattered read of nearly the whole file.
@@ -140,7 +139,7 @@ func prepareColdLoad(path string, mapping []byte, arch *Architecture, opts Optio
 		paged:          opts.StreamWeights,
 	}) {
 	case coldLoadReadFirst:
-		fmt.Fprintf(os.Stderr, "decoder: %s is not in memory: reading its %.1f GB once before the load\n",
+		logs.Infof("decoder: %s is not in memory: reading its %.1f GB once before the load",
 			filepath.Base(path), float64(len(mapping))/1e9)
 		coldReadThrough(mapping)
 	case coldLoadNoReadAround:

@@ -82,14 +82,14 @@ func TestResolveCtxCap(t *testing.T) {
 // (fit-by-default only ever applies to an UNPINNED load), --fit=off (Options.DisableFit) and its GOINFER_NO_FIT_DEFAULT
 // env-var precursor both restore resolveCtxCap exactly, and a model whose own window is already at or below
 // cudaCtxCapDefault has nothing to gain from asking Plan. The live-probe branch (a real free-VRAM reading) is exercised on
-// real hardware separately (docs/tasks/task-gpu-paths-2026-09.md, G11). A real (minimal, tracked-in-git) model is loaded per
+// real hardware separately. A real (minimal, tracked-in-git) model is loaded per
 // case rather than nil: m.FitDisabled() reads a real field, so a nil *decoder.Model would panic in the request==0 cases.
 //
 // `pinned` decides whether the case's Options carries ResidentContext: request, i.e. whether m itself is a GENUINE pin
 // (decoder.Model.ResidentContextPinned() true) or a bare request value passed to resolveCtxCapFit with an unpinned m. Set
 // it deliberately on every request>0 case: left unset, the cases pass by coincidence (fitDefaultCtx is itself 8192 and
 // llama-tiny is small enough that Plan hands 8192 back unshrunk) instead of taking the "genuine pin, skip fit entirely"
-// branch they claim to test (docs/prompts/nobara-mc1-webgpu-2026-09.md §4, item 28).
+// branch they claim to test.
 func TestResolveCtxCapFit_shortcuts(t *testing.T) {
 	for _, c := range []struct {
 		name              string
@@ -174,8 +174,8 @@ func TestResolveCtxCapFit_agreesWithCheckKVFits(t *testing.T) {
 	for i := range layers {
 		layers[i].kvDim = nKV * hd
 	}
-	perPos := kvBytesForCap(kvBlock, layers) / kvBlock // one position, read over the block it is priced in
-	dense := probe.ResidentDenseWeightBytes()
+	perPos := kvBytesForCap(kvBlock, layers) / kvBlock                  // one position, read over the block it is priced in
+	dense := probe.ResidentDenseWeightBytes() + probe.PlanSlack("cuda") // the weights and the driver's charge over them: what Plan prices
 	probe.Close()
 
 	free, ok := decoder.FreeBytesFor("cuda")
@@ -284,58 +284,7 @@ func TestKVBytesForCap(t *testing.T) {
 	}
 }
 
-// TestFitsWeightsBudget is M-02's gate for CUDA's previously-nonexistent memory-fit check on the
-// FIXED (non-expert) weight term — mirrors metal/backend.go's TestResidentMemGuard, same reasoning:
-// a guard that never fires leaves the raw-driver-error failure mode checkWeightsFit exists to
-// avoid; one that fires too eagerly silently moves every model to the staged/CPU path.
-func TestFitsWeightsBudget(t *testing.T) {
-	const gb = int64(1) << 30
-	for _, c := range []struct {
-		name       string
-		need, free int64
-		want       bool
-	}{
-		{"comfortably_fits", 4 * gb, 8 * gb, true},
-		{"exactly_at_margin", 8*gb - testCtxMargin, 8 * gb, true},
-		{"just_over_margin", 8*gb - testCtxMargin + 1, 8 * gb, false},
-		{"far_too_large", 22 * gb, 8 * gb, false}, // Qwen3.5-35B-A3B-shaped dense-only sum on an 8 GB card
-		// Unknown inputs must never refuse: an unreadable MemInfo or a model reporting zero bytes
-		// would otherwise disable residency for everyone, silently.
-		{"unknown_need", 0, 8 * gb, true},
-		{"unknown_free", 4 * gb, 0, true},
-		{"negative_need", -1, 8 * gb, true},
-	} {
-		if got := fitsWeightsBudget(c.need, c.free, testCtxMargin); got != c.want {
-			t.Errorf("%s: fitsWeightsBudget(%.2f GB, %.2f GB) = %v, want %v",
-				c.name, float64(c.need)/float64(gb), float64(c.free)/float64(gb), got, c.want)
-		}
-	}
-}
-
-// TestReservedBudget is tasks/task-fit-to-hardware.md §2's drafter-aware sizing: allocSlots' elastic
-// expert-cache search must see free VRAM MINUS whatever a companion attach (--drafter) will claim
-// afterward, never a negative number capSlots was never written to handle.
-func TestReservedBudget(t *testing.T) {
-	const gb = int64(1) << 30
-	for _, c := range []struct {
-		name             string
-		free, extraBytes int64
-		want             int64
-	}{
-		{"nothing_attaching", 8 * gb, 0, 8 * gb},
-		{"drafter_reserves_its_share", 8 * gb, 500 << 20, 8*gb - 500<<20},
-		{"drafter_exceeds_everything_free_clamps_to_zero", 1 * gb, 2 * gb, 0},
-		{"drafter_exactly_consumes_free", 1 * gb, 1 * gb, 0},
-	} {
-		if got := reservedBudget(c.free, c.extraBytes); got != c.want {
-			t.Errorf("%s: reservedBudget(%.2f GB, %.2f GB) = %.2f GB, want %.2f GB",
-				c.name, float64(c.free)/float64(gb), float64(c.extraBytes)/float64(gb),
-				float64(got)/float64(gb), float64(c.want)/float64(gb))
-		}
-	}
-}
-
-// TestCheckKVFits_realDevice_explicitRefusesWithNumbers is G6 (docs/tasks/task-gpu-paths-2026-09.md §6): "nothing pinned
+// TestCheckKVFits_realDevice_explicitRefusesWithNumbers is G6: "nothing pinned
 // is overridden... honoured or refused with numbers". The sibling test below pins the SENTINEL/wiring without a device;
 // this one calls checkKVFits against a REAL device's REAL free VRAM and asserts the refusal NAMES the requested context
 // and the GB figures, not just that an error occurred. An absurd ctx (1<<30 positions) makes it hold on any card.
@@ -359,7 +308,7 @@ func TestCheckKVFits_realDevice_explicitRefusesWithNumbers(t *testing.T) {
 	if !errors.Is(err, errKVWontFit) {
 		t.Errorf("error %v does not match errKVWontFit — BuildResident's hard-error path would not fire", err)
 	}
-	for _, want := range []string{fmt.Sprintf("%d positions", absurdCtx), "GB", "free"} {
+	for _, want := range []string{fmt.Sprintf("%d positions", absurdCtx), "GiB", "free"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q — a refusal must name the numbers", err, want)
 		}
@@ -398,7 +347,7 @@ func TestCheckKVFits_realDevice_extraResidentBytesRefusesWithNumbers(t *testing.
 	if errors.Is(err, errKVWontFit) {
 		t.Errorf("error %v matches errKVWontFit for an UNPINNED ctx — should be the ordinary decline, not the hard-error sentinel", err)
 	}
-	for _, want := range []string{"companion attach", "--drafter", "GB"} {
+	for _, want := range []string{"companion attach", "--drafter", "GiB"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q — a reservation-caused refusal must name what reserved the room", err, want)
 		}
@@ -538,8 +487,11 @@ func TestBuildDemand_matchesDecoderDefault(t *testing.T) {
 		}
 		if s, ok := planSlack(m); ok {
 			planned++
-			if s != 0 {
-				t.Errorf("%s: CUDA's rounding report is %d bytes, decoder's default 0", dir, s)
+			// Nothing here is at the quantum, so nothing rounds up; what the report prices is the pages these buffers share (pagePacker,
+			// TestPagePacker), which is under a page's remainder for each page the weights fill. Decoder's default of 0 stays the figure for
+			// a build with no CUDA planner linked, which has no layout to pack.
+			if d := m.ResidentDenseWeightBytesFor("cuda"); s < 0 || s >= allocQuantumBytes*(1+d/allocQuantumBytes) {
+				t.Errorf("%s: CUDA's report is %d bytes for %d bytes of weights all under the quantum: more than the pages' remainders", dir, s, d)
 			}
 		}
 		_ = m.Close()
@@ -598,7 +550,7 @@ func largestTensorF32(dir string) (string, int64, error) {
 }
 
 // TestPlanSlack_oneCopy (MM2b gate G-MM2b-3): the driver's rounding over the weight buffers has one copy. packedAllocSlack is
-// called only inside buildResidentMode (plan-only, and the real build's test seam), and neither resolveCtxCapFitSlack nor
+// called only inside buildState.newResident (plan-only, and the real build's test seam), and neither resolveCtxCapFitSlack nor
 // resolveCtxCapFitFree takes a slack parameter or is handed one at a call site, so the build cannot add the figure beside the plan's.
 func TestPlanSlack_oneCopy(t *testing.T) {
 	ents, err := os.ReadDir(".")
@@ -657,12 +609,12 @@ func TestPlanSlack_oneCopy(t *testing.T) {
 		t.Fatalf("read %d source files", read)
 	}
 	for fn, n := range calls {
-		if fn != "buildResidentMode" {
+		if fn != "newResident" {
 			t.Errorf("%s calls packedAllocSlack %d time(s): a second copy of the plan's rounding", fn, n)
 		}
 	}
-	if calls["buildResidentMode"] == 0 {
-		t.Error("buildResidentMode no longer calls packedAllocSlack: the scan checks nothing")
+	if calls["newResident"] == 0 {
+		t.Error("newResident no longer calls packedAllocSlack: the scan checks nothing")
 	}
 	if sites == 0 {
 		t.Error("no call of resolveCtxCapFitSlack or resolveCtxCapFitFree found: the argument check checks nothing")

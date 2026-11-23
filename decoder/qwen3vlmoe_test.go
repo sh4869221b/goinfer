@@ -9,9 +9,11 @@ import (
 	"os"
 	"slices"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
-// G-S10q-a (docs/tasks/task-multimodal-support-2026-10.md, "S10, Qwen3-VL MoE"): the qwen3_vl_moe decoder against HF's
+// G-S10q-a: the qwen3_vl_moe decoder against HF's
 // Qwen3VLMoeForConditionalGeneration on a tiny random checkpoint whose experts are on disk in the released transformers
 // 4.57 layout (scripts/pin_qwen3vlmoe_tiny.py; committed, so this runs in CI). Two inputs, every position at cosine
 // >= 0.99999: a text prompt, and an image prompt with random merged rows and three DeepStack sets through the m-RoPE
@@ -68,7 +70,7 @@ func loadQwen3VLMoeTiny(t *testing.T) (*Model, qwen3vlmoeGolden) {
 func argmaxAgreement(a, b []float32, n int) float64 {
 	v, agree := len(a)/n, 0
 	for i := range n {
-		if argmax(a[i*v:(i+1)*v]) == argmax(b[i*v:(i+1)*v]) {
+		if sampling.Argmax(a[i*v:(i+1)*v]) == sampling.Argmax(b[i*v:(i+1)*v]) {
 			agree++
 		}
 	}

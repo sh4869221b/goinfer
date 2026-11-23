@@ -5,6 +5,8 @@ import (
 	"math"
 	"slices"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
 // The option grid's cells (optiongrid.go) are moved from "admitted, untested" to "tested" by the
@@ -90,6 +92,14 @@ func ogKV(c *KVCache, n int) []float32 {
 			out = append(out, c.valScale[l][:n*nKV]...)
 			continue
 		}
+		if c.quant == kvqF16 {
+			for _, h := range [][]uint16{c.keysH[l][:n*c.kvDim], c.valsH[l][:n*c.kvDim]} {
+				for _, v := range h {
+					out = append(out, float32(v))
+				}
+			}
+			continue
+		}
 		out = append(out, c.keys[l][:n*c.kvDim]...)
 		out = append(out, c.vals[l][:n*c.kvDim]...)
 	}
@@ -111,8 +121,8 @@ func TestOptionPath_cpuBatchedPrefill(t *testing.T) {
 			}
 		}},
 		{name: "ActQuantGroup 32 (int8int8)", opts: Options{Quant: "int8int8", ActQuantGroup: 32}, effect: func(t *testing.T, m *Model) {
-			if m.actGroup != 32 {
-				t.Fatalf("actGroup %d, want 32", m.actGroup)
+			if m.opts.ActQuantGroup != 32 {
+				t.Fatalf("actGroup %d, want 32", m.opts.ActQuantGroup)
 			}
 		}},
 		{name: "ExactPrefill", opts: Options{ExactPrefill: true}, effect: func(t *testing.T, m *Model) {
@@ -157,8 +167,8 @@ func TestOptionPath_cpuBatchedPrefill(t *testing.T) {
 
 			s := m.NewSession(len(prompt) + 1)
 			got := gen(t, func() (<-chan int, *Generation) { return s.Generate(ctx, prompt, 1, SamplingParams{}) })
-			if len(got) != 1 || got[0] != argmax(seqLogits) {
-				t.Errorf("batched prefill picked %v, sequential picks %d", got, argmax(seqLogits))
+			if len(got) != 1 || got[0] != sampling.Argmax(seqLogits) {
+				t.Errorf("batched prefill picked %v, sequential picks %d", got, sampling.Argmax(seqLogits))
 			}
 			if d := ogMaxDiff(ogKV(s.cache, len(prompt)), ogKV(seq, len(prompt))); d != 0 {
 				t.Errorf("batched prefill K/V differs from sequential by %g; documented bit-identical", d)
@@ -214,8 +224,8 @@ func (r *ogRejectingDrafter) Draft(ctx []int, k int) []int {
 func TestOptionPath_specVerify(t *testing.T) {
 	cases := []ogCase{
 		{name: "ActQuantGroup 32 (int8int8)", opts: Options{Quant: "int8int8", ActQuantGroup: 32}, effect: func(t *testing.T, m *Model) {
-			if m.actGroup != 32 {
-				t.Fatalf("actGroup %d, want 32", m.actGroup)
+			if m.opts.ActQuantGroup != 32 {
+				t.Fatalf("actGroup %d, want 32", m.opts.ActQuantGroup)
 			}
 		}},
 		{name: "CPUBatchDecode on", opts: Options{CPUBatchDecode: CPUBatchOn}, effect: func(t *testing.T, m *Model) {

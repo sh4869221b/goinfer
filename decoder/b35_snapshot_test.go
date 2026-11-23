@@ -1,6 +1,7 @@
 package decoder
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"io"
@@ -8,18 +9,20 @@ import (
 	"testing"
 )
 
-// B35 (docs/queue-engineering.md) on the hash fake: a recurrent model's prefix snapshot is taken at KVScope.Keep rounded down to a pass, during
+// B35 on the hash fake: a recurrent model's prefix snapshot is taken at KVScope.Keep rounded down to a pass, during
 // the cold prefill, and a later prompt that repeats that prefix restores it and continues; its reply equals a cold run of the same prompt. The
 // fake's restore to anything but the snapshot's own end corrupts the history, as a DeltaNet state from another position would, so a restore
 // the decoder should have refused changes the reply.
 
-// recurrentSnapFake is snapFake whose snapshots carry the state (decoder.ResidentRecurrentSnapshots) when carries is set. declineRestore
+// recurrentSnapFake is snapFake whose snapshots carry the state (KVSnapshotterAvailable.KVSnapshotRecurrent) when carries is set. declineRestore
 // makes every restore decline, as a backend that cannot serve one does, so a prompt that shares a held point prefills cold.
 type recurrentSnapFake struct {
 	*snapFake
 	carries        bool
 	declineRestore bool
 }
+
+func (f *recurrentSnapFake) ResidentSubsystems() ResidentSubsystems { return selfSubsystems(f) }
 
 func (f *recurrentSnapFake) KVSnapshotRecurrent() bool { return f.carries }
 
@@ -44,11 +47,12 @@ type recurrentSnapBackend struct {
 	Backend
 	rf      *recurrentSnapFake
 	carries bool
+	align   int // the fake's pass width: b35Align when 0
 }
 
 func (b *recurrentSnapBackend) BuildResident(m *Model) (ResidentForward, bool, error) {
 	_, _, _, _, _, _, vocab := m.Dims()
-	b.rf = &recurrentSnapFake{snapFake: &snapFake{mc3Fake: newMC3Fake(vocab, 1), markAlign: b35Align}, carries: b.carries}
+	b.rf = &recurrentSnapFake{snapFake: &snapFake{mc3Fake: newMC3Fake(vocab, 1), markAlign: cmp.Or(b.align, b35Align)}, carries: b.carries}
 	return b.rf, true, nil
 }
 func (b *recurrentSnapBackend) Close() error { return nil }
@@ -57,7 +61,13 @@ const b35Align = 64
 
 func loadRecurrentSnapFake(t *testing.T, carries bool, budget int64) (*Model, *recurrentSnapFake) {
 	t.Helper()
-	be := &recurrentSnapBackend{carries: carries}
+	return loadRecurrentSnapFakeAlign(t, carries, budget, 0)
+}
+
+// loadRecurrentSnapFakeAlign is loadRecurrentSnapFake with passes align rows wide (b35Align when 0).
+func loadRecurrentSnapFakeAlign(t *testing.T, carries bool, budget int64, align int) (*Model, *recurrentSnapFake) {
+	t.Helper()
+	be := &recurrentSnapBackend{carries: carries, align: align}
 	name := fmt.Sprintf("fake-b35-%d", mc3FakeBackends.Add(1))
 	RegisterBackend(name, func() (Backend, error) {
 		cpu, err := NewBackend("cpu")
@@ -69,7 +79,7 @@ func loadRecurrentSnapFake(t *testing.T, carries bool, budget int64) (*Model, *r
 	})
 	m, err := Load("../testdata/qwen35-tiny", Options{Backend: name, KVHostBytes: budget})
 	if err != nil {
-		t.Skipf("no qwen35-tiny: %v", err)
+		t.Fatalf("load ../testdata/qwen35-tiny: %v", err)
 	}
 	t.Cleanup(func() { _ = m.Close() })
 	if !m.ResidentActive() || !m.hasRecurrentState() {

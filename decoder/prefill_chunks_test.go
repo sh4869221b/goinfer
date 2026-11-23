@@ -6,19 +6,26 @@ import (
 	"testing"
 )
 
-// chunkFake is mc3Fake as a resident that cuts its own long prefill (ResidentPrefillChunks, CUDA's shape): it reports a chunk, a
-// per-row scratch figure and a tail minimum, and is NOT a ResidentPrefillBlocks, so the decoder does not split its prompts.
+// chunkFake is mc3Fake as a resident that cuts its own long prefill (PrefillChunksAvailable, CUDA's shape): it reports a chunk, a
+// per-row scratch figure and a tail minimum, and is NOT a PrefillBlocksAvailable, so the decoder does not split its prompts.
 type chunkFake struct {
 	*mc3Fake
 	chunk   int
 	perRow  int64
 	tailMin int
-	perKey  int64 // ResidentPrefillSpanScratch: bytes a pass adds per attended key (0: none)
+	perKey  int64 // PrefillSpanScratchBytes: bytes a pass adds per attended key (0: none)
 }
+
+func (f *chunkFake) ResidentSubsystems() ResidentSubsystems { return selfSubsystems(f) }
+func (f *chunkFake) PrefillChunksAvailable() bool           { return true }
 
 func (f *chunkFake) PrefillChunkRows() int              { return f.chunk }
 func (f *chunkFake) PrefillScratchBytes(rows int) int64 { return int64(rows) * f.perRow }
-func (f *chunkFake) PrefillTailMinRows() int            { return f.tailMin }
+func (f *chunkFake) ResidentCaps() ResidentCaps {
+	c := f.mc3Fake.ResidentCaps()
+	c.TailMinRows = f.tailMin
+	return c
+}
 func (f *chunkFake) PrefillSpanScratchBytes(rows, keys int) int64 {
 	return int64(keys) * f.perKey
 }
@@ -80,11 +87,11 @@ func TestAdmitPrefillMemory_pricesAChunkingResidentByItsChunk(t *testing.T) {
 	if err := m.AdmitPrefillMemoryShare(promptTokens, maxTokens, true, 1); err != nil {
 		t.Errorf("a chunking resident's request was refused though one chunk fits: %v", err)
 	}
-	want := int64(rf.chunk)*rf.perRow + int64(promptTokens)*4*int64(m.ResidentEmbedLen())
+	want := int64(rf.chunk)*rf.perRow + int64(promptTokens)*4*int64(m.BackendView().EmbedLen())
 	if got, ok := m.residentPrefillScratch(promptTokens); !ok || got != want {
 		t.Errorf("residentPrefillScratch = %d, %v; want one chunk's scratch plus the whole suffix's embeddings, %d", got, ok, want)
 	}
-	if got, _ := m.residentPrefillScratch(100); got != 100*rf.perRow+int64(100)*4*int64(m.ResidentEmbedLen()) {
+	if got, _ := m.residentPrefillScratch(100); got != 100*rf.perRow+int64(100)*4*int64(m.BackendView().EmbedLen()) {
 		t.Errorf("a prompt shorter than the chunk is priced at its own rows, got %d", got)
 	}
 	if err := m.AdmitPrefillMemoryShare(promptTokens, maxTokens, false, 1); err == nil {
@@ -101,14 +108,14 @@ func TestAdmitPrefillMemory_pricesAChunkingResidentByItsChunk(t *testing.T) {
 }
 
 // TestAdmitPrefillMemory_addsTheSpanScratch: a chunking resident whose pass allocates more as its rows attend more keys
-// (ResidentPrefillSpanScratch) is priced at its chunk's scratch plus that figure at the request's prompt length, and a request
+// (PrefillSpanScratchBytes) is priced at its chunk's scratch plus that figure at the request's prompt length, and a request
 // the sum does not fit is refused.
 func TestAdmitPrefillMemory_addsTheSpanScratch(t *testing.T) {
 	injectHostRAM(t, 64<<30)
 	injectHostRAMAvailable(t, 300<<20)
 	const promptTokens, maxTokens = 20000, 4096
 	m, rf := loadWithChunkFake(t, func(f *chunkFake) { f.chunk, f.perRow, f.tailMin, f.perKey = 512, 1000, 16, 100 })
-	want := int64(rf.chunk)*rf.perRow + int64(promptTokens)*rf.perKey + int64(promptTokens)*4*int64(m.ResidentEmbedLen())
+	want := int64(rf.chunk)*rf.perRow + int64(promptTokens)*rf.perKey + int64(promptTokens)*4*int64(m.BackendView().EmbedLen())
 	if got, ok := m.residentPrefillScratch(promptTokens); !ok || got != want {
 		t.Errorf("residentPrefillScratch = %d, %v; want the chunk's scratch, the span scratch at %d keys and the embeddings, %d", got, ok, promptTokens, want)
 	}

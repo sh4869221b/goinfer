@@ -7,9 +7,11 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// TestGemma4EndToEndThroughput re-measures the END-TO-END paged-decode gap (docs/completed/task-zeno-compare.md,
+// TestGemma4EndToEndThroughput re-measures the END-TO-END paged-decode gap (
 // "Quiet-machine re-measure": gemma4-26b kind-4 vs kind-3 at 4GB/8GB, budget-invariant). It is NOT the isolated kernel
 // microbenchmark: it is the real production path (Load with StreamWeights+WeightCacheBytes, then Model.Generate), with the
 // steady-state total_tokens/wall_time metric the original measurement used, called in-process so there is no HTTP round-trip
@@ -18,7 +20,7 @@ import (
 // Env vars: GOINFER_EE_GIW (path), GOINFER_EE_BUDGET_GB (float, WeightCacheBytes in GB), GOINFER_EE_LABEL (free-text label
 // for the log line).
 func TestGemma4EndToEndThroughput(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	path := expandHome(t, envOr("GOINFER_EE_GIW", "~/models/gemma4-26b-int4.giw"))
 	if _, err := os.Stat(path); err != nil {
 		t.Skipf("no .giw at %s: %v", path, err)

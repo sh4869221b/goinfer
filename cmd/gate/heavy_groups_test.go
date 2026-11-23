@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +25,7 @@ func TestHeavyPartition_everyTestInExactlyOneGroup(t *testing.T) {
 		"TestG35":      {"qwen3.6-35b-a3b-int4.giw", "qwen36-35b-dflash"},
 		"TestHTower":   {"qwen3.6-35b-a3b-vision", "qwen3.5-0.8b"},
 		"TestI_Regexp": {"aya-expanse-8b"},
+		"TestJKV10":    {"$HOME/models/qwen3.5-0.8b", "KV10_CKPT"},
 	}
 	var listed []string
 	for k := range refs {
@@ -52,6 +54,7 @@ func TestHeavyPartition_everyTestInExactlyOneGroup(t *testing.T) {
 	want := map[string]string{
 		"TestA26": "gemma4-26b", "TestB7": "7b-8b", "TestCTiny": "small", "TestDNone": "small", "TestE15": "small",
 		"TestFGemma3": "gemma3-4b", "TestG35": "qwen3.6-35b", "TestHTower": "small", "TestI_Regexp": "7b-8b",
+		"TestJKV10": "kv10",
 	}
 	for n, g := range want {
 		if owner[n] != g {
@@ -60,6 +63,24 @@ func TestHeavyPartition_everyTestInExactlyOneGroup(t *testing.T) {
 	}
 	if last := groups[len(groups)-1].Label; last != heavySmallGroup {
 		t.Errorf("the shared group runs last; got %q last", last)
+	}
+}
+
+// KV10's harness runs at the gate's depths in its own process: its group is not the shared one, and every heavy process
+// pins GOINFER_KV10_DEPTHS, so a deeper value in the calling environment cannot reach it.
+func TestHeavyGroup_kv10RunsAloneAtTheGatesDepths(t *testing.T) {
+	refs := map[string][]string{"TestKV10_longContextFidelity": {"$HOME/models/qwen3.5-0.8b", "KV10_CKPT"}, "TestSmall": {"qwen3.5-0.8b"}}
+	groups, problems := heavyPartition([]string{"TestKV10_longContextFidelity", "TestSmall"}, refs, nil)
+	if len(problems) > 0 {
+		t.Fatalf("problems: %v", problems)
+	}
+	for _, g := range groups {
+		if slices.Contains(g.Tests, "TestKV10_longContextFidelity") && (g.Label == heavySmallGroup || len(g.Tests) != 1) {
+			t.Errorf("KV10 is in group %q with %v; want a group of its own", g.Label, g.Tests)
+		}
+	}
+	if got := heavyGroupEnv()["GOINFER_KV10_DEPTHS"]; got != "3900,65536" {
+		t.Errorf("heavy processes set GOINFER_KV10_DEPTHS=%q, want 3900,65536", got)
 	}
 }
 
@@ -197,8 +218,11 @@ func TestHeavyPartition_cudaTreeFitsTheTable(t *testing.T) {
 			t.Errorf("group %s is empty; got %v", l, byLabel)
 		}
 	}
-	if got := byGroup["nemotron-h"]; !slices.Equal(got, []string{"TestNemotronResidentCUDA_tier1"}) {
-		t.Errorf("group nemotron-h = %v, want [TestNemotronResidentCUDA_tier1] so absent checkpoints grade as an all-skip group", got)
+	if got := byGroup["nemotron-h"]; !slices.Equal(got, []string{"TestNemotronResidentCUDA_tier1", "TestP1r_nemotronRangeSurvey"}) {
+		t.Errorf("group nemotron-h = %v, want [TestNemotronResidentCUDA_tier1 TestP1r_nemotronRangeSurvey] so absent checkpoints grade as an all-skip group", got)
+	}
+	if got := byGroup["kv10"]; !slices.Equal(got, []string{"TestKV10_longContextFidelity"}) {
+		t.Errorf("group kv10 = %v, want [TestKV10_longContextFidelity] alone, out of the shared group", got)
 	}
 }
 
@@ -214,22 +238,19 @@ func TestProcSampler_findsTheTestBinaryUnderItsParent(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("reads /proc")
 	}
-	sleep, err := exec.LookPath("sleep")
+	// The grandchild is this test binary, already named "<pkg>.test", re-run into TestProcSampler_helperSleeps. A copy of a system
+	// binary under a .test name is not a stand-in: a multi-call coreutils (uutils, busybox) picks its utility from argv[0] and exits.
+	bin, err := os.Executable()
 	if err != nil {
 		t.Skip(err)
 	}
-	b, err := os.ReadFile(sleep)
-	if err != nil {
-		t.Skip(err)
-	}
-	bin := filepath.Join(t.TempDir(), "fake.test")
-	if err := os.WriteFile(bin, b, 0o755); err != nil {
-		t.Fatal(err)
+	if !strings.HasSuffix(filepath.Base(bin), ".test") {
+		t.Skipf("test binary %s is not named .test", bin)
 	}
 	old := procSamplePeriod
 	procSamplePeriod = 20 * time.Millisecond
 	t.Cleanup(func() { procSamplePeriod = old })
-	cmd := exec.Command("sh", "-c", bin+" 1; true")
+	cmd := exec.Command("sh", "-c", `"$0" -test.run='^TestProcSampler_helperSleeps$' -procsampler.helper; true`, bin)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -242,4 +263,14 @@ func TestProcSampler_findsTheTestBinaryUnderItsParent(t *testing.T) {
 	if p.ByTest["TestFake"] == 0 || len(p.ByTest) != 1 {
 		t.Errorf("attribution %v; want the top-level test only", p.ByTest)
 	}
+}
+
+var procSamplerHelper = flag.Bool("procsampler.helper", false, "run TestProcSampler_helperSleeps as the sampler test's grandchild")
+
+// TestProcSampler_helperSleeps is the grandchild TestProcSampler_findsTheTestBinaryUnderItsParent samples: it lives a second.
+func TestProcSampler_helperSleeps(t *testing.T) {
+	if !*procSamplerHelper {
+		t.Skip("only as TestProcSampler_findsTheTestBinaryUnderItsParent's grandchild")
+	}
+	time.Sleep(time.Second)
 }

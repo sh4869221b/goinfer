@@ -8,16 +8,20 @@ import (
 
 	"github.com/townsendmerino/aikit/linalg"
 	gpu "github.com/townsendmerino/goinfer/backend/metal/internal/gpudev"
-	"github.com/townsendmerino/goinfer/backend/metal/kernels"
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
 // Test hooks: entry points into the resident that only goinfer_testhooks tests call (bisection, sub-layer capture, the
 // confirmers, the q4k lane's segments on the unlined plan line). Production code does not reach them.
 
-// q4kLaneProj is q4kLaneProjOn on gpu.UnlinedLine: tests call it; production code names its plan line.
+// q4kLaneProj is q4kLaneProjOn on gpu.UnlinedLine with each segment's row-count uniform, which a build's decode list allocates:
+// tests call it; production code names its plan line.
 func q4kLaneProj(d *Device, kq *decoder.KQuantReader, wms ...*linalg.WeightMat) []q4kSeg {
-	return q4kLaneProjOn(gpu.UnlinedLine, d, kq, wms...)
+	segs := q4kLaneProjOn(gpu.UnlinedLine, d, kq, wms...)
+	for i := range segs {
+		segs[i].uN = NewBufferU32On(gpu.UnlinedLine, d, uint32(segs[i].rows))
+	}
+	return segs
 }
 
 // forwardTrunkForTest runs the trunk over the first nLayers layers ONLY and returns the residual
@@ -37,7 +41,7 @@ func (r *resident) forwardTrunkForTest(emb []float32, pos, nLayers int) []float3
 	r.nL = nLayers
 	defer func() { r.nL = saved }()
 	r.loadEmb(emb)
-	r.setPos(pos)
+	r.setPosAheadForTest(pos)
 	e := r.q.Begin()
 	r.encodeTrunkInto(e)
 	e.End()
@@ -56,13 +60,13 @@ func (r *resident) forwardSubCaptureForTest(emb []float32, pos int) (attn, mlp, 
 	}
 	for l := range r.layers {
 		if r.layers[l].kvShared || r.layers[l].ffnI != r.I {
-			return nil, nil, nil, nil, nil // its own attention/FFN dispatches assume owned KV and one FFN width (S1.3/S1.4)
+			return nil, nil, nil, nil, nil // its own attention/FFN dispatches assume owned KV and one FFN width
 		}
 	}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	r.loadEmb(emb)
-	r.setPos(pos)
+	r.setPosAheadForTest(pos)
 	grab := func() []float32 { return append([]float32(nil), r.oO.Floats()...) }
 	grabD := func() []float32 { return append([]float32(nil), r.dO.Floats()...) }
 	for l := 0; l < r.nL; l++ {
@@ -79,11 +83,11 @@ func (r *resident) forwardSubCaptureForTest(emb []float32, pos int) (attn, mlp, 
 		}
 		e.Dispatch(r.pRope2, r.nH*g.half+g.nKV*g.half, 64, r.qkv, L.invf, g.uHd, r.uPos, g.uQtotal, g.uKtotal, g.uHalf, L.mscale, g.uNHhd, r.uQTempScale)
 		if r.kvI8 {
-			e.Dispatch(r.pKvI8, g.nKV, 1, r.qkv.At(kOff), r.qkv.At(vOff), r.kc[l].At(0), r.vc[l].At(0), r.ks[l].At(0), r.vs[l].At(0), g.uNKV, g.uHd, r.uPos, r.kt)
-			e.Dispatch(r.pAttnI8, r.nH*tgReduceAttn, tgReduceAttn, r.qkv, r.kc[l].At(0), r.vc[l].At(0), r.ks[l].At(0), r.vs[l].At(0), r.ctx, r.uNH, g.uNKV, g.uHd, r.uNKeys, r.uScale, L.uWindow, L.attnSinks, L.uHasSink, r.kt)
+			e.Dispatch(r.pKvI8, g.nKV, 1, r.qkv.At(kOff), r.qkv.At(vOff), r.kc[l].At(0), r.vc[l].At(0), r.ks[l].At(0), r.vs[l].At(0), g.uNKV, g.uHd, r.uPos, r.kvKT(l))
+			e.Dispatch(r.pAttnI8, r.nH*tgReduceAttn, tgReduceAttn, r.qkv, r.kc[l].At(0), r.vc[l].At(0), r.ks[l].At(0), r.vs[l].At(0), r.ctx, r.uNH, g.uNKV, g.uHd, r.uNKeys, r.uScale, L.uWindow, L.attnSinks, L.uHasSink, r.kvKT(l))
 		} else {
-			e.Dispatch(r.pKv, g.kvDim, 64, r.qkv.At(kOff), r.qkv.At(vOff), r.kc[l].At(0), r.vc[l].At(0), g.uKvDim, r.uPos, r.kt)
-			e.Dispatch(r.pAttn, r.nH*tgReduceAttn, tgReduceAttn, r.qkv, r.kc[l].At(0), r.vc[l].At(0), r.ctx, r.uNH, g.uNKV, g.uHd, r.uNKeys, r.uScale, L.uWindow, L.attnSinks, L.uHasSink, r.kt)
+			e.Dispatch(r.pKv, g.kvDim, 64, r.qkv.At(kOff), r.qkv.At(vOff), r.kc[l].At(0), r.vc[l].At(0), g.uKvDim, r.uPos, r.kvKT(l))
+			e.Dispatch(r.pAttn, r.nH*tgReduceAttn, tgReduceAttn, r.qkv, r.kc[l].At(0), r.vc[l].At(0), r.ctx, r.uNH, g.uNKV, g.uHd, r.uNKeys, r.uScale, L.uWindow, L.attnSinks, L.uHasSink, r.kvKT(l))
 		}
 		e.Dispatch(r.pQv, 256, 256, r.ctx, r.cq, r.cSc, g.uNHhd)
 		e.DispatchTG(r.pSA, r.H*32, 256, r.nH*g.hd*2, L.oW, L.oS, r.cq, r.cSc, r.oO, g.uNHhd)
@@ -130,7 +134,7 @@ func (r *resident) l0GegluForTest(emb []float32, pos int) (gateUp, geglu8 []floa
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	r.loadEmb(emb)
-	r.setPos(pos)
+	r.setPosAheadForTest(pos)
 	L := &r.layers[0]
 	g := L.geom
 	nHhd := r.nH * g.hd
@@ -144,11 +148,11 @@ func (r *resident) l0GegluForTest(emb []float32, pos int) (gateUp, geglu8 []floa
 	}
 	e.Dispatch(r.pRope2, r.nH*g.half+g.nKV*g.half, 64, r.qkv, L.invf, g.uHd, r.uPos, g.uQtotal, g.uKtotal, g.uHalf, L.mscale, g.uNHhd, r.uQTempScale)
 	if r.kvI8 {
-		e.Dispatch(r.pKvI8, g.nKV, 1, r.qkv.At(kOff), r.qkv.At(vOff), r.kc[0].At(0), r.vc[0].At(0), r.ks[0].At(0), r.vs[0].At(0), g.uNKV, g.uHd, r.uPos, r.kt)
-		e.Dispatch(r.pAttnI8, r.nH*tgReduceAttn, tgReduceAttn, r.qkv, r.kc[0].At(0), r.vc[0].At(0), r.ks[0].At(0), r.vs[0].At(0), r.ctx, r.uNH, g.uNKV, g.uHd, r.uNKeys, r.uScale, L.uWindow, L.attnSinks, L.uHasSink, r.kt)
+		e.Dispatch(r.pKvI8, g.nKV, 1, r.qkv.At(kOff), r.qkv.At(vOff), r.kc[0].At(0), r.vc[0].At(0), r.ks[0].At(0), r.vs[0].At(0), g.uNKV, g.uHd, r.uPos, r.kvKT(0))
+		e.Dispatch(r.pAttnI8, r.nH*tgReduceAttn, tgReduceAttn, r.qkv, r.kc[0].At(0), r.vc[0].At(0), r.ks[0].At(0), r.vs[0].At(0), r.ctx, r.uNH, g.uNKV, g.uHd, r.uNKeys, r.uScale, L.uWindow, L.attnSinks, L.uHasSink, r.kvKT(0))
 	} else {
-		e.Dispatch(r.pKv, g.kvDim, 64, r.qkv.At(kOff), r.qkv.At(vOff), r.kc[0].At(0), r.vc[0].At(0), g.uKvDim, r.uPos, r.kt)
-		e.Dispatch(r.pAttn, r.nH*tgReduceAttn, tgReduceAttn, r.qkv, r.kc[0].At(0), r.vc[0].At(0), r.ctx, r.uNH, g.uNKV, g.uHd, r.uNKeys, r.uScale, L.uWindow, L.attnSinks, L.uHasSink, r.kt)
+		e.Dispatch(r.pKv, g.kvDim, 64, r.qkv.At(kOff), r.qkv.At(vOff), r.kc[0].At(0), r.vc[0].At(0), g.uKvDim, r.uPos, r.kvKT(0))
+		e.Dispatch(r.pAttn, r.nH*tgReduceAttn, tgReduceAttn, r.qkv, r.kc[0].At(0), r.vc[0].At(0), r.ctx, r.uNH, g.uNKV, g.uHd, r.uNKeys, r.uScale, L.uWindow, L.attnSinks, L.uHasSink, r.kvKT(0))
 	}
 	e.Dispatch(r.pQv, 256, 256, r.ctx, r.cq, r.cSc, g.uNHhd)
 	e.DispatchTG(r.pSA, r.H*32, 256, r.nH*g.hd*2, L.oW, L.oS, r.cq, r.cSc, r.oO, g.uNHhd)
@@ -188,24 +192,22 @@ func (r *resident) attnConfirmForTest(resid, kHist, vHist []float32, layer, pos 
 	qkvRows := nHhd + 2*g.kvDim
 	kOff, vOff := nHhd*4, (nHhd+g.kvDim)*4
 	copy(r.x.Floats(), resid)
-	r.setPos(pos)
+	r.setPosAheadForTest(pos)
 	if injectKV {
 		// Inject goinfer's post-RoPE K and raw V — matched KV history. f32 cache (Gemma) takes the
 		// values verbatim; the f16 cache narrows them (still cos 1.0 for the CORRECT values — the
 		// crater is walked-value drift, not storage of the right ones).
-		if r.kvF32 {
-			o := r.kvHostOff(layer, 4)
-			kc, vc := r.kc[layer].Floats()[o:], r.vc[layer].Floats()[o:]
-			copy(kc[:len(kHist)], kHist)
-			copy(vc[:len(vHist)], vHist)
-		} else {
-			o := r.kvHostOff(layer, 2)
-			kc, vc := r.kc[layer].U16s()[o:], r.vc[layer].U16s()[o:]
-			for i := range kHist {
-				kc[i] = f32ToF16(kHist[i])
+		// Each position goes to its row through the bound slot's table (kvHostRow).
+		for p := range len(kHist) / g.kvDim {
+			at, src := r.kvHostRow(layer, p)*g.kvDim, p*g.kvDim
+			if r.kvF32 {
+				copy(r.kc[layer].Floats()[at:at+g.kvDim], kHist[src:src+g.kvDim])
+				copy(r.vc[layer].Floats()[at:at+g.kvDim], vHist[src:src+g.kvDim])
+				continue
 			}
-			for i := range vHist {
-				vc[i] = f32ToF16(vHist[i])
+			kc, vc := r.kc[layer].U16s()[at:at+g.kvDim], r.vc[layer].U16s()[at:at+g.kvDim]
+			for i := range g.kvDim {
+				kc[i], vc[i] = f32ToF16(kHist[src+i]), f32ToF16(vHist[src+i])
 			}
 		}
 	}
@@ -222,15 +224,15 @@ func (r *resident) attnConfirmForTest(resid, kHist, vHist []float32, layer, pos 
 		// f16-KV drift of positions 0..pos-1 from Metal's walk, with a matched residual).
 		e.Dispatch(r.pRope, g.nKV*g.half, 64, r.qkv.At(kOff), L.invf, g.uHd, r.uPos, g.uKtotal, g.uHalf, L.mscale)
 		if r.kvI8 {
-			e.Dispatch(r.pKvI8, g.nKV, 1, r.qkv.At(kOff), r.qkv.At(vOff), r.kc[layer].At(0), r.vc[layer].At(0), r.ks[layer].At(0), r.vs[layer].At(0), g.uNKV, g.uHd, r.uPos, r.kt)
+			e.Dispatch(r.pKvI8, g.nKV, 1, r.qkv.At(kOff), r.qkv.At(vOff), r.kc[layer].At(0), r.vc[layer].At(0), r.ks[layer].At(0), r.vs[layer].At(0), g.uNKV, g.uHd, r.uPos, r.kvKT(layer))
 		} else {
-			e.Dispatch(r.pKv, g.kvDim, 64, r.qkv.At(kOff), r.qkv.At(vOff), r.kc[layer].At(0), r.vc[layer].At(0), g.uKvDim, r.uPos, r.kt)
+			e.Dispatch(r.pKv, g.kvDim, 64, r.qkv.At(kOff), r.qkv.At(vOff), r.kc[layer].At(0), r.vc[layer].At(0), g.uKvDim, r.uPos, r.kvKT(layer))
 		}
 	}
 	if r.kvI8 {
-		e.Dispatch(r.pAttnI8, r.nH*tgReduceAttn, tgReduceAttn, r.qkv, r.kc[layer].At(0), r.vc[layer].At(0), r.ks[layer].At(0), r.vs[layer].At(0), r.ctx, r.uNH, g.uNKV, g.uHd, r.uNKeys, r.uScale, L.uWindow, L.attnSinks, L.uHasSink, r.kt)
+		e.Dispatch(r.pAttnI8, r.nH*tgReduceAttn, tgReduceAttn, r.qkv, r.kc[layer].At(0), r.vc[layer].At(0), r.ks[layer].At(0), r.vs[layer].At(0), r.ctx, r.uNH, g.uNKV, g.uHd, r.uNKeys, r.uScale, L.uWindow, L.attnSinks, L.uHasSink, r.kvKT(layer))
 	} else {
-		e.Dispatch(r.pAttn, r.nH*tgReduceAttn, tgReduceAttn, r.qkv, r.kc[layer].At(0), r.vc[layer].At(0), r.ctx, r.uNH, g.uNKV, g.uHd, r.uNKeys, r.uScale, L.uWindow, L.attnSinks, L.uHasSink, r.kt)
+		e.Dispatch(r.pAttn, r.nH*tgReduceAttn, tgReduceAttn, r.qkv, r.kc[layer].At(0), r.vc[layer].At(0), r.ctx, r.uNH, g.uNKV, g.uHd, r.uNKeys, r.uScale, L.uWindow, L.attnSinks, L.uHasSink, r.kvKT(layer))
 	}
 	e.End()
 	return append([]float32(nil), r.ctx.Floats()[:nHhd]...)
@@ -246,7 +248,7 @@ func (r *resident) forwardHeadForTest(emb []float32, pos int) (act, logits []flo
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	r.loadEmb(emb)
-	r.setPos(pos)
+	r.setPosAheadForTest(pos)
 	e := r.q.Begin()
 	r.encodeTrunkInto(e)
 	e.Dispatch(r.pGemvW8, (r.V)*32, 32, r.aq, r.aSc, r.lmW, r.lmS, r.logits, r.uH)
@@ -257,8 +259,4 @@ func (r *resident) forwardHeadForTest(emb []float32, pos int) (act, logits []flo
 		act[i] = float32(q[i]) * sc
 	}
 	return act, append([]float32(nil), r.logits.Floats()...)
-}
-
-func dequantG32(q []int8, sc []float32, rows, cols int) []float32 {
-	return kernels.DequantG32(q, sc, rows, cols)
 }

@@ -9,20 +9,21 @@ import (
 	"time"
 
 	"github.com/townsendmerino/aikit/linalg"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TestRow4_vsCanonical_gemma4Shapes is the follow-up the mmap-vs-heap result suggests: memory source is ruled out
-// (TestRow4_mmapVsHeapResident), so if gemma4's paged decode is still slower with kind-4 than kind-3
-// (docs/completed/task-zeno-compare.md's "Quiet-machine re-measure"), the remaining candidate is that the row4 kernel is
-// not faster than canonical on THESE SPECIFIC expert shapes (the original speedup, in
-// docs/completed/task-w4a8-neon-bandwidth.md, may have been measured on different tensor dimensions). Calls both
+// (TestRow4_mmapVsHeapResident), so if gemma4's paged decode is still slower with kind-4 than kind-3,
+// the remaining candidate is that the row4 kernel is
+// not faster than canonical on THESE SPECIFIC expert shapes (the original speedup may have been measured on different tensor dimensions). Calls both
 // free-function kernels directly on the same real gemma4 expert bytes, same activation, same dst: isolates kernel choice
 // as the only variable.
 //
 // It runs on no machine we have, so it is not coverage: it builds only on arm64, and it needs the 26B kind-4 .giw on a Mac
 // that can hold it, which the 16 GB Mac cannot; nobara is amd64. A skip here vouches for nothing.
 func TestRow4_vsCanonical_gemma4Shapes(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	kind4 := expandHome(t, envOr("GOINFER_GEMMA4_26B_GIW_ROW4", "~/models/gemma4-26b-int4-row4.giw"))
 	if _, err := os.Stat(kind4); err != nil {
 		t.Skipf("no kind-4 gemma4 .giw at %s: %v", kind4, err)

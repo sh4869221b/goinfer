@@ -12,8 +12,7 @@ import (
 	"time"
 )
 
-// TestDirSidecar_matchesDirectLoad is G-S18d's identity half (docs/tasks/task-multimodal-support-2026-10.md, S18 on the
-// Mac): for every tiny safetensors fixture in testdata that Load reads as a generating model, the directory
+// TestDirSidecar_matchesDirectLoad is G-S18d's identity half: for every tiny safetensors fixture in testdata that Load reads as a generating model, the directory
 // transcoded to a sidecar (as modelload now does by default on darwin and linux) must generate the same greedy stream as
 // the directory loaded directly, at serve's defaults (int4, embed-int4, the Metal target). A config field the bundle
 // drops is the silent kind of defect (LFM2's NormEps and AttnScale were both zero and legal-looking), and greedy
@@ -213,7 +212,7 @@ func TestDirSidecar_keepsMRopeSection(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := direct.MRopeAxisResident(half)
+			want := direct.BackendView().MRopeAxis(half)
 			direct.Close()
 			if len(want) == 0 {
 				t.Fatal("the direct load has no m-RoPE axis table: the rewritten config is not the released layout")
@@ -226,7 +225,7 @@ func TestDirSidecar_keepsMRopeSection(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got := side.MRopeAxisResident(half)
+			got := side.BackendView().MRopeAxis(half)
 			side.Close()
 			if !slices.Equal(got, want) {
 				t.Errorf("m-RoPE axis table through the sidecar %v, direct %v", got, want)

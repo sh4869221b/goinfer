@@ -3,11 +3,12 @@
 package cuda
 
 import (
+	"github.com/townsendmerino/goinfer/backend/cuda/internal/fitdecide"
 	"github.com/townsendmerino/goinfer/backend/cuda/internal/launchgeom"
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// The context margin computed from its parts (docs/tasks/task-kernel-survey-2026-10.md, "KS-H6 build"): what the build allocates
+// The context margin computed from its parts: what the build allocates
 // after the KV pools, one 512-row prefill pass, the allocation floor and a decode allowance, beside the KV priced as the card
 // charges it. slotMarginBytes is not this.
 
@@ -15,8 +16,7 @@ import (
 // (148–155 MiB, docs/code-notes/cuda.md, "TestAllocFloor").
 const allocFloorBytes = 155 << 20
 
-// decodeAllowanceBytes is decode's transient allocations beyond the prefill pass: H6-R measured none on a dense decode
-// (docs/tasks/task-kernel-survey-2026-10.md, "H6-R read").
+// decodeAllowanceBytes is decode's transient allocations beyond the prefill pass: H6-R measured none on a dense decode.
 const decodeAllowanceBytes = 16 << 20
 
 // grantReserveBytes is the reserve the runtime grants (kvGrantRollback, allocRecurrentCheckpoint) keep beside two prefill passes.
@@ -28,8 +28,8 @@ const grantReserveBytes = 384 << 20
 func chargedBytes(n int64) int64 { return n + allocRoundSlack(n) }
 
 // kvChargedBytes is the device bytes kvAllocPools takes for slots slots at capacity cap: every owning layer's K and V pool (one
-// latent pool for MLA), each holding its group's blocks for every slot plus the null block and charged as the device rounds it,
-// and the slots' block tables. It mirrors kvAllocPools and kvSlotBlocks; TestKSH6C_marginPriced holds it to the pools' allocations.
+// latent pool for MLA) and an int8 layer's two scale pools, each holding its group's blocks for every slot plus the null block and charged
+// as the device rounds it, and the slots' block tables. It mirrors kvAllocPools and kvSlotBlocks; TestKSH6C_marginPriced holds it to the pools' allocations.
 func kvChargedBytes(cap, slots int, layers []cudaLayer) int64 {
 	full := int64(slots*kvBlocksFor(cap) + 1)
 	var n int64
@@ -39,7 +39,10 @@ func kvChargedBytes(cap, slots int, layers []cudaLayer) int64 {
 			continue
 		}
 		elem := int64(4)
-		if Ly.kvHalf {
+		switch {
+		case Ly.kvI8:
+			elem = 1
+		case Ly.kvHalf:
 			elem = 2
 		}
 		blocks := full
@@ -47,6 +50,9 @@ func kvChargedBytes(cap, slots int, layers []cudaLayer) int64 {
 			blocks = int64(slots*kvWindowBlocks(cap, int(Ly.window)+kvWindowSlack) + 1)
 		}
 		buf := chargedBytes(blocks * kvBlock * int64(Ly.kvDim) * elem)
+		if Ly.kvI8 { // and its scale pool, one f32 per row and KV head
+			buf += chargedBytes(blocks * kvBlock * int64(Ly.nKV) * 4)
+		}
 		if Ly.isMLA() {
 			n += buf
 			continue
@@ -56,35 +62,14 @@ func kvChargedBytes(cap, slots int, layers []cudaLayer) int64 {
 	return n + chargedBytes(int64(slots*kvGroups*kvBlocksFor(cap))*4)
 }
 
-// kvChargedCapForBytes is the largest capacity in [lo, hi] whose slots slots of pools charge at most budget (ok=false when even lo
-// does not). kvChargedBytes is non-decreasing in the capacity, so a search finds the edge.
+// kvChargedCapForBytes is the largest capacity in [lo, hi] whose slots slots of pools charge at most budget (fitdecide.CapForBytes).
 func kvChargedCapForBytes(budget int64, slots, lo, hi int, layers []cudaLayer) (c int, ok bool) {
-	if hi < lo || kvChargedBytes(lo, slots, layers) > budget {
-		return lo, false
-	}
-	for hi > lo {
-		mid := lo + (hi-lo+1)/2
-		if kvChargedBytes(mid, slots, layers) <= budget {
-			lo = mid
-		} else {
-			hi = mid - 1
-		}
-	}
-	return lo, true
+	return fitdecide.CapForBytes(func(cap, n int) int64 { return kvChargedBytes(cap, n, layers) }, budget, slots, lo, hi)
 }
 
-// kvChargedSlotsFit is the largest n in [1, want] whose n slots of pools charge at most free less reserve; never below 1 (the first
-// slot is checkKVFits' own and is refused there). free is read after the weights are on the device and the pools count KV only:
-// a weights-inclusive base compared with it counts the weights twice.
+// kvChargedSlotsFit is the largest n in [1, want] whose n slots of pools charge at most free less reserve (fitdecide.SlotsFit).
 func kvChargedSlotsFit(want int, free int64, cap int, layers []cudaLayer, reserve, slotState int64) int {
-	n := 1
-	for k := 2; k <= want; k++ {
-		if kvChargedBytes(cap, k, layers)+int64(k-1)*slotState+reserve > free {
-			break
-		}
-		n = k
-	}
-	return n
+	return fitdecide.SlotsFit(func(c, n int) int64 { return kvChargedBytes(c, n, layers) }, want, free, cap, reserve, slotState)
 }
 
 // kvRoundingBound is the most the device's rounding can add to the linear KV price the plan uses (decoder's per-position KV):
@@ -94,11 +79,14 @@ func kvRoundingBound(owners, mla int) int64 {
 	return int64(2*owners+mla+1) * allocQuantumBytes
 }
 
-// ctxMarginFor is the context margin at load for a context of ctx positions (docs/tasks/task-kernel-survey-2026-10.md, "KS-H6
-// build"): the build's own allocations after the KV pools (postPoolBytes), one 512-row prefill pass at that context, the
+// ctxMarginFor is the context margin at load for a context of ctx positions: the build's own allocations after the KV pools (postPoolBytes), one 512-row prefill pass at that context, the
 // allocation floor and the decode allowance. BuildResident computes it once, on the planned geometry (planLayerGeometry) before the
 // context is planned, and keeps it in ctxMarginBytes: the plan, checkKVFits, checkWeightsFit and their declines read that one
 // figure. TestKSH6C_marginPriced holds it to the built resident's.
+//
+// The margin stays free, and part of it cannot be used: allocFloorBytes (155 MiB) is VRAM the driver will not hand out at any
+// request size. The usable reserve is the 512-row pass plus the post-pool buffers and decodeAllowanceBytes (about 18 MiB on the
+// models read: a 2 MiB post-pool page and the 16 MiB allowance).
 func (r *cudaResident) ctxMarginFor(ctx int) int64 {
 	return r.postPoolBytes() + r.PrefillScratchBytes(prefillDefaultChunk) + r.PrefillSpanScratchBytes(prefillDefaultChunk, ctx) +
 		allocFloorBytes + decodeAllowanceBytes
@@ -211,21 +199,25 @@ func planLayerGeometry(m *decoder.Model, hls []hlayer, nH int, r *cudaResident) 
 		case decoder.MixerMLA:
 			L.hd, L.nKV, L.qDim, L.kvDim = r.mlaQKHead, 1, nH*r.mlaVHead, r.mlaLatDim
 		default:
-			L.hd, L.nKV = m.HeadDimAtResident(l), m.KVHeadsAtResident(l)
+			v := m.BackendView()
+			lv := v.Layer(l)
+			L.hd, L.nKV = lv.HeadDim(), lv.KVHeads()
 			L.qDim, L.kvDim = nH*L.hd, L.nKV*L.hd
-			if src := m.KVSrcAtResident(l); src != l {
+			if src := lv.KVSrc(); src != l {
 				L.kvShared, L.kvSrc = true, src
 			}
-			L.kEqV = m.VFromKResident(l) && !L.kvShared
-			L.vNorm = !L.kvShared && (L.kEqV || m.IsGemma4Resident())
+			L.kEqV = lv.VFromK() && !L.kvShared
+			L.vNorm = !L.kvShared && (L.kEqV || v.IsGemma4())
 		}
 		L.kvHalf = r.kvF16 && !L.noKV() && !L.kvShared
+		L.kvI8 = r.kvI8 && !L.noKV() && !L.kvShared
 		ls[l] = L
 	}
 	return ls
 }
 
-// kvLayerCounts is the number of layers owning a K/V pool pair and the number owning one latent pool (MLA), for kvRoundingBound.
+// kvLayerCounts is the number of layers owning a K/V pool pair and the number owning one latent pool (MLA), for kvRoundingBound. An int8
+// layer counts twice: its K and V scale pools are a second pair of buffers.
 func kvLayerCounts(layers []cudaLayer) (owners, mla int) {
 	for l := range layers {
 		Ly := &layers[l]
@@ -233,6 +225,8 @@ func kvLayerCounts(layers []cudaLayer) (owners, mla int) {
 		case Ly.kvShared || Ly.noKV() || Ly.kvDim == 0:
 		case Ly.isMLA():
 			mla++
+		case Ly.kvI8:
+			owners += 2
 		default:
 			owners++
 		}

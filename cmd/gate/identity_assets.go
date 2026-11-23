@@ -19,7 +19,7 @@ import (
 // TINY (the default, by day) is the fixture the family's forward golden already loads, with that
 // golden's own prompt ids — the family's parity prompt — so "identical here" is a statement about
 // exactly the input the family's tiny validation used. REAL (-assets real) is a small table of
-// checkpoints under ~/models with two fixed prose prompts (L1's), tokenized once by this build so both
+// checkpoints under ~/models with two fixed prose prompts (the prose prefill gate's), tokenized once by this build so both
 // revisions see the same ids. The table is explicit on purpose: a family with no tiny fixture is
 // listed with the reason, and TestIdentityAssets_coverTheManifest fails when a manifest family is in
 // neither list — a new family cannot silently fall out of the check.
@@ -46,6 +46,7 @@ var identityTiny = []identityAsset{
 	{Family: "cohere", Name: "tiny", Path: "testdata/cohere-tiny", Golden: "testdata/cohere_tiny_golden.json"},
 	{Family: "cohere2", Name: "tiny", Path: "testdata/cohere2-tiny", Golden: "testdata/cohere2_tiny_golden.json"},
 	{Family: "deepseek_v3", Name: "tiny", Path: "testdata/deepseek-tiny", Golden: "testdata/deepseek_tiny_text_golden.json"},
+	{Family: "flint", Name: "tiny", Path: "testdata/flint-tiny", Golden: "testdata/flint_tiny_golden.json"},
 	{Family: "gemma3", Name: "vl-tiny-text", Path: "testdata/gemma3-vl-tiny", Golden: "testdata/gemma3_vl_tiny_text_golden.json"},
 	{Family: "gemma4", Name: "moe-tiny", Path: "testdata/gemma4-moe-tiny", Golden: "testdata/gemma4_moe_forward_golden.json"},
 	{Family: "gemma4", Name: "moe-unified-tiny", Path: "testdata/gemma4-moe-unified-tiny", Golden: "testdata/gemma4_moe_forward_golden.json"},
@@ -117,11 +118,10 @@ var identityReal = []identityAsset{
 	{Family: "spark2_5", Name: "1.7b", Path: "spark25-1.7b", Tok: "spark25-1.7b"},
 }
 
-// identityRealPrompts are L1's two prose prompts (docs/measurements/cpu-decode-peer-gap-2026-09-27/
+// identityRealPrompts are the prose prefill gate's two prompts (docs/measurements/cpu-decode-peer-gap-2026-09-27/
 // f16xbuild-mac.go.txt): 145 and 621 tokens on the qwen2.5 tokenizer.
 //
-// long adds a third of about 2,500 tokens, so a CPU prefill crosses its 2,048-row chunk (OP3's gate T1,
-// docs/tasks/task-forward-architecture-2026-10.md §4.8).
+// long adds a third of about 2,500 tokens, so a CPU prefill crosses its 2,048-row chunk.
 func identityRealPrompts(long bool) []string {
 	base := "Rivers shape the land they cross. Over thousands of years a river carves valleys, deposits silt on its floodplain, and builds deltas where it meets the sea. "
 	reps := []int{4, 18}
@@ -217,7 +217,7 @@ func maxPositions(dir string) int {
 }
 
 // longPrompt cycles the parity prompt out to a longer one, so a prompt past the batched-prefill
-// threshold is covered as well as the golden's short one (L1's dumps used 145 and 621 tokens). It
+// threshold is covered as well as the golden's short one (the prose prompts are 145 and 621 tokens). It
 // stays inside the checkpoint's context with room for the decode steps; 0 when there is no room.
 func longPrompt(ids []int, maxPos, steps int) []int {
 	const want = 160

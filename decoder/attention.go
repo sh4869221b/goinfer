@@ -5,6 +5,8 @@ import (
 	"sync/atomic"
 
 	"github.com/townsendmerino/aikit/linalg"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/hybridattn"
 )
 
 // addBias adds b into x in place, for architectures with q/k/v/o bias (Qwen2's projections, GPT-2's output). Callers pass equal
@@ -255,7 +257,7 @@ func applyGateRow(gates, ctx []float32, perHead bool, nH, hd int) {
 func applySigmoidGateRow(gates, ctx []float32, perHead bool, nH, hd int) {
 	if perHead {
 		for head := range nH {
-			g := sigmoidf(gates[head])
+			g := hybridattn.Sigmoidf(gates[head])
 			row := ctx[head*hd : head*hd+hd]
 			for i := range row {
 				row[i] *= g
@@ -264,7 +266,7 @@ func applySigmoidGateRow(gates, ctx []float32, perHead bool, nH, hd int) {
 		return
 	}
 	for i := range ctx {
-		ctx[i] *= sigmoidf(gates[i])
+		ctx[i] *= hybridattn.Sigmoidf(gates[i])
 	}
 }
 
@@ -293,8 +295,8 @@ func softcapScore(s, c float64) float64 {
 }
 
 // attnScoreStatsForTest, when set, counts the scores softcapScore caps: how many, how many past |15|, and the largest
-// |score|, before the cap. OP1's real Gemma 2 gate reads it (docs/tasks/task-forward-architecture-2026-10.md §4.6, G2-R's
-// planted arm). Set only through StartAttnScoreStatsForTest (goinfer_testhooks); nil costs one atomic load per capped
+// |score|, before the cap. The real Gemma 2 gate (TestG2R_registered) reads it
+// for its planted arm. Set only through StartAttnScoreStatsForTest (goinfer_testhooks); nil costs one atomic load per capped
 // score and nothing for a model without a cap.
 var attnScoreStatsForTest atomic.Pointer[attnScoreStats]
 

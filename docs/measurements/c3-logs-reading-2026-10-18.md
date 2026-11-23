@@ -1,5 +1,7 @@
 # Tack's E0 run C3 on goinfer f20f0d93: two findings read from its logs and the code (2026-10-18)
 
+> **Note, 2026-11-18 (memory audit, phase 2; the readings below are not rewritten).** Finding 3 of section 1 and its proposed fix 3 are superseded: the `.giw` fit guard has priced a `--moe-cache-experts` load's pinned expert copy since `9641b42d9` (2026-10-18, the day after this reading), through `mem.SolveGIW` and `GIWLoad.PinnedExperts`. A build's anonymous transients remain unpriced.
+
 Logs only; nothing was run for this note. Sources: tack's C3 output and the servers' load logs on nobara (under `~/tack-runs/e0/`), `internal/kvmgr`, `decoder/cachestate.go`, `backend/cuda/prefill.go`, and the `kv3-tiled-2026-10` branch.
 Nothing here is built. Where a number is not in the logs, the note says so and names the cheapest run that would give it.
 
@@ -69,7 +71,7 @@ Model facts (GGUF metadata): 32 layers, `full_attention_interval` 4 (so 8 full-a
 - **Tack's "reused" cell** (`internal/eval/runner.go` in tack: `measure("reused", …, prefix+tailAt(10+rep))`) sends "the previous prompt with only its last 512 tokens changed". For a recurrent model that is the one request that can never be reused: continuing at the unchanged prefix needs the
   recurrent state as it was 512 tokens before the end, and the state is mutated in place with no history. The cache-state grid says so (`decoder/cachestate.go`, `recurrentCells`: rewind inexact, snapshot refused, share "only a strict extension of the whole sequence continues, from exactly where the state stopped; anything else is cold").
   So cold equal to reused at every size (15.3 vs 15.7 s at 4k, 38.8 vs 38.8 s at 8k, 421.3 vs 421.5 s at 31.7k) is the designed behaviour for that request. Qwen3-8B and Qwen3-4B differ only because their positional KV rewinds exactly.
-- **The append-only request is served by the engine, and the chat endpoint does not send one.** `internal/runtime/kvmgr/slots.go:scoreRecurrent` reuses the whole held sequence when the request's tokens start with all of them and are longer. Measured the same evening
+- **The append-only request is served by the engine, and the chat endpoint does not send one.** `internal/runtime/kvmgr/sequence.go:scoreRecurrentTokens` reuses the whole held sequence when the request's tokens start with all of them and are longer. Measured the same evening
   (`docs/measurements/qwen35-reuse-probe-2026-10-18/README.md`): on plain `/v1/completions`, turn 2 and turn 3 start in 0.04 s against 15.2 s cold; through `/v1/chat/completions` the same conversation gets no reuse at 4k or 8k. The cause is the template: its history render drops the
   empty `<think>\n\n</think>\n\n` that the generation prompt ends with, so the next prompt shares only the first 22 of the previous 26 prompt ids (rendered offline with the 9B's own template), and a recurrent state cannot be continued from there.
 - **Other ways the real loop can miss** (beyond the think block above): the held sequence is the prompt *plus the generated tokens*, and the next request is re-rendered from the message list, so a history that drops earlier reasoning, re-renders a tool call's arguments with different whitespace, or tokenizes the reply text into different ids than were sampled is also not an extension, and the rule then returns 0 with no partial credit.

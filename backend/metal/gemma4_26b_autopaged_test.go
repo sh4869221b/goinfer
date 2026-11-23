@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"github.com/townsendmerino/goinfer/decoder"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// TestGemma4_26B_autoPagedRuns is R11(c) (docs/tasks/red-october.md): the M26 row re-run against
+// TestGemma4_26B_autoPagedRuns is R11(c): the M26 row re-run against
 // the AUTO-SIZED pager (decoder.Options.MoECacheExperts with MoECacheSlots left at 0), not a
 // hand-picked N the way TestGemma4_26B_pagedRuns (GOINFER_METAL_MOE_SLOTS, N=32 default) exercises.
 // metalMoESlotsRequest (metal/backend.go) only calls the real autoMoESlots formula when
@@ -37,7 +39,7 @@ import (
 //
 //	GOINFER_HEAVY_TESTS=1 go test -tags goinfer_testhooks ./metal/ -run TestGemma4_26B_autoPagedRuns -v -timeout 10m
 func TestGemma4_26B_autoPagedRuns(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	giw := modelPath("gemma4-26b-int4.giw")
 	if _, err := os.Stat(giw); err != nil {
 		t.Skipf("no .giw (%s)", giw)
@@ -71,7 +73,7 @@ func TestGemma4_26B_autoPagedRuns(t *testing.T) {
 			"(benchmarks.md \"M35/M26 on the Mac\"); refusing to decode", path)
 	}
 
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("BuildResident: %v", err)
 	}

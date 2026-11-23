@@ -16,6 +16,8 @@ import (
 	"github.com/townsendmerino/goinfer/internal/vision"
 
 	"github.com/townsendmerino/goinfer/multimodal"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // q25Tiny loads the tiny Qwen2.5-VL tower sharpened through GPUWeights' aliasing slices, which the CPU tower reads too:
@@ -52,7 +54,7 @@ func q25Tiny(t *testing.T) *vision.QwenVisionEncoder {
 	return enc
 }
 
-// TestQwen25VisionWebGPU_matchesCPU is G-S12.3f-1 (docs/tasks/task-multimodal-support-2026-10.md, S12.3f): the tiny
+// TestQwen25VisionWebGPU_matchesCPU is G-S12.3f-1: the tiny
 // Qwen2.5-VL tower on WebGPU then aikit's merger against the CPU Forward, every merged token at cosine >= 0.9999, on
 // two grids and a two-image batch; once with the windowed attention kernels and once with every block on the matmul
 // path. Each planted defect, alone, must put the comparison under the bar.
@@ -168,7 +170,7 @@ func q25Real(t *testing.T, missing func(format string, a ...any)) (cpu, dev *vis
 //
 //	GOINFER_HEAVY_TESTS=1 go test -count=1 -timeout 30m -tags 'gpu goinfer_testhooks' -run '^TestQwen25VisionWebGPU_real$' -v ./gpu/
 func TestQwen25VisionWebGPU_real(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	cpu, dev, pp := q25Real(t, t.Skipf)
 	for _, img := range gvRealImages {
 		data, err := os.ReadFile(filepath.Join("../../../../testdata", img))

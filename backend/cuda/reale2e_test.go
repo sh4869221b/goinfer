@@ -13,6 +13,9 @@ import (
 	"github.com/townsendmerino/aikit/linalg"
 	gpu "github.com/townsendmerino/goinfer/backend/cuda/internal/gpudev"
 	"github.com/townsendmerino/goinfer/decoder"
+
+	"github.com/townsendmerino/goinfer/backend/cuda/internal/wpack"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // BenchmarkRealE2EDecode is the REAL end-to-end decode tok/s of the parity-green forward path (TestRealForwardParity) on
@@ -38,7 +41,7 @@ import (
 // The teacher-forced check is KEPT and still fails the run, deliberately: a throughput number for a forward that does not
 // reproduce production is worse than no number. Its failures cost a benchmark run, not a release gate.
 func BenchmarkRealE2EDecode(b *testing.B) {
-	requireHeavyModel(b)
+	testgate.RequireHeavy(b)
 	gguf := os.Getenv("GOINFER_CUDA_MODEL")
 	if gguf == "" {
 		gguf = os.ExpandEnv("$HOME/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf")
@@ -57,7 +60,7 @@ func BenchmarkRealE2EDecode(b *testing.B) {
 	H, nLayers, nH, nKV, hd, I, vocab := m.Dims()
 	qDim, kvDim := nH*hd, nKV*hd
 	eps := m.NormEps()
-	invFreq := m.RopeInvFreq()
+	invFreq := m.BackendView().RopeInvFreq()
 	attnScale := m.AttnScale()
 	half := hd / 2
 
@@ -94,7 +97,7 @@ func BenchmarkRealE2EDecode(b *testing.B) {
 			}
 			gs := make([]uint16, len(sc))
 			for i, v := range sc {
-				gs[i] = f32tof16(v)
+				gs[i] = wpack.F32ToF16(v)
 			}
 			return hw{kind: "int4", wpk: p, ws16: gs, N: N, K: K}
 		case "int8":

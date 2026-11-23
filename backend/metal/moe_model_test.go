@@ -52,7 +52,7 @@ func TestMoE_assemblyVsDense(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load moe: %v", err)
 	}
-	moeR, err := buildResident(moeM)
+	moeR, err := buildResident(moeM, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("build moe resident: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestMoE_assemblyVsDense(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load dense: %v", err)
 	}
-	denseR, err := buildResident(denseM)
+	denseR, err := buildResident(denseM, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("build dense resident: %v", err)
 	}
@@ -279,7 +279,7 @@ func writeSTF32(t *testing.T, path string, tensors map[string]stf32) {
 }
 
 // TestMoE_declinesPrefill: the name is historical (kept for `git log -p` on it, decoder/gptoss_decline_test.go precedent). MoE
-// is admitted by the f16 MMA prefill path (G8 MoE half, docs/tasks/task-gpu-paths-2026-09.md), which runs a MoE layer's FFN row
+// is admitted by the f16 MMA prefill path (G8 MoE half), which runs a MoE layer's FFN row
 // by row off the batched residual, reusing the per-token decode MoE dispatch chain
 // (encodeMoERoute/encodeMoEExperts/encodeMoESharedExpert, metal/moe.go). Both MoE and its dense twin must accept.
 //
@@ -307,7 +307,7 @@ func TestMoE_declinesPrefill(t *testing.T) {
 		if err != nil {
 			t.Fatalf("load %s: %v", dir, err)
 		}
-		r, err := buildResident(m)
+		r, err := buildResident(m, metalCtxPlan{})
 		if err != nil {
 			t.Fatalf("build %s: %v", dir, err)
 		}

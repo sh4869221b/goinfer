@@ -2,8 +2,8 @@
 
 // REAL-WEIGHT layer-slice oracle for Mellum2 (JetBrains Mellum2-12B-A2.5B-Instruct): the CPU half of G11, and
 // the DECODER-side gate (goinfer's own CPU forward against the HF f32 reference on real weights). The Metal half
-// (metal/mellum_real_test.go) runs residentParity against the SAME slice; docs/queue-correctness.md G11 has the
-// handoff, including how to regenerate the slice bit-identically (it is 4 GB, so the checkpoint is gitignored and
+// (metal/mellum_real_test.go) runs residentParity against the SAME slice. The slice can be regenerated
+// bit-identically (it is 4 GB, so the checkpoint is gitignored and
 // only the golden is tracked).
 //
 // It is not a synthetic fixture because random weights lack a real checkpoint's outlier structure, so int4/int8
@@ -25,16 +25,19 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 func TestMellumSlice_realWeightOracle(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	const golden = "testdata/mellum_mellum2_slice_golden.json"
 	const ckpt = "testdata/mellum-mellum2-slice"
 
 	raw, err := os.ReadFile(golden)
 	if errors.Is(err, fs.ErrNotExist) {
-		t.Skipf("no golden — see the regeneration recipe in docs/queue-correctness.md (G11)")
+		t.Skipf("no golden — see the regeneration recipe in this file's header")
 	}
 	if err != nil {
 		t.Fatalf("read golden: %v", err)
@@ -108,7 +111,7 @@ func TestMellumSlice_realWeightOracle(t *testing.T) {
 			t.Fatalf("forward: %v", err)
 		}
 	}
-	gotArg := argmax(logits)
+	gotArg := sampling.Argmax(logits)
 	cos := logitCosine(logits, g.LastLogits)
 	t.Logf("mellum2 slice (REAL weights, %d layers): argmax got=%d want=%d | logit cosine=%.8f",
 		g.NLayers, gotArg, g.Argmax, cos)
@@ -131,9 +134,9 @@ func TestMellumSlice_realWeightOracle(t *testing.T) {
 			t.Fatalf("prefillLogits: %v", err)
 		}
 		bcos := logitCosine(bl, g.LastLogits)
-		t.Logf("mellum2 slice batched prefill: argmax=%d cosine=%.8f", argmax(bl), bcos)
-		if argmax(bl) != g.Argmax {
-			t.Errorf("batched-prefill argmax = %d, want %d", argmax(bl), g.Argmax)
+		t.Logf("mellum2 slice batched prefill: argmax=%d cosine=%.8f", sampling.Argmax(bl), bcos)
+		if sampling.Argmax(bl) != g.Argmax {
+			t.Errorf("batched-prefill argmax = %d, want %d", sampling.Argmax(bl), g.Argmax)
 		}
 		if bcos < 0.9999 {
 			t.Errorf("batched-prefill cosine %.8f < 0.9999 on REAL weights", bcos)
@@ -151,7 +154,7 @@ func TestMellumSlice_realWeightOracle(t *testing.T) {
 				t.Fatalf("forward: %v", err)
 			}
 		}
-		nxt := argmax(lg)
+		nxt := sampling.Argmax(lg)
 		if i < len(g.ContinuationIDs) && nxt != g.ContinuationIDs[i] {
 			t.Errorf("continuation[%d] = %d, want %d", i, nxt, g.ContinuationIDs[i])
 			break

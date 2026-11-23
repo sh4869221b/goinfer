@@ -8,7 +8,7 @@ import (
 
 // generation is one in-flight generation in the process-wide registry (generationRegistry), keyed by the id each
 // handler already mints (reqID(), via the chatcmpl-/msg_/resp_ prefixes), so an operator can cancel one generation,
-// or every generation of one model, from outside the process that started it (docs/tasks/task-halt-2026-09.md).
+// or every generation of one model, from outside the process that started it.
 //
 // Registration happens inside drive/driveVL, which every generation path funnels through, not at each call site. A
 // handler that wants cancellation opts in by setting genRequest.id before calling drive/driveVL; gr.id == "" (a
@@ -18,7 +18,7 @@ import (
 // KV-reuse cache selected by longest-common-prefix match (bestExtend) and has no client-visible, stable identifier an
 // operator could type into a cancel request, and none of the four request surfaces carries a session, user or thread
 // id (embeddings' `User` field is accepted and ignored). The task doc's `POST /admin/sessions/{id}/cancel` is
-// therefore not implemented (the task doc defers it to its K4 item); inventing an id would be a design decision to
+// therefore not implemented (the task doc defers it); inventing an id would be a design decision to
 // take, not to work around.
 type generation struct {
 	id      string
@@ -141,7 +141,7 @@ func (r *generationRegistry) count() int {
 }
 
 // waitEmpty polls until no generation is registered, or timeout elapses, and returns how long it took (the halt's
-// time to quiescence, docs/tasks/task-halt-2026-09.md). Each registered generation stops at its next per-token ctx
+// time to quiescence). Each registered generation stops at its next per-token ctx
 // check, the fastest signal there is, so this is normally fast; the poll interval trades a little latency in the
 // measurement for not spinning a goroutine per halt. The halt path calls it after cancelAll: the cancel calls return
 // immediately (they only flip a context), but "halted" should mean the work actually stopped.

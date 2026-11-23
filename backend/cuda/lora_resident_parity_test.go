@@ -14,7 +14,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// TestLoRAResidentParityCUDA is the G3 numeric gate (docs/tasks/task-gpu-paths-2026-09.md): compute-
+// TestLoRAResidentParityCUDA is the G3 numeric gate: compute-
 // time LoRA applied on this backend's resident decode path must match the CPU reference (the
 // same adapter applied via decoder's generic gatedMLP/causalAttention forward). Mirrors
 // metal/lora_resident_parity_test.go and gpu/lora_resident_parity_test.go exactly — same
@@ -22,7 +22,7 @@ import (
 // q/k/v sites are all genuinely exercised), same synthetic 7-projection/4-layer adapter, same
 // 0.95 floor (gpt2_resident_parity_test.go's established resident-vs-CPU decode-logit bar on
 // Metal — the anchor every backend's LoRA parity test uses), same vacuousness
-// check. Drives decoder.ResidentAdapter directly via ResidentForwardForTest/
+// check. Drives decoder.ResidentRuntimeSubsystem directly via ResidentForwardForTest/
 // ResidentAdapterLayersForTest to isolate the KERNEL correctness question from the WIRING
 // question decoder/resident_adapter_seam_test.go already gates.
 func TestLoRAResidentParityCUDA(t *testing.T) {
@@ -40,9 +40,10 @@ func TestLoRAResidentParityCUDA(t *testing.T) {
 		t.Fatalf("llama-tiny did not go resident (BuildResident refused) — decode path %q; decline: %s",
 			mRes.DecodePath(), mRes.ResidentDecline())
 	}
-	ra, ok := rf.(decoder.ResidentAdapter)
+	ra := decoder.SubsystemsOf(rf).Runtime
+	ok := ra.AdapterAvailable()
 	if !ok {
-		t.Fatalf("cuda resident runner does not implement decoder.ResidentAdapter")
+		t.Fatalf("cuda resident runner does not implement decoder.ResidentRuntimeSubsystem")
 	}
 	if err := mRes.LoadAdapter("a", adapterDir); err != nil {
 		t.Fatalf("LoadAdapter (cuda side): %v", err)

@@ -133,6 +133,7 @@ func propertySchemas(t *testing.T) map[string][]byte {
 // constrained generations under each supported schema, the output ALWAYS parses
 // and conforms to the schema (checked by an independent validator).
 func TestSchema_propertyValidates(t *testing.T) {
+	t.Parallel()
 	for name, schema := range propertySchemas(t) {
 		var doc map[string]any
 		if err := json.Unmarshal(schema, &doc); err != nil {
@@ -163,6 +164,7 @@ func TestSchema_propertyValidates(t *testing.T) {
 // generation against a struct-derived grammar always json.Unmarshals into the
 // struct (with unknown fields disallowed — additionalProperties:false).
 func TestGrammarFromStruct_roundTrip(t *testing.T) {
+	t.Parallel()
 	type Address struct {
 		City string `json:"city"`
 		Zip  string `json:"zip,omitempty"`
@@ -585,7 +587,7 @@ func TestSchemaFromStruct_namedEmbeddedIsNotPromoted(t *testing.T) {
 	}
 }
 
-// TestSchemaFromStruct_unexportedEmbedIsStillPromoted pins V-14 (docs/completed/review-2026-09-04.md):
+// TestSchemaFromStruct_unexportedEmbedIsStillPromoted pins V-14:
 // an anonymous field's reflect name IS its type name, so an embedded struct of UNEXPORTED type reads
 // f.IsExported()==false, and structSchema must not skip it on that check alone. encoding/json does not:
 // its own typeFields has the identical special case ("do not ignore embedded fields of unexported struct

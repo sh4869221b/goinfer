@@ -30,6 +30,9 @@ import (
 	"time"
 
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // deepseekRealGate loads a real DeepSeek MLA checkpoint at int8 and matches it against an
@@ -79,7 +82,7 @@ func deepseekRealGate(t *testing.T, ckpt, golden, wantArch, reference string, wa
 			t.Fatalf("forward: %v", err)
 		}
 	}
-	gotArg := argmax(logits)
+	gotArg := sampling.Argmax(logits)
 	cos := logitCosine(logits, g.LastLogits)
 	t.Logf("%s parity: argmax got=%d want=%d | logit cosine=%.6f", wantArch, gotArg, g.Argmax, cos)
 	if gotArg != g.Argmax {
@@ -91,7 +94,7 @@ func deepseekRealGate(t *testing.T, ckpt, golden, wantArch, reference string, wa
 
 	got := make([]int, 0, g.NNew)
 	for range g.NNew {
-		id := argmax(logits)
+		id := sampling.Argmax(logits)
 		got = append(got, id)
 		if logits, err = m.forward(id, cache); err != nil {
 			t.Fatalf("continuation forward: %v", err)
@@ -111,7 +114,7 @@ func deepseekRealGate(t *testing.T, ckpt, golden, wantArch, reference string, wa
 
 // TestDeepseekV2LiteReal_gate — V2-Lite (deepseek_v2): direct-q + SOFTMAX routing + YaRN.
 func TestDeepseekV2LiteReal_gate(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ckpt := assetPath(t, "GOINFER_DEEPSEEK_V2LITE")
 	deepseekRealGate(t, ckpt, "../testdata/deepseek_v2lite_golden.json", "deepseek_v2", "HF bf16 (DeepSeek-V2-Lite 15.7B; int8 resident)", false)
 }
@@ -123,7 +126,7 @@ func TestDeepseekV2LiteReal_gate(t *testing.T) {
 // the gap widens with context. Output is identical (TestMLAAbsorb_parity gates that);
 // this only reports tok/s + speedup.
 func TestMLAAbsorb_speed(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	if testing.Short() {
 		t.Skip("perf measurement: skipped in -short")
 	}
@@ -172,7 +175,7 @@ func TestMLAAbsorb_speed(t *testing.T) {
 // TestDeepseekMoonlightReal_gate — Moonlight-16B (deepseek_v3): direct-q + SIGMOID
 // noaux_tc routing with a real e_score_correction_bias + routed_scaling_factor.
 func TestDeepseekMoonlightReal_gate(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ckpt := assetPath(t, "GOINFER_DEEPSEEK_MOONLIGHT")
 	deepseekRealGate(t, ckpt, "../testdata/deepseek_moonlight_golden.json.gz", "deepseek_v3", "HF bf16 (Moonlight-16B-A3B; int8 resident)", true)
 }
@@ -188,7 +191,7 @@ func TestDeepseekMoonlightReal_gate(t *testing.T) {
 //	GOINFER_DEEPSEEK_GGUF=~/models/.../DeepSeek-V2-Lite-Chat-Q4_K_M.gguf \
 //	  go test -tags realckpt ./decoder/ -run TestDeepseekGGUFReal -v -timeout 20m
 func TestDeepseekGGUFReal_gate(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	gguf := assetPath(t, "GOINFER_DEEPSEEK_GGUF")
 	m, err := Load(gguf, Options{Quant: "int8int8"})
 	if err != nil {

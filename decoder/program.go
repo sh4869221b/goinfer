@@ -1,6 +1,12 @@
 package decoder
 
-import "slices"
+import (
+	"slices"
+	"sync/atomic"
+)
+
+// buildProgramCalls counts the programs buildProgram builds, so a test can see that a fit search builds none per probe.
+var buildProgramCalls atomic.Int64
 
 // mlaOpParamsAt is layer l's opMLA parameters.
 func (a *Architecture) mlaOpParamsAt(l int) mlaOpParams {
@@ -11,6 +17,7 @@ func (a *Architecture) mlaOpParamsAt(l int) mlaOpParams {
 // buildProgram builds a's program. experts reports whether layer l carries MoE experts: a MoE family's leading dense layers
 // (first_k_dense_replace) do not, and only the weights say so.
 func buildProgram(a *Architecture, experts func(l int) bool) *layerProgram {
+	buildProgramCalls.Add(1)
 	p := &layerProgram{
 		Embed: embedParams{Scale: a.embedScale(), LearnedPos: a.LearnedPosEmbed, PLE: a.gemma4 != nil && a.gemma4.HiddenSizePerLayerInput > 0},
 		Head: headParams{
@@ -25,13 +32,9 @@ func buildProgram(a *Architecture, experts func(l int) bool) *layerProgram {
 	return p
 }
 
-// embedScale is the factor the embedding stage multiplies by: Granite's embedding_multiplier (1 under GOINFER_SSM_NOMUL), else
-// EmbedScale.
+// embedScale is the factor the embedding stage multiplies by: Granite's embedding_multiplier, else EmbedScale.
 func (a *Architecture) embedScale() float64 {
 	if a.granite != nil {
-		if ssmNoMul {
-			return 1
-		}
 		return float64(a.granite.EmbMul)
 	}
 	return a.EmbedScale
@@ -234,13 +237,9 @@ func (a *Architecture) gemma4LayerOps(l int, moeLayer bool) []op {
 }
 
 // graniteLayerOps is a Granite-4.0-H layer: pre-norm, a Mamba-2 mixer or GQA attention, each sublayer's output scaled by
-// residual_multiplier before its add, and a MoE FFN. The isolation seams GOINFER_SSM_NOMUL (multipliers 1) and
-// GOINFER_SSM_SKIPFFN (no FFN) shape the program, as they shaped the loop it replaced.
+// residual_multiplier before its add, and a MoE FFN.
 func (a *Architecture) graniteLayerOps(l int, input func(normSlot) op, ffn func(opReg) op) []op {
 	resid := op{Kind: opResidual, Res: residualParams{Scale: float64(a.granite.ResidMul)}}
-	if ssmNoMul {
-		resid.Res.Scale = 1
-	}
 	ops := []op{input(slotPreAttn)}
 	if a.isMambaLayer(l) {
 		ops = append(ops, op{Kind: opMamba2, In: regX, Out: regA, Mamba: mamba2OpParams{Eps: a.NormEps, NormGroups: 1}})
@@ -248,9 +247,6 @@ func (a *Architecture) graniteLayerOps(l int, input func(normSlot) op, ffn func(
 		ops = append(ops, a.attentionOps(l)...)
 	}
 	ops = append(ops, resid)
-	if ssmSkipFFN {
-		return ops
-	}
 	return append(ops, input(slotPreMLP), ffn(regA), resid)
 }
 

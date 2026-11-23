@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
 func TestPlamo3Parity(t *testing.T) {
@@ -55,7 +57,7 @@ func TestPlamo3Parity(t *testing.T) {
 		}
 	}
 	for _, want := range g.Continuation {
-		if got := argmax(logits); got != want {
+		if got := sampling.Argmax(logits); got != want {
 			t.Fatalf("greedy token %d, want %d", got, want)
 		}
 		logits, err = m.forward(want, cache)

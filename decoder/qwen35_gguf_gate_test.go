@@ -19,10 +19,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 func TestQwen35GGUF_gate(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	gguf := assetPath(t, "GOINFER_QWEN35_GGUF")
 	goldenDir := assetPath(t, "GOINFER_QWEN35_GOLDEN")
 	raw, err := os.ReadFile(filepath.Join(goldenDir, "manifest.json"))
@@ -39,7 +42,7 @@ func TestQwen35GGUF_gate(t *testing.T) {
 	prev := runtime.GOMAXPROCS(2)
 	// The fit guard is bypassed for this model only. This gate checks the LOADER's parity, not memory planning, and the guard
 	// prices the 37 GB mapped checkpoint as resident for the whole load, which refuses a load this box completes: the mapping is
-	// page cache, not anonymous memory. requireHeavyModel keeps it to the box that holds it.
+	// page cache, not anonymous memory. testgate.RequireHeavy keeps it to the box that holds it.
 	m, err := Load(gguf, Options{Quant: "int8int8", Knobs: &Knobs{"GOINFER_NO_FIT_GUARD": "1"}})
 	runtime.GOMAXPROCS(prev)
 	if err != nil {
@@ -84,7 +87,7 @@ func TestQwen35GGUF_gate(t *testing.T) {
 				t.Fatalf("prompt %d step %d forward: %v", pi, s, err)
 			}
 			want := golden[s*man.Vocab : (s+1)*man.Vocab]
-			am := argmax(logits)
+			am := sampling.Argmax(logits)
 			totalSteps++
 			if am == p.GenIDs[s] {
 				argmaxHits++

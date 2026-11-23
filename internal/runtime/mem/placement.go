@@ -35,6 +35,11 @@ type DeviceLoad struct {
 	// StateBytes is one KV slot's recurrent and conv state on this backend (mem.LineState), 0 for a model with none. It does not grow
 	// with the context, and is priced wherever the dense weights are.
 	StateBytes int64
+	// ScratchBytes is what the backend's build holds for its forward passes once a load (Metal's decode scratch), 0 where none is
+	// priced. It does not grow with the context, and is priced wherever the dense weights are. ScratchPagedExtra is what the scratch
+	// holds beyond it when the routed experts page (Metal's slot indices), priced on an expert cache under the expert count.
+	ScratchBytes      int64
+	ScratchPagedExtra int64
 
 	CtxCeiling int // a fixed context cap past which the backend allocates nothing more (0 for none)
 	// CtxStep is the grid a shrunk context stays on (Metal allocates KV in 8-position steps; 1 elsewhere). CtxSearch makes the
@@ -60,17 +65,16 @@ type DevicePlan struct {
 	KVBytes         int64
 	HostCopyBytes   int64
 	StateBytes      int64 // DeviceLoad.StateBytes: the plan's state line
+	ScratchBytes    int64 // DeviceLoad.ScratchBytes: the plan's scratch line
 	Reason          string
 }
-
-func gbf(b int64) float64 { return float64(b) / (1 << 30) }
 
 // slackNote names the allocator's rounding in a reason when there is any.
 func slackNote(b int64) string {
 	if b <= 0 {
 		return ""
 	}
-	return fmt.Sprintf(" + allocation rounding %.2f GB", gbf(b))
+	return fmt.Sprintf(" + allocation rounding %s", GiB(b))
 }
 
 // stateNote names the recurrent state in a reason when there is any.
@@ -78,14 +82,22 @@ func stateNote(b int64) string {
 	if b <= 0 {
 		return ""
 	}
-	return fmt.Sprintf(" + recurrent state %.2f GB", gbf(b))
+	return fmt.Sprintf(" + recurrent state %s", GiB(b))
+}
+
+// scratchNote names the backend's scratch in a reason when there is any.
+func scratchNote(b int64) string {
+	if b <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" + scratch %.2f MB", float64(b)/(1<<20))
 }
 
 func hostCopyNote(b int64) string {
 	if b <= 0 {
 		return ""
 	}
-	return fmt.Sprintf(" + host copy %.2f GB", gbf(b))
+	return fmt.Sprintf(" + host copy %s", GiB(b))
 }
 
 // SolvePlacement places l on m's free memory for l.Tier: the dense weights always stay, and the context shrinks toward the
@@ -99,8 +111,9 @@ func SolvePlacement(l DeviceLoad, req PlanRequest, m Machine, pol Policy) Device
 // solvePlacement is SolvePlacement; withReserve false is the planner before the MoE reserve, the monotone test's planted defect.
 func solvePlacement(l DeviceLoad, req PlanRequest, m Machine, pol Policy, withReserve bool) DevicePlan {
 	free := m.Available(l.Tier)
-	p := DevicePlan{StateBytes: l.StateBytes}
-	fixed := l.DenseBytes + l.ExpertBytesFixed
+	p := DevicePlan{StateBytes: l.StateBytes, ScratchBytes: l.ScratchBytes}
+	weights := l.DenseBytes + l.ExpertBytesFixed // what a reason quotes as dense; the scratch has its own note
+	fixed := weights + l.ScratchBytes
 	decline := func(format string, args ...any) DevicePlan {
 		p.Reason = fmt.Sprintf(format, args...)
 		if l.Backend == "cpu" {
@@ -116,7 +129,7 @@ func solvePlacement(l DeviceLoad, req PlanRequest, m Machine, pol Policy, withRe
 			l.ExpertBytesFull, l.NExperts)
 	}
 	// reserve is the expert bytes priced before the context grows: an MoE placement's experts are reserved first (owner
-	// decision, docs/tasks/task-subsystems-2026-10.md, "MM1's MoE reserve"), or one more KV step could leave no room for them
+	// decision), or one more KV step could leave no room for them
 	// and more memory would give a worse placement.
 	var reserve int64
 	tryCtx := func(ctx int) (kv int64, fits bool) {
@@ -182,14 +195,19 @@ func solvePlacement(l DeviceLoad, req PlanRequest, m Machine, pol Policy, withRe
 		if ctx, kv, ok := chooseCtx(); ok {
 			p.Placement, p.Ctx, p.KVBytes = Resident, ctx, kv
 			p.ExpertBytesUsed, p.HostCopyBytes = l.ExpertBytesFull+l.ExpertBytesFixed, hostAll
-			p.Reason = fmt.Sprintf("dense %.2f GB + experts %.2f GB%s + KV@%d %.2f GB fits %.2f GB free",
-				gbf(l.DenseBytes), gbf(p.ExpertBytesUsed), stateNote(l.StateBytes)+slackNote(l.FixedSlack)+hostCopyNote(hostAll), ctx, gbf(kv), gbf(free))
+			p.Reason = fmt.Sprintf("dense %s + experts %s%s + KV@%d %s fits %s free",
+				GiB(l.DenseBytes), GiB(p.ExpertBytesUsed), stateNote(l.StateBytes)+scratchNote(l.ScratchBytes)+slackNote(l.FixedSlack)+hostCopyNote(hostAll), ctx, GiB(kv), GiB(free))
 			return p
 		}
 		reserve = 0
 		if l.ExpertBytesFull >= int64(l.NExperts) {
 			reserve = int64(l.TopK) * (l.ExpertBytesFull / int64(l.NExperts))
 		}
+	}
+	paged := int64(0) // an expert cache's scratch beyond a resident build's, solved for as held
+	if l.NExperts > 0 {
+		paged = l.ScratchPagedExtra
+		fixed += paged
 	}
 	ctx, kv, ctxOK := chooseCtx()
 	p.Ctx, p.KVBytes = ctx, kv
@@ -201,31 +219,38 @@ func solvePlacement(l DeviceLoad, req PlanRequest, m Machine, pol Policy, withRe
 			return decline("context %d exceeds webgpu's fixed %d-position ceiling at this KV precision (M-32) — pass a smaller -ctx or drop --kv-f16/--kv-i8",
 				req.Ctx, l.CtxCeiling)
 		}
-		return decline("context %d does not fit even at the %d-position floor: dense %.2f GB%s + KV %.2f GB exceeds %.2f GB free",
-			req.Ctx, floor, gbf(fixed), stateNote(l.StateBytes)+slackNote(l.FixedSlack)+hostCopyNote(l.HostFixed), gbf(kv), gbf(free))
+		return decline("context %d does not fit even at the %d-position floor: dense %s%s + KV %s exceeds %s free",
+			req.Ctx, floor, GiB(weights), stateNote(l.StateBytes)+scratchNote(l.ScratchBytes+paged)+slackNote(l.FixedSlack)+hostCopyNote(l.HostFixed), GiB(kv), GiB(free))
 	}
 	if l.NExperts == 0 {
 		p.Placement = Resident
 		p.HostCopyBytes = l.HostFixed
-		p.Reason = fmt.Sprintf("dense %.2f GB%s + KV@%d %.2f GB fits %.2f GB free", gbf(l.DenseBytes), stateNote(l.StateBytes)+slackNote(l.FixedSlack)+hostCopyNote(l.HostFixed), ctx, gbf(kv), gbf(free))
+		p.Reason = fmt.Sprintf("dense %s%s + KV@%d %s fits %s free", GiB(l.DenseBytes), stateNote(l.StateBytes)+scratchNote(l.ScratchBytes)+slackNote(l.FixedSlack)+hostCopyNote(l.HostFixed), ctx, GiB(kv), GiB(free))
 		return p
 	}
 	// Every expert resident, at the context just chosen.
-	if fixed+l.StateBytes+l.FixedSlack+l.ExpertBytesFull+hostAll+kv+req.ExtraBytes <= free {
+	if fixed-paged+l.StateBytes+l.FixedSlack+l.ExpertBytesFull+hostAll+kv+req.ExtraBytes <= free {
 		p.Placement = Resident
 		p.ExpertBytesUsed = l.ExpertBytesFull + l.ExpertBytesFixed
 		p.HostCopyBytes = hostAll
-		p.Reason = fmt.Sprintf("dense %.2f GB + experts %.2f GB%s + KV@%d %.2f GB fits %.2f GB free",
-			gbf(l.DenseBytes), gbf(p.ExpertBytesUsed), stateNote(l.StateBytes)+slackNote(l.FixedSlack)+hostCopyNote(hostAll), ctx, gbf(kv), gbf(free))
+		p.Reason = fmt.Sprintf("dense %s + experts %s%s + KV@%d %s fits %s free",
+			GiB(l.DenseBytes), GiB(p.ExpertBytesUsed), stateNote(l.StateBytes)+scratchNote(l.ScratchBytes)+slackNote(l.FixedSlack)+hostCopyNote(hostAll), ctx, GiB(kv), GiB(free))
 		return p
 	}
 	// The largest slot count whose bytes fit beside the fixed terms. A layer's experts are uniform in shape, so this is arithmetic.
-	remaining := free - fixed - l.StateBytes - l.FixedSlack - l.HostFixed - kv - req.ExtraBytes
-	if remaining <= 0 {
-		return decline("dense %.2f GB%s + KV@%d %.2f GB alone exceeds %.2f GB free — no room left for any expert cache",
-			gbf(fixed), stateNote(l.StateBytes)+slackNote(l.FixedSlack)+hostCopyNote(l.HostFixed), ctx, gbf(kv), gbf(free))
-	}
+	// A cache under the expert count pages and holds the paged slot indices too, so they are charged, and quoted, exactly where it
+	// pages: where the room holds fewer than every expert, or a smaller count was asked for.
 	perExpert := l.ExpertBytesFull / int64(l.NExperts) // at least 1: unpriced experts declined above
+	room := free - (fixed - paged) - l.StateBytes - l.FixedSlack - l.HostFixed - kv - req.ExtraBytes
+	held := int64(0)
+	if room < int64(l.NExperts)*perExpert || req.Slots > 0 && req.Slots < l.NExperts {
+		held = paged
+	}
+	remaining := room - held
+	if remaining <= 0 {
+		return decline("dense %s%s + KV@%d %s alone exceeds %s free — no room left for any expert cache",
+			GiB(weights), stateNote(l.StateBytes)+scratchNote(l.ScratchBytes+held)+slackNote(l.FixedSlack)+hostCopyNote(l.HostFixed), ctx, GiB(kv), GiB(free))
+	}
 	slots := int(remaining / perExpert)
 	if req.Slots > 0 && req.Slots < slots {
 		slots = req.Slots // an explicit, smaller request is honoured even if more would fit
@@ -234,14 +259,15 @@ func solvePlacement(l DeviceLoad, req PlanRequest, m Machine, pol Policy, withRe
 		slots = l.NExperts
 	}
 	if slots < l.TopK {
-		return decline("expert-cached needs at least top-k=%d slots/layer (%.2f GB) but only %.2f GB is free beside dense+KV",
-			l.TopK, gbf(int64(l.TopK)*perExpert), gbf(remaining))
+		return decline("expert-cached needs at least top-k=%d slots/layer (%s) but only %s is free beside dense+KV",
+			l.TopK, GiB(int64(l.TopK)*perExpert), GiB(remaining))
 	}
 	p.Placement = ExpertCached
 	p.Slots = slots
+	p.ScratchBytes += held
 	p.ExpertBytesUsed = int64(slots)*perExpert + l.ExpertBytesFixed
 	p.HostCopyBytes = l.HostFixed
-	p.Reason = fmt.Sprintf("dense %.2f GB%s + %d/%d experts %.2f GB + KV@%d %.2f GB fits %.2f GB free",
-		gbf(l.DenseBytes), stateNote(l.StateBytes)+slackNote(l.FixedSlack)+hostCopyNote(l.HostFixed), slots, l.NExperts, gbf(p.ExpertBytesUsed), ctx, gbf(kv), gbf(free))
+	p.Reason = fmt.Sprintf("dense %s%s + %d/%d experts %s + KV@%d %s fits %s free",
+		GiB(l.DenseBytes), stateNote(l.StateBytes)+scratchNote(l.ScratchBytes)+slackNote(l.FixedSlack)+hostCopyNote(l.HostFixed), slots, l.NExperts, GiB(p.ExpertBytesUsed), ctx, GiB(kv), GiB(free))
 	return p
 }

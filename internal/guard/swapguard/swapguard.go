@@ -1,7 +1,7 @@
-// Package swapguard is S3's load-time swap tripwire (docs/tasks/task-never-swap-2026-09.md), shared by every
+// Package swapguard is the load-time swap tripwire, shared by every
 // entry point that loads a model: goinfer-serve (internal/serveapp, which also runs the SERVING half — the
 // admission gate — on top of ThresholdBytes) and goinfer-chat (internal/chatapp, which has no admission gate,
-// so it takes only this half: "chat gets the load-time half only", S3 Build item 4).
+// so it takes only this half; docs/completed/task-never-swap-2026-09.md, "Swap tripwire in the binary").
 //
 // The load-time half arms a watch around exactly one decoder.Load of a .gguf direct build; a trip closes the
 // channel the build observes through Options.LoadAbort (checked between layers by parallelLayers) and
@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/internal/runtime/logs"
 	"github.com/townsendmerino/goinfer/internal/runtime/mem/probe"
 )
 
@@ -39,7 +40,7 @@ func ThresholdBytes() (thresholdBytes, thresholdMB int64, ok bool) {
 		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
 			mb = parsed
 		} else {
-			fmt.Fprintf(os.Stderr, "swap guard: GOINFER_SWAP_GUARD=%q is neither \"off\" nor a positive integer (MB) — using the %d MB default\n", v, defaultMB)
+			logs.Warnf("swap guard: GOINFER_SWAP_GUARD=%q is neither \"off\" nor a positive integer (MB) — using the %d MB default", v, defaultMB)
 		}
 	}
 	return mb * 1024 * 1024, mb, true
@@ -62,7 +63,7 @@ func StartLoad(loadPath string, opts decoder.Options, advice string) (abort <-ch
 	return armLoad(loadPath, opts, advice, srcs, banner)
 }
 
-// ArmLoad arms a watch scoped to exactly one decoder.Load call — S3's load-time half.
+// ArmLoad arms a watch scoped to exactly one decoder.Load call — the load-time half.
 // Unlike serveapp's armSwapGuard (armed once for the process's life, after startup, so its baseline is
 // "steady state"), a fresh baseline every load is correct here: the question is "did loading THIS
 // model grow swap," not "is the machine's swap elevated in general." ResumeAfter is 0 (no
@@ -97,7 +98,7 @@ func armLoad(loadPath string, opts decoder.Options, advice string, srcs []Source
 	var trippedName string
 	var trippedUsed, trippedDelta int64
 
-	fmt.Fprintf(os.Stderr, "swap guard (load): armed for %s: %s\n", loadPath, banner)
+	logs.Infof("swap guard (load): armed for %s: %s", loadPath, banner)
 	watch := Start(srcs, 0, func(src Source, used, delta int64) {
 		mu.Lock()
 		first := !tripped
@@ -108,7 +109,7 @@ func armLoad(loadPath string, opts decoder.Options, advice string, srcs []Source
 		if first {
 			close(abortCh) // the actual signal parallelLayers' abort select observes
 		}
-		fmt.Fprintf(os.Stderr, "swap guard (load): TRIPPED — %s grew %.2f GB over baseline (%.2f GB used now); aborting the load of %s\n", src.Name, float64(delta)/1e9, float64(used)/1e9, loadPath)
+		logs.Warnf("swap guard (load): TRIPPED — %s grew %.2f GB over baseline (%.2f GB used now); aborting the load of %s", src.Name, float64(delta)/1e9, float64(used)/1e9, loadPath)
 	}, nil)
 
 	wrap := func(err error) error {

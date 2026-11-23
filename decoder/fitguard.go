@@ -1,7 +1,6 @@
 package decoder
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +12,7 @@ import (
 	"github.com/townsendmerino/aikit/linalg"
 
 	"github.com/townsendmerino/goinfer/decoder/fit"
+	"github.com/townsendmerino/goinfer/internal/runtime/logs"
 	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 )
 
@@ -68,12 +68,11 @@ type fitCheck struct {
 	// unaffected. The measurement: docs/code-notes/decoder.md#fitCheck.srcFileBytes.
 	srcFileBytes int64
 
-	// cudaBuildBytes is the HOST peak of building a CUDA C' expert cache (--backend cuda --moe-cache-experts) from a plain .gguf:
-	// 2*weightBytes + expertBytes (the canonical weights on the Go heap, a second host-packed copy, and a pinned host copy of the experts).
-	// Zero when that path is not in play. It REPLACES the weights+KV+srcFileBytes total when it is larger rather than adding to it, because
-	// the phases do not overlap: decoder.Load unmaps the source file before cuda.BuildResident starts, and on the resident path KV lives in
-	// VRAM. Go heap slack (about 9% over this estimate on the measured model) is not priced. The measurement:
-	// docs/code-notes/decoder.md#fitCheck.cudaBuildBytes.
+	// cudaBuildBytes is the HOST peak of building a CUDA C' expert cache (--backend cuda --moe-cache-experts) from a plain .gguf: the
+	// backend's BuildDemand.HostBuildPeak, the weights, the experts' pinned copy and the packing (one packed layer once the config is
+	// read, and the staging). Zero when that path is not in play. It REPLACES the weights+KV+srcFileBytes total when it is larger rather
+	// than adding to it, because the phases do not overlap: decoder.Load unmaps the source file before cuda.BuildResident starts, and on
+	// the resident path KV lives in VRAM. The measurement: docs/measurements/memfix-e6-2026-11/README.md.
 	cudaBuildBytes int64
 	expertBytes    int64
 
@@ -85,6 +84,10 @@ type fitCheck struct {
 	deviceKV  bool
 	packBytes int64
 
+	// snapshotBytes is the prefix-snapshot store's budget (Options.KVHostBytes) where the load will keep one: host memory the server holds once it is
+	// serving, beside what stays on the host (snapshotStoreBytes). 0 for a load with no store.
+	snapshotBytes int64
+
 	// cfg, effCtx, pinned, kvF16, kvI8 carry what re-pricing needs to recompute KV at a SMALLER context when the load does not fit and the
 	// caller never pinned one (see smallerFittingContext). cfg is nil when the GGUF's config could not be read: kvBytes stays 0 and unknown
 	// proceeds.
@@ -92,8 +95,9 @@ type fitCheck struct {
 	effCtx int  // the context KV was priced at: opts.ResidentContext if pinned, else cfg.MaxPositions
 	pinned bool // true when the caller explicitly requested effCtx (an explicit request that
 	// cannot be honoured is refused, never silently downgraded)
-	kvF16 bool
-	kvI8  bool
+	kvF16   bool
+	kvI8    bool
+	metalKV string // kvPrice.metalKV
 
 	// denseStreamable is true when a -stream-weights retry after this refusal would engage
 	// decoder/layerpaging.go's windowed dense pager — see denseStreamable(cfg)'s own doc comment.
@@ -121,16 +125,21 @@ func (f fitCheck) ratio() float64 { return f.check().Ratio() }
 // The int4-against-int8 comparison a refusal's last line reads is measured only for a load not already at int4.
 func (f fitCheck) check() mem.HostCheck {
 	l := mem.HostLoad{Name: f.name, Quant: f.quant, WeightBytes: f.weightBytes, KVBytes: f.kvBytes, SourceBytes: f.srcFileBytes,
-		CUDABuildBytes: f.cudaBuildBytes, ExpertBytes: f.expertBytes, PackBytes: f.packBytes, DeviceKV: f.deviceKV,
+		CUDABuildBytes: f.cudaBuildBytes, ExpertBytes: f.expertBytes, PackBytes: f.packBytes, DeviceKV: f.deviceKV, SnapshotBytes: f.snapshotBytes,
 		Ctx: f.effCtx, Pinned: f.pinned, NoGuard: f.noGuard, GGUF: f.isGGUF, DenseStreamable: f.denseStreamable}
 	if f.quant != "int4" && f.quant != "int4mix" {
 		l.Int4Smaller = quantBytesPerElem(quantInt4) < quantBytesPerElem(quantInt8)
 	}
-	if cfg, f16, i8 := f.cfg, f.kvF16, f.kvI8; cfg != nil {
-		l.MaxCtx = cfg.MaxPositions
-		l.KV = func(ctx int) int64 { return estimateKVBytes(cfg, ctx, f16, i8) }
+	if f.cfg != nil {
+		l.MaxCtx = f.cfg.MaxPositions
+		l.KV = f.kvAt
 	}
 	return mem.NewHostCheck(l, mem.HostMachine(f.availBytes), mem.DefaultPolicy())
+}
+
+// kvAt is the KV f prices at ctx positions, the one function its own figure and every re-pricing at another context read.
+func (f fitCheck) kvAt(ctx int) int64 {
+	return kvPrice{kvF16: f.kvF16, kvI8: f.kvI8, metalKV: f.metalKV}.bytes(f.cfg, ctx)
 }
 
 const fitGB = 1 << 30
@@ -183,7 +192,7 @@ func guardFit(f fitCheck) (int, error) {
 		return 0, fitDecline(fit.Decline)
 	}
 	if fit.Line != "" {
-		fmt.Fprintln(os.Stderr, fit.Line)
+		logs.Infof("%s", fit.Line)
 	}
 	return fit.PinCtx, nil
 }
@@ -195,7 +204,7 @@ func (f fitCheck) decide() (pinCtx int, decline *FitDeclineError) {
 	return pin, fitDecline(d)
 }
 
-// giwMemMargin is the flat margin guardGIWFit leaves against the live availability probe (docs/tasks/task-never-swap-2026-09.md, item 1).
+// giwMemMargin is the flat margin guardGIWFit leaves against the live availability probe.
 // A .giw load's weights are file-backed (zero-copy aliases, evictable under memory pressure), so it deliberately does not reuse
 // fitMemFraction's 70% conservatism, which is sized for a load that commits anonymous memory for its weights; only KV and scratch are real
 // anonymous cost here.
@@ -214,7 +223,7 @@ const giwMemMargin = mem.GIWMargin // 1 GB
 func guardGIWFit(cfg *Config, opts Options) (pinnedCtx int, err error) {
 	d := decideGIWFit(cfg, opts)
 	if d.note != "" {
-		fmt.Fprint(os.Stderr, d.note)
+		logs.InfoText(d.note)
 	}
 	return d.pinCtx, d.err
 }
@@ -248,16 +257,29 @@ func decideGIWFitAt(cfg *Config, opts Options, read func() int64) giwFit {
 	if avail <= 0 {
 		return d
 	}
-	p, ok := kvPricingFor(cfg, opts) // what the load will allocate: Metal's f16 at its default context, or the CPU's ceiling
+	p, ok := kvPricingFor(cfg, opts) // what the load will allocate: Metal's pools at its default context, or the CPU's ceiling
 	if !ok {
 		return d // no pin and the model's own max is unknown ⇒ can't price KV; proceed
 	}
-	kvF16, kvI8 := p.kvF16, p.kvI8
 	r := mem.SolveGIW(mem.GIWLoad{Ctx: p.ctx, Pinned: p.pinned, DeviceKV: p.deviceKV, Scratch: prefillAttnScratchBudget,
-		PinnedExperts: giwPinnedExpertBytes(cfg, opts), KV: func(ctx int) int64 { return estimateKVBytes(cfg, ctx, kvF16, kvI8) }},
+		PinnedExperts: giwPinnedExpertBytes(cfg, opts), SnapshotBytes: snapshotStoreBytes(cfg, opts),
+		KV: func(ctx int) int64 { return p.bytes(cfg, ctx) }},
 		mem.HostMachine(avail), mem.DefaultPolicy())
 	return giwFit{known: r.Known, avail: r.Avail, budget: r.Budget, need: r.Need, pinnedExperts: r.PinnedExperts, ctx: r.Ctx,
 		pinned: r.Pinned, pinCtx: r.PinCtx, err: r.Err, note: r.Note}
+}
+
+// snapshotStoreBytes is the prefix-snapshot store's budget the host guards price: Options.KVHostBytes for a load whose backend goes resident (the
+// stores of a CPU load, or one that streams its weights, are not built), 0 when snapshots are off (-kv-host-bytes 0, or -kv-share off). It is the
+// budget, not what is held: the store fills as requests arrive, and a server that outgrows the machine's memory pages to swap.
+func snapshotStoreBytes(cfg *Config, opts Options) int64 {
+	if opts.KVHostBytes <= 0 || opts.KVShareOff || cfg == nil {
+		return 0
+	}
+	if d := buildDemandFor(cfg, opts, 0, 0, false); !d.Resident && !d.KVOnDevice {
+		return 0
+	}
+	return opts.KVHostBytes
 }
 
 // giwPinnedExpertBytes is the host memory a CUDA C' expert cache (--moe-cache-experts) holds for a .giw load that will be resident: every
@@ -281,7 +303,7 @@ func resolveWeightCacheBudget(requested int64) int64 {
 	if b := mem.WeightCacheBudget(0, mem.HostMachine(hostRAMAvailable())); b > 0 {
 		return b
 	}
-	fmt.Fprintln(os.Stderr, "decoder: no live memory probe on this platform — falling back to aikit's default weight-cache budget (Linux /proc probe, or a fixed 8 GB elsewhere)")
+	logs.Warnf("decoder: no live memory probe on this platform — falling back to aikit's default weight-cache budget (Linux /proc probe, or a fixed 8 GB elsewhere)")
 	return 0
 }
 
@@ -340,73 +362,6 @@ func measureBytesPerElem(q quantMode) float64 {
 	return 4
 }
 
-// f32PinnedTensorName reports whether a checkpoint tensor name is one the loaders ALWAYS keep resident at f32 regardless of the requested
-// quant: a Mamba-2 mixer (Granite-4.0-H's "mamba.*" prefix, GGUF "ssm_*") or an MLA attention projection (GGUF
-// "attn_q_a"/"attn_q_b"/"attn_kv_a_mqa"/"attn_kv_b", safetensors "q_a_proj"/"q_b_proj"/"kv_a_proj"/"kv_b_proj").
-//
-// DELIBERATELY NOT a bare "mixer."/"in_proj"/"out_proj" match: Nemotron-H shares the "mixer." prefix across its Mamba-2 (f32), attention,
-// MLP and MoE layer types, and bare "in_proj"/"out_proj" collide with LFM2's conv mixer and qwen3.5/qwen3_next's DeltaNet hybrid, where
-// SOME "linear_attn.in_proj_*" sub-tensors are f32 and OTHERS are genuinely quantized, so a name-only classifier cannot tell them apart.
-// Nemotron-H's Mamba-2 in_proj/out_proj/conv1d ARE matched, via the full "mixer.in_proj"/"mixer.out_proj"/"mixer.conv1d" compound
-// (never bare "mixer." or bare "in_proj"), which no other Nemotron block kind contains.
-//
-// A load armed for int8 MLA (mlaProjInt8, tests only) holds its q-LoRA pair and kv-A at int8 instead (mlaInt8TensorName, checked first).
-//
-// KNOWN RESIDUAL GAP, left unfixed rather than over-matched: MLA's output projection (self_attn.o_proj.weight / Bailing's dense.weight)
-// and a LoRA-less q_proj are held f32, but "o_proj"/"q_proj"/"dense.weight" are ordinary quantizable tensor names in every non-MLA
-// family, so they are priced at the load's rate: a small, honest under-estimate at int4
-// (TestFitEstimate_f32PinnedMixersAgreeWithResident).
-func f32PinnedTensorName(name string) bool {
-	for _, s := range []string{
-		"ssm_", "mamba.",
-		"mixer.in_proj", "mixer.out_proj", "mixer.conv1d", // Nemotron-H Mamba-2 only (see doc comment)
-		"attn_q_a", "attn_q_b", "attn_kv_a", "attn_kv_b",
-		"q_a_proj", "q_b_proj", "kv_a_proj", "kv_b_proj",
-		"_exps.bias", // gpt-oss's expert biases: stacked 2-D in the file, f32 per expert after the load
-	} {
-		if strings.Contains(name, s) {
-			return true
-		}
-	}
-	return false
-}
-
-// mlaInt8TensorName reports whether name is an MLA q-LoRA or kv-A projection, which a load armed for int8 MLA holds as per-row int8
-// (mlaProjInt8). kv_b is not one: it stays f32.
-func mlaInt8TensorName(name string) bool {
-	for _, s := range []string{"attn_q_a.", "attn_q_b.", "attn_kv_a_mqa.", "q_a_proj.", "q_b_proj.", "kv_a_proj"} {
-		if strings.Contains(name, s) {
-			return true
-		}
-	}
-	return false
-}
-
-// visionTowerTensorName reports whether name belongs to a bundled multimodal vision tower or projector rather than the text decoder.
-// decoder/weights.go's text loader never requests these names, but this estimator walks EVERY tensor in the checkpoint's metadata, so it
-// must exclude them explicitly or they are swept into the text model's per-element quant price.
-func visionTowerTensorName(name string) bool {
-	return strings.Contains(name, "vision_tower.") || strings.Contains(name, "multi_modal_projector.")
-}
-
-// gptqAWQAuxSuffix reports whether name is a GPTQ/AWQ auxiliary tensor (qzeros/g_idx/scales, decoder/gptq.go, decoder/awq.go) that is fully
-// consumed during the one-time reconstruct-then-requantize step and never itself kept resident: pricing it as an ordinary weight matrix at
-// the target quant's rate would double-count storage the real load path discards.
-func gptqAWQAuxSuffix(name string) bool {
-	for _, s := range []string{".qzeros", ".g_idx", ".scales"} {
-		if strings.HasSuffix(name, s) {
-			return true
-		}
-	}
-	return false
-}
-
-// gptqAWQPackFactor is how many 4-bit codes GPTQ/AWQ pack into each element along qweight's packed dimension (decoder/gptq.go: 8 4-bit codes
-// per int32), so qweight's ON-DISK shape under-counts the logical [in,out] matrix by exactly this factor. The checkpoint is fully unpacked
-// and re-quantized to the requested resident quant at load time (decoder/weights.go's loadProj), so the estimator must correct for it or
-// lands ~8x low.
-const gptqAWQPackFactor = 8
-
 // estimateGGUFWeightBytes sums every tensor's element count from the GGUF's metadata and prices
 // it at the target quant. Metadata only: no tensor data is touched, so this costs a header parse
 // on a model that is about to be read in full anyway.
@@ -427,58 +382,24 @@ func estimateGGUFWeightBreakdown(path string, q quantMode) (total, experts int64
 	defer g.Close()
 	// q4k prices each tensor at what its load keeps: a dense projection stored as Q4_K at its own super-blocks
 	// (q4kKeptBytes), every other matrix at int8 W8A8, which q4k makes of them (streamQuantizedRow4).
+	r := fitRates(q)
 	price := q
 	if q == quantQ4K && !q4kPriceAsInt4ForTest {
 		price = quantInt8I8
+		r.Kept = func(name string, dims []int) (float64, bool) { return q4kKeptBytes(g, name, dims) }
 	}
+	r.Matrix = quantBytesPerElem(price)
 	ggufArch, _ := g.Str("general.architecture")
-	nemoInt8 := (ggufArch == "nemotron_h" || ggufArch == "nemotron_h_moe") && mambaProjInt8(q)
-	var sum, exp float64
-	for _, name := range g.Names() {
-		dims, ok := g.Dims(name)
-		if !ok {
-			continue
-		}
-		n := 1
-		for _, d := range dims {
-			if d <= 0 {
-				n = 0
-				break
-			}
-			n *= d
-		}
-		if n == 0 {
-			continue
-		}
-		if len(dims) < 2 {
-			sum += 4 * float64(n)
-			continue
-		}
-		// A quantized Nemotron-H holds its two Mamba projections at int8 (mambaProjInt8).
-		if nemoInt8 && (strings.HasSuffix(name, ".ssm_in.weight") || strings.HasSuffix(name, ".ssm_out.weight")) {
-			sum += quantBytesPerElem(quantInt8I8) * float64(n)
-			continue
-		}
-		// A load armed for int8 MLA holds its q (or q-LoRA pair) and kv-A projections at int8 (mlaProjInt8).
-		if mlaProjInt8(q) && mlaInt8TensorName(name) {
-			sum += quantBytesPerElem(quantInt8I8) * float64(n)
-			continue
-		}
-		// Mamba-2/MLA tensors stay f32 regardless of the requested quant: price them at what they cost, not the ambient rate.
-		if f32PinnedTensorName(name) {
-			sum += 4 * float64(n)
-			continue
-		}
-		b := quantBytesPerElem(price) * float64(n)
-		if kept, ok := q4kKeptBytes(g, name, dims); ok && q == quantQ4K && !q4kPriceAsInt4ForTest {
-			b = kept
-		}
-		sum += b
-		if strings.Contains(name, "_exps") {
-			exp += b
-		}
+	return fit.GGUFWeightBytes(g.Names(), g.Dims, ggufArch, r)
+}
+
+// fitRates are the per-element prices of q's load, measured through the loader's quantizer. Matrix is left for the caller to set.
+func fitRates(q quantMode) fit.Rates {
+	r := fit.Rates{MambaProjInt8: mambaProjInt8(q), MLAProjInt8: mlaProjInt8(q)}
+	if r.MambaProjInt8 || r.MLAProjInt8 {
+		r.Int8 = quantBytesPerElem(quantInt8I8)
 	}
-	return int64(sum), int64(exp)
+	return r
 }
 
 // q4kDenseProj matches the dense layer projections a q4k load keeps as Q4_K when the GGUF stores them so (q4kMat's load
@@ -515,101 +436,30 @@ func estimateSafetensorsWeightBytes(dir string, q quantMode) int64 {
 		return 0 // unknown ⇒ proceed
 	}
 	defer st.Close()
-	var total float64
-	for _, name := range st.Names() {
+	r := fitRates(q)
+	r.Matrix = quantBytesPerElem(q)
+	// The token embedding and LM head are held at q.embedding() (int8 under int4), not at q.
+	r.Embedding = quantBytesPerElem(q.embedding())
+	if cfg, cerr := loadConfig(os.DirFS(dir), "config.json"); cerr == nil {
+		if qc, qerr := parseCheckpointQuantConfig(cfg); qerr == nil && qc != nil && qc.Method == "mlx" {
+			r.MLXBits = qc.Bits
+		}
+	}
+	return fit.SafetensorsWeightBytes(st.Names(), func(name string) ([]int, bool) {
 		t, err := st.Tensor(name)
 		if err != nil {
-			continue
+			return nil, false
 		}
-		n := 1
-		for _, d := range t.Shape {
-			if d <= 0 {
-				n = 0
-				break
-			}
-			n *= d
-		}
-		if n == 0 {
-			continue
-		}
-		// A GPTQ/AWQ auxiliary tensor is fully consumed during reconstruction and never kept resident: price it at zero, not as a weight matrix.
-		if gptqAWQAuxSuffix(name) {
-			continue
-		}
-		// A bundled vision tower/projector loads at its own precision, independent of the text
-		// model's requested quant (aikit/vision.LoadEncoder's own -vision-quant knob, invisible
-		// here) — price it at f32, the default the text loader never touches it at, rather than
-		// blending it into the text quant rate.
-		if visionTowerTensorName(name) {
-			total += 4 * float64(n)
-			continue
-		}
-		if len(t.Shape) < 2 {
-			total += 4 * float64(n)
-			continue
-		}
-		// Mamba-2/MLA tensors stay f32 regardless of the requested quant.
-		// A quantized Nemotron-H holds its two Mamba projections at int8 (mambaProjInt8); these compound names are its alone.
-		if mambaProjInt8(q) && (strings.HasSuffix(name, "mixer.in_proj.weight") || strings.HasSuffix(name, "mixer.out_proj.weight")) {
-			total += quantBytesPerElem(quantInt8I8) * float64(n)
-			continue
-		}
-		if mlaProjInt8(q) && mlaInt8TensorName(name) {
-			total += quantBytesPerElem(quantInt8I8) * float64(n)
-			continue
-		}
-		if f32PinnedTensorName(name) {
-			total += 4 * float64(n)
-			continue
-		}
-		// A GPTQ/AWQ qweight tensor's ON-DISK shape is the packed [in/8, out] layout, not the
-		// logical [in, out] matrix it is unpacked and re-quantized to at load time — correct for
-		// the pack factor before pricing at the target quant's rate, or this under-counts ~8x.
-		if strings.HasSuffix(name, ".qweight") {
-			n *= gptqAWQPackFactor
-		}
-		// The token embedding and LM head are held at q.embedding() (int8 under int4), not at q: pricing
-		// them at q under-counted every big-vocabulary small model, and binary16 int4 scales (aikit
-		// v1.50.0) pushed the tiny fixtures' estimate below the 0.85 band.
-		if embeddingTensorName(name) {
-			total += quantBytesPerElem(q.embedding()) * float64(n)
-			continue
-		}
-		total += quantBytesPerElem(q) * float64(n)
-	}
-	return int64(total)
-}
-
-// embeddingTensorName reports a checkpoint tensor the loaders keep at the embedding precision
-// (quantMode.embedding()): a token-embedding table or an untied LM head, under the names the supported
-// safetensors families use.
-func embeddingTensorName(name string) bool {
-	if name == "output.weight" { // InternLM2's LM head
-		return true
-	}
-	for _, s := range []string{"embed_tokens.weight", "lm_head.weight", "tok_embeddings.weight", "wte.weight", "word_embeddings.weight", "embed_in.weight", "embed_out.weight"} {
-		if name == s || strings.HasSuffix(name, "."+s) {
-			return true
-		}
-	}
-	return false
+		return t.Shape, true
+	}, r)
 }
 
 // kvBytesPerPosition is the KV cost of ONE position, so estimateKVBytes and smallerFittingContext share the identical per-position rate.
 func kvBytesPerPosition(cfg *Config, kvF16, kvI8 bool) int64 {
-	if cfg == nil || cfg.NumLayers <= 0 || cfg.NumKVHeads <= 0 {
+	if cfg == nil {
 		return 0
 	}
-	perElem := 4.0
-	switch {
-	case kvI8:
-		perElem = 1.125 // int8 payload + per-row f32 scale
-	case kvF16:
-		perElem = 2
-	}
-	kvDim := cfg.NumKVHeads * cfg.headDim()
-	// ×2 for K and V.
-	return int64(2 * perElem * float64(kvDim) * float64(cfg.NumLayers))
+	return fit.KVBytesPerPosition(cfg.NumLayers, cfg.NumKVHeads, cfg.EffectiveHeadDim(), kvF16, kvI8)
 }
 
 // estimateKVBytes is the KV cache at ctx positions. ctx is the caller's job to choose (fitCheckFor picks opts.ResidentContext when pinned,
@@ -717,13 +567,19 @@ func FitDescribe(path string, opts Options) (string, error) {
 // share. Price at opts.ResidentContext when pinned, else the model's own MaxPositions, the worst case a real request can reach.
 func (f fitCheck) priceCtxAndKV(cfg *Config, opts Options) fitCheck {
 	f.cfg = cfg
+	f.snapshotBytes = snapshotStoreBytes(cfg, opts)
 	f.denseStreamable = denseStreamable(cfg) && mem.QuantPages(f.quant) // TestStreamedGIW_pagesOnlyTheQuantsTheFitGuardOffers
 	p, ok := kvPricingFor(cfg, opts)
 	f.pinned = p.pinned
 	if !ok {
 		return f // no pin and the model's own max is unknown ⇒ can't price KV; proceed as before
 	}
-	f.effCtx, f.kvF16, f.kvI8 = p.ctx, p.kvF16, p.kvI8
+	f.effCtx, f.kvF16, f.kvI8, f.metalKV = p.ctx, p.kvF16, p.kvI8, p.metalKV
+	if f.cudaBuildBytes > 0 { // the config gives the layer count: the build peak now prices its packed layer
+		if peak := buildDemandFor(cfg, opts, f.weightBytes, f.expertBytes, f.isGGUF).HostBuildPeak; peak > 0 {
+			f.cudaBuildBytes = peak
+		}
+	}
 	if p.deviceKV {
 		f.deviceKV = true
 		if f.cudaBuildBytes == 0 {
@@ -731,7 +587,7 @@ func (f fitCheck) priceCtxAndKV(cfg *Config, opts Options) fitCheck {
 		}
 		return f
 	}
-	f.kvBytes = estimateKVBytes(cfg, f.effCtx, f.kvF16, f.kvI8)
+	f.kvBytes = f.kvAt(f.effCtx)
 	return f
 }
 
@@ -740,19 +596,33 @@ type kvPrice struct {
 	ctx         int
 	pinned      bool
 	kvF16, kvI8 bool
-	metalSizing bool // priced as the Metal resident will allocate, not at the CPU's per-request ceiling
-	deviceKV    bool // the load will be CUDA-resident: its KV is in VRAM, so a host guard prices none of it (ctx is still the context in play)
+	metalSizing bool   // priced as the Metal resident will allocate, not at the CPU's per-request ceiling
+	metalKV     string // the precision a Metal resident's pools hold (ResolveKV), set with metalSizing when the architecture resolves
+	deviceKV    bool   // the load will be CUDA-resident: its KV is in VRAM, so a host guard prices none of it (ctx is still the context in play)
+}
+
+// bytes is the KV p prices at ctx positions of cfg: one slot of Metal's pools where p.metalKV names their precision, else the CPU
+// cache (estimateKVBytes).
+func (p kvPrice) bytes(cfg *Config, ctx int) int64 {
+	if p.metalKV != "" {
+		if arch, _, err := resolveArchitecture(cfg); err == nil && arch != nil {
+			return metalKVBytesFor(arch, ctx, p.metalKV)
+		}
+	}
+	return estimateKVBytes(cfg, ctx, p.kvF16, p.kvI8)
 }
 
 // kvPricingFor is what both host guards (priceCtxAndKV for .gguf/safetensors, guardGIWFit for .giw) price KV at: what the load will
 // actually allocate.
 //
 //   - A load that will be Metal-resident (Metal compiled in, the resolved backend, and the architecture inside Metal's feature gate) is
-//     priced at f16, or at f32 where ResolveKV delivers f32 there (an int8 cache stays priced at f16, above what it allocates), for
-//     MetalCtxDefault positions unless the caller pinned a context, clamped to the model's window.
-//     Pricing it at Options.KVPrecision over the whole window would refuse or pin down a load that fits.
-//   - Every other load: the CPU allocates KV per request, at Options.KVPrecision, up to the window, and that ceiling is what a long
-//     request reaches.
+//     priced as one slot of Metal's pools (metalKVBytesFor): the precision ResolveKV delivers there and the full padded context on
+//     every attention layer, sliding ones included, for MetalCtxDefault positions unless the caller pinned a context, clamped to the
+//     model's window. Pricing it at Options.KVPrecision over the whole window would refuse or pin down a load that fits.
+//   - A load that will be CUDA-resident holds its KV on the device (deviceKV), which the host guards do not price.
+//   - Every other load allocates KV per request, up to the window, and that ceiling is what a long request reaches. A CPU load, and a
+//     Metal or CUDA load that backend does not take (not compiled, streamed, or outside its gate), hold it in the CPU cache at the
+//     precision ResolveKV("cpu") delivers (Options.KVQuant's, where the family allows it).
 //
 // A Metal resident that then declines for memory falls back to the CPU, whose per-request KV this no longer prices at load. The weights
 // term is unchanged by that fallback, and serve's -require-backend refuses rather than fall back.
@@ -761,13 +631,6 @@ type kvPrice struct {
 func kvPricingFor(cfg *Config, opts Options) (p kvPrice, ok bool) {
 	p.pinned = opts.ResidentContext > 0
 	p.kvF16, p.kvI8 = opts.KVPrecision == "f16", opts.KVQuant == "i8"
-	if opts.Backend == "" || opts.Backend == "cpu" { // the CPU cache's precision is KVQuant's, where the family allows it (ResolveKV)
-		p.kvF16 = false
-		if arch, _, err := resolveArchitecture(cfg); err == nil {
-			got, _ := ResolveKV("cpu", arch, opts)
-			p.kvF16 = got == kvPrecF16
-		}
-	}
 	if _, ok := kvPolicies[opts.Backend]; ok {
 		// A backend with a KV policy is f16 only where ResolveKV says so (the default included), else f32 whatever was requested.
 		p.kvF16 = false
@@ -778,11 +641,10 @@ func kvPricingFor(cfg *Config, opts Options) (p kvPrice, ok bool) {
 	}
 	d := buildDemandFor(cfg, opts, 0, 0, false)
 	if opts.Backend == "metal" && d.Resident {
-		p.metalSizing, p.kvF16 = true, true
+		p.metalSizing, p.kvF16, p.kvI8 = true, true, false
 		if arch, _, err := resolveArchitecture(cfg); err == nil {
-			// An explicit --kv f32: 4 B per element.
-			if got, _ := ResolveKV("metal", arch, opts); got == kvPrecF32 {
-				p.kvF16, p.kvI8 = false, false
+			if got, _ := ResolveKV("metal", arch, opts); got != "" {
+				p.metalKV, p.kvF16, p.kvI8 = got, got == kvPrecF16, got == kvPrecI8
 			}
 		}
 		p.ctx = MetalCtxDefault
@@ -795,6 +657,18 @@ func kvPricingFor(cfg *Config, opts Options) (p kvPrice, ok bool) {
 		return p, true
 	}
 	p.deviceKV = d.KVOnDevice
+	switch opts.Backend {
+	case "", "cpu", "metal", "cuda":
+		if p.deviceKV {
+			break
+		}
+		// No resident runner holds this KV, so the CPU cache does, at KVQuant's precision where the family allows it (ResolveKV).
+		p.kvF16 = false
+		if arch, _, err := resolveArchitecture(cfg); err == nil {
+			got, _ := ResolveKV("cpu", arch, opts)
+			p.kvF16 = got == kvPrecF16
+		}
+	}
 	switch {
 	case p.pinned:
 		p.ctx = opts.ResidentContext

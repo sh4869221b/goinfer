@@ -31,8 +31,8 @@ func TestGIWRoundTripPreservesRouterBias(t *testing.T) {
 		t.Skipf("no tiny GLM GGUF at %s — run scripts/pin_glm_tiny_gguf.py", gguf)
 	}
 	// The tiny fixture carries no tokenizer, so go through the weights serializer
-	// directly (StreamTranscodeGGUF → LoadSerializedWeights) rather than the full
-	// .giw bundle — it's the serialize round-trip we're guarding.
+	// directly (StreamTranscodeGGUF → LoadSerializedWeights) rather than the full.
+	// giw bundle — it's the serialize round-trip we're guarding.
 	var body bytes.Buffer
 	if _, err := StreamTranscodeGGUF(context.Background(), gguf, &body, "int4", false, GIWTargetNone, "glm-tiny"); err != nil {
 		t.Fatalf("StreamTranscodeGGUF: %v", err)
@@ -61,16 +61,7 @@ func TestStreamTranscode_ctxCancel_M21(t *testing.T) {
 	if _, err := os.Stat(gguf); err != nil {
 		t.Skipf("no tiny GLM GGUF at %s — run scripts/pin_glm_tiny_gguf.py", gguf)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // pre-cancelled
-	var body bytes.Buffer
-	n, err := StreamTranscodeGGUF(ctx, gguf, &body, "int4", false, GIWTargetNone, "glm-tiny")
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("StreamTranscodeGGUF with a cancelled ctx = (%d, %v); want a context.Canceled error", n, err)
-	}
-	if body.Len() != 0 {
-		t.Errorf("wrote %d bytes after cancellation; want 0 (the transcode must abort before writing)", body.Len())
-	}
+	checkStreamTranscodeCancelled(t, gguf, "glm-tiny")
 }
 
 // giwSplit splits a .giw bundle at the v5 quant-label field and verifies the trailing CRC32-IEEE is
@@ -425,7 +416,7 @@ func TestSidecar_failedTranscodeLeavesNoFinalFile(t *testing.T) {
 	}
 }
 
-// V-01 (docs/completed/review-2026-09-04.md): a SUCCESSFUL GGUF TranscodeGIW must be driven end to end —
+// V-01: a SUCCESSFUL GGUF TranscodeGIW must be driven end to end —
 // the M-12 tests above assert failure on a non-GGUF source and an AST shape, neither of which
 // exercises selfCheck on a real bundle (a temp name `out + ".tmp"`, not ending in ".giw", could never
 // route Load's suffix dispatch in selfCheck to the bundle loader, so every real TranscodeGIW
@@ -435,7 +426,7 @@ func TestSidecar_failedTranscodeLeavesNoFinalFile(t *testing.T) {
 // succeeds and that the file it left behind is loadable.
 //
 // GOINFER_HEAVY_TESTS-gated like every other real-checkpoint test in this repo (decoder's
-// requireHeavyModel), but deliberately NOT through testdata/assets.json's GOINFER_PREQUANT_GGUF:
+// testgate.RequireHeavy), but deliberately NOT through testdata/assets.json's GOINFER_PREQUANT_GGUF:
 // that name is enforced single-resolution-site by TestAssetRegistry_noDirectReads
 // (decoder/asset_registry_test.go), which flags any os.Getenv read of a registered name outside
 // that file. A local path check avoids colliding with that enforcement rather than fighting it.
@@ -629,5 +620,21 @@ func TestTranscodeDir_failedWriteLeavesNoFinalFile(t *testing.T) {
 	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(out), "*.tmp.giw"))
 	if len(matches) != 0 {
 		t.Errorf("leftover temp file(s) after a failed transcodeDir: %v", matches)
+	}
+}
+
+// checkStreamTranscodeCancelled holds M-21's contract on one fixture: an already-cancelled context aborts with the context error, and
+// nothing reaches the sink.
+func checkStreamTranscodeCancelled(t *testing.T, gguf, name string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancelled
+	var body bytes.Buffer
+	n, err := StreamTranscodeGGUF(ctx, gguf, &body, "int4", false, GIWTargetNone, name)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("StreamTranscodeGGUF with a cancelled ctx = (%d, %v); want a context.Canceled error", n, err)
+	}
+	if body.Len() != 0 {
+		t.Errorf("wrote %d bytes after cancellation; want 0 (the transcode must abort before writing)", body.Len())
 	}
 }

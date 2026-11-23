@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/constrain"
+	"github.com/townsendmerino/goinfer/internal/runtime/kvmgr"
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
 // scriptedForward is a fake Forward (SB5): the logits after a history are a pure function of that history, so a policy
@@ -79,7 +81,7 @@ func plainConstrained(fw Forward, prompt []int, n int, isStop func(int) bool, pr
 	var gen []int
 	for len(gen) < n {
 		proc(gen, logits)
-		tok := argmax(logits)
+		tok := sampling.Argmax(logits)
 		if isStop(tok) {
 			break
 		}
@@ -118,6 +120,7 @@ func (d *policyScriptDrafter) Draft(ctx []int, k int) []int {
 // completing (its stop token) inside a draft. It also holds TestGrammarSpecParity's claim, which needed a checkpoint CI
 // does not have.
 func TestGrammarSpecLoop_exactOnTheFake(t *testing.T) {
+	t.Parallel()
 	const vocab = 256
 	eos := []int{0}
 	isStop := func(tok int) bool { return slices.Contains(eos, tok) }
@@ -196,7 +199,7 @@ func plainGreedy(fw Forward, prompt []int, n int, isStop func(int) bool) []int {
 	logits, _ := fw.Prefill(ctx, prompt)
 	var gen []int
 	for len(gen) < n {
-		tok := argmax(logits)
+		tok := sampling.Argmax(logits)
 		if isStop(tok) {
 			break
 		}
@@ -212,7 +215,7 @@ func perturbScript(script func([]int) []float32, at func(n int) bool) func([]int
 	return func(h []int) []float32 {
 		l := script(h)
 		if at(len(h)) {
-			l[(argmax(l)+1)%len(l)] += 10
+			l[(sampling.Argmax(l)+1)%len(l)] += 10
 		}
 		return l
 	}
@@ -345,7 +348,7 @@ func fakeNgramTarget(t *testing.T, fw *scriptedForward, isStop func(int) bool, a
 			rows, err := tg.verify(seq, base)
 			ids := make([]int, len(rows))
 			for i, r := range rows {
-				ids[i] = argmax(r)
+				ids[i] = sampling.Argmax(r)
 			}
 			return ids, err
 		}
@@ -438,17 +441,43 @@ func (k *fakeKV) truncate(pos int) bool {
 	return exact
 }
 
+// fakeSeqView is fakeKV and the session's token record as the kvmgr.SequenceState Session.rewindForReuse hands to
+// kvmgr.RewindSequence, with the rule of cpuSequenceState.ReusablePrefix (a prefix past the KV's position, or a cut a ring
+// cannot make exactly, is not servable).
+type fakeSeqView struct {
+	kv     *fakeKV
+	tokens []int
+}
+
+func (v fakeSeqView) Len() int                  { return len(v.tokens) }
+func (v fakeSeqView) Tokens() []int             { return v.tokens }
+func (v fakeSeqView) Root() kvmgr.Root          { return kvmgr.Root{Model: "fake", Precision: "f32"} }
+func (v fakeSeqView) Images() []kvmgr.ImageSpan { return nil }
+func (v fakeSeqView) Classes() []kvmgr.ClassRun { return nil }
+func (v fakeSeqView) Recurrent() bool           { return v.kv.recurrent }
+func (v fakeSeqView) Checkpoint() int           { return 0 }
+func (v fakeSeqView) Floor() int                { return 0 }
+func (v fakeSeqView) Truncate(target int) bool {
+	return target >= 0 && target <= len(v.kv.hist) && v.kv.truncate(target)
+}
+func (v fakeSeqView) ReusablePrefix(prefix int) int {
+	if prefix <= 0 || prefix > len(v.kv.hist) || (prefix < len(v.kv.hist) && v.kv.ring > 0 && prefix < len(v.kv.hist)-v.kv.ring) {
+		return 0
+	}
+	return prefix
+}
+
 // fakeSessionTurn is one Session.Generate on the fake, as the CPU decode loop runs it: rewind the KV for the prompt,
 // prefill the rest, emit greedy tokens, forward and commit each emitted token but the last, stop on a stop token; cutAt
 // > 0 ends the turn after that many commits with the KV one token behind (a forward that failed mid-sweep). It returns
 // the stream, the reuse, and the session's new tokens.
 func fakeSessionTurn(kv *fakeKV, tokens, prompt []int, clean bool, n, cutAt int, isStop func(int) bool) (gen []int, matched int, after []int) {
 	ctx := context.Background()
-	matched = sessionRewind(tokens, prompt, clean, false, kv.truncate)
+	matched = kvmgr.RewindSequence(fakeSeqView{kv, tokens}, kvmgr.Request{Root: kvmgr.Root{Model: "fake", Precision: "f32"}, Tokens: prompt}, clean)
 	logits, _ := kv.Prefill(ctx, prompt[matched:])
 	seq := slices.Clone(prompt)
 	for {
-		tok := argmax(logits)
+		tok := sampling.Argmax(logits)
 		if isStop(tok) {
 			break
 		}
@@ -459,8 +488,8 @@ func fakeSessionTurn(kv *fakeKV, tokens, prompt []int, clean bool, n, cutAt int,
 		logits, _ = kv.Step(ctx, tok)
 		seq = append(seq, tok)
 		if cutAt > 0 && len(seq)-len(prompt) == cutAt {
-			seq = append(seq, argmax(logits)) // emitted, but its forward failed: the KV is one behind
-			gen = append(gen, argmax(logits))
+			seq = append(seq, sampling.Argmax(logits)) // emitted, but its forward failed: the KV is one behind
+			gen = append(gen, sampling.Argmax(logits))
 			break
 		}
 	}
@@ -468,7 +497,7 @@ func fakeSessionTurn(kv *fakeKV, tokens, prompt []int, clean bool, n, cutAt int,
 	return gen, matched, after
 }
 
-// TestSessionPolicy_exactOnTheFake is SB5-P3 for sessions: a run of turns on one fake KV (a cold start, a resume
+// TestSessionPolicy_exactOnTheFake is SB5-P3 for sessions, through kvmgr.RewindSequence (what Session.rewindForReuse calls): a run of turns on one fake KV (a cold start, a resume
 // extending the last turn, the same prompt again, a rewind to a shorter prefix, a divergence, a turn cut off mid-write)
 // emits, turn by turn, exactly what cold decoding of that turn's prompt emits, with a plain KV, a ring cache that cannot
 // truncate exactly below a window, and recurrent state; and the session's tokens are always the KV's contents.
@@ -597,7 +626,7 @@ func TestNgramSpecLoop_sampledIsLosslessOnTheFake(t *testing.T) {
 		}
 	}
 	walk(prompt, nil, 1)
-	likeliest := argmax(script(prompt))
+	likeliest := sampling.Argmax(script(prompt))
 	unlikely := (likeliest + 1) % vocab
 	for _, dr := range []struct {
 		name string

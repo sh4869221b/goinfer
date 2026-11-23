@@ -10,7 +10,7 @@ import (
 	"github.com/oliverbestmann/webgpu/wgpu"
 )
 
-// W4A8 decode GEMV: int4 group-wise weights × int8 activation. The decode roofline is weight bytes/token, and int4 streams
+// W4a8GroupSize is the group of the W4A8 decode GEMV (int4 group-wise weights × int8 activation). The decode roofline is weight bytes/token, and int4 streams
 // about 0.6× the bytes of int8 (½ the nibbles + ⅛ the f32 group scales). Format matches aikit's int4-resident
 // (`internal/linalg`, group=32, GGUF Q4_K granularity): per row, K/32 groups each of 32 nibbles + one f32 scale; element i's
 // nibble = (word>>4i)&0xF, value (nibble−8). group=32 nibbles = 16 bytes = exactly one vec4<u32>, so one group is one
@@ -90,15 +90,14 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 type ResidentW4A8 struct {
 	ctx     *Context     // the Context that owns the buffers: Close after it is closed releases on the finalizer goroutine (releaseOwned)
 	bq      *wgpu.Buffer // [N, kp/32] vec4<u32> packed nibbles
-	bScales *wgpu.Buffer // [N, kp/32] f16 per-group scales, packed 2/u32 (N-83, docs/audit-2026-09-10.md:
-	// both writers below pack via packF16Pairs, not raw f32 — this field's comment was stale)
-	rows    int // N
-	cols    int // K (unpadded)
-	kp      int // K padded to mult of 32
-	nGroups int // kp/32
+	bScales *wgpu.Buffer // [N, kp/32] f16 per-group scales, packed 2/u32 (both writers below pack via packF16Pairs, not raw f32)
+	rows    int          // N
+	cols    int          // K (unpadded)
+	kp      int          // K padded to mult of 32
+	nGroups int          // kp/32
 }
 
-// Release frees the resident GPU buffers.
+// Close frees the resident GPU buffers.
 func (rm *ResidentW4A8) Close() error {
 	rm.ctx.releaseOwned(func() {
 		traceFree(rm)
@@ -148,7 +147,7 @@ func f16to32(h uint16) float32 {
 	}
 }
 
-// packF16Pairs packs []float32 into u32 words, two f16 per word (even index in
+// PackF16Pairs packs []float32 into u32 words, two f16 per word (even index in
 // the low half), for the GPU's unpack2x16float reads. Odd length zero-pads.
 func PackF16Pairs(f []float32) []uint32 {
 	out := make([]uint32, (len(f)+1)/2)
@@ -275,14 +274,14 @@ func (c *Context) ensureGEMVW4() error {
 		sh.Release()
 		return fmt.Errorf("gpu: create W4A8 pipeline: %w", err)
 	}
-	c.track(sh.Release, pl.Release) // audit C-26: register at creation
+	c.track(sh.Release, pl.Release) // registered at creation, so Close releases them
 	c.gemvW4Shader = sh
 	c.gemvW4Pipeline = pl
 	c.gemvW4Layout = c.bgl(pl)
 	return nil
 }
 
-// decodeWeight is a resident projection matrix the DecodeRunner can GEMV —
+// DecodeWeight is a resident projection matrix the DecodeRunner can GEMV —
 // either W8A8 or W4A8. Both kernels share the same 6-binding layout
 // (aq, weights, aScale, scales, dst, dims) and the dims.addResidual epilogue, so
 // the runner's gemv/gemvAdd builders are uniform across precisions; only the

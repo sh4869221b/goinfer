@@ -14,9 +14,12 @@ import (
 	"github.com/townsendmerino/goinfer/internal/audio"
 	"github.com/townsendmerino/goinfer/multimodal"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// G-S14e3 of docs/tasks/task-multimodal-support-2026-10.md (registered 2026-10-09 before any code): the REAL Voxtral Mini 3B, goinfer float32 on the CPU, against transformers float32
+// G-S14e3: the REAL Voxtral Mini 3B, goinfer float32 on the CPU, against transformers float32
 // (scripts/pin_voxtral_real.py: the reference loads with no missing keys and is proved real by transcribing the LibriSpeech clip). Registered bars, on the LibriSpeech clip: the prompt ids equal
 // the processor's (the Tekken tokenizer and VoxtralPrompt on the real tekken.json); the tower output compared per row (1500 rows) and the projector output per row (375 rows) at cosine >=
 // 0.9999, the first and last rows named; the prompt-row logits at cosine >= 0.9999 with the argmax equal; the greedy transcription BYTE-EQUAL (token for token) to transformers'; and with the
@@ -25,7 +28,7 @@ import (
 //
 //	GOINFER_HEAVY_TESTS=1 GOINFER_VOXTRAL_REF=<pin output dir> [GOINFER_VOXTRAL_DIR=<checkpoint, with tekken.json>] go test -tags realckpt ./decoder/ -run TestVoxtralReal -v -timeout 60m
 func TestVoxtralReal_gate(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ref := os.Getenv("GOINFER_VOXTRAL_REF")
 	if ref == "" {
 		t.Skip("set GOINFER_VOXTRAL_REF to scripts/pin_voxtral_real.py's output directory")
@@ -179,14 +182,14 @@ func TestVoxtralReal_gate(t *testing.T) {
 		}
 		refLogits := rd(name + ".logits.f32")
 		cos := q3aCos(lg, refLogits)
-		t.Logf("%s: prompt prefill %.1fs; last-position logit cosine %.9f, argmax %d (reference %d)", name, time.Since(t2).Seconds(), cos, argmax(lg), argmax(refLogits))
-		if cos < 0.9999 || argmax(lg) != argmax(refLogits) {
-			bad("%s: prompt logits differ from transformers (cosine %.9f, argmax %d against %d)", name, cos, argmax(lg), argmax(refLogits))
+		t.Logf("%s: prompt prefill %.1fs; last-position logit cosine %.9f, argmax %d (reference %d)", name, time.Since(t2).Seconds(), cos, sampling.Argmax(lg), sampling.Argmax(refLogits))
+		if cos < 0.9999 || sampling.Argmax(lg) != sampling.Argmax(refLogits) {
+			bad("%s: prompt logits differ from transformers (cosine %.9f, argmax %d against %d)", name, cos, sampling.Argmax(lg), sampling.Argmax(refLogits))
 		}
 		var gen []int
 		l := lg
 		for len(gen) < len(refGen)+8 { // allow a few more tokens than the reference made, so a missed stop is seen
-			id := argmax(l)
+			id := sampling.Argmax(l)
 			gen = append(gen, id)
 			if id == eos {
 				break
@@ -220,7 +223,7 @@ func TestVoxtralReal_gate(t *testing.T) {
 		for k, id := range refGen {
 			cc := q3aCos(l2, tfRef[k*c.Vocab:(k+1)*c.Vocab])
 			worst = min(worst, cc)
-			if argmax(l2) != id {
+			if sampling.Argmax(l2) != id {
 				miss++
 			}
 			if k < len(refGen)-1 {

@@ -45,7 +45,7 @@ func tinyPrefillResident(t *testing.T, opts decoder.Options, maxPositions int) *
 		t.Fatalf("load: %v", err)
 	}
 	t.Cleanup(func() { m.Close() })
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("build resident: %v", err)
 	}
@@ -119,6 +119,7 @@ func TestPrefill_exactAttentionTilesPast4096Keys(t *testing.T) {
 	if fused, _ := a.r.prefillAttnKernels(); fused {
 		t.Fatal("the fused kernel is still selected; the test proves nothing")
 	}
+	a.r.kvWriteMust(a.r.kvSlot, 0, prefillExactAttnMaxKeys-16) // the slot holds a prefix to that depth: a write starts where its sequence ends
 	if _, err := a.PrefillLast(context.Background(), tinyEmbs(32), prefillExactAttnMaxKeys-16); err != nil {
 		t.Errorf("a pass reaching %d keys on the exact kernel declined: %v", prefillExactAttnMaxKeys+16, err)
 	}

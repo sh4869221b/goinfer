@@ -6,12 +6,13 @@
   "own": [
     "decoder/lfm2.go",
     "decoder/forward_lfm2.go",
-    "decoder/arch_lfm2.go"
+    "decoder/arch_lfm2.go",
+    "decoder/island.go"
   ],
   "programs": [
     "testdata/lfm2-tiny"
   ],
-  "deps_hash": "sha256:fcdcf0e318c118a8bd759851c548383f3a4b7580c48d329e4a23a3260f01c18e",
+  "deps_hash": "sha256:594879ced28cbb2d43eb1b63864d390e5cbf8dad29217b4001f79219d4e162f4",
   "status": "validated",
   "validated_at": "7b50947a",
   "date": "2026-10-05",

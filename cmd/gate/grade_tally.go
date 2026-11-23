@@ -163,7 +163,7 @@ func reportCensus(w io.Writer, cfg *gateConfig, res *results, requireFixtures bo
 			rc = 1
 		} else {
 			// Say out loud what is being let through. skip_census.py exits 0 on a package-level
-			// fail, and E8 does not change what a gate decides — but a suppressed failure that
+			// fail, and this port does not change what a gate decides — but a suppressed failure that
 			// nobody is told about is indistinguishable from no failure, which is the defect this
 			// whole census exists to prevent. So it is preserved AND announced.
 			fmt.Fprintf(w, "\n  %sNOTE: %d package-level failure(s) above are NOT counted in this verdict%s\n",
@@ -359,6 +359,20 @@ func (r *results) lookupTop(name string) (string, bool) {
 		}
 	}
 	return act, found
+}
+
+// topOutput is the output of the top-level run of name that lookupTop reads: the last one with a terminal action.
+func (r *results) topOutput(name string) []string {
+	var out []string
+	for _, k := range r.order {
+		if k.Test != name || isSubtest(k) {
+			continue
+		}
+		if _, ok := r.final[k]; ok {
+			out = r.out[k]
+		}
+	}
+	return out
 }
 
 // gradeCellError is a cell that never produced a stream (go not on PATH, a log that could not be created, a start that

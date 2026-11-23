@@ -17,7 +17,7 @@ import (
 	"github.com/townsendmerino/goinfer/tokenizer"
 )
 
-// TestVsumMechanism is R6 step 1 (docs/tasks/red-october.md): why did the V-sum spike's KL against the f32/f64 reference
+// TestVsumMechanism is R6 step 1: why did the V-sum spike's KL against the f32/f64 reference
 // read worse than exact's on D7@8000 while its argmax metrics were better? Pre-registered in
 // docs/measurements/vsum-mechanism-PREREGISTERED.md; the hypotheses, the numeric tests and the decision rule are there and
 // are not restated here.
@@ -34,10 +34,7 @@ func TestVsumMechanism(t *testing.T) {
 	if os.Getenv("GOINFER_HEAVY_TESTS") == "" {
 		t.Skip("set GOINFER_HEAVY_TESTS=1 (real checkpoint; needs Phase A's reference files)")
 	}
-	maxS := 0
-	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("GOINFER_SPLITKV_VSUM_SPLIT"))); err == nil {
-		maxS = v
-	}
+	maxS := vsumSplitFromEnv(t)
 	var ss []int
 	sSpec := os.Getenv("GOINFER_VSUM_MECH_S")
 	if sSpec == "" {

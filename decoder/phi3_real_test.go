@@ -14,10 +14,13 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 func TestPhi3MiniReal_gate(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ckpt := assetPath(t, "GOINFER_PHI3_MINI")
 	const golden = "../testdata/phi3_mini_golden.json"
 	raw, err := os.ReadFile(golden)
@@ -54,7 +57,7 @@ func TestPhi3MiniReal_gate(t *testing.T) {
 			t.Fatalf("forward: %v", err)
 		}
 	}
-	gotArg := argmax(logits)
+	gotArg := sampling.Argmax(logits)
 	cos := logitCosine(logits, g.LastLogits)
 	t.Logf("phi3-mini parity: argmax got=%d want=%d | logit cosine=%.6f", gotArg, g.Argmax, cos)
 	if gotArg != g.Argmax {
@@ -66,7 +69,7 @@ func TestPhi3MiniReal_gate(t *testing.T) {
 
 	got := make([]int, 0, g.NNew)
 	for range g.NNew {
-		id := argmax(logits)
+		id := sampling.Argmax(logits)
 		got = append(got, id)
 		if logits, err = m.forward(id, cache); err != nil {
 			t.Fatalf("continuation forward: %v", err)
@@ -95,7 +98,7 @@ func TestPhi3MiniReal_gate(t *testing.T) {
 // snapshot delta + Q4, not load error (f32-resident vs int8-resident agree to ~0.02, ruling
 // out goinfer quant). Fixture reuses scripts/pin_phi3_mini.py's golden.
 func TestPhi3GGUFReal_gate(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	gguf := assetPath(t, "GOINFER_PHI3_GGUF")
 	raw, err := os.ReadFile("../testdata/phi3_mini_golden.json")
 	if err != nil {
@@ -127,13 +130,13 @@ func TestPhi3GGUFReal_gate(t *testing.T) {
 		}
 	}
 	cos := logitCosine(logits, g.LastLogits)
-	t.Logf("phi3 GGUF parity: argmax got=%d want=%d | cosine=%.4f (logged; Q4 + earlier snapshot)", argmax(logits), g.Argmax, cos)
-	if argmax(logits) != g.Argmax {
-		t.Errorf("GGUF argmax = %d, want %d", argmax(logits), g.Argmax)
+	t.Logf("phi3 GGUF parity: argmax got=%d want=%d | cosine=%.4f (logged; Q4 + earlier snapshot)", sampling.Argmax(logits), g.Argmax, cos)
+	if sampling.Argmax(logits) != g.Argmax {
+		t.Errorf("GGUF argmax = %d, want %d", sampling.Argmax(logits), g.Argmax)
 	}
 	got := make([]int, 0, g.NNew)
 	for range g.NNew {
-		id := argmax(logits)
+		id := sampling.Argmax(logits)
 		got = append(got, id)
 		if logits, err = m.forward(id, cache); err != nil {
 			t.Fatalf("continuation forward: %v", err)

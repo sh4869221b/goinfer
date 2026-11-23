@@ -1,6 +1,6 @@
 package decoder
 
-// Parity validation manifest and staleness detector (docs/completed/task-parity-coverage.md). The manifest
+// Parity validation manifest and staleness detector. The manifest
 // The parity records, testdata/parity (one <family>.json each, and shared_sets.json), record, per family, the source files its numerics depend on (shared sets via `uses`
 // plus per-family `own`), a content hash of that set, and the validation metrics.
 //
@@ -9,7 +9,8 @@ package decoder
 //   - STRUCTURE: every path in every shared set and every family's `own` list must exist on disk (catches renames).
 //   - COVERAGE: the manifest's family keys must equal the capability matrix's family set (a family added without a
 //     manifest row fails CI).
-//   - HASH/ENFORCEMENT: for each family, re-hash the SORTED, DEDUPED union of its dependency files plus the digest of
+//   - HASH/ENFORCEMENT: for each family, re-hash the SORTED, DEDUPED union of its dependency files (less the program
+//     builders, for a family with programs, whose program fingerprints stand for them) plus the digest of
 //     the kernel fingerprint table (testdata/kernel_fingerprints.json); for VALIDATED families a mismatch against the recorded deps_hash fails ("parity stale"),
 //     pending families do not.
 //
@@ -57,7 +58,7 @@ type parityManifest struct {
 type familyParity struct {
 	Uses        []string        `json:"uses"`
 	Own         []string        `json:"own"`
-	Programs    []string        `json:"programs,omitempty"` // fixture directories whose program fingerprints stand for the builders in VK5's shadow key
+	Programs    []string        `json:"programs,omitempty"` // fixture directories whose program fingerprints stand for the builders in the parity key
 	DepsHash    string          `json:"deps_hash"`
 	Status      string          `json:"status"`
 	ValidatedAt json.RawMessage `json:"validated_at"`
@@ -229,9 +230,6 @@ func familyDepFiles(m *parityManifest, fam familyParity) []string {
 	return out
 }
 
-// freshDepsHash computes the deterministic content hash over a family's
-// dependency set: for each path (sorted) write path + NUL + file bytes + NUL,
-// then mix in the kernel fingerprint table's digest. Returns "sha256:" + hex.
 // goCodeTokens reduces a Go source file to what the compiler reads: its token stream with
 // ordinary comments and layout dropped, so an edit to a comment or to formatting does not
 // re-stale a validated family. Directive comments (`//go:…`, `// +build`) are kept, because
@@ -266,9 +264,16 @@ func goCodeTokens(name string, src []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
+// freshDepsHash is a family's key as the staleness gate computes it: for each dependency path (sorted) write path + NUL +
+// content + NUL, then a tail, and return "sha256:" + hex. A family with programs leaves the builders out (isBuilder) and
+// its tail starts "programs=" and its fixtures' program fingerprints for every GOARCH (familyProgramsDigest), which stand
+// for them; every family's tail ends with the kernel fingerprint table's digest.
 func freshDepsHash(m *parityManifest, fam familyParity) (string, error) {
 	h := sha256.New()
 	for _, p := range familyDepFiles(m, fam) {
+		if len(fam.Programs) > 0 && isBuilder(p) {
+			continue
+		}
 		b, err := os.ReadFile(repoPath(p))
 		if err != nil {
 			return "", err
@@ -283,12 +288,55 @@ func freshDepsHash(m *parityManifest, fam familyParity) (string, error) {
 		h.Write(b)
 		h.Write([]byte{0})
 	}
+	if len(fam.Programs) > 0 {
+		d, err := familyProgramsDigest(fam.Programs)
+		if err != nil {
+			return "", err
+		}
+		h.Write([]byte("programs=" + d + "\n"))
+	}
 	tab, err := paritykey.ReadKernelTable(paritykey.Dir(repoPath(".")))
 	if err != nil {
 		return "", err
 	}
 	h.Write([]byte("kernel_fingerprints=" + paritykey.KernelTableDigest(tab)))
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// familyProgramsDigest is the digest of fixtures' entries in the program table, computed here: each GOARCH in sorted order
+// and a newline, then "fixture=fingerprint" lines in sorted fixture order. A fixture with no entry for a GOARCH is an error.
+func familyProgramsDigest(fixtures []string) (string, error) {
+	b, err := os.ReadFile(programFingerprintsPath)
+	if err != nil {
+		return "", err
+	}
+	var tab map[string]map[string]string
+	if err := json.Unmarshal(b, &tab); err != nil {
+		return "", err
+	}
+	return programsDigestOf(fixtures, tab)
+}
+
+// programsDigestOf is familyProgramsDigest over an already-read table. A missing or empty table is an error, never the
+// digest of nothing.
+func programsDigestOf(fixtures []string, tab map[string]map[string]string) (string, error) {
+	if len(tab) == 0 {
+		return "", fmt.Errorf("%s is missing or empty, so it cannot stand for the builders", programFingerprintsPath)
+	}
+	fx := append([]string(nil), fixtures...)
+	sort.Strings(fx)
+	d := sha256.New()
+	for _, a := range sortedKeys(tab) {
+		d.Write([]byte(a + "\n"))
+		for _, f := range fx {
+			fp, ok := tab[a][f]
+			if !ok {
+				return "", fmt.Errorf("%s has no %s entry for %s", programFingerprintsPath, a, f)
+			}
+			d.Write([]byte(f + "=" + fp + "\n"))
+		}
+	}
+	return hex.EncodeToString(d.Sum(nil)), nil
 }
 
 func TestParityManifest_fresh(t *testing.T) {
@@ -450,7 +498,7 @@ func isT3Method(m string) bool {
 	return t3Methods[m] || strings.HasPrefix(m, "shared-path (via ")
 }
 
-// identityInherited parses "identity-inherited (<method> @ <rev>)" (TE6(b), docs/tasks/task-test-efficiency-2026-09.md;
+// identityInherited parses "identity-inherited (<method> @ <rev>)" (TE6(b);
 // parity-coverage-policy.md): a family whose full logits at the current rev are byte-identical, on the same arch and
 // backend, to the build its T3 oracle ran at. <method> is that original T3 method and <rev> the rev it ran at; both
 // carry through chains of inheritance unchanged, and the row keeps the original metrics. It clears T3 exactly when the

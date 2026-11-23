@@ -13,7 +13,7 @@ import (
 // Unlike prefillLogitsVL and prefillLogitsQwenVL, this walks ids one token at a time via the Gemma 4 program walk and
 // runLayersFromEmbedPLE: Gemma 4's program has no batched causal walk (the batched walker declines its operations, and its
 // batched twin serves only the bidirectional spans). That is exact for a checkpoint that ships
-// use_bidirectional_attention="" (the E-models, docs/multimodal.md P7 entry): the reference attends to the image block
+// use_bidirectional_attention="" (the E-models, docs/multimodal.md, the Gemma 4 vision entry): the reference attends to the image block
 // strictly causally too, so a sequential per-position walk is that forward. A checkpoint with
 // use_bidirectional_attention="vision" needs the batched, blockwise-masked forward
 // (prefillLogitsGemma4VLBidirectional); GenerateGemma4VL dispatches, and this function is never called for a
@@ -79,7 +79,7 @@ func (m *Model) prefillLogitsGemma4VLBidirectionalSpans(ctx context.Context, ids
 	if err := checkImageSpans(spans, len(ids), imageEmbeds, hidden); err != nil {
 		return nil, err
 	}
-	// Passes of prefillChunkRows rows, cut outside the image blocks (MEM5-VL): each pass embeds its own rows, with the raw projected
+	// Passes of prefillChunkRows rows, cut outside the image blocks: each pass embeds its own rows, with the raw projected
 	// features (no embed scale) spliced in. A capture or a speculative tree keeps one pass.
 	n, C := len(ids), len(ids)
 	if cache.captureLayers == nil && !cache.subCapture && cache.treeRowPos == nil && cache.treeMask == nil {
@@ -195,11 +195,8 @@ func (m *Model) GenerateGemma4VLSpans(ctx context.Context, ids []int, spans []Im
 				useGPU = true
 				g.DecodeResident = true
 				gpuPos = len(ids)
-				if capper, ok := m.resident.(ResidentCapped); ok {
-					if ctxCap := capper.ContextCap(); ctxCap > 0 && gpuPos+maxTokens > ctxCap {
-						maxTokens = ctxCap - gpuPos
-						g.BudgetClamped = true // the resident cap (not the request) bounds this turn
-					}
+				if c, clamped := m.clampToResidentCap(gpuPos, maxTokens); clamped {
+					maxTokens, g.BudgetClamped = c, true
 				}
 			}
 		}
@@ -230,7 +227,7 @@ func (m *Model) GenerateGemma4VLSpans(ctx context.Context, ids []int, spans []Im
 }
 
 // gemma4VLResidentPrefill is GenerateGemma4VL's resident image prefill, then resident decode. An E-model (causal) runs
-// the whole prompt through the backend's Prefiller; a bidirectional non-E checkpoint through its ResidentSpanPrefill,
+// the whole prompt through the backend's Prefiller; a bidirectional non-E checkpoint through its SpanPrefillAvailable,
 // with each span its own block. It reports whether it ran the turn (true: the generation is done, g holds its result);
 // false means the backend has no such prefill, the resident is busy, or the prefill declined, and the caller runs the
 // CPU path. A cancelled prefill is not a decline: it ends the turn.
@@ -241,19 +238,23 @@ func (m *Model) gemma4VLResidentPrefill(ctx context.Context, out chan<- int, g *
 	var prefill func(rows [][]float32) ([]float32, error)
 	build := m.gemma4EModelImageRowsSpans
 	if m.w.Cfg.UseBidirectionalAttention != "" {
-		ssp, ok := m.resident.(ResidentSpanPrefill)
-		if !ok || gemma4IsEModel(m.w.arch) {
+		if !canStep(m.resident, stepBatch{Pass: passRows, In: inSpans, Emb: stepProbe}) || gemma4IsEModel(m.w.arch) {
 			return false
 		}
 		blocks := imageSpanBlocks(spans)
-		prefill = func(rows [][]float32) ([]float32, error) { return ssp.PrefillSpansLast(ctx, rows, 0, blocks) }
+		prefill = func(rows [][]float32) ([]float32, error) {
+			sr, err := m.step(stepBatch{Pass: passRows, Ctx: ctx, In: inSpans, Emb: rows, Spans: blocks})
+			return sr.Logits, err
+		}
 		build = m.gemma4BidirImageRowsSpans
 	} else {
-		pf, ok := m.resident.(Prefiller)
-		if !ok {
+		if !canStep(m.resident, stepBatch{Pass: passRows, Emb: stepProbe}) {
 			return false
 		}
-		prefill = func(rows [][]float32) ([]float32, error) { return pf.PrefillLast(ctx, rows, 0) }
+		prefill = func(rows [][]float32) ([]float32, error) {
+			sr, err := m.step(stepBatch{Pass: passRows, Ctx: ctx, Emb: rows})
+			return sr.Logits, err
+		}
 	}
 	if !m.tryClaimResident() {
 		return false
@@ -276,11 +277,8 @@ func (m *Model) gemma4VLResidentPrefill(ctx context.Context, out chan<- int, g *
 	}
 	g.ImgPrefillResident, g.DecodeResident = true, true
 	gpuPos := len(ids)
-	if capper, ok := m.resident.(ResidentCapped); ok {
-		if ctxCap := capper.ContextCap(); ctxCap > 0 && gpuPos+maxTokens > ctxCap {
-			maxTokens = ctxCap - gpuPos
-			g.BudgetClamped = true
-		}
+	if c, clamped := m.clampToResidentCap(gpuPos, maxTokens); clamped {
+		maxTokens, g.BudgetClamped = c, true
 	}
 	g.Budget = maxTokens
 	sampler := NewSampler(sp)
@@ -304,7 +302,7 @@ func (m *Model) gemma4VLResidentPrefill(ctx context.Context, out chan<- int, g *
 // identity (as runLayersFromEmbedPLE computes them).
 func (m *Model) gemma4ResidentMediaRow(feature []float32) []float32 {
 	hidden := m.w.arch.HiddenDim
-	row := make([]float32, m.ResidentEmbedLen())
+	row := make([]float32, m.BackendView().EmbedLen())
 	copy(row[:hidden], feature)
 	if len(row) > hidden {
 		m.gemma4PLEInputs(row[:hidden], m.w.arch.gemma4.PadTokenID, row[hidden:])
@@ -335,7 +333,7 @@ func (m *Model) gemma4EModelImageRowsSpans(ids []int, feats []float32, spans []I
 		f := feats[r*hidden : (r+1)*hidden]
 		switch gemma4VLRowsDefectForTest {
 		case 1: // planted: the placeholder's own id instead of the pad id
-			row := make([]float32, m.ResidentEmbedLen())
+			row := make([]float32, m.BackendView().EmbedLen())
 			copy(row[:hidden], f)
 			m.gemma4PLEInputs(row[:hidden], id, row[hidden:])
 			rows[i] = row

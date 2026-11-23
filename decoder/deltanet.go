@@ -1,13 +1,13 @@
 package decoder
 
 import (
-	"fmt"
 	"os"
 	"sync/atomic"
 	"time"
 
 	"github.com/townsendmerino/aikit/linalg"
 	"github.com/townsendmerino/goinfer/internal/runtime/hybridattn"
+	"github.com/townsendmerino/goinfer/internal/runtime/logs"
 )
 
 // deltaNetTiming (GOINFER_DELTANET_TIMING=1) is a diagnostic that splits gatedDeltaNetStep's cost into the three dominant
@@ -63,14 +63,14 @@ func PrintDeltaNetTiming() {
 	if elems > 0 {
 		nsPerElem = float64(recur.Nanoseconds()) / float64(elems)
 	}
-	fmt.Printf("DELTANET TIMING (%d steps): proj %.3f ms/step (%.1f%%) | recurrence %.3f ms/step (%.1f%%) | other %.3f ms/step (%.1f%%) | recurrence %.3f ns/state-elem (Σ %d elems)\n",
+	logs.Infof("DELTANET TIMING (%d steps): proj %.3f ms/step (%.1f%%) | recurrence %.3f ms/step (%.1f%%) | other %.3f ms/step (%.1f%%) | recurrence %.3f ns/state-elem (Σ %d elems)",
 		n, msPer(proj), pct(proj), msPer(recur), pct(recur), msPer(other), pct(other), nsPerElem, elems)
 }
 
 // Gated DeltaNet, the linear-attention primitive of Qwen3.5/3.6-MoE (qwen3_5_moe). It replaces softmax attention on most layers
 // with a gated delta-rule recurrence over a fixed-size per-head matrix state, so memory is O(1) in sequence length rather than a
 // growing KV cache. The math mirrors HF's torch_recurrent_gated_delta_rule plus the surrounding conv, gates and gated RMSNorm,
-// validated op-for-op against a traced golden (deltanet_test.go); see docs/completed/qwen3_5_moe.md.
+// validated op-for-op against a traced golden (deltanet_test.go);
 //
 // The CPU reference implementation lives in internal/hybridattn so backend kernel tests (metal/kernels) can exercise the single
 // production implementation without importing decoder.
@@ -106,15 +106,6 @@ func (p qwen35Params) deltaNetParams() hybridattn.DeltaNetParams {
 	}
 }
 
-// negExpAFromLog precomputes the DeltaNet decay coefficient −exp(A_log) that the
-// recurrence multiplies by softplus(a+dt_bias).
-func negExpAFromLog(aLog []float32) []float32 { return hybridattn.NegExpAFromLog(aLog) }
-
-// matvec computes y[r] = Σ_c W[r*cols+c]·x[c] for a row-major [rows,cols] weight.
-func matvec(w []float32, rows, cols int, x []float32) []float32 {
-	return hybridattn.Matvec(w, rows, cols, x)
-}
-
 // matvecWM is matvec for a WeightMat: the same M=1 projection, but routed through the shared
 // quantization-aware matmul so an int4/int8 weight uses the W4A8/W8A8 integer kernel instead of
 // being dequantized. f32 WeightMats land on the same MatmulBT path matvec uses, so the no-quant
@@ -125,26 +116,23 @@ func matvecWM(be Backend, w *linalg.WeightMat, x []float32) []float32 {
 	return y
 }
 
-// matvecWMPre is matvecWM using p's block when it was quantized for x and w (R-13; see w4a8Act).
+// matvecWMPre is matvecWM using p's block when it was quantized for x and w (see w4a8Act).
 func matvecWMPre(be Backend, w *linalg.WeightMat, p *w4a8Act, x []float32) []float32 {
 	y := make([]float32, w.Rows())
 	matmulPre(be, w, p, x, y, 1)
 	return y
 }
 
-func sigmoidf(x float32) float32  { return hybridattn.Sigmoidf(x) }
-func softplusf(x float32) float32 { return hybridattn.Softplusf(x) }
-
 // deltaState is one Gated DeltaNet layer's streaming state in the KV cache: the
 // last K-1 conv inputs (so the causal conv has its left context at decode) and
 // the recurrent matrix state S (one [head_k_dim, head_v_dim] block per value
 // head). Fixed size — independent of sequence length, and NOT position-
 // truncatable (why qwen3_5_moe falls back from prefix reuse / speculative; see
-// docs/completed/qwen3_5_moe.md).
+// ).
 type deltaState struct {
 	convWin [][]float32 // up to K-1 prior mixed_qkv vectors, oldest first
 	s       []float32   // [numV * head_k_dim * head_v_dim]
-	hq      w4a8Act     // h quantized once for in_proj_qkv and in_proj_z (R-13); rewritten every step
+	hq      w4a8Act     // h quantized once for in_proj_qkv and in_proj_z; rewritten every step
 }
 
 func newDeltaState(p qwen35Params) *deltaState {
@@ -207,9 +195,3 @@ func gatedDeltaNet(be Backend, h [][]float32, w *deltaNetWeights, p qwen35Params
 	}
 	return out
 }
-
-// l2normScaledInto writes x/‖x‖ (eps 1e-6, matching FLA's l2norm) times s into dst.
-func l2normScaledInto(dst, x []float32, s float32) { hybridattn.L2NormScaledInto(dst, x, s) }
-
-// l2normScaled returns x/‖x‖ (eps 1e-6, matching FLA's l2norm) times s.
-func l2normScaled(x []float32, s float32) []float32 { return hybridattn.L2NormScaled(x, s) }

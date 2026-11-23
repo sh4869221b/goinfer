@@ -5,13 +5,15 @@ package decoder
 import (
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TestGraniteResidentBridge validates the accessor bridge: the resident SSM builder reads the Mamba geometry, per-layer
 // mixer-kind, and correctly-shaped f32 mixer tensors through these accessors. It shape-checks the weights against the
 // projDim/convDim/dInner the kernels expect, so a wiring error surfaces here before any GPU dispatch.
 func TestGraniteResidentBridge(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	path := os.ExpandEnv("$HOME/models/granite/granite-4.0-h-tiny-Q8_0.gguf")
 	if _, err := os.Stat(path); err != nil {
 		t.Skipf("no granite model: %v", err)
@@ -22,10 +24,12 @@ func TestGraniteResidentBridge(t *testing.T) {
 	}
 	defer m.Close()
 
-	nHeads, headDim, dState, nGroups, dConv, embMul, residMul, logitScale, attnScale, ok := m.GraniteResidentParams()
+	g, ok := m.BackendView().Granite()
 	if !ok {
-		t.Fatal("GraniteResidentParams ok=false for a granite model")
+		t.Fatal("Granite ok=false for a granite model")
 	}
+	nHeads, headDim, dState, nGroups, dConv := g.NHeads, g.HeadDim, g.DState, g.NGroups, g.DConv
+	embMul, residMul, logitScale, attnScale := g.EmbMul, g.ResidMul, g.LogitScale, g.AttnScale
 	dInner := nHeads * headDim
 	convDim := dInner + 2*nGroups*dState
 	projDim := 2*dInner + 2*nGroups*dState + nHeads
@@ -39,12 +43,12 @@ func TestGraniteResidentBridge(t *testing.T) {
 	want := map[string]int{"inProj": projDim * hidden, "convW": convDim * dConv, "convB": convDim,
 		"aLog": nHeads, "d": nHeads, "dtBias": nHeads, "normW": dInner, "outProj": hidden * dInner}
 	for l := 0; l < nLayers; l++ {
-		if !m.GraniteMambaLayer(l) {
+		if !m.BackendView().Layer(l).GraniteMamba() {
 			attn++
 			continue
 		}
 		mamba++
-		inProj, convW, convB, aLog, dW, dtBias, normW, outProj := m.GraniteMambaWeights(l)
+		inProj, convW, convB, aLog, dW, dtBias, normW, outProj := m.BackendView().Layer(l).GraniteMambaWeights()
 		got := map[string]int{"inProj": len(inProj), "convW": len(convW), "convB": len(convB),
 			"aLog": len(aLog), "d": len(dW), "dtBias": len(dtBias), "normW": len(normW), "outProj": len(outProj)}
 		for k, w := range want {

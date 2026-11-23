@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// G-S11f (S11, docs/tasks/task-multimodal-support-2026-10.md): several images in one message keep their order on every
+// G-S11f: several images in one message keep their order on every
 // API surface. Each parser records where its images sat among the text parts (imageRef.at), and placeImageBlocks puts
 // each block back there.
 
@@ -112,7 +112,7 @@ func TestTwoImages_refusals(t *testing.T) {
 		t.Errorf("the cap message %q does not name the cap", m)
 	}
 	two := []imageRef{{data: []byte("a")}, {data: []byte("b")}}
-	_, err := (&loadedModel{glm: &glmOcrTower{}}).visionPromptN(nil, "", nil, two, false, "")
+	_, err := (&loadedModel{vision: &glmVision{glmOcrTower: &glmOcrTower{}}}).visionPromptN(nil, "", nil, two, false, "")
 	if err == nil || !strings.Contains(err.Error(), "GLM-OCR takes one image") {
 		t.Errorf("GLM-OCR with two images: %v", err)
 	}

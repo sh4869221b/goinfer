@@ -4,8 +4,9 @@ package cuda
 
 import (
 	"fmt"
-	"os"
 	"strconv"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/logs"
 )
 
 // prefillWidths are the default pass widths the build chooses among (prefillWidthFor), widest first; each a multiple of the block
@@ -14,8 +15,7 @@ var prefillWidths = []int{2048, 1024, prefillDefaultChunk}
 
 // prefillWidthFor is the build's default pass width: the widest of prefillWidths whose pass (pass(rows), its device scratch) fits in
 // free less margin less attach, the VRAM left after the build beyond what must stay free beside a pass (marginBesidePass) and what
-// is still to attach. When none of the wider ones fits it is prefillDefaultChunk, whose pass the context margin holds. Measurement and gates:
-// docs/tasks/task-kernel-survey-2026-10.md, "KS-B8 build".
+// is still to attach. When none of the wider ones fits it is prefillDefaultChunk, whose pass the context margin holds.
 func prefillWidthFor(free, margin, attach int64, pass func(rows int) int64) int {
 	room := free - margin - attach
 	for _, w := range prefillWidths[:len(prefillWidths)-1] {
@@ -44,7 +44,7 @@ func (r *cudaResident) choosePrefillWidth() {
 	}
 	var line string
 	r.prefillWidth, line = r.prefillWidthChoice(free)
-	fmt.Fprint(os.Stderr, line)
+	logs.InfoText(line)
 }
 
 // prefillWidthChoice is choosePrefillWidth's decision over the free VRAM it read: the width (prefillWidthFor over a pass's scratch plus
@@ -91,10 +91,10 @@ func (r *cudaResident) prefillPassRowsAt(width int) int {
 	return chunk
 }
 
-// PrefillChunkRows (decoder.ResidentPrefillChunks, matched structurally: TestKV3_residentReportsItsChunks holds the wiring) is the most rows one pass of a long prompt's prefill takes.
+// PrefillChunkRows (decoder.ResidentPrefillSubsystem, matched structurally: TestKV3_residentReportsItsChunks holds the wiring) is the most rows one pass of a long prompt's prefill takes.
 func (r *cudaResident) PrefillChunkRows() int { return r.prefillPassRows() }
 
-// PrefillTailMinRows (decoder.ResidentPrefillTailMin) is the fewest rows a prefill's last pass may have: a shorter one runs the
+// PrefillTailMinRows (decoder.ResidentCaps.TailMinRows) is the fewest rows a prefill's last pass may have: a shorter one runs the
 // exact kernels while the pass before it ran the fused ones (attnFusedMinRows).
 func (r *cudaResident) PrefillTailMinRows() int { return attnFusedMinRows }
 
@@ -113,10 +113,23 @@ func scratchBufBytes(n int) int64 {
 	return b + allocRoundSlack(b)
 }
 
-// PrefillScratchBytes (decoder.ResidentPrefillChunks) is what one ordinary prefill pass of rows rows allocates on the device beyond
+// StepScratchBytes is what a ragged step of rows decode and verify rows (no prefill chunk) allocates on the device beyond the
+// standing buffers: an ordinary pass's M-row buffers at that width and the rows' slots, positions and query scales
+// (raggedRowsWords). TestCUDAStepRagged_scratchIsPriced holds it to a step's allocations and to the pass the margin reserves.
+func (r *cudaResident) StepScratchBytes(rows int) int64 {
+	s := r.PrefillScratchBytes(rows)
+	if w := r.raggedRowsWords(rows); w > 0 {
+		s += scratchBufBytes(w)
+	}
+	return s
+}
+
+// PrefillScratchBytes (decoder.ResidentPrefillSubsystem) is what one ordinary prefill pass of rows rows allocates on the device beyond
 // the standing buffers: the M-row buffers prefillCore creates, each after the allocator's rounding. It prices a pass whose tail is
-// the last row only (PrefillLast), text only; the all-logits tails of speculative verify add an M x vocab logits block, an image pass
-// its block table, and neither is a prompt's prefill. It mirrors prefillCore's allocations by the same arithmetic, and
+// the last row only (PrefillLast), text only. The all-logits tails add a retained logits block of rows x vocab f32, grown on demand (speculative verify's
+// batchedHeadArgmax, and StepBatch's batchedHeadFull, whose row count is the draft block or the slot count: about 2.3 MiB at four
+// slots on a 151,936-entry vocabulary), and an image pass adds its block table; neither is a prompt's prefill, and neither is in
+// this figure or in ctxMarginFor. It mirrors prefillCore's allocations by the same arithmetic, and
 // TestKV3_prefillScratchBytes_matchesThePass holds it to them.
 func (r *cudaResident) PrefillScratchBytes(rows int) int64 {
 	M := rows
@@ -139,7 +152,7 @@ func (r *cudaResident) PrefillScratchBytes(rows int) int64 {
 		M * maxQDim / 4, M, // cqB, cScB
 		M * hidden / 4, M, // mqB, mScB
 		M * inter, M * inter, // gOb, uOb
-		M * inter / 4, M, M * inter, // dqB, dScB, dScrB
+		M * inter / 4, M, // dqB, dScB: glu_quant_batched writes its product into gOb, so there is no third M x inter buffer
 	} {
 		sum += scratchBufBytes(n)
 	}

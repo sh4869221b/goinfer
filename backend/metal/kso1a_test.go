@@ -16,7 +16,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// kso1aOld rebuilds the pre-KS-O1a library source from src (docs/tasks/task-kernel-survey-2026-10.md, "KS-O1a"): the
+// kso1aOld rebuilds the pre-KS-O1a library source from src: the
 // q4k_scale_min2 definition removed and each call to it put back as the two per-byte q4k_scale_min calls, so every other
 // line of the library stands where it did.
 func kso1aOld(t testing.TB, src string) string {
@@ -173,11 +173,11 @@ func TestKSO1a_phi3Speed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer mg.Close()
-	if why := residentMemoryDecline(mg); why != "" {
+	if why := residentMemoryDecline(mg, metalCtxPlan{}); why != "" {
 		fmt.Fprintf(os.Stderr, "[O1a-G3] FIT-REFUSED: %s\n", why)
 		t.Fatalf("Metal's fit guard declines Phi-3: %s", why)
 	}
-	r, err := buildResident(mg)
+	r, err := buildResident(mg, metalCtxPlan{})
 	if err != nil {
 		t.Fatal(err)
 	}

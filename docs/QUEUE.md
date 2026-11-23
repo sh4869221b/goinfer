@@ -5,11 +5,11 @@ queue, keeps its original ID, and keeps the section it was filed under.
 
 | queue | holds | the question it answers |
 |---|---|---|
-| [**performance**](queue-performance.md) | throughput, latency, kernels, residency, memory | *how fast, how much memory* |
-| [**correctness**](queue-correctness.md) | parity, numerics, goldens, quantization, families | *does it compute the right thing* |
+| **performance** | throughput, latency, kernels, residency, memory | *how fast, how much memory* |
+| **correctness** | parity, numerics, goldens, quantization, families | *does it compute the right thing* |
 | [**engineering**](queue-engineering.md) | gates, lints, censuses, tooling, process rules | *would we find out* |
-| [**release**](queue-release.md) | release gates, tagging, v1.0 criteria, capability claims | *can we tag* |
-| [**presentation**](queue-presentation.md) | web UI, README, landing site, published docs, model discovery, outbound comms | *what a user sees, reads, or can find* |
+| **release** | release gates, tagging, v1.0 criteria, capability claims | *can we tag* |
+| **presentation** | web UI, README, landing site, published docs, model discovery, outbound comms | *what a user sees, reads, or can find* |
 
 **Task docs are not queues.** `docs/task-*.md` are design records — why a thing is built as it is —
 and they are cited from **88 code comments**. A queue entry cannot carry that, so they stay where
@@ -45,7 +45,7 @@ Boxes: `linux` (nvidia-rtx2070s, CUDA) · `mac` (Apple Silicon, Metal).
 
 ## In flight
 
-- **Metal runs int8 weights natively (W8A8)**, `docs/tasks/task-metal-int8-2026-10.md`. Slice 1, dense int8 decode,
+- **Metal runs int8 weights natively (W8A8)**, `docs/completed/task-metal-int8-2026-10.md`. Slice 1, dense int8 decode,
   built 2026-10-01 with the native path off by default; F1 and F2 passed by day, F3 and S are on the Mac's night queue.
   Owner decision O1: native, once F3 and S pass.
 
@@ -128,7 +128,10 @@ RoPE-locality handling has been read with olmo3's specific defect in mind. Not i
 — filed as a suspicion, not a finding, so it travels with the rest of the open work instead
 of being rediscovered independently later.
 
-**Two decoder tests are RED on main, and neither is from the spec-x-pager work** *(observed
+~~**Two decoder tests are RED on main, and neither is from the spec-x-pager work**~~ **Both green, checked 2026-11-09
+(mbp2-fit).** `TestLoadSession_rejectsCorrupt`'s fixture broke M-04's pos-equals-tokens invariant and was fixed on
+2026-09-03 (`decoder/session_test.go:TestLoadSession_rejectsCorrupt`; the clean blob now loads); `TestParityManifest_fresh` passes on main. The entry is kept as written:
+*(observed
 2026-09-02, both A/B-confirmed pre-existing by stashing the day's changes)*. A full
 `go test ./decoder/ -v -timeout 30m` on nobara-pc ran 451 tests with exactly these two failures:
 
@@ -205,9 +208,12 @@ silently dropped off the resident path onto CPU/staged. That is a **capability r
 test problem**: the tests are correctly reporting it.
 
 **`TestPrefillAttnRowTileInvariance` fails in `./decoder/`** *(found 2026-09-02, unfiled)*. Also
-reproduces on a clean `origin/main` checkout. Not investigated.
+reproduces on a clean `origin/main` checkout. Not investigated. *Checked 2026-11-09 (mbp2-fit): not verifiable on a box without
+the Qwen2.5-Coder-0.5B GGUF (the test skips there); no commit since names the failure. Next: one run where the asset is,
+`go test -count=1 ./decoder -run '^TestPrefillAttnRowTileInvariance$' -v` (a slow test, not `-short`), read for `--- PASS`,
+and strike this entry or file the failure with its output.*
 
-**G5 leftovers** *(the harness-UX gate, `docs/tasks/task-embed-and-harness-ux.md`)*. The Claude Code half
+**G5 leftovers** (the harness-UX gate). The Claude Code half
 is done and `docs/integrations/claude-code.md` is published with measured numbers. Still open:
 - **dsh's 277 s run is un-re-measured** — deliberately parked 2026-09-02 (dsh is not installed and
   `server.md` documents the install as an ordeal). The figure stands unverified, not disproven.
@@ -228,7 +234,7 @@ is done and `docs/integrations/claude-code.md` is published with measured number
   host-RAM parking option (~257 MiB and ~43 ms for a 2.3k-token conversation, against ~8.9 s to recompute it) stays
   unbuilt.
 
-**The facade (`docs/tasks/task-embed-and-harness-ux.md` phase 1) is unblocked and undecided.** G4 was the
+**The facade is unblocked and undecided.** G4 was the
 gate and it passes at 1.21×.
 
 **Model-pull leftovers** — three small items left when `task-model-pull.md` was archived
@@ -237,7 +243,9 @@ gate and it passes at 1.21×.
 
 - ~~**Disk-space precheck** before a multi-gigabyte fetch.~~ **Done 2026-11-01** (mbp2-sb7): `pull/pull.go:checkDiskSpace`,
   on both the file-set and the checkpoint path; the free-space reader is `internal/runtime/diskfree`, shared with the sidecar's check.
-- **Split-GGUF checkpoints.** A shard is *detected* and refused by name (`Select`), so nobody
+- ~~**Split-GGUF checkpoints.**~~ **Done 2026-10-03** (checkpoint-fetch P4): `pull` fetches every shard of a
+  split quant and the decoder loads the set as one model (`decoder/gguf_split_test.go`; `docs/server.md`). Kept as written:
+  A shard is *detected* and refused by name (`Select`), so nobody
   gets one useless piece — but assembling a split checkpoint needs loader work beyond the fetch
   command, which is why it stopped at the refusal.
 - **Generate `release-assets.yml`'s matrix from `internal/modelpull/curated.json`.** Optional:
@@ -862,7 +870,7 @@ _(append with commit sha and date)_
 
 **Metal audit program** — `mac`, **DONE and archived 2026-10-05** (its last build pushed in `f7497c2c`). It ran
 `docs/audit-metal-2026-09-30.md` §10's items from 2026-10-01; the record is `docs/completed/task-metal-audit-2026-10.md`,
-and what it left open, each with a trigger, is `docs/tasks/parked/task-metal-audit-followups-2026-10.md`. The audit
+and what it left open, each with a trigger, is a private task doc. The audit
 itself stays live.
 
 **G12 · `role: "developer"` silently demoted to a user turn on the OpenAI surfaces** — `mac`,
@@ -895,7 +903,7 @@ three that pin unchanged behavior (`instructions` plumbing, the non-goal guard, 
 pass either way, as they should. Equality gate is byte-identical rendering against the equivalent
 `system` request across all six families plus the `rawPrompt` fallback.
 
-**Unblocks** Tier 0 of `docs/scoping-dsh-goinfer.md` — the dsh run can now start past this.
+**Unblocks** Tier 0 of a private planning note — the dsh run can now start past this.
 
 **Follow-up filed as G13** (`docs/queue-engineering.md`): demote-vs-alias was the wrong menu for
 `/v1/messages`. Upstream rejects an illegal role, and `anthropicRole`'s
@@ -1848,7 +1856,7 @@ maxAbsDiff=0) both pass with it on.
 ## G37 · P-20 measured, then fixed: constrained decoding 1.9× → **1.21×** — and the ratio is model-dependent by construction
 
 Measured 2026-09-02, before designing anything on top of it, per the ordering revision in
-`docs/tasks/task-embed-and-harness-ux.md` §6. P-20 was explicit that its numbers were an **estimate**
+a private task doc. P-20 was explicit that its numbers were an **estimate**
 ("Estimate 40–120 ns/token → 6–30 ms per step… plausibly 3–10× slower per token on GPU") and
 named the measurement to run; the audit itself lists P-20 among the items whose measurement is
 cheap. It cost about an hour and it changes the answer.
@@ -2009,7 +2017,7 @@ grammar implementations. Proven able to go red: mis-classifying control bytes as
 > wasn't — deleting the body would lose that lesson. **Do not cite the "72-82%" or "10-17×" figures
 > from anywhere below this notice; they are retracted.**
 
-Investigated 2026-09-21 starting from `docs/tasks/red-october.md` R10's decode-build item ("on-device
+Investigated 2026-09-21 starting from `docs/completed/red-october.md` R10's decode-build item ("on-device
 argmax for the greedy path with a K-entry MapAsync ... so the 608 KB readback goes"). Read first:
 G35/G36 above — both of R10's OTHER named decode items (the K1 rmsQuant fusion, the attention
 occupancy lever) are **already done**: G35 killed K1 on its own arithmetic (5.2%→2.2% of the token,

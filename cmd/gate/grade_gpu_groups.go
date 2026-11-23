@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// The gpu gate's cgofree (Metal) and webgpu groups as graders (SB12 step 9, docs/tasks/task-subsystems-2026-10.md): each
+// The gpu gate's cgofree (Metal) and webgpu groups as graders: each
 // verdict is a function of what the run recorded, the build and otool's output for cgofree, the adapter probe and the cells
 // for webgpu.
 
@@ -225,7 +225,7 @@ func gradeRepoLint(ok bool, out string) groupVerdict {
 		lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
 		return groupVerdict{State: groupPass, Uncounted: true, Line: lines[len(lines)-1]}
 	}
-	v := groupVerdict{State: groupFail, Line: "docs/QUEUE.md SHA citations"}
+	v := groupVerdict{State: groupFail, Line: "the queue's SHA citations"}
 	for i, ln := range strings.Split(out, "\n") {
 		if i >= 6 {
 			break

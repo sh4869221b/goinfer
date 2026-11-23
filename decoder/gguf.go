@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
-	"os"
 	"path/filepath"
 
 	"github.com/townsendmerino/aikit/embed"
 	"github.com/townsendmerino/aikit/linalg"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/logs"
+
+	"github.com/townsendmerino/goinfer/decoder/config"
 )
 
 // GGUF loading: read a quantized llama.cpp checkpoint and run it through the generic forward. The GGUF file carries both
@@ -42,50 +44,10 @@ func ggufConfig(g *embed.GGUFFile) (cfg *Config, err error) {
 			cfg.Sampling = ggufSampling(g)
 		}
 	}()
-	switch arch {
-	case "llama":
-		return ggufLlamaConfig(g)
-	case "qwen2":
-		return ggufQwen2Config(g)
-	case "qwen3":
-		return ggufQwen3Config(g)
-	case "gemma", "gemma2":
-		return ggufGemma12Config(g, arch)
-	case "gemma3", "gemma3_text":
-		return ggufGemmaConfig(g)
-	case "gemma4":
-		return ggufGemma4Config(g)
-	case "mellum":
-		return ggufMellumConfig(g)
-	case "qwen35moe":
-		return ggufQwen35Config(g)
-	case "qwen35":
-		return ggufQwen35DenseConfig(g)
-	case "qwen3moe":
-		return ggufQwen3MoeConfig(g)
-	case "laguna":
-		return ggufLagunaConfig(g)
-	case "glm4moe":
-		return ggufGlm4MoeConfig(g)
-	case "granitehybrid":
-		return ggufGraniteConfig(g)
-	case "granite":
-		return ggufGraniteDenseConfig(g)
-	case "nemotron_h":
-		return ggufNemotronConfig(g)
-	case "nemotron_h_moe": // Nemotron 3 Nano — same HF model_type "nemotron_h", llama.cpp gives it its own GGUF arch string
-		return ggufNemotronConfig(g)
-	case "deepseek2":
-		return ggufDeepseekConfig(g)
-	case "phi3":
-		return ggufPhi3Config(g)
-	case "llama4":
-		return ggufLlama4Config(g)
-	case "gpt-oss":
-		return ggufGptOssConfig(g)
-	default:
-		return nil, fmt.Errorf("decoder(gguf): architecture %q unsupported (have: llama, qwen2, qwen3, gemma, gemma2, gemma3, gemma4 [wip], mellum, qwen35moe, qwen35, qwen3moe, glm4moe, laguna, granitehybrid, granite, nemotron_h, nemotron_h_moe, deepseek2, phi3, gpt-oss)", arch)
+	if adapter, ok := ggufRegistry[arch]; ok {
+		return adapter(g)
 	}
+	return nil, errorOfKind(ErrUnsupportedModel, "decoder(gguf): architecture %q unsupported (have: %s)", arch, knownGGUFArchitectures())
 }
 
 // ggufVocabSize reads the vocab size from the embedding tensor's dims (no
@@ -143,10 +105,7 @@ func ggufLlamaConfig(g *embed.GGUFFile) (*Config, error) {
 // exactly llama's: the metadata namespace differs, so ggufLlamaConfig cannot be reused, but tensor loading is identical
 // once resolveArchitecture returns llamaTensorSchema.
 func ggufGraniteDenseConfig(g *embed.GGUFFile) (*Config, error) {
-	u := func(k string) int {
-		v, _ := g.Uint("granite." + k)
-		return int(v)
-	}
+	u := ggufUintReader(g, "granite.")
 	f := func(k string) float64 {
 		v, _ := g.Float("granite." + k)
 		return v
@@ -178,10 +137,7 @@ func ggufGraniteDenseConfig(g *embed.GGUFFile) (*Config, error) {
 // (QKVBias) and loaded by buildWeightsFromGGUF. RoPE base defaults to llama.cpp's
 // qwen2 default (1e6) when absent.
 func ggufQwen2Config(g *embed.GGUFFile) (*Config, error) {
-	u := func(k string) int {
-		v, _ := g.Uint("qwen2." + k)
-		return int(v)
-	}
+	u := ggufUintReader(g, "qwen2.")
 	cfg := &Config{
 		ModelType:       "qwen2",
 		MaxPositions:    u("context_length"),
@@ -212,10 +168,7 @@ func ggufQwen2Config(g *embed.GGUFFile) (*Config, error) {
 // derived). NEOX rope (no q/k permute, via ggufQKPermuted). RoPE base defaults to
 // llama.cpp's qwen3 default (1e6) when absent.
 func ggufQwen3Config(g *embed.GGUFFile) (*Config, error) {
-	u := func(k string) int {
-		v, _ := g.Uint("qwen3." + k)
-		return int(v)
-	}
+	u := ggufUintReader(g, "qwen3.")
 	cfg := &Config{
 		ModelType:       "qwen3",
 		MaxPositions:    u("context_length"),
@@ -249,10 +202,7 @@ func ggufQwen3Config(g *embed.GGUFFile) (*Config, error) {
 // pattern, and head_dim). Gemma 3 has no logit/attn soft-capping (that's Gemma 2),
 // so those stay zero — ValidateAssumptions rejects a Gemma 2 GGUF here.
 func ggufGemmaConfig(g *embed.GGUFFile) (*Config, error) {
-	u := func(k string) int {
-		v, _ := g.Uint("gemma3." + k)
-		return int(v)
-	}
+	u := ggufUintReader(g, "gemma3.")
 	cfg := &Config{
 		ModelType:        "gemma3",
 		MaxPositions:     u("context_length"),
@@ -287,6 +237,26 @@ func ggufGemmaConfig(g *embed.GGUFFile) (*Config, error) {
 	cfg.QueryPreAttnScalar = float64(cfg.HeadDim)
 	ggufEOS(g, cfg)
 	return cfg, nil
+}
+
+// ggufUintReader reads the unsigned metadata keys under prefix (a family's "arch." keys) as int, 0 when absent.
+func ggufUintReader(g *embed.GGUFFile, prefix string) func(k string) int {
+	return func(k string) int {
+		v, _ := g.Uint(prefix + k)
+		return int(v)
+	}
+}
+
+// ggufFloatReader reads a float metadata key under prefix, or an unsigned one as float (a value some writers store as an
+// integer), 0 when absent.
+func ggufFloatReader(g *embed.GGUFFile, prefix string) func(k string) float64 {
+	return func(k string) float64 {
+		if v, ok := g.Float(prefix + k); ok {
+			return v
+		}
+		v, _ := g.Uint(prefix + k)
+		return float64(v)
+	}
 }
 
 // ggufIntArray / ggufBoolArray coerce a GGUF array metadatum (parsed as []any)
@@ -338,10 +308,7 @@ func ggufBoolArray(v any) []bool {
 // (partial-rotary) factor for the global layers isn't in the GGUF metadata, so
 // it's set from the known Gemma 4 value (0.25). Defaults mirror ggufGemmaConfig.
 func ggufGemma4Config(g *embed.GGUFFile) (*Config, error) {
-	u := func(k string) int {
-		v, _ := g.Uint("gemma4." + k)
-		return int(v)
-	}
+	u := ggufUintReader(g, "gemma4.")
 	cfg := &Config{
 		ModelType:               "gemma4",
 		MaxPositions:            u("context_length"),
@@ -426,17 +393,8 @@ func ggufGemma4Config(g *embed.GGUFFile) (*Config, error) {
 // shapes the mellum adapter consumes (LayerTypes + a rope_parameters JSON), so
 // resolveArchitecture runs the identical descriptor build as the safetensors path.
 func ggufMellumConfig(g *embed.GGUFFile) (*Config, error) {
-	u := func(k string) int {
-		v, _ := g.Uint("mellum." + k)
-		return int(v)
-	}
-	gf := func(k string) float64 { // float-or-int metadata
-		if v, ok := g.Float("mellum." + k); ok {
-			return v
-		}
-		v, _ := g.Uint("mellum." + k)
-		return float64(v)
-	}
+	u := ggufUintReader(g, "mellum.")
+	gf := ggufFloatReader(g, "mellum.")
 	normTopK := true
 	cfg := &Config{
 		ModelType:           "mellum",
@@ -503,17 +461,8 @@ func ggufMellumConfig(g *embed.GGUFFile) (*Config, error) {
 // norm_topk_prob is not GGUF metadata and is hardcoded true to match HF Qwen3MoeConfig's default, the same convention
 // ggufMellumConfig uses for its own missing metadata.
 func ggufQwen3MoeConfig(g *embed.GGUFFile) (*Config, error) {
-	u := func(k string) int {
-		v, _ := g.Uint("qwen3moe." + k)
-		return int(v)
-	}
-	gf := func(k string) float64 {
-		if v, ok := g.Float("qwen3moe." + k); ok {
-			return v
-		}
-		v, _ := g.Uint("qwen3moe." + k)
-		return float64(v)
-	}
+	u := ggufUintReader(g, "qwen3moe.")
+	gf := ggufFloatReader(g, "qwen3moe.")
 	normTopK := true
 	cfg := &Config{
 		ModelType:           "qwen3_moe",
@@ -558,17 +507,8 @@ func ggufQwen3MoeConfig(g *embed.GGUFFile) (*Config, error) {
 //     *float64 whose nil means "compute get_mscale(factor) = 0.1*ln(factor)+1", which is what the safetensors config
 //     states. So the field is omitted at the sentinel and passed through otherwise.
 func ggufLagunaConfig(g *embed.GGUFFile) (*Config, error) {
-	u := func(k string) int {
-		v, _ := g.Uint("laguna." + k)
-		return int(v)
-	}
-	gf := func(k string) float64 {
-		if v, ok := g.Float("laguna." + k); ok {
-			return v
-		}
-		v, _ := g.Uint("laguna." + k)
-		return float64(v)
-	}
+	u := ggufUintReader(g, "laguna.")
+	gf := ggufFloatReader(g, "laguna.")
 	headDim := u("attention.key_length")
 	numLayers := u("block_count")
 	if headDim <= 0 || numLayers <= 0 {
@@ -648,7 +588,7 @@ func ggufLagunaConfig(g *embed.GGUFFile) (*Config, error) {
 			}
 		}
 	}
-	// leading_dense_block_count → the mlp_layer_types spelling lagunaFirstKDense reads,
+	// leading_dense_block_count → the mlp_layer_types spelling LagunaFirstKDense reads,
 	// so the GGUF and safetensors paths converge on one code path.
 	if k := u("leading_dense_block_count"); k > 0 {
 		cfg.MlpLayerTypes = make([]string, numLayers)
@@ -697,6 +637,108 @@ func ggufLagunaConfig(g *embed.GGUFFile) (*Config, error) {
 	return cfg, nil
 }
 
+// ggufFlintConfig builds a Flint (Cognichip) Config from the flint.* metadata
+// emitted by llama.cpp PR #21882. Per-layer full vs sliding attention is encoded
+// in flint.rope.scaling.factors (0.0 -> full_attention / NoPE, 1.0 ->
+// sliding_attention / RoPE); when absent, ValidateFlint synthesizes the upstream
+// default schedule.
+func ggufFlintConfig(g *embed.GGUFFile) (*Config, error) {
+	u := ggufUintReader(g, "flint.")
+	gf := ggufFloatReader(g, "flint.")
+	headDim := u("attention.key_length")
+	numLayers := u("block_count")
+	if headDim <= 0 || numLayers <= 0 {
+		return nil, fmt.Errorf("decoder(gguf-flint): missing attention.key_length / block_count")
+	}
+	if _, err := ggufLayerCount(numLayers); err != nil {
+		return nil, err
+	}
+	if gfn := u("expert_gating_func"); gfn != 0 && gfn != 2 {
+		return nil, fmt.Errorf("decoder(gguf-flint): expert_gating_func=%d unsupported (2 = sigmoid)", gfn)
+	}
+	normTopK := true
+	if b, ok := g.Metadata["flint.expert_weights_norm"].(bool); ok {
+		normTopK = b
+	} else if n, ok := g.Uint("flint.expert_weights_norm"); ok {
+		normTopK = n != 0
+	}
+	scale := gf("expert_weights_scale")
+	if scale == 0 {
+		scale = 1
+	}
+	base := gf("rope.freq_base")
+	if base == 0 {
+		base = 10000
+	}
+	cfg := &Config{
+		ModelType:                    "flint",
+		MaxPositions:                 u("context_length"),
+		HiddenDim:                    u("embedding_length"),
+		NumLayers:                    numLayers,
+		NumHeads:                     u("attention.head_count"),
+		NumKVHeads:                   u("attention.head_count_kv"),
+		HeadDim:                      headDim,
+		IntermediateDim:              u("feed_forward_length"),
+		MoeIntermediateSize:          u("expert_feed_forward_length"),
+		SharedExpertIntermediateSize: u("expert_shared_feed_forward_length"),
+		NumExperts:                   u("expert_count"),
+		NumExpertsPerTok:             u("expert_used_count"),
+		SlidingWindow:                u("attention.sliding_window"),
+		RoutedScalingFactor:          scale,
+		NormTopKProb:                 &normTopK,
+		HiddenAct:                    "silu",
+		VocabSize:                    ggufVocabSize(g),
+		RMSNormEps:                   gf("attention.layer_norm_rms_epsilon"),
+		RoPEGlobalBase:               base,
+	}
+	if k, ok := g.Uint("flint.leading_dense_block_count"); ok {
+		cfg.MlpOnlyLayers = make([]int, int(k))
+		for i := range cfg.MlpOnlyLayers {
+			cfg.MlpOnlyLayers[i] = i
+		}
+	}
+	if arr, ok := g.Metadata["flint.attention.sliding_window_pattern"].([]any); ok && len(arr) > 0 {
+		if len(arr) != numLayers {
+			return nil, fmt.Errorf("decoder(gguf-flint): attention.sliding_window_pattern has %d entries, want %d", len(arr), numLayers)
+		}
+		cfg.LayerTypes = make([]string, numLayers)
+		for i, v := range arr {
+			if b, _ := v.(bool); b {
+				cfg.LayerTypes[i] = "sliding_attention"
+			} else {
+				cfg.LayerTypes[i] = "full_attention"
+			}
+		}
+	} else if arr, ok := g.Metadata["flint.rope.scaling.factors"].([]any); ok && len(arr) > 0 {
+		if len(arr) != numLayers {
+			return nil, fmt.Errorf("decoder(gguf-flint): rope.scaling.factors has %d entries, want %d", len(arr), numLayers)
+		}
+		cfg.LayerTypes = make([]string, numLayers)
+		for i, v := range arr {
+			var f float64
+			if f32, ok := v.(float32); ok {
+				f = float64(f32)
+			} else if f64, ok := v.(float64); ok {
+				f = f64
+			}
+			if f == 0 {
+				cfg.LayerTypes[i] = "full_attention"
+			} else {
+				cfg.LayerTypes[i] = "sliding_attention"
+			}
+		}
+	}
+	if arr, ok := g.Metadata["flint.attention.rope_pattern"].([]any); ok && len(arr) == numLayers {
+		for i, v := range arr {
+			if b, _ := v.(bool); !b {
+				cfg.NoRopeLayerIndices = append(cfg.NoRopeLayerIndices, i)
+			}
+		}
+	}
+	ggufEOS(g, cfg)
+	return cfg, nil
+}
+
 // ggufGlm4MoeConfig builds a GLM-4.5/4.6 Config from the glm4moe.* metadata: dims,
 // the DeepSeek-style MoE counts (expert_count / expert_used_count /
 // expert_shared_count / expert_feed_forward_length), the leading_dense_block_count
@@ -704,17 +746,8 @@ func ggufLagunaConfig(g *embed.GGUFFile) (*Config, error) {
 // rope_parameters JSON (partial_rotary_factor = rope.dimension_count / head_dim) so
 // glm4moeArchitecture runs the identical descriptor build as the safetensors path.
 func ggufGlm4MoeConfig(g *embed.GGUFFile) (*Config, error) {
-	u := func(k string) int {
-		v, _ := g.Uint("glm4moe." + k)
-		return int(v)
-	}
-	gf := func(k string) float64 {
-		if v, ok := g.Float("glm4moe." + k); ok {
-			return v
-		}
-		v, _ := g.Uint("glm4moe." + k)
-		return float64(v)
-	}
+	u := ggufUintReader(g, "glm4moe.")
+	gf := ggufFloatReader(g, "glm4moe.")
 	normTopK := true
 	if b, ok := g.Metadata["glm4moe.expert_weights_norm"].(bool); ok {
 		normTopK = b
@@ -820,17 +853,8 @@ func ggufGptOssConfig(g *embed.GGUFFile) (*Config, error) {
 // embedding_scale / attention.scale / residual_scale / logit_scale. rope_parameters
 // is synthesized so graniteArchitecture runs the same descriptor build as safetensors.
 func ggufGraniteConfig(g *embed.GGUFFile) (*Config, error) {
-	u := func(k string) int {
-		v, _ := g.Uint("granitehybrid." + k)
-		return int(v)
-	}
-	gf := func(k string) float64 {
-		if v, ok := g.Float("granitehybrid." + k); ok {
-			return v
-		}
-		v, _ := g.Uint("granitehybrid." + k)
-		return float64(v)
-	}
+	u := ggufUintReader(g, "granitehybrid.")
+	gf := ggufFloatReader(g, "granitehybrid.")
 	nLayers, err := ggufLayerCount(u("block_count"))
 	if err != nil {
 		return nil, err
@@ -1020,17 +1044,8 @@ func ggufNemotronConfig(g *embed.GGUFFile) (*Config, error) {
 // descriptor build as safetensors (yarn_log_multiplier = 0.1·mscale; DeepSeek's
 // mscale == mscale_all_dim ⇒ the cos/sin attention_factor ratio is 1.0).
 func ggufDeepseekConfig(g *embed.GGUFFile) (*Config, error) {
-	u := func(k string) int {
-		v, _ := g.Uint("deepseek2." + k)
-		return int(v)
-	}
-	gf := func(k string) float64 {
-		if v, ok := g.Float("deepseek2." + k); ok {
-			return v
-		}
-		v, _ := g.Uint("deepseek2." + k)
-		return float64(v)
-	}
+	u := ggufUintReader(g, "deepseek2.")
+	gf := ggufFloatReader(g, "deepseek2.")
 	keyLen := u("attention.key_length")  // qk_nope_head_dim + qk_rope_head_dim
 	ropeDim := u("rope.dimension_count") // qk_rope_head_dim
 	sigmoid := u("expert_gating_func") == 2
@@ -1096,17 +1111,8 @@ func ggufDeepseekConfig(g *embed.GGUFFile) (*Config, error) {
 // rotary. LongRoPE (128k variants) is deferred — those store a rope.scaling block that this
 // minimal reader doesn't translate (and phi3Architecture would reject).
 func ggufPhi3Config(g *embed.GGUFFile) (*Config, error) {
-	u := func(k string) int {
-		v, _ := g.Uint("phi3." + k)
-		return int(v)
-	}
-	gf := func(k string) float64 {
-		if v, ok := g.Float("phi3." + k); ok {
-			return v
-		}
-		v, _ := g.Uint("phi3." + k)
-		return float64(v)
-	}
+	u := ggufUintReader(g, "phi3.")
+	gf := ggufFloatReader(g, "phi3.")
 	hidden, heads := u("embedding_length"), u("attention.head_count")
 	headDim := hidden / heads
 	base := gf("rope.freq_base")
@@ -1142,17 +1148,8 @@ func ggufPhi3Config(g *embed.GGUFFile) (*Config, error) {
 // NOT applied (negligible below original_max_position_embeddings; the GGUF stores it as a
 // precomputed rope_freqs.weight goinfer doesn't consume) — fine for short-prompt gates.
 func ggufLlama4Config(g *embed.GGUFFile) (*Config, error) {
-	u := func(k string) int {
-		v, _ := g.Uint("llama4." + k)
-		return int(v)
-	}
-	gf := func(k string) float64 {
-		if v, ok := g.Float("llama4." + k); ok {
-			return v
-		}
-		v, _ := g.Uint("llama4." + k)
-		return float64(v)
-	}
+	u := ggufUintReader(g, "llama4.")
+	gf := ggufFloatReader(g, "llama4.")
 	nLayers, err := ggufLayerCount(u("block_count"))
 	if err != nil {
 		return nil, err
@@ -1345,7 +1342,7 @@ func StreamTranscodeGGUF(ctx context.Context, path string, out io.Writer, quant 
 	// into cfg.EOSTokenID so it round-trips through the bundle. Without it a .giw would carry only the raw GGUF-metadata EOS,
 	// dropping any extra stop id from a sibling generation_config.json, and the stream would diverge from the resident bundle
 	// (TestStreamTranscodeMatchesResident byte-diffs the two).
-	if raw, jerr := json.Marshal(resolveEOSIDs(filepath.Dir(path), cfg)); jerr == nil {
+	if raw, jerr := json.Marshal(config.ResolveEOSIDs(filepath.Dir(path), cfg)); jerr == nil {
 		cfg.EOSTokenID = raw
 	}
 	if err := validateGGUFDims(cfg); err != nil {
@@ -1471,14 +1468,14 @@ func LoadGGUFBytes(raw []byte, opts Options) (*Model, error) {
 		closeBackend(be)
 		return nil, err
 	}
-	w, err := buildGGUFWeights(g, quant, opts.EmbedInt4, wantsCanonicalInt4(opts.Backend, be), !wantsRow4Fallback(opts.Backend), opts.LoadAbort)
+	w, err := buildGGUFWeights(g, quant, opts.EmbedInt4, wantsCanonicalInt4(opts.Backend, be), !wantsRow4Fallback(opts.layoutBackend()), opts.LoadAbort)
 	g.Close()
 	if err != nil {
 		closeBackend(be)
 		return nil, err
 	}
 	if beErr != nil {
-		fmt.Fprintln(os.Stderr, beErr) // webgpu requested but fell back — not fatal (N-03: stderr, not stdout — never contaminate a piped token stream)
+		logs.Warnf("%v", beErr) // webgpu requested but fell back — not fatal (stderr, not stdout — never contaminate a piped token stream)
 	}
 	m := modelFromOptions(w, be, opts)
 	m.quant = opts.Quant
@@ -1487,8 +1484,8 @@ func LoadGGUFBytes(raw []byte, opts Options) (*Model, error) {
 
 // ggufRowFilter, when non-nil, rewrites each dequantized layer-matmul row (streamMat,
 // streamMatBatched and Phi-3's fusedSplit) before it is quantized. A test seam only: set by SetGGUFRowFilterForTest under
-// goinfer_testhooks, nil in every production build. docs/tasks/task-int4-weight-quality-2026-09.md
-// Phase 0 uses it to fake-quantize rows by their source GGUF type.
+// goinfer_testhooks, nil in every production build. It is used
+// to fake-quantize rows by their source GGUF type.
 var ggufRowFilter func(name string, row []float32)
 
 // ggufRowFiltered reads one row through the dequantizer and applies ggufRowFilter.
@@ -1502,20 +1499,30 @@ func ggufRowFiltered(name string, into func(start int, dst []float32) error, sta
 	return nil
 }
 
-// q4kMat builds the native Q4_K WeightMat for quantQ4K: output rows [0, out) of tensor name, where
+// q4kMat builds the native K-quant WeightMat for quantQ4K: output rows [0, out) of tensor name, where
 // rowSrc(r) is destination row r's element offset in the tensor (a permutation for RoPE-permuted
-// q/k, an offset for a fused split). ok is false, with a nil error, when the tensor is not stored as
-// Q4_K; the caller then loads it at int8 W8A8. The super-blocks are COPIED: loadGGUFWeights closes
-// the mapping once the load returns.
-func q4kMat(g *embed.GGUFFile, name string, out, in int, rowSrc func(r int) int) (linalg.WeightMat, bool, error) {
+// q/k, an offset for a fused split). A Q4_K tensor is always kept as Q4_K; a Q5_K or Q6_K one only
+// when native56 is set (q4kNative56). ok is false, with a nil error, for any other tensor; the
+// caller then loads it at int8 W8A8. The super-blocks are COPIED: loadGGUFWeights closes the
+// mapping once the load returns.
+func q4kMat(g *embed.GGUFFile, name string, out, in int, rowSrc func(r int) int, native56 bool) (linalg.WeightMat, bool, error) {
+	wrap, rowBytes := linalg.WrapQ4K, linalg.Q4KRowBytes
 	dims, raw, ok, err := g.Q4KRaw(name)
+	if err == nil && !ok && native56 {
+		if dims, raw, ok, err = g.Q5KRaw(name); err == nil && ok {
+			wrap, rowBytes = linalg.WrapQ5K, linalg.Q5KRowBytes
+		} else if err == nil {
+			dims, raw, ok, err = g.Q6KRaw(name)
+			wrap, rowBytes = linalg.WrapQ6K, linalg.Q6KRowBytes
+		}
+	}
 	if err != nil || !ok {
 		return linalg.WeightMat{}, false, err
 	}
 	if len(dims) != 2 || dims[0] != in || in%256 != 0 {
 		return linalg.WeightMat{}, false, fmt.Errorf("decoder(gguf): %q dims %v for a q4k load of [%d, %d]", name, dims, out, in)
 	}
-	rb := linalg.Q4KRowBytes(in)
+	rb := rowBytes(in)
 	buf := make([]byte, out*rb)
 	for r := range out {
 		off := rowSrc(r)
@@ -1525,9 +1532,26 @@ func q4kMat(g *embed.GGUFFile, name string, out, in int, rowSrc func(r int) int)
 		src := off / in
 		copy(buf[r*rb:(r+1)*rb], raw[src*rb:(src+1)*rb])
 	}
-	wm, err := linalg.WrapQ4K(buf, out, in)
+	wm, err := wrap(buf, out, in)
 	return wm, err == nil, err
 }
+
+// q4kNative56 reports whether a q4k load keeps the file's Q5_K and Q6_K projections natively instead of widening them to
+// int8: only where linalg has an arch kernel for them (linalg.KQuantNative; the portable dot is far slower than int8), and
+// only for a CPU reader: a heap load with needCanonical false (no GPU lane, which takes those blocks from the int8 copy
+// through KQuantReader), or a .giw written for the cpu-amd64 target (kinds 11 and 12; every other target widens).
+func q4kNative56(needCanonical bool, sink *giwWriter) bool {
+	if !linalg.KQuantNative() || q4kWiden56ForTest {
+		return false
+	}
+	if sink != nil {
+		return sink.target == GIWTargetCPUAmd64
+	}
+	return !needCanonical
+}
+
+// q4kWiden56ForTest restores the int8 widening of Q5_K and Q6_K on every q4k load, for the test that compares the two.
+var q4kWiden56ForTest = false
 
 // buildWeightsFromGGUF dequantizes the GGUF tensors into the weight bundle. When quant is set, each matmul tensor is
 // re-quantized (per-row int8 or group-wise int4) right after it is dequantized (and un-permuted) and its f32 is freed, so
@@ -1545,6 +1569,7 @@ func buildWeightsFromGGUF(cfg *Config, arch *Architecture, g *embed.GGUFFile, qu
 	hidden, hd := arch.HiddenDim, arch.HeadDim
 	w := &Weights{Cfg: *cfg, arch: arch, Layers: make([]LayerWeights, arch.NumLayers)}
 	skipRow4 = skipRow4 || !repackForDecode(sink) // every closure and family branch below takes it from here
+	native56 := q4kNative56(needCanonical, sink)
 
 	// streamMat builds a [out, in] linalg.WeightMat by streaming the tensor's rows through
 	// the GGUF dequantizer and quantizing each row directly into the resident
@@ -1552,16 +1577,16 @@ func buildWeightsFromGGUF(cfg *Config, arch *Architecture, g *embed.GGUFFile, qu
 	// a destination row index to its source element offset in the tensor (identity
 	// for a plain load; a permutation for the RoPE-permuted q/k projections).
 	streamMat := func(name string, out, in int, mode quantMode, rowSrc func(r int) int) (linalg.WeightMat, error) {
-		dims, into, err := g.RowDequantizer(name)
+		dims, into, err := ggufScaledRowDequantizer(g, name)
 		if err != nil {
 			return linalg.WeightMat{}, err
 		}
 		if len(dims) != 2 || dims[0] != in || dims[1] != out {
 			return linalg.WeightMat{}, fmt.Errorf("decoder(gguf): %q dims %v, want [in=%d, out=%d]", name, dims, in, out)
 		}
-		q4k := mode == quantQ4K
+		q4k := mode == quantQ4K && !g.Has(name+".scale")
 		if q4k {
-			if wm, ok, err := q4kMat(g, name, out, in, rowSrc); ok || err != nil {
+			if wm, ok, err := q4kMat(g, name, out, in, rowSrc, native56); ok || err != nil {
 				return wm, err
 			}
 			mode = quantInt8I8
@@ -1579,16 +1604,16 @@ func buildWeightsFromGGUF(cfg *Config, arch *Architecture, g *embed.GGUFFile, qu
 	// streamQuantizedBatchedProj instead of streamQuantized, so it may build repacked-only int4 when this load's backend
 	// allows it. See quantizeBatchedProjWM for the safety argument.
 	streamMatBatched := func(name string, out, in int, mode quantMode, rowSrc func(r int) int) (linalg.WeightMat, error) {
-		dims, into, err := g.RowDequantizer(name)
+		dims, into, err := ggufScaledRowDequantizer(g, name)
 		if err != nil {
 			return linalg.WeightMat{}, err
 		}
 		if len(dims) != 2 || dims[0] != in || dims[1] != out {
 			return linalg.WeightMat{}, fmt.Errorf("decoder(gguf): %q dims %v, want [in=%d, out=%d]", name, dims, in, out)
 		}
-		q4k := mode == quantQ4K
+		q4k := mode == quantQ4K && !g.Has(name+".scale")
 		if q4k {
-			if wm, ok, err := q4kMat(g, name, out, in, rowSrc); ok || err != nil {
+			if wm, ok, err := q4kMat(g, name, out, in, rowSrc, native56); ok || err != nil {
 				return wm, err
 			}
 			mode = quantInt8I8
@@ -1613,7 +1638,7 @@ func buildWeightsFromGGUF(cfg *Config, arch *Architecture, g *embed.GGUFFile, qu
 	// embMatAt streams an embedding-shaped table at q through streamQuantizedEmbed, which may build repacked-only when
 	// needCanonical is false and int4 mode applies; see that function.
 	embMatAt := func(name string, out, in int, q quantMode) (linalg.WeightMat, error) {
-		dims, into, err := g.RowDequantizer(name)
+		dims, into, err := ggufScaledRowDequantizer(g, name)
 		if err != nil {
 			return linalg.WeightMat{}, err
 		}
@@ -1632,7 +1657,7 @@ func buildWeightsFromGGUF(cfg *Config, arch *Architecture, g *embed.GGUFFile, qu
 			*dst = m
 			return err
 		}
-		dims, into, err := g.RowDequantizer(name)
+		dims, into, err := ggufScaledRowDequantizer(g, name)
 		if err != nil {
 			return err
 		}
@@ -1709,7 +1734,7 @@ func buildWeightsFromGGUF(cfg *Config, arch *Architecture, g *embed.GGUFFile, qu
 	// (fastest-first) blob where each expert occupies a contiguous [out, in]
 	// row-major slice — and returns one quantized linalg.WeightMat per expert.
 	stackedExperts := func(name string, out, in, nExpert int) ([]linalg.WeightMat, error) {
-		dims, into, err := g.RowDequantizer(name)
+		dims, into, err := ggufScaledRowDequantizer(g, name)
 		if err != nil {
 			return nil, err
 		}
@@ -1753,7 +1778,7 @@ func buildWeightsFromGGUF(cfg *Config, arch *Architecture, g *embed.GGUFFile, qu
 		rowSrc := func(r int) int { return (rowStart + r) * in }
 		q4k := mode == quantQ4K
 		if q4k {
-			if wm, ok, err := q4kMat(g, name, rows, in, rowSrc); ok || err != nil {
+			if wm, ok, err := q4kMat(g, name, rows, in, rowSrc, native56); ok || err != nil {
 				return wm, err
 			}
 			mode = quantInt8I8
@@ -1809,1171 +1834,67 @@ func buildWeightsFromGGUF(cfg *Config, arch *Architecture, g *embed.GGUFFile, qu
 		}
 	}
 
-	// qwen3_5_moe (qwen35moe): the Gated DeltaNet / gated-softmax hybrid. The GGUF
-	// converter bakes layout transforms the HF safetensors path never sees — V
-	// heads tiled (num_v>num_k), A_log stored as −exp(A_log), the standard norms
-	// (1+w)'d (ssm_norm exempt) — all reversed here so the shared forward runs
-	// unchanged. Attention stays f32 (parity-first, like the safetensors path);
-	// experts/embeddings quantize. Only blk.{0..NumLayers-1} load — the trailing
-	// NextN/MTP block is excluded by ggufQwen35Config's NumLayers.
+	b := &ggufBuild{arch: arch, g: g, w: w, quant: quant, needCanonical: needCanonical, skipRow4: skipRow4, sink: sink, abort: abort,
+		hidden: hidden, streamMat: streamMat, mat: mat, vec: vec, vnorm: vnorm, stackedExperts: stackedExperts, hd: hd, permMat: permMat, cfg: cfg, embInto: embInto, id: id, fusedSplit: fusedSplit}
+
 	if q := arch.qwen35; q != nil {
-		numK, numV := q.NumKeyHeads, q.NumValueHeads
-		vpk := numV / numK
-		hkd, hvd := q.KeyHeadDim, q.ValueHeadDim
-		keyDim, valueDim := hkd*numK, hvd*numV
-		convDim := 2*keyDim + valueDim
-		// f32mat dequantizes a [out, in] tensor to a row-major f32 slice. Some of these need a
-		// layout transform (untileVHeads) before they can be used, so the f32 form is still the
-		// working intermediate; wmQ below wraps the result and applies Options.Quant.
-		f32mat := func(name string, out, in int) ([]float32, error) {
-			dims, data, derr := g.Tensor(name)
-			if derr != nil {
-				return nil, derr
-			}
-			if len(dims) != 2 || dims[0] != in || dims[1] != out {
-				return nil, fmt.Errorf("decoder(gguf-qwen35): %q dims %v, want [in=%d, out=%d]", name, dims, in, out)
-			}
-			return data, nil
-		}
-		// wmQ is f32mat + Options.Quant, for the projections that dominate decode bandwidth. Transform-then-quantize: the untile
-		// below has to see f32. These are the projections for which the row4 side-copy is waste, so both route through the
-		// skip-aware wrapper like every other family's layer projections.
-		wmQ := func(name string, out, in int) (linalg.WeightMat, error) {
-			f, e := f32mat(name, out, in)
-			if e != nil {
-				return linalg.WeightMat{}, e
-			}
-			return quantizeLayerWM(linalg.WrapF32(f, out, in), quant, needCanonical, skipRow4), nil
-		}
-		wrapQ := func(f []float32, out, in int) linalg.WeightMat {
-			return quantizeLayerWM(linalg.WrapF32(f, out, in), quant, needCanonical, skipRow4)
-		}
-		loadQ35 := func(i int) error {
-			l := &w.Layers[i]
-			p := fmt.Sprintf("blk.%d.", i)
-			var e error
-			// attn_norm = input_layernorm (pre-attn); post_attention_norm =
-			// post_attention_layernorm (pre-MLP, Pre2). Both (1+w)'d → vnorm subtracts.
-			if l.PreAttnNorm, e = vnorm(p+"attn_norm.weight", hidden); e != nil {
-				return e
-			}
-			if l.PreMLPNorm, e = vnorm(p+"post_attention_norm.weight", hidden); e != nil {
-				return e
-			}
-			if arch.isLinearLayer(i) {
-				d := &deltaNetWeights{}
-				// in_proj_qkv (attn_qkv): only the V output rows are tiled; q/k untouched.
-				qkv, err := f32mat(p+"attn_qkv.weight", convDim, hidden)
-				if err != nil {
-					return err
-				}
-				vOff := 2 * keyDim * hidden
-				copy(qkv[vOff:], untileVHeads(qkv[vOff:], 1, numK, vpk, hvd, hidden))
-				d.inProjQKV = wrapQ(qkv, convDim, hidden)
-				// in_proj_z (attn_gate): all rows tiled.
-				z, err := f32mat(p+"attn_gate.weight", valueDim, hidden)
-				if err != nil {
-					return err
-				}
-				d.inProjZ = wrapQ(untileVHeads(z, 1, numK, vpk, hvd, hidden), valueDim, hidden)
-				// in_proj_a / in_proj_b (ssm_alpha/ssm_beta): one row per value head (hd=1).
-				a, err := f32mat(p+"ssm_alpha.weight", numV, hidden)
-				if err != nil {
-					return err
-				}
-				d.inProjA = untileVHeads(a, 1, numK, vpk, 1, hidden)
-				b, err := f32mat(p+"ssm_beta.weight", numV, hidden)
-				if err != nil {
-					return err
-				}
-				d.inProjB = untileVHeads(b, 1, numK, vpk, 1, hidden)
-				// conv1d (ssm_conv1d): only the V channel block tiled; trail = kernel width.
-				cw, err := f32mat(p+"ssm_conv1d.weight", convDim, q.ConvKernel)
-				if err != nil {
-					return err
-				}
-				vOffC := 2 * keyDim * q.ConvKernel
-				copy(cw[vOffC:], untileVHeads(cw[vOffC:], 1, numK, vpk, hvd, q.ConvKernel))
-				d.convW = cw
-				// ssm_a is already −exp(A_log); reorder by value head (1-D).
-				av, err := vec(p+"ssm_a", numV)
-				if err != nil {
-					return err
-				}
-				d.negExpA = untileVHeads(av, 1, numK, vpk, 1, 1)
-				// dt_bias (ssm_dt.bias): reorder by value head (1-D).
-				dt, err := vec(p+"ssm_dt.bias", numV)
-				if err != nil {
-					return err
-				}
-				d.dtBias = untileVHeads(dt, 1, numK, vpk, 1, 1)
-				// ssm_norm: per-head_v_dim gated-RMSNorm weight — NOT tiled and NOT
-				// (1+w)'d by the converter, so load raw (vec, not vnorm).
-				if d.normW, err = vec(p+"ssm_norm.weight", hvd); err != nil {
-					return err
-				}
-				// out_proj (ssm_out): the value/input columns are tiled.
-				op, err := f32mat(p+"ssm_out.weight", hidden, valueDim)
-				if err != nil {
-					return err
-				}
-				d.outProj = wrapQ(untileVHeads(op, hidden, numK, vpk, hvd, 1), hidden, valueDim)
-				l.delta = d
-			} else {
-				// Gated softmax layer: double-width q_proj (query ‖ gate per head, kept
-				// fused in attn_q), per-head QK-norm. NEOX rope ⇒ no q/k permute.
-				a := &qwenAttnWeights{}
-				shd := arch.HeadDim
-				kvDim := arch.NumKVHeads * shd
-				if a.qProj, e = wmQ(p+"attn_q.weight", arch.NumHeads*shd*2, hidden); e != nil {
-					return e
-				}
-				if a.kProj, e = wmQ(p+"attn_k.weight", kvDim, hidden); e != nil {
-					return e
-				}
-				if a.vProj, e = wmQ(p+"attn_v.weight", kvDim, hidden); e != nil {
-					return e
-				}
-				if a.oProj, e = wmQ(p+"attn_output.weight", hidden, arch.NumHeads*shd); e != nil {
-					return e
-				}
-				if a.qNorm, e = vnorm(p+"attn_q_norm.weight", shd); e != nil {
-					return e
-				}
-				if a.kNorm, e = vnorm(p+"attn_k_norm.weight", shd); e != nil {
-					return e
-				}
-				l.qattn = a
-			}
-			// DENSE (Qwen3.8, llama.cpp arch "qwen35"): a plain SwiGLU where the MoE sibling has a router. The rest of this loader (the
-			// V un-tile, the -exp(A_log) un-bake, the (1+w) norms) is shared.
-			if arch.MoE == nil {
-				if l.GateProj, e = mat(p+"ffn_gate.weight", arch.IntermediateDim, hidden); e != nil {
-					return e
-				}
-				if l.UpProj, e = mat(p+"ffn_up.weight", arch.IntermediateDim, hidden); e != nil {
-					return e
-				}
-				if l.DownProj, e = mat(p+"ffn_down.weight", hidden, arch.IntermediateDim); e != nil {
-					return e
-				}
-				return nil
-			}
-			// MoE FFN (every layer): router f32 (matching safetensors), 256 stacked
-			// experts quantized, shared expert quantized + f32 sigmoid gate.
-			if l.Router, e = streamMat(p+"ffn_gate_inp.weight", arch.MoE.NumExperts, hidden, quantNone, func(r int) int { return r * hidden }); e != nil {
-				return e
-			}
-			expInter := arch.MoE.IntermediateDim
-			gate, gerr := stackedExperts(p+"ffn_gate_exps.weight", expInter, hidden, arch.MoE.NumExperts)
-			up, uerr := stackedExperts(p+"ffn_up_exps.weight", expInter, hidden, arch.MoE.NumExperts)
-			down, derr := stackedExperts(p+"ffn_down_exps.weight", hidden, expInter, arch.MoE.NumExperts)
-			if gerr != nil || uerr != nil || derr != nil {
-				return fmt.Errorf("decoder(gguf-qwen35): experts layer %d: %v / %v / %v", i, gerr, uerr, derr)
-			}
-			l.Experts = make([]expertWeights, arch.MoE.NumExperts)
-			for ei := range arch.MoE.NumExperts {
-				l.Experts[ei] = expertWeights{Gate: gate[ei], Up: up[ei], Down: down[ei]}
-			}
-			sInter := arch.MoE.SharedIntermediateDim
-			if l.SharedExpert.Gate, e = mat(p+"ffn_gate_shexp.weight", sInter, hidden); e != nil {
-				return e
-			}
-			if l.SharedExpert.Up, e = mat(p+"ffn_up_shexp.weight", sInter, hidden); e != nil {
-				return e
-			}
-			if l.SharedExpert.Down, e = mat(p+"ffn_down_shexp.weight", hidden, sInter); e != nil {
-				return e
-			}
-			// shared_expert_gate (ffn_gate_inp_shexp): 1-D [hidden] → [1, hidden] f32.
-			sg, err := vec(p+"ffn_gate_inp_shexp.weight", hidden)
-			if err != nil {
-				return err
-			}
-			l.SharedGate = linalg.WrapF32(sg, 1, hidden)
-			return nil
-		}
-		// Streaming (sink != nil, e.g. cmd/prequant): loadQ35 builds one layer's data independently of every other layer
-		// (parallelLayers's concurrency is a speed choice, not a correctness dependency), so streamLayers' build, write and
-		// release, a window of layers at a time, writes bit-identical per-layer output while bounding peak RSS to about one
-		// window. Non-streaming (sink == nil): all layers in parallel.
-		if sink != nil {
-			if err := streamLayers(w, arch, sink, loadQ35); err != nil {
-				return nil, err
-			}
-			return w, nil
-		}
-		if err := parallelLayers(arch.NumLayers, abort, loadQ35); err != nil {
-			return nil, err
-		}
-		return w, nil
+		return b.loadQwen35(q)
 	}
 
-	// gpt-oss: sparse MoE on every layer with per-head attention sinks, per-expert biases and a router-logit bias. q/k/v/o all
-	// carry biases; no QK-norm. Attention/embeddings/router quantize per policy; the (F32) sinks and biases load raw. The
-	// expert weights are MXFP4 (ggml type 39) in the real checkpoint; stackedExperts routes them through aikit's
-	// RowDequantizer.
 	if arch.gptoss != nil {
-		nH, nKV := arch.NumHeads, arch.NumKVHeads
-		qDim, kvDim := nH*hd, nKV*hd
-		nExp := arch.MoE.NumExperts
-		expInter := arch.MoE.IntermediateDim
-		// stackedExpertBias slices a 2-D [out, nExpert] (fastest-first) f32 bias
-		// tensor into one [out] slice per expert (expert e occupies [e*out, e*out+out)).
-		stackedExpertBias := func(name string, out int) ([][]float32, error) {
-			dims, data, derr := g.Tensor(name)
-			if derr != nil {
-				return nil, derr
-			}
-			if len(dims) != 2 || dims[0] != out || dims[1] != nExp {
-				return nil, fmt.Errorf("decoder(gguf-gptoss): %q dims %v, want [out=%d, experts=%d]", name, dims, out, nExp)
-			}
-			res := make([][]float32, nExp)
-			for e := range nExp {
-				res[e] = append([]float32(nil), data[e*out:(e+1)*out]...)
-			}
-			return res, nil
-		}
-		loadGptOss := func(i int) error {
-			l := &w.Layers[i]
-			p := fmt.Sprintf("blk.%d.", i)
-			var e error
-			if l.PreAttnNorm, e = vnorm(p+"attn_norm.weight", hidden); e != nil {
-				return e
-			}
-			if l.PreMLPNorm, e = vnorm(p+"post_attention_norm.weight", hidden); e != nil {
-				return e
-			}
-			// Attention: q/k/v/o projections + biases. gpt-oss GGUF stores q/k in HF
-			// order (no undo_permute), so a plain mat load — no permMat.
-			if l.QProj, e = mat(p+"attn_q.weight", qDim, hidden); e != nil {
-				return e
-			}
-			if l.KProj, e = mat(p+"attn_k.weight", kvDim, hidden); e != nil {
-				return e
-			}
-			if l.VProj, e = mat(p+"attn_v.weight", kvDim, hidden); e != nil {
-				return e
-			}
-			if l.OProj, e = mat(p+"attn_output.weight", hidden, qDim); e != nil {
-				return e
-			}
-			if l.QBias, e = vec(p+"attn_q.bias", qDim); e != nil {
-				return e
-			}
-			if l.KBias, e = vec(p+"attn_k.bias", kvDim); e != nil {
-				return e
-			}
-			if l.VBias, e = vec(p+"attn_v.bias", kvDim); e != nil {
-				return e
-			}
-			if l.OBias, e = vec(p+"attn_output.bias", hidden); e != nil {
-				return e
-			}
-			if l.AttnSinks, e = vec(p+"attn_sinks.weight", nH); e != nil {
-				return e
-			}
-			// MoE: router (+ logit bias) + stacked routed experts (+ per-expert biases). Router stays f32 regardless of the ambient
-			// quant mode (matching gptoss_safetensors.go and qwen35's streamMat(..., quantNone, ...) below): top-k selection is
-			// discrete, so quantizing it flips which experts win rather than adding rounding noise. Plain mat() would quantize it.
-			if l.Router, e = streamMat(p+"ffn_gate_inp.weight", nExp, hidden, quantNone, func(r int) int { return r * hidden }); e != nil {
-				return e
-			}
-			if l.RouterBias, e = vec(p+"ffn_gate_inp.bias", nExp); e != nil {
-				return e
-			}
-			gate, ge := stackedExperts(p+"ffn_gate_exps.weight", expInter, hidden, nExp)
-			up, ue := stackedExperts(p+"ffn_up_exps.weight", expInter, hidden, nExp)
-			down, de := stackedExperts(p+"ffn_down_exps.weight", hidden, expInter, nExp)
-			if ge != nil || ue != nil || de != nil {
-				return fmt.Errorf("decoder(gguf-gptoss): experts layer %d: %v / %v / %v", i, ge, ue, de)
-			}
-			gb, gbe := stackedExpertBias(p+"ffn_gate_exps.bias", expInter)
-			ub, ube := stackedExpertBias(p+"ffn_up_exps.bias", expInter)
-			db, dbe := stackedExpertBias(p+"ffn_down_exps.bias", hidden)
-			if gbe != nil || ube != nil || dbe != nil {
-				return fmt.Errorf("decoder(gguf-gptoss): expert biases layer %d: %v / %v / %v", i, gbe, ube, dbe)
-			}
-			l.Experts = make([]expertWeights, nExp)
-			for ei := range nExp {
-				l.Experts[ei] = expertWeights{
-					Gate: gate[ei], Up: up[ei], Down: down[ei],
-					GateBias: gb[ei], UpBias: ub[ei], DownBias: db[ei],
-				}
-			}
-			return nil
-		}
-		// Streaming (sink != nil): loadGptOss builds one layer's data independently of every other layer (every tensor it reads is
-		// named blk.{i}.*, including the per-layer AttnSinks and RouterBias; stackedExperts and stackedExpertBias are per-tensor
-		// RowDequantizer reads keyed by the same name), so the loadQ35 shape applies: streamLayers' build, write and release
-		// bounds peak RSS to about one window. Non-streaming (sink == nil): all layers in parallel.
-		if sink != nil {
-			if err := streamLayers(w, arch, sink, loadGptOss); err != nil {
-				return nil, err
-			}
-			return w, nil
-		}
-		if err := parallelLayers(arch.NumLayers, abort, loadGptOss); err != nil {
-			return nil, err
-		}
-		return w, nil
+		return b.loadGptOss()
 	}
 
-	// Laguna (poolside). llama.cpp names its tensors the way every other MoE family here is named, so the only genuinely new
-	// one is blk.N.attn_gate.weight, the softplus output gate. Two shape details drive the rest:
-	//
-	//   * qDim is per layer (arch.headsAt(i)): full-attention and sliding layers project different head counts, so
-	//     attn_q/attn_output differ by layer.
-	//   * the gate's granularity is read from attn_gate's row count, exactly as the safetensors loader does, because neither
-	//     format carries a trustworthy declaration of it (XS.2's config says per-element and ships per-head).
-	//
-	// Experts are fused and stacked per projection (ffn_*_exps), the shared expert is *_shexp, and the router bias is
-	// exp_probs_b: all shapes goinfer already reads for GLM/DeepSeek/Granite. Layers below FirstKDense are plain dense FFNs.
 	if arch.laguna != nil {
-		kvDim := arch.NumKVHeads * arch.HeadDim
-		// exp_probs_b is 1-D; the shared `mat` helper wants 2-D, so read it as a flat
-		// vector the same way the other MoE GGUF loaders do.
-		flat := func(name string, n int) ([]float32, error) { // 1-D or [1,n]/[n,1] → n floats
-			_, data, derr := g.Tensor(name)
-			if derr != nil {
-				return nil, derr
-			}
-			if len(data) != n {
-				return nil, fmt.Errorf("decoder(gguf-laguna): %q has %d elems, want %d", name, len(data), n)
-			}
-			return data, nil
-		}
-		loadLaguna := func(i int) error {
-			l := &w.Layers[i]
-			p := fmt.Sprintf("blk.%d.", i)
-			lqDim := arch.headsAt(i) * arch.HeadDim
-			var e error
-			if l.PreAttnNorm, e = vnorm(p+"attn_norm.weight", hidden); e != nil {
-				return e
-			}
-			if l.PreMLPNorm, e = vnorm(p+"ffn_norm.weight", hidden); e != nil {
-				return e
-			}
-			if l.QProj, e = mat(p+"attn_q.weight", lqDim, hidden); e != nil {
-				return e
-			}
-			if l.KProj, e = mat(p+"attn_k.weight", kvDim, hidden); e != nil {
-				return e
-			}
-			if l.VProj, e = mat(p+"attn_v.weight", kvDim, hidden); e != nil {
-				return e
-			}
-			if l.OProj, e = mat(p+"attn_output.weight", hidden, lqDim); e != nil {
-				return e
-			}
-			if l.QNorm, e = vnorm(p+"attn_q_norm.weight", arch.HeadDim); e != nil {
-				return e
-			}
-			if l.KNorm, e = vnorm(p+"attn_k_norm.weight", arch.HeadDim); e != nil {
-				return e
-			}
-			// The gate: per-head (headsAt rows) or per-element (headsAt*headDim). Try the
-			// per-head shape first and fall back, so both are accepted and anything else
-			// is a hard error rather than a silently mis-shaped gate.
-			if l.GProj, e = mat(p+"attn_gate.weight", arch.headsAt(i), hidden); e != nil {
-				if l.GProj, e = mat(p+"attn_gate.weight", lqDim, hidden); e != nil {
-					return fmt.Errorf("decoder(gguf-laguna): layer %d attn_gate is neither per-head [%d,%d] nor per-element [%d,%d]: %w",
-						i, arch.headsAt(i), hidden, lqDim, hidden, e)
-				}
-			}
-			if i < arch.FirstKDense {
-				// Dense prefix layer: a plain SwiGLU at the model's feed_forward_length.
-				if l.GateProj, e = mat(p+"ffn_gate.weight", arch.IntermediateDim, hidden); e != nil {
-					return e
-				}
-				if l.UpProj, e = mat(p+"ffn_up.weight", arch.IntermediateDim, hidden); e != nil {
-					return e
-				}
-				if l.DownProj, e = mat(p+"ffn_down.weight", hidden, arch.IntermediateDim); e != nil {
-					return e
-				}
-				return nil
-			}
-			moe := arch.MoE
-			// Router stays f32 regardless of the ambient quant mode (matching qwen35/gptoss above): top-k selection is discrete, so
-			// quantizing it flips which experts win rather than adding rounding noise.
-			if l.Router, e = streamMat(p+"ffn_gate_inp.weight", moe.NumExperts, hidden, quantNone, func(r int) int { return r * hidden }); e != nil {
-				return e
-			}
-			// exp_probs_b is llama.cpp's name for e_score_correction_bias.
-			if l.RouterBias, e = flat(p+"exp_probs_b.bias", moe.NumExperts); e != nil {
-				return e
-			}
-			expInter := moe.IntermediateDim
-			gate, ge := stackedExperts(p+"ffn_gate_exps.weight", expInter, hidden, moe.NumExperts)
-			up, ue := stackedExperts(p+"ffn_up_exps.weight", expInter, hidden, moe.NumExperts)
-			down, de := stackedExperts(p+"ffn_down_exps.weight", hidden, expInter, moe.NumExperts)
-			if ge != nil || ue != nil || de != nil {
-				return fmt.Errorf("decoder(gguf-laguna): experts layer %d: %v / %v / %v", i, ge, ue, de)
-			}
-			l.Experts = make([]expertWeights, moe.NumExperts)
-			for ei := range moe.NumExperts {
-				l.Experts[ei] = expertWeights{Gate: gate[ei], Up: up[ei], Down: down[ei]}
-			}
-			if sInter := moe.SharedIntermediateDim; sInter > 0 {
-				if l.SharedExpert.Gate, e = mat(p+"ffn_gate_shexp.weight", sInter, hidden); e != nil {
-					return e
-				}
-				if l.SharedExpert.Up, e = mat(p+"ffn_up_shexp.weight", sInter, hidden); e != nil {
-					return e
-				}
-				if l.SharedExpert.Down, e = mat(p+"ffn_down_shexp.weight", hidden, sInter); e != nil {
-					return e
-				}
-			}
-			return nil
-		}
-		// Streaming (sink != nil): loadLaguna is self-contained per layer (every tensor it reads is blk.{i}.*-named;
-		// decoder/gguf_streaming_shape_test.go proves this from source and keeps it true), so the loadQ35/loadGptOss streaming
-		// shape applies unchanged.
-		if sink != nil {
-			if err := streamLayers(w, arch, sink, loadLaguna); err != nil {
-				return nil, err
-			}
-			return w, nil
-		}
-		if err := parallelLayers(arch.NumLayers, abort, loadLaguna); err != nil {
-			return nil, err
-		}
-		return w, nil
+		return b.loadLaguna()
 	}
 
-	// Granite-4.0-H (granitehybrid): per-layer Mamba-2 mixer or GQA attention, MoE on every layer. The Mamba-2 ssm_*
-	// tensors use llama.cpp's conventions (shared with qwen35): ssm_a stores -exp(A_log) directly (reversed to A_log via
-	// log(-a) so the shared mamba2Step works), conv1d is [convDim, K], ssm_norm raw. Mixer stays f32 (parity-first);
-	// experts/attention/embeddings quantize. NEOX rope, so no q/k permute.
 	if gp := arch.granite; gp != nil {
-		dInner := gp.NHeads * gp.HeadDim
-		convDim := dInner + 2*gp.NGroups*gp.DState
-		projDim := 2*dInner + 2*gp.NGroups*gp.DState + gp.NHeads
-		hd := arch.HeadDim
-		qDim, kvDim := arch.NumHeads*hd, arch.NumKVHeads*hd
-		f32mat := func(name string, out, in int) ([]float32, error) {
-			dims, data, derr := g.Tensor(name)
-			if derr != nil {
-				return nil, derr
-			}
-			if len(dims) != 2 || dims[0] != in || dims[1] != out {
-				return nil, fmt.Errorf("decoder(gguf-granite): %q dims %v, want [in=%d, out=%d]", name, dims, in, out)
-			}
-			return data, nil
-		}
-		flat := func(name string, n int) ([]float32, error) { // 1-D or [1,n]/[n,1] tensor → n floats
-			_, data, derr := g.Tensor(name)
-			if derr != nil {
-				return nil, derr
-			}
-			if len(data) != n {
-				return nil, fmt.Errorf("decoder(gguf-granite): %q has %d elems, want %d", name, len(data), n)
-			}
-			return data, nil
-		}
-		loadGranite := func(i int) error {
-			l := &w.Layers[i]
-			p := fmt.Sprintf("blk.%d.", i)
-			var e error
-			if l.PreAttnNorm, e = vnorm(p+"attn_norm.weight", hidden); e != nil {
-				return e
-			}
-			if l.PreMLPNorm, e = vnorm(p+"ffn_norm.weight", hidden); e != nil {
-				return e
-			}
-			if arch.isMambaLayer(i) {
-				mw := &mamba2Weights{}
-				if mw.inProj, e = f32mat(p+"ssm_in.weight", projDim, hidden); e != nil {
-					return e
-				}
-				if mw.convW, e = f32mat(p+"ssm_conv1d.weight", convDim, gp.DConv); e != nil {
-					return e
-				}
-				if mw.convB, e = flat(p+"ssm_conv1d.bias", convDim); e != nil {
-					return e
-				}
-				if mw.d, e = flat(p+"ssm_d", gp.NHeads); e != nil {
-					return e
-				}
-				if mw.dtBias, e = flat(p+"ssm_dt.bias", gp.NHeads); e != nil {
-					return e
-				}
-				if mw.normW, e = flat(p+"ssm_norm.weight", dInner); e != nil {
-					return e
-				}
-				if mw.outProj, e = f32mat(p+"ssm_out.weight", hidden, dInner); e != nil {
-					return e
-				}
-				// ssm_a is −exp(A_log); reverse to A_log so mamba2Step's −exp(aLog) recovers it.
-				a, aerr := flat(p+"ssm_a", gp.NHeads)
-				if aerr != nil {
-					return aerr
-				}
-				mw.aLog = make([]float32, gp.NHeads)
-				for h := range a {
-					mw.aLog[h] = float32(math.Log(-float64(a[h])))
-				}
-				l.mamba = mw
-			} else {
-				// llama.cpp converts GraniteHybrid attention with undo_permute=True, so
-				// q/k are RoPE-permuted in the GGUF (like Llama) and must be un-permuted.
-				if l.QProj, e = permMat(p+"attn_q.weight", qDim, hidden, arch.NumHeads); e != nil {
-					return e
-				}
-				if l.KProj, e = permMat(p+"attn_k.weight", kvDim, hidden, arch.NumKVHeads); e != nil {
-					return e
-				}
-				if l.VProj, e = mat(p+"attn_v.weight", kvDim, hidden); e != nil {
-					return e
-				}
-				if l.OProj, e = mat(p+"attn_output.weight", hidden, qDim); e != nil {
-					return e
-				}
-			}
-			// MoE on every layer: router + stacked routed experts + ungated shared.
-			expInter := arch.MoE.IntermediateDim
-			// Router stays f32; see the Laguna site above.
-			if l.Router, e = streamMat(p+"ffn_gate_inp.weight", arch.MoE.NumExperts, hidden, quantNone, func(r int) int { return r * hidden }); e != nil {
-				return e
-			}
-			gate, ge := stackedExperts(p+"ffn_gate_exps.weight", expInter, hidden, arch.MoE.NumExperts)
-			up, ue := stackedExperts(p+"ffn_up_exps.weight", expInter, hidden, arch.MoE.NumExperts)
-			down, de := stackedExperts(p+"ffn_down_exps.weight", hidden, expInter, arch.MoE.NumExperts)
-			if ge != nil || ue != nil || de != nil {
-				return fmt.Errorf("decoder(gguf-granite): experts layer %d: %v / %v / %v", i, ge, ue, de)
-			}
-			l.Experts = make([]expertWeights, arch.MoE.NumExperts)
-			for ei := range arch.MoE.NumExperts {
-				l.Experts[ei] = expertWeights{Gate: gate[ei], Up: up[ei], Down: down[ei]}
-			}
-			sInter := arch.MoE.SharedIntermediateDim
-			if l.SharedExpert.Gate, e = mat(p+"ffn_gate_shexp.weight", sInter, hidden); e != nil {
-				return e
-			}
-			if l.SharedExpert.Up, e = mat(p+"ffn_up_shexp.weight", sInter, hidden); e != nil {
-				return e
-			}
-			if l.SharedExpert.Down, e = mat(p+"ffn_down_shexp.weight", hidden, sInter); e != nil {
-				return e
-			}
-			return nil
-		}
-		// Streaming (sink != nil): loadGranite is self-contained per layer (every tensor it reads is blk.{i}.*-named;
-		// decoder/gguf_streaming_shape_test.go proves this from source and keeps it true), so the loadQ35/loadGptOss streaming
-		// shape applies unchanged.
-		if sink != nil {
-			if err := streamLayers(w, arch, sink, loadGranite); err != nil {
-				return nil, err
-			}
-			return w, nil
-		}
-		if err := parallelLayers(arch.NumLayers, abort, loadGranite); err != nil {
-			return nil, err
-		}
-		return w, nil
+		return b.loadGranite(gp)
 	}
 
-	// Nemotron-H (nemotron_h): single-op-per-block hybrid. Each layer is one of
-	// mamba / attention (NoPE — no q/k permute) / non-gated mlp, under a single
-	// attn_norm. The ssm_* tensors reuse llama.cpp's conventions (ssm_a = −exp(A_log),
-	// conv [convDim,K], grouped ssm_norm). Mixer f32; attention/mlp/embeddings quantize.
 	if npar := arch.nemotron; npar != nil {
-		dInner := npar.NHeads * npar.HeadDim
-		convDim := dInner + 2*npar.NGroups*npar.DState
-		projDim := 2*dInner + 2*npar.NGroups*npar.DState + npar.NHeads
-		hd := arch.HeadDim
-		qDim, kvDim := arch.NumHeads*hd, arch.NumKVHeads*hd
-		inter := arch.IntermediateDim
-		f32mat := func(name string, out, in int) ([]float32, error) {
-			dims, data, derr := g.Tensor(name)
-			if derr != nil {
-				return nil, derr
-			}
-			if len(dims) != 2 || dims[0] != in || dims[1] != out {
-				return nil, fmt.Errorf("decoder(gguf-nemotron): %q dims %v, want [in=%d, out=%d]", name, dims, in, out)
-			}
-			return data, nil
-		}
-		flat := func(name string, n int) ([]float32, error) {
-			_, data, derr := g.Tensor(name)
-			if derr != nil {
-				return nil, derr
-			}
-			if len(data) != n {
-				return nil, fmt.Errorf("decoder(gguf-nemotron): %q has %d elems, want %d", name, len(data), n)
-			}
-			return data, nil
-		}
-		loadNemo := func(i int) error {
-			l := &w.Layers[i]
-			p := fmt.Sprintf("blk.%d.", i)
-			var e error
-			if l.PreAttnNorm, e = vnorm(p+"attn_norm.weight", hidden); e != nil {
-				return e
-			}
-			switch npar.blockKind[i] {
-			case nemoMamba:
-				mw := &mamba2Weights{}
-				if mw.inProj, e = f32mat(p+"ssm_in.weight", projDim, hidden); e != nil {
-					return e
-				}
-				if mw.convW, e = f32mat(p+"ssm_conv1d.weight", convDim, npar.DConv); e != nil {
-					return e
-				}
-				if mw.convB, e = flat(p+"ssm_conv1d.bias", convDim); e != nil {
-					return e
-				}
-				if mw.d, e = flat(p+"ssm_d", npar.NHeads); e != nil {
-					return e
-				}
-				if mw.dtBias, e = flat(p+"ssm_dt.bias", npar.NHeads); e != nil {
-					return e
-				}
-				if mw.normW, e = flat(p+"ssm_norm.weight", dInner); e != nil {
-					return e
-				}
-				if mw.outProj, e = f32mat(p+"ssm_out.weight", hidden, dInner); e != nil {
-					return e
-				}
-				a, aerr := flat(p+"ssm_a", npar.NHeads)
-				if aerr != nil {
-					return aerr
-				}
-				mw.aLog = make([]float32, npar.NHeads)
-				for h := range a {
-					mw.aLog[h] = float32(math.Log(-float64(a[h])))
-				}
-				if mambaProjInt8(quant) {
-					mw.quantizeProjections(projDim, hidden, dInner)
-				}
-				l.mamba = mw
-			case nemoAttn:
-				// NoPE → no q/k permute.
-				if l.QProj, e = mat(p+"attn_q.weight", qDim, hidden); e != nil {
-					return e
-				}
-				if l.KProj, e = mat(p+"attn_k.weight", kvDim, hidden); e != nil {
-					return e
-				}
-				if l.VProj, e = mat(p+"attn_v.weight", kvDim, hidden); e != nil {
-					return e
-				}
-				if l.OProj, e = mat(p+"attn_output.weight", hidden, qDim); e != nil {
-					return e
-				}
-			case nemoMLP:
-				if l.UpProj, e = mat(p+"ffn_up.weight", inter, hidden); e != nil {
-					return e
-				}
-				if l.DownProj, e = mat(p+"ffn_down.weight", hidden, inter); e != nil {
-					return e
-				}
-			case nemoMoE:
-				// Nemotron 3 Nano's MoE FFN. The tensor names are the GGUF's own, not llama.cpp's conversion-script source mapping (which
-				// names the source safetensors tensor, not the output GGUF tensor). Experts are fused per projection (one 3-D
-				// [in,out,nExpert] tensor each), unlike the safetensors path's one tensor per expert, so stackedExperts, the helper other
-				// GGUF MoE families use for this shape, applies. exp_probs_b.bias is llama.cpp's name for e_score_correction_bias.
-				moe := arch.MoE
-				// Router stays f32; see the Laguna site above.
-				if l.Router, e = streamMat(p+"ffn_gate_inp.weight", moe.NumExperts, hidden, quantNone, func(r int) int { return r * hidden }); e != nil {
-					return e
-				}
-				if l.RouterBias, e = flat(p+"exp_probs_b.bias", moe.NumExperts); e != nil {
-					return e
-				}
-				upExp, uerr := stackedExperts(p+"ffn_up_exps.weight", moe.IntermediateDim, hidden, moe.NumExperts)
-				if uerr != nil {
-					return uerr
-				}
-				downExp, derr := stackedExperts(p+"ffn_down_exps.weight", hidden, moe.IntermediateDim, moe.NumExperts)
-				if derr != nil {
-					return derr
-				}
-				l.Experts = make([]expertWeights, moe.NumExperts)
-				for ei := range l.Experts {
-					l.Experts[ei].Up, l.Experts[ei].Down = upExp[ei], downExp[ei]
-				}
-				if moe.SharedIntermediateDim > 0 {
-					if l.SharedExpert.Up, e = mat(p+"ffn_up_shexp.weight", moe.SharedIntermediateDim, hidden); e != nil {
-						return e
-					}
-					if l.SharedExpert.Down, e = mat(p+"ffn_down_shexp.weight", hidden, moe.SharedIntermediateDim); e != nil {
-						return e
-					}
-				}
-			}
-			return nil
-		}
-		// Streaming (sink != nil): loadNemo is self-contained per layer (every tensor it reads is blk.{i}.*-named;
-		// decoder/gguf_streaming_shape_test.go proves this from source and keeps it true), so the loadQ35/loadGptOss streaming
-		// shape applies unchanged.
-		if sink != nil {
-			if err := streamLayers(w, arch, sink, loadNemo); err != nil {
-				return nil, err
-			}
-			return w, nil
-		}
-		if err := parallelLayers(arch.NumLayers, abort, loadNemo); err != nil {
-			return nil, err
-		}
-		return w, nil
+		return b.loadNemotron(npar)
 	}
 
-	// Gemma 4 (E-models): a dedicated layer loader. Per-layer head_dim/FFN, the
-	// global/sliding split, the cross-layer KV-shared tail (layers ≥ first-shared
-	// carry no k/v), and the PLE branch (inp_gate/proj/post_norm + layer scalar).
-	// The model-level PLE inputs (per_layer_*) load here. NEOX rope ⇒ no q/k
-	// permute, so plain mat() throughout.
 	if g4 := arch.gemma4; g4 != nil {
-		if g4.HiddenSizePerLayerInput > 0 {
-			pleTotal := arch.NumLayers * g4.HiddenSizePerLayerInput
-			if err = embInto(&w.PerLayerTokenEmbed, "per_layer_token_embd.weight", cfg.VocabSize, pleTotal, quant.gatherTable()); err != nil {
-				return nil, err
-			}
-			if w.PerLayerModelProj, err = mat("per_layer_model_proj.weight", pleTotal, hidden); err != nil {
-				return nil, err
-			}
-			if w.PerLayerProjNorm, err = vnorm("per_layer_proj_norm.weight", g4.HiddenSizePerLayerInput); err != nil {
-				return nil, err
-			}
-		}
-		firstShared := arch.NumLayers - g4.SharedKVLayers
-		loadG4 := func(i int) error {
-			l := &w.Layers[i]
-			p := fmt.Sprintf("blk.%d.", i)
-			hdL := arch.headDimAt(i)
-			qDimL, kvDimL, ffn := arch.NumHeads*hdL, arch.kvHeadsAt(i)*hdL, arch.ffnAt(i)
-			var e error
-			if l.PreAttnNorm, e = vnorm(p+"attn_norm.weight", hidden); e != nil {
-				return e
-			}
-			if l.PostAttnNorm, e = vnorm(p+"post_attention_norm.weight", hidden); e != nil {
-				return e
-			}
-			if l.PreMLPNorm, e = vnorm(p+"ffn_norm.weight", hidden); e != nil {
-				return e
-			}
-			if l.PostMLPNorm, e = vnorm(p+"post_ffw_norm.weight", hidden); e != nil {
-				return e
-			}
-			if l.QProj, e = mat(p+"attn_q.weight", qDimL, hidden); e != nil {
-				return e
-			}
-			if l.QNorm, e = vnorm(p+"attn_q_norm.weight", hdL); e != nil {
-				return e
-			}
-			l.KVShared = i >= firstShared
-			if !l.KVShared {
-				if l.KProj, e = mat(p+"attn_k.weight", kvDimL, hidden); e != nil {
-					return e
-				}
-				if l.KNorm, e = vnorm(p+"attn_k_norm.weight", hdL); e != nil {
-					return e
-				}
-				// attention_k_eq_v (12B global layers): no v_proj — V reuses K's
-				// projection. Detect by the tensor's absence (robust to whether the
-				// converter omits or duplicates it).
-				if g.Has(p + "attn_v.weight") {
-					if l.VProj, e = mat(p+"attn_v.weight", kvDimL, hidden); e != nil {
-						return e
-					}
-				} else {
-					l.VFromK = true
-				}
-			}
-			if l.OProj, e = mat(p+"attn_output.weight", hidden, qDimL); e != nil {
-				return e
-			}
-			if l.GateProj, e = mat(p+"ffn_gate.weight", ffn, hidden); e != nil {
-				return e
-			}
-			if l.UpProj, e = mat(p+"ffn_up.weight", ffn, hidden); e != nil {
-				return e
-			}
-			if l.DownProj, e = mat(p+"ffn_down.weight", hidden, ffn); e != nil {
-				return e
-			}
-			// The per-layer output scalar is read BEFORE the MoE branch below, which copies it into gemma4MoEWeights.layerScalar, the
-			// value the MoE forward multiplies the whole layer's output by (forward_gemma4_moe.go). Read after that copy, every MoE
-			// layer of a directly loaded GGUF would be scaled by 0 and the model would emit only <pad>; the .giw reader and the
-			// safetensors loader also read it first (TestGemma4GGUF_moeLayerScalarMatchesLayer).
-			l.LayerScalar = 1
-			if sc, se := vec(p+"layer_output_scale.weight", 1); se == nil {
-				l.LayerScalar = sc[0]
-			}
-			// 26B-A4B's parallel MoE branch (enable_moe_block; nil arch.MoE ⇒ the dense
-			// E2B/E4B/12B GGUFs, byte-unchanged). llama.cpp's converter fuses gate‖up per
-			// expert exactly like the safetensors path (ffn_gate_up_exps.weight is a 3-D
-			// [hidden, 2*moeInter, nE] blob, structurally identical to stackedExperts'
-			// existing [in,out,nExpert] contract — no new tensor-reading helper needed),
-			// and stores the router's weightless-RMSNorm learned scale + the per-expert
-			// scale as ffn_gate_inp.scale/ffn_down_exps.scale rather than a dequant
-			// artifact (both real model parameters — routerScale/perExpertScale below).
-			if arch.MoE != nil {
-				nE, moeInter := arch.MoE.NumExperts, arch.MoE.IntermediateDim
-				gm := &gemma4MoEWeights{
-					preFFNNorm:  l.PreMLPNorm,
-					postFFNNorm: l.PostMLPNorm,
-					mlpGate:     l.GateProj,
-					mlpUp:       l.UpProj,
-					mlpDown:     l.DownProj,
-					layerScalar: l.LayerScalar,
-					denseInter:  ffn,
-					moeInter:    moeInter,
-					nE:          nE,
-					topK:        arch.MoE.TopK,
-				}
-				if gm.postFFNNorm1, e = vnorm(p+"post_ffw_norm_1.weight", hidden); e != nil {
-					return e
-				}
-				if gm.preFFNNorm2, e = vnorm(p+"pre_ffw_norm_2.weight", hidden); e != nil {
-					return e
-				}
-				if gm.postFFNNorm2, e = vnorm(p+"post_ffw_norm_2.weight", hidden); e != nil {
-					return e
-				}
-				// Router stays f32 (see the Laguna site above); the safetensors Gemma4 loader does the same.
-				if gm.routerProj, e = streamMat(p+"ffn_gate_inp.weight", nE, hidden, quantNone, func(r int) int { return r * hidden }); e != nil {
-					return e
-				}
-				if gm.routerScale, e = vec(p+"ffn_gate_inp.scale", hidden); e != nil {
-					return e
-				}
-				if gm.perExpertScale, e = vec(p+"ffn_down_exps.scale", nE); e != nil {
-					return e
-				}
-				if gm.expertsGateUp, e = stackedExperts(p+"ffn_gate_up_exps.weight", 2*moeInter, hidden, nE); e != nil {
-					return e
-				}
-				if gm.expertsDown, e = stackedExperts(p+"ffn_down_exps.weight", hidden, moeInter, nE); e != nil {
-					return e
-				}
-				l.gemma4moe = gm
-			}
-			if g4.HiddenSizePerLayerInput > 0 {
-				if l.PLEGate, e = mat(p+"inp_gate.weight", g4.HiddenSizePerLayerInput, hidden); e != nil {
-					return e
-				}
-				if l.PLEProj, e = mat(p+"proj.weight", hidden, g4.HiddenSizePerLayerInput); e != nil {
-					return e
-				}
-				if l.PostPLENorm, e = vnorm(p+"post_norm.weight", hidden); e != nil {
-					return e
-				}
-			}
-			return nil
-		}
-		// Streaming (sink != nil): the model-level PLE inputs (per_layer_token_embd / per_layer_model_proj / per_layer_proj_norm,
-		// plus FFNPerLayer) are written in the head (writeHeadGlobals) before any layer and loaded above before loadG4 runs.
-		// Everything else gemma4-specific (PLE gate/proj/norm, the layer scalar, the KV-shared and K=V flags, the whole 26B-A4B
-		// MoE branch) lives in each layer's own record (giwWriter.gemma4Layer) and is read from blk.{i}.* only
-		// (decoder/gguf_streaming_shape_test.go keeps that true). So: head once the PLE globals exist, then streamLayers'
-		// build, write and release. Non-streaming (sink == nil): all layers in parallel.
-		if sink != nil {
-			if err := sink.writeHeadGlobals(w, id); err != nil {
-				return nil, err
-			}
-			// The head is on disk and nothing below reads these again (the returned *Weights of a streaming build is discarded; see
-			// this function's doc), so release them before the layers: holding them is a flat floor under the whole stream.
-			w.Embed, w.LMHead, w.PosEmbed = linalg.WeightMat{}, linalg.WeightMat{}, linalg.WeightMat{}
-			w.PerLayerTokenEmbed, w.PerLayerModelProj = linalg.WeightMat{}, linalg.WeightMat{}
-			if err := streamLayers(w, arch, sink, loadG4); err != nil {
-				return nil, err
-			}
-			return w, nil
-		}
-		if err = parallelLayers(arch.NumLayers, abort, loadG4); err != nil {
-			return nil, err
-		}
-		// K=V (attention_k_eq_v) on the 12B global layers: V reuses K's projection (v_norm(k_proj); see loadG4/the Gemma 4 program walk).
-		// Parity-gated against the HF bf16 oracle by TestGemma4_12B_logitParity.
-		return w, nil
+		return b.loadGemma4(g4)
 	}
 
 	if lp := arch.llama4; lp != nil {
-		// Llama 4: separate q/k/v/o (no q/k-norm tensors — the L2 QK-norm is
-		// parameter-free, applied in the forward), per-layer dense/MoE. MoE = router
-		// (NO exp_probs_b — top-1 sigmoid, no bias) + stacked per-expert SwiGLU
-		// (ffn_{gate,up,down}_exps, the standard [in,out,nE] layout) + an ungated shared
-		// expert. NEOX/interleaved rope ⇒ no q/k permute.
-		qDim, kvDim := arch.NumHeads*hd, arch.NumKVHeads*hd
-		expInter, denseInter, nE := arch.MoE.IntermediateDim, arch.IntermediateDim, arch.MoE.NumExperts
-		loadL4 := func(i int) error {
-			l := &w.Layers[i]
-			p := fmt.Sprintf("blk.%d.", i)
-			var e error
-			if l.PreAttnNorm, e = vnorm(p+"attn_norm.weight", hidden); e != nil {
-				return e
-			}
-			if l.QProj, e = mat(p+"attn_q.weight", qDim, hidden); e != nil {
-				return e
-			}
-			if l.KProj, e = mat(p+"attn_k.weight", kvDim, hidden); e != nil {
-				return e
-			}
-			if l.VProj, e = mat(p+"attn_v.weight", kvDim, hidden); e != nil {
-				return e
-			}
-			if l.OProj, e = mat(p+"attn_output.weight", hidden, qDim); e != nil {
-				return e
-			}
-			if l.PreMLPNorm, e = vnorm(p+"ffn_norm.weight", hidden); e != nil {
-				return e
-			}
-			if !lp.isMoE[i] {
-				if l.GateProj, e = mat(p+"ffn_gate.weight", denseInter, hidden); e != nil {
-					return e
-				}
-				if l.UpProj, e = mat(p+"ffn_up.weight", denseInter, hidden); e != nil {
-					return e
-				}
-				if l.DownProj, e = mat(p+"ffn_down.weight", hidden, denseInter); e != nil {
-					return e
-				}
-				return nil
-			}
-			// Router stays f32; see the Laguna site above.
-			if l.Router, e = streamMat(p+"ffn_gate_inp.weight", nE, hidden, quantNone, func(r int) int { return r * hidden }); e != nil {
-				return e
-			}
-			gate, ge := stackedExperts(p+"ffn_gate_exps.weight", expInter, hidden, nE)
-			up, ue := stackedExperts(p+"ffn_up_exps.weight", expInter, hidden, nE)
-			down, de := stackedExperts(p+"ffn_down_exps.weight", hidden, expInter, nE)
-			if ge != nil || ue != nil || de != nil {
-				return fmt.Errorf("decoder(gguf-llama4): experts layer %d: %v / %v / %v", i, ge, ue, de)
-			}
-			l.Experts = make([]expertWeights, nE)
-			for x := range l.Experts {
-				l.Experts[x] = expertWeights{Gate: gate[x], Up: up[x], Down: down[x]}
-			}
-			if l.SharedExpert.Gate, e = mat(p+"ffn_gate_shexp.weight", expInter, hidden); e != nil {
-				return e
-			}
-			if l.SharedExpert.Up, e = mat(p+"ffn_up_shexp.weight", expInter, hidden); e != nil {
-				return e
-			}
-			if l.SharedExpert.Down, e = mat(p+"ffn_down_shexp.weight", hidden, expInter); e != nil {
-				return e
-			}
-			return nil
-		}
-		// Streaming (sink != nil): loadL4 is self-contained per layer (every tensor it reads is blk.{i}.*-named;
-		// decoder/gguf_streaming_shape_test.go proves this from source and keeps it true), so the loadQ35/loadGptOss streaming
-		// shape applies unchanged.
-		if sink != nil {
-			if err := streamLayers(w, arch, sink, loadL4); err != nil {
-				return nil, err
-			}
-			return w, nil
-		}
-		if err = parallelLayers(arch.NumLayers, abort, loadL4); err != nil {
-			return nil, err
-		}
-		return w, nil
+		return b.loadLlama4(lp)
 	}
 
-	qDim, kvDim := arch.NumHeads*hd, arch.NumKVHeads*hd
-	// llama.cpp permutes the q/k weights (and their per-row biases / head-dim
-	// norms) only for the NORM rope type — llama and its derivatives (incl.
-	// mellum). The NEOX rope type (qwen2/qwen3/gemma) leaves q/k in HF order, so
-	// no un-permutation is needed there.
-	permuteQK := ggufQKPermuted(arch.Name)
-	loadQK := func(name string, out, nHead int) (linalg.WeightMat, error) {
-		if permuteQK {
-			return permMat(name, out, hidden, nHead)
-		}
-		return mat(name, out, hidden)
+	return b.loadLayers()
+}
+
+// ggufScaledRowDequantizer wraps g.RowDequantizer(name) and, when a companion `<name>.scale` tensor is present (llama.cpp
+// PR #21445's GGUF NVFP4 per-tensor F32 [1] multiplier), scales each dequantized row in place before quantization.
+func ggufScaledRowDequantizer(g *embed.GGUFFile, name string) ([]int, func(offset int, dst []float32) error, error) {
+	dims, into, err := g.RowDequantizer(name)
+	if err != nil || !g.Has(name+".scale") {
+		return dims, into, err
 	}
-	// Load the layers in parallel: each is independent (its own linalg.WeightMat slots over the read-only mmap), and the
-	// per-tensor dequant and re-quant is the load's cost.
-	loadLayer := func(i int) error {
-		l := &w.Layers[i]
-		p := fmt.Sprintf("blk.%d.", i)
-		var err error
-		if l.PreAttnNorm, err = vnorm(p+"attn_norm.weight", hidden); err != nil {
+	sDims, sData, sErr := g.Tensor(name + ".scale")
+	if sErr != nil {
+		return nil, nil, fmt.Errorf("decoder(gguf): %q: %w", name+".scale", sErr)
+	}
+	if len(sDims) != 1 || sDims[0] != 1 || len(sData) != 1 {
+		return nil, nil, fmt.Errorf("decoder(gguf): %q dims %v, want [1]", name+".scale", sDims)
+	}
+	scale := sData[0]
+	if scale == 1 {
+		return dims, into, nil
+	}
+	return dims, func(offset int, dst []float32) error {
+		if err := into(offset, dst); err != nil {
 			return err
 		}
-		if arch.mla != nil {
-			// DeepSeek MLA: the latent-attention tensor set (q-LoRA / kv down+up + the
-			// two latent norms), loaded f32 — not the standard q/k/v/o. The FFN block
-			// below is shared with the other DeepSeek-style MoE families.
-			if err = loadDeepseekAttnGGUF(g, p, l, arch); err != nil {
-				return err
-			}
-			if mlaProjInt8(quant) {
-				l.mla.quantizeProjections(arch)
-			}
-		} else if arch.Name == "phi3" {
-			// Phi-3/Phi-4: fused attn_qkv [qDim+2*kvDim, hidden] → Q ‖ K ‖ V by output
-			// rows (NEOX rope ⇒ no permute). o_proj is unfused.
-			if l.QProj, err = fusedSplit(p+"attn_qkv.weight", qDim+2*kvDim, hidden, 0, qDim); err != nil {
-				return err
-			}
-			if l.KProj, err = fusedSplit(p+"attn_qkv.weight", qDim+2*kvDim, hidden, qDim, kvDim); err != nil {
-				return err
-			}
-			if l.VProj, err = fusedSplit(p+"attn_qkv.weight", qDim+2*kvDim, hidden, qDim+kvDim, kvDim); err != nil {
-				return err
-			}
-			if l.OProj, err = mat(p+"attn_output.weight", hidden, qDim); err != nil {
-				return err
-			}
-		} else {
-			if l.QProj, err = loadQK(p+"attn_q.weight", qDim, arch.NumHeads); err != nil {
-				return err
-			}
-			if l.KProj, err = loadQK(p+"attn_k.weight", kvDim, arch.NumKVHeads); err != nil {
-				return err
-			}
-			if l.VProj, err = mat(p+"attn_v.weight", kvDim, hidden); err != nil {
-				return err
-			}
-			if l.OProj, err = mat(p+"attn_output.weight", hidden, qDim); err != nil {
-				return err
-			}
-			// q/k/v projection bias (Qwen2): the q and k biases are per-output-row, so
-			// llama.cpp's RoPE row permutation applies to them exactly as to the q/k
-			// weight rows (ggufInvPermute with in=1); the v bias is not permuted.
-			if arch.QKVBias {
-				qb, qe := vec(p+"attn_q.bias", qDim)
-				kb, ke := vec(p+"attn_k.bias", kvDim)
-				vb, ve := vec(p+"attn_v.bias", kvDim)
-				if qe != nil || ke != nil || ve != nil {
-					return fmt.Errorf("decoder(gguf): qkv bias layer %d: %v / %v / %v", i, qe, ke, ve)
-				}
-				if permuteQK {
-					qb = ggufInvPermute(qb, qDim, 1, arch.NumHeads)
-					kb = ggufInvPermute(kb, kvDim, 1, arch.NumKVHeads)
-				}
-				l.QBias, l.KBias, l.VBias = qb, kb, vb
-			}
-			// QK-norm (Mellum, Qwen3): per-head RMSNorm over head_dim, before RoPE.
-			// llama.cpp permutes the q/k weights for its RoPE, so the matching
-			// per-head-dim norm weights are un-permuted the same way.
-			if arch.QKNorm {
-				qn, kerr := vnorm(p+"attn_q_norm.weight", hd)
-				if kerr != nil {
-					return kerr
-				}
-				kn, kerr := vnorm(p+"attn_k_norm.weight", hd)
-				if kerr != nil {
-					return kerr
-				}
-				if permuteQK {
-					qn, kn = ggufInvPermuteVec(qn), ggufInvPermuteVec(kn)
-				}
-				l.QNorm, l.KNorm = qn, kn
-			}
-		}
-		// Pre-MLP norm. GLM4_MOE has no ffn_norm — llama.cpp stores its (positionally
-		// pre-MLP, Pre2) post_attention_layernorm under the ATTN_POST_NORM name; every
-		// other family here uses ffn_norm.
-		preMLPNorm := "ffn_norm.weight"
-		if arch.Name == "glm4_moe" {
-			preMLPNorm = "post_attention_norm.weight"
-		}
-		if l.PreMLPNorm, err = vnorm(p+preMLPNorm, hidden); err != nil {
-			return err
-		}
-		// Sandwich norms (Gemma 3): a post-attention and a post-FFN RMSNorm in
-		// addition to the pre-norms. GGUF names them post_attention_norm /
-		// post_ffw_norm.
-		if arch.NormPlacement == NormSandwich4 {
-			if l.PostAttnNorm, err = vnorm(p+"post_attention_norm.weight", hidden); err != nil {
-				return err
-			}
-			if l.PostMLPNorm, err = vnorm(p+"post_ffw_norm.weight", hidden); err != nil {
-				return err
-			}
-		}
-		if arch.MoE != nil && i >= arch.FirstKDense {
-			// Sparse MoE: router + stacked per-expert SwiGLU at the narrower
-			// moe_intermediate_size. Mellum stops there; GLM/DeepSeek add an
-			// e_score_correction_bias (exp_probs_b) and an always-on shared expert
-			// (ffn_*_shexp, ungated). GLM's first_k_dense_replace prefix (i < FirstKDense)
-			// has no router and falls through to the dense FFN below.
-			expInter := arch.MoE.IntermediateDim
-			// Router stays f32; see the Laguna site above.
-			if l.Router, err = streamMat(p+"ffn_gate_inp.weight", arch.MoE.NumExperts, hidden, quantNone, func(r int) int { return r * hidden }); err != nil {
-				return err
-			}
-			if arch.MoE.RouterSigmoid { // DeepSeek/GLM e_score_correction_bias (a bias term)
-				if l.RouterBias, err = vec(p+"exp_probs_b.bias", arch.MoE.NumExperts); err != nil {
-					return err
-				}
-			}
-			gate, gerr := stackedExperts(p+"ffn_gate_exps.weight", expInter, hidden, arch.MoE.NumExperts)
-			up, uerr := stackedExperts(p+"ffn_up_exps.weight", expInter, hidden, arch.MoE.NumExperts)
-			down, derr := stackedExperts(p+"ffn_down_exps.weight", hidden, expInter, arch.MoE.NumExperts)
-			if gerr != nil || uerr != nil || derr != nil {
-				return fmt.Errorf("decoder(gguf): experts layer %d: %v / %v / %v", i, gerr, uerr, derr)
-			}
-			l.Experts = make([]expertWeights, arch.MoE.NumExperts)
-			for e := range arch.MoE.NumExperts {
-				l.Experts[e] = expertWeights{Gate: gate[e], Up: up[e], Down: down[e]}
-			}
-			// Shared always-on expert (GLM: ffn_*_shexp). Ungated for GLM/DeepSeek;
-			// Qwen2-MoE-style families would also carry a sigmoid gate (not in GGUF here).
-			if arch.MoE.SharedIntermediateDim > 0 {
-				sInter := arch.MoE.SharedIntermediateDim
-				if l.SharedExpert.Gate, err = mat(p+"ffn_gate_shexp.weight", sInter, hidden); err != nil {
-					return err
-				}
-				if l.SharedExpert.Up, err = mat(p+"ffn_up_shexp.weight", sInter, hidden); err != nil {
-					return err
-				}
-				if l.SharedExpert.Down, err = mat(p+"ffn_down_shexp.weight", hidden, sInter); err != nil {
-					return err
-				}
-				if !arch.MoE.SharedUngated {
-					sg, serr := vec(p+"ffn_gate_inp_shexp.weight", hidden)
-					if serr != nil {
-						return serr
-					}
-					l.SharedGate = linalg.WrapF32(sg, 1, hidden)
-				}
-			}
-			return nil
-		}
-		if arch.Name == "phi3" {
-			// Phi-3/Phi-4: fused ffn_up [2*inter, hidden] is gate‖up (no separate
-			// ffn_gate); ffn_down is unfused.
-			inter := arch.IntermediateDim
-			if l.GateProj, err = fusedSplit(p+"ffn_up.weight", 2*inter, hidden, 0, inter); err != nil {
-				return err
-			}
-			if l.UpProj, err = fusedSplit(p+"ffn_up.weight", 2*inter, hidden, inter, inter); err != nil {
-				return err
-			}
-			if l.DownProj, err = mat(p+"ffn_down.weight", hidden, inter); err != nil {
-				return err
-			}
-			return nil
-		}
-		if l.GateProj, err = mat(p+"ffn_gate.weight", arch.IntermediateDim, hidden); err != nil {
-			return err
-		}
-		if l.UpProj, err = mat(p+"ffn_up.weight", arch.IntermediateDim, hidden); err != nil {
-			return err
-		}
-		if l.DownProj, err = mat(p+"ffn_down.weight", hidden, arch.IntermediateDim); err != nil {
-			return err
+		for i := range dst {
+			dst[i] *= scale
 		}
 		return nil
-	}
-	if sink != nil {
-		// Build, write and free a window of layers at a time (streamLayers): peak RAM is one window, not the model.
-		if err := streamLayers(w, arch, sink, loadLayer); err != nil {
-			return nil, err
-		}
-		return w, nil
-	}
-	if err := parallelLayers(arch.NumLayers, abort, loadLayer); err != nil {
-		return nil, err
-	}
-	return w, nil
+	}, nil
 }
 
 // ggufQKPermuted reports whether llama.cpp's GGUF conversion permuted this architecture's q/k weights (and their per-row

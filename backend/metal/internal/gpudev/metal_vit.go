@@ -266,8 +266,7 @@ kernel void attention(
 // see AttentionTiledEligible below, which callers MUST check before dispatching this
 // rather than after a silent wrong answer or an out-of-bounds write into Ks/Vs.
 //
-// Wired into gpu/visionmetal's and gpu/qwenmetal's attn calls via
-// AttentionTiledEligible(hd) plus the AttentionTiledMinNP crossover (see cuda_vit.go);
+// Callers gate on AttentionTiledEligible(hd) plus the AttentionTiledMinNP crossover (see cuda_vit.go);
 // verified standalone (metal_vit_w8a8reg_test.go's sibling — see
 // TestMetal_vitAttentionTiled).
 #define AT_MAXHD 128
@@ -1089,7 +1088,7 @@ const (
 	KernelGELUTanh  = "gelu_tanh"
 	KernelAttention = "attention"
 
-	// KernelAttentionTiled is the query-tiled online-softmax kernel (M-15). Dispatch via
+	// KernelAttentionTiled is the query-tiled online-softmax kernel. Dispatch via
 	// AttentionTiledDispatch, and only when AttentionTiledEligible(hd) — see the kernel's
 	// own doc comment.
 	KernelAttentionTiled = "attention_tiled"
@@ -1187,8 +1186,8 @@ const (
 )
 
 // GEMMW8A8Plan picks the int8 GEMM kernel and its Run2D geometry for a shape M×N×K — the
-// int8 analogue of GEMMF32Plan, and the Metal twin of cuda_vit.go's GEMMW8A8Plan (M-15,
-// audit-metal-2026-09-12.md; ported from CUDA's already-shipped M-12 kernel).
+// int8 analogue of GEMMF32Plan, and the Metal twin of cuda_vit.go's GEMMW8A8Plan
+// (docs/audit-metal-2026-09-12.md).
 //
 // It needs only K%16==0: M and N edge tiles stage zeros and skip their stores, so the
 // inner loop stays unguarded while any M and N are accepted — SigLIP-so400m's
@@ -1246,7 +1245,7 @@ func (v ViT) GEMMF32BiasAddPlan(M, N, K int) (p Pipeline, gx, gy, tgx, tgy int) 
 }
 
 // AttnTiledMaxHD/AttnTiledKTile/AttnTiledQTile mirror attention_tiled's AT_MAXHD/AT_KTILE/
-// AT_QTILE (M-15) — kept in sync by hand, like GEMMTile/SGBlock above mirror their own
+// AT_QTILE — kept in sync by hand, like GEMMTile/SGBlock above mirror their own
 // kernels' #defines elsewhere in this file.
 const (
 	AttnTiledMaxHD = 128
@@ -1309,6 +1308,12 @@ func AttentionSegTiledDispatch(seq, nH int) (n, tg int) {
 // in vitMSL, each tagged as bit-identity-coupled).
 const ViTBlock = 256
 
+// AttentionThreadgroupBytes is the threadgroup memory one `attention` or `attention_seg` dispatch needs when its
+// dynamic score row holds n floats (n patches, or the longest segment): 4 bytes per element plus the kernel's two static
+// ViTBlock-float reduction arrays. A dispatch over Device.MaxThreadgroupMemoryLength aborts its command buffer yet reports
+// Completed, so a caller sizing n from model or image dimensions checks this first and declines.
+func AttentionThreadgroupBytes(n int) int { return n*4 + 2*ViTBlock*4 }
+
 // ViT holds the compiled encoder kernel pipelines — identical shape to the CUDA ViT.
 type ViT struct {
 	QuantRows Pipeline
@@ -1320,7 +1325,7 @@ type ViT struct {
 	GELUTanh  Pipeline
 	Attention Pipeline
 
-	// AttentionTiled is the query-tiled online-softmax kernel (M-15) — see its own doc
+	// AttentionTiled is the query-tiled online-softmax kernel — see its own doc
 	// comment in vitMSL.
 	AttentionTiled Pipeline
 

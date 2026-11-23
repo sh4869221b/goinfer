@@ -20,7 +20,7 @@ import (
 	"github.com/townsendmerino/goinfer/multimodal"
 )
 
-// G-S14t4 on the real checkpoints (docs/tasks/task-multimodal-support-2026-10.md, S14.6 lever B): the device encoder against the CPU encoder, whole-window, every position, on Whisper-small
+// G-S14t4 on the real checkpoints: the device encoder against the CPU encoder, whole-window, every position, on Whisper-small
 // (80 mels, 12 layers, d 768) and Voxtral Mini's tower (128 mels, 32 layers, d 1280, head dim 64: the fused attention kernel's shape). The features are a clip's own log-mel when
 // GOINFER_SPEED_WAV is set, else seeded noise.
 
@@ -65,7 +65,11 @@ func gpuMemUsedMiB() int {
 }
 
 func TestAudioEncoder_realMatchesCPU(t *testing.T) {
-	for name, dir := range realAudioEncoderDirs(t) {
+	dirs := realAudioEncoderDirs(t)
+	if len(dirs) == 0 {
+		t.Skip("no real audio checkpoint under ~/models: nothing was compared (a skip, not a pass)")
+	}
+	for name, dir := range dirs {
 		t.Run(name, func(t *testing.T) {
 			enc, err := audio.LoadWhisperEncoder(dir)
 			if err != nil {
@@ -134,7 +138,11 @@ func TestAudioEncoderSpeed_record(t *testing.T) {
 		t.Skip("set GOINFER_SPEED_ROUNDS (5 for the record)")
 	}
 	rounds, _ := strconv.Atoi(os.Getenv("GOINFER_SPEED_ROUNDS"))
-	for name, dir := range realAudioEncoderDirs(t) {
+	dirs := realAudioEncoderDirs(t)
+	if len(dirs) == 0 {
+		t.Skip("no real audio checkpoint under ~/models: nothing was timed (a skip, not a pass)")
+	}
+	for name, dir := range dirs {
 		enc, err := audio.LoadWhisperEncoder(dir)
 		if err != nil {
 			t.Fatal(err)

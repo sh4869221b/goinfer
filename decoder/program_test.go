@@ -17,7 +17,7 @@ import (
 // simulate another configuration: the program is what the forward reads.
 func (m *Model) rebuildProgramForTest() { m.prog = buildProgram(m.w.arch, m.w.hasExperts) }
 
-// Gates P and L of docs/tasks/task-forward-architecture-2026-10.md §4.8 (OP3), on the per-token walker. Both change a model's
+// Gates P and L, on the per-token walker. Both change a model's
 // built program and run the per-token forward over a fixed prompt on every tiny fixture whose family walks a program; a change
 // is detected when the last position's logits differ in any bit, or the forward errors or panics.
 
@@ -330,6 +330,7 @@ var programParamNeeds = map[string]string{
 // must change every fixture they run whose per-token logits it changes: a walker that read the parameter from elsewhere would
 // keep that fixture's logits.
 func TestProgram_L_everyParameterIsLive(t *testing.T) {
+	t.Parallel()
 	fx := programFixtures(t)
 	type tally struct {
 		changed, errored, same []string
@@ -577,7 +578,7 @@ func perturbValue(f reflect.Value) {
 
 // TestProgram_gemma4DenseFormWithoutStateIsAnError holds the per-token walker to an error, not a nil dereference, when a model
 // without Gemma 4's per-token state carries Gemma 4's dense FFN form (gate L's ffn.Form perturbation does this). Called
-// without runProgram's recover, so a panic fails the test (docs/queue-correctness.md G50).
+// without runProgram's recover, so a panic fails the test.
 func TestProgram_gemma4DenseFormWithoutStateIsAnError(t *testing.T) {
 	for _, dir := range []string{"../testdata/llama-tiny", "../testdata/nemotron3nano-tiny"} {
 		m, err := Load(dir, Options{Backend: "cpu", Quant: "f32"})

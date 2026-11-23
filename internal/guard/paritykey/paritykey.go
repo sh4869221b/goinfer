@@ -1,19 +1,18 @@
-// Package paritykey computes a parity family's validation key from a tree: today's key, which is
-// decoder/parity_manifest_test.go:freshDepsHash as a library, and the shadow key VK5's week 2 logs beside it, in which the
-// program builders (BuilderFile) leave the key and the family's program fingerprints take their place.
+// Package paritykey computes a parity family's validation key from a tree: today's key (TodayKey), which is
+// decoder/parity_manifest_test.go:freshDepsHash as a library, and the shadow key VK5 logs beside it (ShadowKey).
 //
 // Contract. A key hashes, in sorted order, each dependency path, a NUL, its content (a Go file's token stream, comments
 // and layout dropped, directives kept; any other file's bytes) and a NUL, then a tail. Today's tail is the committed
-// kernel fingerprint table's digest, or the aikit pin in a tree from before the table. The shadow key of a family with
-// programs hashes its files less the builders, with "programs=<digest>" and today's tail as its tail; a family with no
-// programs keeps today's key. A tree is read through a Source, so the same code hashes a working tree and any commit.
+// kernel fingerprint table's digest, or the aikit pin in a tree from before the table. In a tree with the key marker
+// (KeyDefinitionPath), today's key of a family with programs hashes its files less the program builders (BuilderFile),
+// with "programs=<digest>" before today's tail; a tree without it hashes every file. The shadow key adds the loader rule
+// (LoaderRule) to the builder rule. A family with no programs keeps every file in both. A tree is read through a Source,
+// so the same code hashes a working tree and any commit.
 // decoder's TestParityKey_matchesFreshDepsHash holds today's key equal to freshDepsHash, and
-// decoder's TestParityKey_shadowMatchesDecoder holds the shadow key to decoder's own computation. LoaderDigest reads SB4's
+// decoder's TestParityKey_shadowMatchesDecoder holds the shadow key to decoder's own computation. LoaderDigest reads the
 // loader identity table, which no key reads yet.
 //
 // Imports: the standard library only.
-//
-// Plan: docs/tasks/task-subsystems-2026-10.md §5.8.
 package paritykey
 
 import (
@@ -34,7 +33,7 @@ import (
 )
 
 // RecordsDir holds the parity records: SharedSetsFile and one <family>.json per family. LegacyManifestPath is the single
-// file they replaced (VK3); commits before the change carry it, and ManifestJSON still reads it there.
+// file they replaced; commits before the change carry it, and ManifestJSON still reads it there.
 const (
 	RecordsDir         = "testdata/parity"
 	SharedSetsFile     = RecordsDir + "/shared_sets.json"
@@ -70,7 +69,7 @@ func (d Dir) ListDir(path string) ([]string, error) {
 }
 
 // ManifestJSON assembles the parity manifest as one JSON object, {"shared_sets": {...}, "families": {"<name>": {...}}},
-// from src's records, each family's record carried verbatim. A tree without records (a commit before VK3) yields its
+// from src's records, each family's record carried verbatim. A tree without records (a commit before the per-family records) yields its
 // single manifest file unchanged. A tree with neither is an error, never an empty manifest.
 func ManifestJSON(src Source) ([]byte, error) {
 	sets, err := src.ReadFile(SharedSetsFile)
@@ -246,16 +245,71 @@ const (
 	KernelTailPrefix = "kernel_fingerprints="
 )
 
-// ProgramTablePath is VK4's committed program fingerprint table: GOARCH -> fixture directory -> fingerprint. decoder's
+// KeyDefinitionPath marks a tree whose today key takes the builders out and the program fingerprints in. Its one field,
+// "today", is DefinitionPrograms; a tree without the file keys every dependency file (DefinitionFiles). The marker is
+// read from the tree, not assumed by this code, so gate shadow keys a push from before the switch as it was keyed then.
+const KeyDefinitionPath = "testdata/parity_key.json"
+
+// The two definitions of today's key's file set.
+const (
+	DefinitionFiles    = "files"
+	DefinitionPrograms = "programs"
+)
+
+// TodayDefinition is src's definition of today's key: DefinitionPrograms under the marker, DefinitionFiles without it.
+// Any other value is an error, so a typo cannot quietly put the builders back.
+func TodayDefinition(src Source) (string, error) {
+	b, err := src.ReadFile(KeyDefinitionPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return DefinitionFiles, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	var v struct {
+		Today string `json:"today"`
+	}
+	if err := json.Unmarshal(b, &v); err != nil {
+		return "", fmt.Errorf("%s: %w", KeyDefinitionPath, err)
+	}
+	if v.Today != DefinitionPrograms {
+		return "", fmt.Errorf("%s: today is %q, want %q", KeyDefinitionPath, v.Today, DefinitionPrograms)
+	}
+	return v.Today, nil
+}
+
+// TodayKey is the family's key as the staleness gate computes it under def (TodayDefinition): under DefinitionPrograms a
+// family with programs hashes its files less the builders, then "programs=<ProgramsDigest>", then tail; otherwise Key. Any
+// other def is an error.
+func TodayKey(src Source, m *Manifest, fam Family, def, tail string, programs map[string]map[string]string) (string, error) {
+	if def != DefinitionFiles && def != DefinitionPrograms {
+		return "", fmt.Errorf("today's key: unknown definition %q", def)
+	}
+	if def != DefinitionPrograms || len(fam.Programs) == 0 {
+		return Key(src, m, fam, tail)
+	}
+	d, err := ProgramsDigest(fam.Programs, programs)
+	if err != nil {
+		return "", err
+	}
+	return hashFiles(src, ShadowFiles(m, fam, nil), "programs="+d+"\n"+tail)
+}
+
+// ProgramTablePath is the committed program fingerprint table: GOARCH -> fixture directory -> fingerprint. decoder's
 // TestProgramFingerprint_table holds each GOARCH's entry to the programs the fixtures' configs build.
 const ProgramTablePath = "testdata/program_fingerprints.json"
+
+// ProgramTypesFile declares the program's types and nothing else (TestBuilderFile_programTypesDeclareOnly): the values a program
+// holds in them are what a program fingerprint hashes. Their methods (methods.go) and constants (values.go) stay in every key.
+const ProgramTypesFile = "internal/runtime/program/program.go"
 
 // BuilderFile reports whether path is a program builder: a file whose effect on numerics is the program it builds,
 // which the program fingerprints cover. The executors, which compute each op, are not builders and stay in every key.
 func BuilderFile(path string) bool {
 	switch path {
-	case "decoder/program.go", "decoder/blockspec.go", "decoder/arch.go", "decoder/config.go", "decoder/registry.go",
-		"decoder/gemma12.go": // gemma's and gemma2's adapters, under another name
+	case "decoder/program.go", "decoder/blockspec.go", "decoder/arch.go", "decoder/config.go", "decoder/config/config.go", "decoder/registry.go",
+		"decoder/gemma12.go", // gemma's and gemma2's adapters, under another name
+		ProgramTypesFile:
 		return true
 	}
 	return strings.HasPrefix(path, "decoder/arch_") && strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, "_test.go")
@@ -300,10 +354,10 @@ func ProgramsDigest(fixtures []string, tab map[string]map[string]string) (string
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// LoaderTablePath is SB4's committed loader identity table: GOARCH -> fixture -> quant mode -> the digest of the fixture's
+// LoaderTablePath is the committed loader identity table: GOARCH -> fixture -> quant mode -> the digest of the fixture's
 // per-tensor identities as loaded in that mode. decoder's TestLoaderIdentity_table holds each GOARCH's entry to the
 // loaders. The shadow key reads it (LoaderRule), so the loader files leave a family's key the way the program fingerprints let
-// the builders leave it (docs/tasks/task-subsystems-2026-10.md §8 SB4).
+// the builders leave it.
 const LoaderTablePath = "testdata/loader_identity.json"
 
 // ReadLoaderTable reads src's loader identity table, or nil in a tree from before it.

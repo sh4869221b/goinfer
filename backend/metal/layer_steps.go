@@ -7,8 +7,7 @@ import (
 	"github.com/townsendmerino/goinfer/internal/runtime/program"
 )
 
-// Metal's names for internal/program's sublayers (OP4cu-b2 moved the derivation there, from this file): a layer's steps are its
-// sublayers, each one of Metal's fused blocks.
+// Metal's names for internal/program's sublayers: a layer's steps are its sublayers, each one of Metal's fused blocks.
 type (
 	layerStep = program.Sublayer
 	stepSpan  = program.SublayerSpan
@@ -44,20 +43,24 @@ func (r *resident) buildLayerSteps(p *program.Program) error {
 	}
 	for l, ops := range p.Layers {
 		err := program.Metal.CheckLayer(ops)
-		var spans []stepSpan
+		var lw program.LayerWalk
 		if err == nil {
-			spans, err = layerStepsOf(ops)
-		}
-		if err == nil {
-			err = checkStepClaims(ops, spans)
+			lw, err = program.DecodeLayerWalk(ops, "Metal")
 		}
 		if err != nil {
 			return fmt.Errorf("layer %d: %w", l, err)
 		}
+		spans := lw.Spans
 		L := &r.layers[l]
-		steps := make([]layerStep, len(spans))
+		steps, stepOps := make([]layerStep, len(spans)), make([][]program.Op, len(spans))
 		for i, s := range spans {
-			steps[i] = s.Kind
+			steps[i], stepOps[i] = s.Kind, ops[s.From:s.To]
+			if err := r.checkMixerWalk(L, s.Kind, stepOps[i]); err != nil {
+				return fmt.Errorf("layer %d: %w", l, err)
+			}
+			if err := r.checkFFNWalk(L, s, stepOps[i]); err != nil {
+				return fmt.Errorf("layer %d: %w", l, err)
+			}
 		}
 		if want := r.loadedSteps(L); !slices.Equal(steps, want) {
 			return fmt.Errorf("layer %d: the program's steps are %v and the layer's build loaded %v", l, steps, want)
@@ -66,7 +69,7 @@ func (r *resident) buildLayerSteps(p *program.Program) error {
 			return fmt.Errorf("layer %d: the q4k lane runs a sequential attention and dense FFN step only, and the layer's steps are %v (a parallel block: %v)",
 				l, steps, spans[0].Parallel)
 		}
-		L.steps = steps
+		L.steps, L.stepOps, L.walk = steps, stepOps, lw
 	}
 	return nil
 }

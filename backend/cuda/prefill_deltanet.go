@@ -6,8 +6,8 @@ import (
 	gpu "github.com/townsendmerino/goinfer/backend/cuda/internal/gpudev"
 )
 
-// dnPrefillBufs are the M-row buffers a batched prefill of a Gated-DeltaNet model uses
-// (docs/tasks/task-cuda-deltanet-prefill-2026-09.md). Rows are packed at each projection's own width.
+// dnPrefillBufs are the M-row buffers a batched prefill of a Gated-DeltaNet model uses.
+// Rows are packed at each projection's own width.
 type dnPrefillBufs struct {
 	mix, bt, at, z Buffer // the four input projections, [M × convDim | nv | nv | valueDim]
 	conv           Buffer // the conv output [q|k|v] per row, [M × convDim]
@@ -44,7 +44,7 @@ func (r *cudaResident) prefillDeltaNetRows(Ly *cudaLayer, xB, aqB, aScB Buffer, 
 	t = r.profTic()
 	// The recurrence, five launches for all M rows. The conv ring and the delta rule walk the rows in order inside
 	// each thread; the gates and both norms are row-independent. Bit-identical to five launches per row.
-	// A speculative verify (SP2, recurrent_spec.go) takes the twins: they fold the previous verify's committed rows (pend, pM)
+	// A speculative verify (recurrent_spec.go) takes the twins: they fold the previous verify's committed rows (pend, pM)
 	// into the window and state first, then the conv reads its window and the pass's earlier rows and the scan starts from the
 	// committed state, and neither stores this pass's rows.
 	convCfg := g1cfg(dp.convDim, 256)
@@ -74,7 +74,7 @@ func (r *cudaResident) prefillDeltaNetRows(Ly *cudaLayer, xB, aqB, aScB Buffer, 
 		return e
 	}
 	// For hk == hv == 128 (every released model) the scan holds each state row in registers across the rows (the measured cost
-	// of the generic scan: docs/tasks/task-cuda-deltanet-prefill-2026-09.md).
+	// of the generic scan).
 	if e := r.launchRuleRows(r.dnSpecOn, b.qn, b.kn, b.conv, b.headP, Ly.dnState, b.core, M, pend, pM); e != nil {
 		return e
 	}

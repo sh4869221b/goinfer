@@ -549,7 +549,7 @@ func TestPublicCheckpointLoadsRecheckConfig(t *testing.T) {
 	})
 }
 
-// TestCheckpoint_shardedRoundTrip is P9's first gate (docs/tasks/task-checkpoint-fetch-2026-09.md): a safetensors
+// TestCheckpoint_shardedRoundTrip is P9's first gate: a safetensors
 // repo with a shard index goes plan -> fetch -> load -> one token. The plan takes config, index and both shards and
 // leaves the README and the legacy .bin out; the fetched directory is what decoder.Load opens; a second Resolve is
 // answered from the cache with no request.

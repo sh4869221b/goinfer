@@ -19,8 +19,8 @@ import (
 //
 // WHY IT EXISTS. Metal declares FeatAttnSink/FeatOutBias/FeatRopeMscale, but the evidence under
 // that declaration is TestGptOssResidentParity on a hand-built 2-layer tiny fixture — sub-T3 by
-// this repo's own tiering. docs/queue-correctness.md G7 records that "nothing has run a whole
-// gpt-oss forward on the resident path" on EITHER backend, and a declaration made on kernel-level parity was once
+// this repo's own tiering. Nothing has run a whole
+// gpt-oss forward on the resident path on EITHER backend, and a declaration made on kernel-level parity was once
 // correctly reverted for want of exactly that. This is that
 // missing run, on the backend where it is reachable.
 //
@@ -63,7 +63,7 @@ func TestGptOssResidentParityReal20B(t *testing.T) {
 		// buffer touches, so the resident arm alone needs the full model plus KV and scratch.
 		if need := uint64(st.Size()) * 3 / 2; ram > 0 && need > ram {
 			t.Skipf("checkpoint %.2f GB needs ~%.1f GB with Metal wiring against %.1f GB RAM — "+
-				"this thrashes swap to exhaustion rather than declining (see docs/queue-correctness.md G7)",
+				"this thrashes swap to exhaustion rather than declining",
 				float64(st.Size())/(1<<30), float64(need)/(1<<30), float64(ram)/(1<<30))
 		}
 	}

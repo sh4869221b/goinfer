@@ -8,6 +8,7 @@ import (
 
 	"github.com/townsendmerino/aikit/embed"
 	"github.com/townsendmerino/aikit/linalg"
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
 // DSparkDrafter is an imported DeepSeek DSpark block drafter (docs/spec/08): the same non-causal block trunk DFlash
@@ -157,7 +158,7 @@ func LoadDSparkDrafter(dir string) (*DSparkDrafter, error) {
 	}
 
 	mat := func(dst *linalg.WeightMat, name string, rows, cols int) error {
-		m, err := stIsland(st, name, rows, cols) // unquantized: a bf16 checkpoint's bits stay bf16, mapped (MEM11-bf16)
+		m, err := stIsland(st, name, rows, cols) // unquantized: a bf16 checkpoint's bits stay bf16, mapped
 		if err != nil {
 			return fmt.Errorf("dspark: %w", err)
 		}
@@ -291,7 +292,7 @@ func (d *DSparkDrafter) SampleBlock(be Backend, trunk [][]float32, firstPrev int
 				lg[i] += bias[i]
 			}
 		}
-		next := argmax(lg)
+		next := sampling.Argmax(lg)
 		ids = append(ids, next)
 		corrected = append(corrected, lg)
 		prev = next

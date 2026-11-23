@@ -9,14 +9,16 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/decoder"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// TestKSD5_guFShare is KS-D5's first measurement (docs/tasks/task-kernel-survey-2026-10.md): the batched prefill's scratch
+// TestKSD5_guFShare is KS-D5's first measurement: the batched prefill's scratch
 // on Qwen2.5-Coder-1.5B (the Metal .giw in ~/models) for one 3,900-token pass, read from the scratch counter
 // (prefillScratchSeen) while the prefill runs as one block, against the planned bytes (prefillScratchBytes) and guF's share
 // of them (Mpad × 2 × maxI halves). It changes no product code. Not timed; a real checkpoint (GOINFER_HEAVY_TESTS=1).
 func TestKSD5_guFShare(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	path, opts := ksd5Checkpoint()
 	if _, err := os.Stat(path); err != nil {
 		t.Skipf("no checkpoint at %s", path)

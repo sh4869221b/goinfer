@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """bench_peer_transcript.py — W4: the agent-turn transcript replay
-(docs/tasks/task-peer-benchmarks.md §3/§7).
+.
 
 WHAT IT MEASURES. A scripted N-turn tool-calling conversation is replayed
 against goinfer's /v1/chat/completions as strict prefix extensions — each
@@ -66,7 +66,7 @@ avoid. So each variant gets a fresh server.
   GOINFER_SERVE_METAL=~/bench-cur/serve-metal \\
     python3 scripts/bench_peer_transcript.py out.json --model 7B --backend metal
 
-R12 (docs/tasks/red-october.md), 2026-09: extended to metal (mirrors bench_peer_prefill.py's own
+R12 (docs/completed/red-october.md), 2026-09: extended to metal (mirrors bench_peer_prefill.py's own
 cuda/metal SERVE-path pattern — no change to the request shape, tool-forcing, or probe/real
 two-request-per-turn technique above, all of which are backend-agnostic).
 """
@@ -78,7 +78,7 @@ GPORT = 8098  # same value bench_peer_prefill.py uses; not run concurrently with
 SERVE_CUDA = os.environ.get("GOINFER_SERVE_CUDA", os.path.expanduser("~/bench-cur/serve-cuda"))
 SERVE_METAL = os.environ.get("GOINFER_SERVE_METAL", os.path.expanduser("~/bench-cur/serve-metal"))
 SERVE = {"cuda": SERVE_CUDA, "metal": SERVE_METAL}
-# Only the model cell this pass validates against (docs/tasks/task-peer-benchmarks.md's "D7"
+# Only the model cell this pass validates against (the "D7"
 # cell) — add more MODELS entries here if a later pass extends coverage.
 MODELS = {
     "7B": (os.path.expanduser("~/models/qwen2.5-7b-instruct-q4_k_m.gguf"), "q7b"),
@@ -87,7 +87,7 @@ MODELS = {
     # W7's concurrency sweep moved to this smaller cell rather than keep forcing 7B.
     "1.5B": (os.path.expanduser("~/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"), "q15"),
 }
-# W7 (R12, docs/tasks/red-october.md): the --clients sweep restarts a fresh 7B-model server
+# W7 (R12, docs/completed/red-october.md): the --clients sweep restarts a fresh 7B-model server
 # several times in a tight loop, and darwin's reclaim of a just-exited large process's resident
 # pages is not instantaneous -- measured directly, a restart that outran it drove this machine
 # from ~6 GB free to 58 MB free in under 20s. Refuse to start (or continue) rather than risk it;
@@ -141,9 +141,9 @@ def wait_port(port, timeout=240):
 
 class GoinferServer:
     """A single-engine analogue of bench_peer_prefill.py's Engine — this pass validates
-    goinfer alone (docs/tasks/task-peer-benchmarks.md scoped this workload's first landing to
+    goinfer alone (this workload's first landing was scoped to
     one engine); a peer arm is future work, not dropped by oversight. cuda and metal both
-    supported (R12, docs/tasks/red-october.md); the request/probe shape above is unchanged
+    supported (R12, docs/completed/red-october.md); the request/probe shape above is unchanged
     either way, only which binary and -backend flag get launched differs."""
 
     def __init__(self, model_key, backend="cuda"):
@@ -210,7 +210,7 @@ def run_transcript(url, fixture, max_tokens, temperature=0.0, nonce=None):
     """Replays one fixture end to end against one live server. Returns the list
     of per-turn records (see the module docstring for what probe vs real means).
 
-    nonce: prepended to the FIRST user turn only (docs/tasks/task-peer-benchmarks.md's own
+    nonce: prepended to the FIRST user turn only (the peer benchmark's own
     "nonce-prefixed prompts to defeat [the engine's] KV prefix cache" idiom, same one
     bench_peer.py/bench_peer_prefill.py already use). Every later turn is a strict prefix
     extension of turn 1, so a unique first turn is enough to make an entire replay's token
@@ -278,7 +278,7 @@ def run_transcript(url, fixture, max_tokens, temperature=0.0, nonce=None):
 
 
 def run_concurrent(url, fixture, max_tokens, temperature, n_clients):
-    """W7 (docs/tasks/red-october.md, R12 item iv): n_clients independent replays of the SAME
+    """W7 (docs/completed/red-october.md, R12 item iv): n_clients independent replays of the SAME
     fixture running CONCURRENTLY against one live server — each client keeps its own message
     history from scratch (genuinely independent conversations, not shared state; goinfer's
     resident reuse is keyed on raw token content, so two clients replaying the identical
@@ -399,7 +399,7 @@ def main():
 
 
 if __name__ == "__main__":
-    # TE9 (docs/tasks/task-test-efficiency-2026-09.md): one timed run per box. The lock is held for the whole run and
+    # TE9 (docs/completed/task-test-efficiency-2026-09.md): one timed run per box. The lock is held for the whole run and
     # taken before preflight(), so a second timed run refuses, naming this one; BENCH_LOCK_WAIT=<seconds> waits for a
     # holder instead. Under a night.py job or a `timing_lock.py run` wrapper the lock is inherited, not re-taken.
     import timing_lock

@@ -10,7 +10,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// The KV term Metal's resident guard — and, since docs/tasks/task-memory-accounting-2026-09.md, Plan("metal") —
+// The KV term Metal's resident guard — and Plan("metal") —
 // prices is decoder.Model.ResidentKVBytes("metal", …), which claims to be exact to what buildResident allocates.
 // This checks that claim against the real buffers: every layer's K and V payload (NewBufferBytes: Len is bytes)
 // plus the int8 per-head scales (NewBufferLen: Len is float32s). Fixtures cover a dense model, per-layer geometry
@@ -40,8 +40,8 @@ func TestResidentKVBytes_matchesMetalAllocation(t *testing.T) {
 				t.Fatalf("load: %v", err)
 			}
 			defer m.Close()
-			want := residentKVBytes(m)
-			r, err := buildResident(m)
+			want := residentKVBytes(m, metalCtxPlan{})
+			r, err := buildResident(m, metalCtxPlan{})
 			if err != nil {
 				t.Skipf("not resident on Metal: %v", err)
 			}
@@ -53,7 +53,7 @@ func TestResidentKVBytes_matchesMetalAllocation(t *testing.T) {
 			for l := range r.ks {
 				got += 4 * int64(r.ks[l].Len()+r.vs[l].Len())
 			}
-			got += 4 * int64(r.kvTab.Len())
+			got += r.kvTableBytes() // every group's table: a model with sliding and other layers holds two
 			t.Logf("ctxCap %d: allocated %d B, ResidentKVBytes %d B", r.ctxCap, got, want)
 			if got == 0 {
 				t.Fatal("no KV buffers found — the comparison would be vacuous")

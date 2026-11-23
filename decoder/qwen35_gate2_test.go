@@ -25,6 +25,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // readNpyF32 reads a NumPy .npy v1.0 little-endian float32 array (C-order),
@@ -100,7 +103,7 @@ func cosineFull(a, b []float32) float64 {
 // check (deliverable 2): matching argmax every step ⇒ the continuation reproduces
 // the golden's text.
 func TestQwen35Real_gate2FullModel(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	dir := realQwen35Dir(t)
 	goldenDir := assetPath(t, "GOINFER_QWEN35_GOLDEN")
 	raw, err := os.ReadFile(filepath.Join(goldenDir, "manifest.json"))
@@ -164,7 +167,7 @@ func TestQwen35Real_gate2FullModel(t *testing.T) {
 				t.Fatalf("prompt %d step %d forward: %v", pi, s, err)
 			}
 			want := golden[s*man.Vocab : (s+1)*man.Vocab]
-			am := argmax(logits)
+			am := sampling.Argmax(logits)
 			totalSteps++
 			match := am == p.GenIDs[s]
 			if match {

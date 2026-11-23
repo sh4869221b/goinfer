@@ -37,7 +37,7 @@ func TestGemma4Admission_unconditional(t *testing.T) {
 	}
 
 	// enable_moe_block is admitted like the dense variant: the parallel dense||MoE FFN has its own cuda path (gemma4MoeMLP,
-	// routed around the generic MoE checks via HasGemma4MoEResident). Every backend in residentGemma4MoEBackends ships the
+	// routed around the generic MoE checks via HasGemma4MoE). Every backend in residentGemma4MoEBackends ships the
 	// block (CUDA, Metal, WebGPU); a backend outside it is refused by the feature gate (the same no-overclaim shape as dense).
 	// It is the PLE-free 26B-A4B shape, so no FeatGemma4EModel.
 	moe, _, err := resolveArchitecture(representativeConfig("gemma4_text"))
@@ -60,7 +60,7 @@ func TestGemma4Admission_unconditional(t *testing.T) {
 	}
 
 	// A Gemma-4 E-MODEL (E2B/E4B: per-layer embeddings / shared-KV / variable FFN) is admitted by every backend that declares
-	// FeatGemma4EModel, which is all three (docs/tasks/task-multimodal-support-2026-10.md, S1 and S12.1). A backend without the
+	// FeatGemma4EModel, which is all three. A backend without the
 	// feature would skip the per-layer embeddings and mis-run, so the gate must refuse it: the made-up backend below.
 	e := denseArch()
 	e.gemma4.HiddenSizePerLayerInput = 256 // turn the dense arch into an E-model shape

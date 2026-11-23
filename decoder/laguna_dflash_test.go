@@ -18,10 +18,13 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 func TestLagunaDFlash_load(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	dir := assetPath(t, "GOINFER_LAGUNA_DFLASH")
 
 	d, err := LoadDFlashDrafter(dir)
@@ -96,7 +99,7 @@ func TestLagunaDFlash_load(t *testing.T) {
 //	  GOINFER_LAGUNA_DFLASH=~/models/laguna-xs2-dflash \
 //	  go test -tags realckpt ./decoder/ -run TestLagunaDFlash_acceptance -v -timeout 180m
 func TestLagunaDFlash_acceptance(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ckpt := assetPath(t, "GOINFER_LAGUNA_XS2")
 	ddir := assetPath(t, "GOINFER_LAGUNA_DFLASH")
 
@@ -160,7 +163,7 @@ func TestLagunaDFlash_acceptance(t *testing.T) {
 		eos[e] = true
 	}
 	rounds, acceptedTotal, generated := 0, 0, 1
-	anchor := argmax(logits)
+	anchor := sampling.Argmax(logits)
 	emitted := []int{anchor}
 	for generated < maxNew {
 		fused, ferr := d.FuseContext(m.be, ctxCat)
@@ -181,14 +184,14 @@ func TestLagunaDFlash_acceptance(t *testing.T) {
 		mark, markCtx := cache.Pos(), len(ctxCat)
 		feed(anchor)
 		accepted := 0
-		next := argmax(logits)
+		next := sampling.Argmax(logits)
 		for i, tok := range drafted {
 			if tok != next {
 				break
 			}
 			feed(tok)
 			accepted = i + 1
-			next = argmax(logits)
+			next = sampling.Argmax(logits)
 		}
 		cache.TruncateTo(mark + 1 + accepted)
 		ctxCat = ctxCat[:markCtx+1+accepted]

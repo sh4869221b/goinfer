@@ -1,11 +1,12 @@
 package decoder
 
 import (
-	"os"
 	"sync"
 
 	"github.com/townsendmerino/aikit/linalg"
 	"github.com/townsendmerino/goinfer/internal/runtime/mamba2"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/hybridattn"
 )
 
 // Mamba-2 selective state-space sequence mixer (Granite-4.0 hybrid). Like Gated DeltaNet (deltanet.go) it is an
@@ -63,7 +64,7 @@ func (w *mamba2Weights) mixer() mamba2.Weights {
 }
 
 // mambaProjInt8 reports whether a load at q holds Nemotron-H's Mamba projections as int8: every integer quant does, and
-// an f32, bf16 or f16 load keeps them f32 (docs/queue-engineering.md, B27).
+// an f32, bf16 or f16 load keeps them f32.
 func mambaProjInt8(q quantMode) bool {
 	switch q {
 	case quantInt8, quantInt8I8, quantInt4, quantInt4Mix, quantQ4K:
@@ -72,7 +73,7 @@ func mambaProjInt8(q quantMode) bool {
 	return false
 }
 
-// mambaKeepF32ForTest keeps the f32 projections on a quantized load: the f32 arm of B27's fidelity bar, and its planted defect.
+// mambaKeepF32ForTest keeps the f32 projections on a quantized load: the f32 arm of the int8 Mamba projections' fidelity bar, and its planted defect.
 var mambaKeepF32ForTest bool
 
 // quantizeProjections replaces the f32 projections with their int8 form.
@@ -107,7 +108,7 @@ func mamba2Step(h []float32, w *mamba2Weights, p mamba2Params, eps float64, st *
 	if w.inQ.Rows() > 0 {
 		proj = matvecWM(nil, &w.inQ, h)
 	} else {
-		proj = matvec(inProj, p.projDim(), p.Hidden, h)
+		proj = hybridattn.Matvec(inProj, p.projDim(), p.Hidden, h)
 	}
 
 	// 2–5. The conv, the selective scan and the gated norm (internal/mamba2).
@@ -121,7 +122,7 @@ func mamba2Step(h []float32, w *mamba2Weights, p mamba2Params, eps float64, st *
 	if w.outQ.Rows() > 0 {
 		return matvecWM(nil, &w.outQ, gated)
 	}
-	return matvec(outProj, p.Hidden, dInner, gated)
+	return hybridattn.Matvec(outProj, p.Hidden, dInner, gated)
 }
 
 // mambaCapHook (test seam, gpu/mamba_realinput_test.go) captures each mamba2Step's in_proj
@@ -130,10 +131,10 @@ func mamba2Step(h []float32, w *mamba2Weights, p mamba2Params, eps float64, st *
 // reconciliation. nil in production.
 var mambaCapHook func(proj, gated []float32)
 
-// ssmQ8CPU + q8RoundTrip are a confirmation seam (GOINFER_SSM_Q8CPU): round-trip the
+// ssmQ8CPU + q8RoundTrip are a confirmation seam, set by tests through SetSSMQ8CPU: round-trip the
 // Mamba projections through int8 so the CPU reference carries the SAME quantization error
 // as the resident W8A8 path — isolating kernel-correctness from int8 sensitivity.
-var ssmQ8CPU = os.Getenv("GOINFER_SSM_Q8CPU") != ""
+var ssmQ8CPU bool
 
 // ssmQ8WeightsOnly (W8A16 control, set by tests) round-trips the mamba in/out_proj WEIGHTS
 // through int8 but keeps activations f32 — int8-weights / f32-activations, the W8A16 question.

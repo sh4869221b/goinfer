@@ -1,6 +1,6 @@
 //go:build cuda && goinfer_testhooks
 
-// G-S10q-e of docs/tasks/task-multimodal-support-2026-10.md ("S10, Qwen3-VL MoE"): the CUDA resident's half of G-S10q-c's instrument.
+// G-S10q-e: the CUDA resident's half of G-S10q-c's instrument.
 // decoder/qwen3vlmoe_logits_real_test.go teacher-forces the CPU arms along the pinned continuations and writes the logits that
 // predict each path token; this does the same on a CUDA resident (the paged-experts build for the 30B), along the route a served
 // image turn takes for a MoE decoder: the CPU prefill, the UploadKV bridge, then the resident's m-RoPE decode. The pinned
@@ -29,6 +29,8 @@ import (
 	"github.com/townsendmerino/goinfer/internal/vision"
 	"github.com/townsendmerino/goinfer/multimodal"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 type q3mCudaSeq struct {
@@ -44,7 +46,7 @@ type q3mCudaImage struct {
 }
 
 func TestQwen3VLMoe_cudaLogits(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	requireCUDADevice(t)
 	dir, out := os.Getenv("GOINFER_Q3M_DIR"), os.Getenv("GOINFER_Q3M_OUT")
 	if dir == "" || out == "" {

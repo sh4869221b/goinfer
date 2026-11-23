@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,7 +13,7 @@ import (
 	"testing"
 )
 
-// LoadVocabMerges (S14.3 of docs/tasks/task-multimodal-support-2026-10.md): a Qwen2-class tokenizer assembled from vocab.json + merges.txt + tokenizer_config.json must encode and decode
+// LoadVocabMerges: a Qwen2-class tokenizer assembled from vocab.json + merges.txt + tokenizer_config.json must encode and decode
 // exactly like the tokenizer.json the same three files make. The committed Qwen2.5 tokenizer.json is taken apart into those three files, reassembled, and compared on a corpus built to
 // hit the pipeline's parts: the split regex's alternatives (contractions, letters, single digits, punctuation runs, newlines, trailing whitespace), non-ASCII, and the added tokens.
 
@@ -194,5 +195,13 @@ func TestLoadVocabMerges_realQwen3ASR(t *testing.T) {
 	gd, _ := got.Decode(ids)
 	if wd != gd {
 		t.Error("a sweep of ids decodes differently")
+	}
+}
+
+// A missing file is both kinds of error at once: the sentinel a caller branches on, and the OS error underneath it.
+func TestLoadVocabMerges_missingFileAnswersBothKinds(t *testing.T) {
+	_, err := LoadVocabMerges(t.TempDir())
+	if !errors.Is(err, ErrNoVocabMerges) || !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("error %v: want both ErrNoVocabMerges and fs.ErrNotExist", err)
 	}
 }

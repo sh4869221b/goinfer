@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// The gpu gate's CUDA cell groups and cgofree as graders (SB12 step 10, docs/tasks/task-subsystems-2026-10.md): suite,
+// The gpu gate's CUDA cell groups and cgofree as graders: suite,
 // parity and graphsforced are one `go test` cell each, and each verdict is a function of the cell's graded result, its
 // top-level results and text, and what the runner read beside it (the card's free VRAM after a zero-cosine parity failure);
 // cgofree's is a function of the build and ldd's recorded output. The live gate and `gate gpu -replay` print through these.
@@ -14,10 +14,10 @@ var (
 	cudaSuiteCell = cell{Name: "cuda-suite", Pkgs: []string{"./backend/cuda/", "./backend/cuda/kernels/"}, Tags: []string{"cuda"},
 		Serial: true, Extra: []string{"-short"}, Env: map[string]string{"CGO_ENABLED": "0"}}
 	// The parity cell declares its timeout: without it the cell inherits go's 10m default, and an overrun reports
-	// "FAIL <pkg> 608.417s" with no test named, indistinguishable from a crash until detailLines dumps the tail. It is 20m
-	// because the package outgrew 10m on a quiet card (docs/measurements/sb12-2026-10.md §19).
+	// "FAIL <pkg> 608.417s" with no test named, indistinguishable from a crash until detailLines dumps the tail. It is the
+	// package's wall on a quiet card plus headroom; when that wall nears it, raise it (docs/code-notes/cmd-gate.md, "cudaParityCell: timeout").
 	cudaParityCell = cell{Name: "cuda-parity", Pkgs: []string{"./backend/cuda/"}, Tags: []string{"cuda", "goinfer_testhooks"},
-		Serial: true, Timeout: "20m", Env: map[string]string{"CGO_ENABLED": "0"}}
+		Serial: true, Timeout: "35m", Env: map[string]string{"CGO_ENABLED": "0"}}
 	// The graphs cell is separate from parity and labelled FORCED, deliberately. admitGraphs declines under DEFAULT compute
 	// mode without MPS, which is correct production behaviour, so on this box capture and replay are otherwise never
 	// exercised; forcing them tests the code without changing the admission policy. A forced result must never be read as
@@ -74,7 +74,7 @@ func gradeCUDASuite(cr cellResult, skipped []string, out string) groupVerdict {
 // gradeCUDAParity grades the resident parity cell. A failure whose text holds a cosine of exactly zero also prints the
 // all-zero-buffer note with freeVRAM, the card's free memory the runner read after the cell ("" reads "unknown"): an all-zero
 // buffer is what a failed allocation leaves, so it is not by itself a parity result. The note states the reading and points
-// at the A12 entry; it names no mechanism (docs/code-notes/cmd-gate.md, "vramNote").
+// at its docs/QUEUE.md entry; it names no mechanism (docs/code-notes/cmd-gate.md, "vramNote").
 func gradeCUDAParity(cr cellResult, out, freeVRAM string) groupVerdict {
 	if cr.RC == 0 {
 		return groupVerdict{State: groupPass,

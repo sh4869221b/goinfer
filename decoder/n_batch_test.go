@@ -109,7 +109,7 @@ func TestGiw_layerCountCheckedBeforeAllocation(t *testing.T) {
 	const fixture = "../testdata/llama-tiny"
 	m, err := Load(fixture, Options{})
 	if err != nil {
-		t.Skipf("no fixture at %s: %v", fixture, err)
+		t.Fatalf("load ../testdata/llama-tiny: %v", err)
 	}
 	blob, err := SerializeWeights(m.Weights(), "probe")
 	m.Close()
@@ -178,9 +178,9 @@ func TestFP8_shapeCheckDistinguishesTranspose(t *testing.T) {
 		t.Error("the shape check rejects the correct [out,in]")
 	}
 	// And the real function must use the shape-aware form.
-	src, err := readSource("fp8.go")
+	src, err := readSource("quant/fp8.go")
 	if err != nil {
-		t.Fatalf("read fp8.go: %v", err)
+		t.Fatalf("read quant/fp8.go: %v", err)
 	}
 	if !strings.Contains(src, "wT.Shape[0] != out || wT.Shape[1] != in") {
 		t.Error("fp8Reconstruct does not compare the declared shape against [out,in]: an " +

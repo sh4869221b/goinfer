@@ -8,7 +8,7 @@ import (
 	"sort"
 )
 
-// Mistral's Tekken tokenizer (Voxtral Mini, Mistral Small 3.x), shipped as ONE file, tekken.json, and no tokenizer.json (docs/tasks/task-multimodal-support-2026-10.md).
+// Mistral's Tekken tokenizer (Voxtral Mini, Mistral Small 3.x), shipped as ONE file, tekken.json, and no tokenizer.json.
 //
 // The file is tiktoken's format: a list of byte strings whose position is their RANK, plus 1,000 special tokens at ids 0-999. The model's token id is rank+1000, and only the first
 // default_vocab_size-1000 ranks are in the model's vocabulary (130,072 of the 150,000 shipped). tiktoken encodes by repeatedly merging the adjacent pair whose concatenation has the
@@ -55,7 +55,7 @@ func LoadTekken(raw []byte) (*Tokenizer, error) { return loadTekken(raw, tekkenO
 func loadTekken(raw []byte, opt tekkenOptions) (*Tokenizer, error) {
 	var f tekkenFile
 	if err := json.Unmarshal(raw, &f); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrNotTekken, err)
+		return nil, fmt.Errorf("%w: %w", ErrNotTekken, err)
 	}
 	if f.Config.Pattern == "" || len(f.Vocab) == 0 || len(f.Special) == 0 {
 		return nil, fmt.Errorf("%w: missing pattern, vocab or special_tokens", ErrNotTekken)
@@ -80,8 +80,11 @@ func loadTekken(raw []byte, opt tekkenOptions) (*Tokenizer, error) {
 			return nil, fmt.Errorf("%w: vocab entry %d carries rank %d", ErrNotTekken, i, e.Rank)
 		}
 		b, err := base64.StdEncoding.DecodeString(e.TokenBytes)
-		if err != nil || len(b) == 0 {
-			return nil, fmt.Errorf("%w: vocab entry %d token_bytes: %v", ErrNotTekken, i, err)
+		if err != nil {
+			return nil, fmt.Errorf("%w: vocab entry %d token_bytes: %w", ErrNotTekken, i, err)
+		}
+		if len(b) == 0 {
+			return nil, fmt.Errorf("%w: vocab entry %d has empty token_bytes", ErrNotTekken, i)
 		}
 		toks[i] = b
 		ranks[string(b)] = i

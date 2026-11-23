@@ -30,12 +30,9 @@ type ExactAttentionScoper interface {
 // goroutine starts, so the scope is active from the moment the entry point returns.
 func (m *Model) enterExactAttention() func() {
 	if m == nil || m.resident == nil {
-		return func() {}
+		return noopLeave
 	}
-	if sc, ok := m.resident.(ExactAttentionScoper); ok {
-		return sc.EnterExactAttention()
-	}
-	return func() {}
+	return m.resRuntime().EnterExactAttention()
 }
 
 // SpecDecodeConflict reports why speculative decoding on this model would not be lossless, or nil when it would be.
@@ -69,17 +66,13 @@ func (m *Model) SpecDecodeConflict() error {
 	if m.be != nil && isWebGPUBackend(m.be.Name()) {
 		switch m.Quant() {
 		case "int4", "int4mix":
-			return fmt.Errorf("speculative decoding would not be lossless: staged webgpu int4 decodes M=1 on the device and verifies M>1 on the CPU kernel, two different kernels with no measured tolerance between them (M-09, docs/audit-2026-09-10.md); use Generate")
+			return fmt.Errorf("speculative decoding would not be lossless: staged webgpu int4 decodes M=1 on the device and verifies M>1 on the CPU kernel, two different kernels with no measured tolerance between them; use Generate")
 		}
 	}
 	if m.resident == nil {
 		return nil
 	}
-	d, ok := m.resident.(DecodeVerifyDiverger)
-	if !ok {
-		return nil
-	}
-	if err := d.DecodeVerifyDivergence(); err != nil {
+	if err := m.resRuntime().DecodeVerifyDivergence(); err != nil {
 		return fmt.Errorf("speculative decoding would not be lossless on this resident: %w", err)
 	}
 	return nil

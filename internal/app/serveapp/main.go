@@ -28,6 +28,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/townsendmerino/goinfer/internal/app/serveapp/jobs"
 	"io"
 	"net"
 	"net/http"
@@ -277,50 +278,51 @@ type config struct {
 	adapters adapterFlag // compute-time LoRA adapters (-adapter, repeatable); each shares a base model's resident weights (#7)
 	// load is the model-loading flags goinfer-chat shares (internal/loadflags): server-global
 	// DEFAULTS, each of which a --model spec can override (see modelSpec / modelFlag.Set).
-	load            loadflags.Flags
-	kvQuant         string // DEPRECATED -kv-quant: CPU KV cache override, "" = follow -kv
-	name            string // -served-model-name (applies only to a single unnamed --model)
-	kvSessions      int
-	kvSessionsSet   bool          // -kv-sessions was given on the command line (flag.Visit after Parse)
-	sessionDir      string        // -session-dir (also where /admin unload snapshots warm KV)
-	kvIdleDemote    time.Duration // -kv-idle-demote: tiered KV — demote a session idle this long to disk (0 = off)
-	kvDemotedMax    int           // -kv-demoted-max: cap on the on-disk cold tier
-	maxQueue        int           // -max-queue: bounded per-model queue depth (0 = unbounded)
-	maxConcurrent   int           // -max-concurrent: generations one CPU model may run at once (1 = serialized)
-	cpuBatch        int           // -cpu-batch: decoder.CPUBatchAuto (default) / CPUBatchOn / CPUBatchOff
-	prefillChunk    int           // -prefill-chunk: under concurrent generation, a long prompt arriving while others decode prefills in chunks of this many tokens (default 512); 0 = off
-	kvShare         string        // -kv-share: "on" (default) or "off"
-	kvShareOff      bool          // kvShareOffFor's answer, set once the API key and bind are known
-	kvHostBytesFlag string        // -kv-host-bytes: auto, 0, or a byte count
-	kvHostBytes     int64         // the resolved budget for prefix snapshots (0: off); a config built without the flag keeps none
-	kvHostBytesHow  string        // how it was reached, for the startup line
-	kvDemote        bool          // the flag names a budget, not auto: released conversations' rows wait in it too
-	jobDir          string        // -job-dir (docs/tasks/task-work-queue-2026-09.md): optional dir for the job journal (one JSONL line per state transition); "" = in-memory job tracking only, no durability
-	maxInflight     int           // -max-inflight: global cap on concurrent inference handlers (bounds pre-queue work; 0 = unbounded)
-	maxBodyBytes    int64         // -max-body-bytes: request-body cap (0 = derive from the model's context window)
-	unloadDrainWait time.Duration // -unload-drain-wait: how long an unload waits for in-flight requests to drain before 202 (native free continues detached)
-	spec            string        // -spec: "" (off) | "ngram" — lossless n-gram speculative decode
-	specAdaptive    bool          // -spec-adaptive: "speculate when alone, batch under load" (needs -spec ngram and a resident that batches; off has no effect otherwise)
-	drafter         string        // -drafter: dir of a pretrained BLOCK drafter (DFlash); resident GPU backends only
-	drafterWidth    int           // -drafter-width: the verify width a greedy request's block-spec rounds run at; 0 = decoder's default
-	allowAdmin      bool          // -allow-admin: enable POST /admin/models/{load,unload}
-	allowedHosts    string        // -allowed-hosts: extra Host names a loopback-bound listener answers (hostGuard)
-	logRequests     bool          // -log-requests: one stderr line per generation request
-	logTokenIDs     string        // -log-token-ids: append one JSON line per generation (prompt hash, generated ids) to this file; "" = off
-	idsKeyFile      string        // -ids-key-file: the key that signs carried token ids; "" = a random key per start
-	noCarryIDs      bool          // -carry-ids=false: do not carry a reply's token ids back in its reasoning item (the zero value carries them)
-	fastAlias       bool          // -fast-alias: serve "<model>-fast", the same model with thinking off, for an agent's side requests
-	haltFile        string        // -halt-file: polled every 250ms; present ⇒ halted, absent ⇒ resumed
-	haltExitCode    int           // -halt-exit-code: nonzero ⇒ halt exits the process with this code after quiescence; 0 = stay up
-	adminSocket     string        // -admin-socket: serve /admin/* on this Unix socket instead of the TCP listener; "" = off
-	web             bool          // -web: serve the local browser UI + its model-pull routes
-	requireBE       bool          // -require-backend: refuse to start when a model silently fell back off the requested backend's fast paths (resident decode / batched prefill)
-	visionPath      string        // -vision: dir holding the vision tower (SigLIP + projector) for a multimodal --model
-	noSelfTest      bool          // -no-selftest: skip the startup self-tests (H2)
-	visionMaxPixels int           // -vision-max-pixels: lowers GLM-OCR's image pixel budget (0 = the model's own 4.82 MP ceiling)
-	visionQuant     string        // -vision-quant: "" (unset: f32; Gemma 3 on cuda may fall back to int8) | "f32" (explicit) | "int8" (W8A8; only faster on AVX512-VNNI — a WASH on AVX2)
-	visionDevice    string        // -vision-device: "auto" (default: the backend's device tower when it has one) | "cpu" | "gpu" (also a device tower that is opt-in)
-	// decisions (D5, docs/tasks/task-constrained-confidence.md): POST /v1/systemone's label-scoring template, and an
+	load              loadflags.Flags
+	kvQuant           string // DEPRECATED -kv-quant: CPU KV cache override, "" = follow -kv
+	name              string // -served-model-name (applies only to a single unnamed --model)
+	kvSessions        int
+	kvSessionsSet     bool          // -kv-sessions was given on the command line (flag.Visit after Parse)
+	sessionDir        string        // -session-dir (also where /admin unload snapshots warm KV)
+	kvIdleDemote      time.Duration // -kv-idle-demote: tiered KV — demote a session idle this long to disk (0 = off)
+	kvDemotedMax      int           // -kv-demoted-max: cap on the on-disk cold tier
+	maxQueue          int           // -max-queue: bounded per-model queue depth (0 = unbounded)
+	maxConcurrent     int           // -max-concurrent: generations one CPU model may run at once (1 = serialized)
+	cpuBatch          int           // -cpu-batch: decoder.CPUBatchAuto (default) / CPUBatchOn / CPUBatchOff
+	prefillChunk      int           // -prefill-chunk: under concurrent generation, a long prompt arriving while others decode prefills in chunks of this many tokens (default 512); 0 = off
+	kvShare           string        // -kv-share: "on" (default) or "off"
+	kvShareOff        bool          // kvShareOffFor's answer, set once the API key and bind are known
+	kvHostBytesFlag   string        // -kv-host-bytes: auto, 0, or a byte count
+	kvHostBytes       int64         // the resolved budget for prefix snapshots (0: off); a config built without the flag keeps none
+	kvHostBytesHow    string        // how it was reached, for the startup line
+	kvDemote          bool          // the flag names a budget, not auto: released conversations' rows wait in it too
+	jobDir            string        // -job-dir: optional dir for the job journal (one JSONL line per state transition); "" = in-memory job tracking only, no durability
+	maxInflight       int           // -max-inflight: global cap on concurrent inference handlers (bounds pre-queue work; 0 = unbounded)
+	maxBodyBytes      int64         // -max-body-bytes: request-body cap (0 = derive from the model's context window)
+	maxFileStoreBytes int64         // -max-file-store-bytes: what uploaded files and batch results may hold in memory (0 = no limit on bytes)
+	unloadDrainWait   time.Duration // -unload-drain-wait: how long an unload waits for in-flight requests to drain before 202 (native free continues detached)
+	spec              string        // -spec: "" (off) | "ngram" — lossless n-gram speculative decode
+	specAdaptive      bool          // -spec-adaptive: "speculate when alone, batch under load" (needs -spec ngram and a resident that batches; off has no effect otherwise)
+	drafter           string        // -drafter: dir of a pretrained BLOCK drafter (DFlash); resident GPU backends only
+	drafterWidth      int           // -drafter-width: the verify width a greedy request's block-spec rounds run at; 0 = decoder's default
+	allowAdmin        bool          // -allow-admin: enable POST /admin/models/{load,unload}
+	allowedHosts      string        // -allowed-hosts: extra Host names a loopback-bound listener answers (hostGuard)
+	logRequests       bool          // -log-requests: one stderr line per generation request
+	logTokenIDs       string        // -log-token-ids: append one JSON line per generation (prompt hash, generated ids) to this file; "" = off
+	idsKeyFile        string        // -ids-key-file: the key that signs carried token ids; "" = a random key per start
+	noCarryIDs        bool          // -carry-ids=false: do not carry a reply's token ids back in its reasoning item (the zero value carries them)
+	fastAlias         bool          // -fast-alias: serve "<model>-fast", the same model with thinking off, for an agent's side requests
+	haltFile          string        // -halt-file: polled every 250ms; present ⇒ halted, absent ⇒ resumed
+	haltExitCode      int           // -halt-exit-code: nonzero ⇒ halt exits the process with this code after quiescence; 0 = stay up
+	adminSocket       string        // -admin-socket: serve /admin/* on this Unix socket instead of the TCP listener; "" = off
+	web               bool          // -web: serve the local browser UI + its model-pull routes
+	requireBE         bool          // -require-backend: refuse to start when a model silently fell back off the requested backend's fast paths (resident decode / batched prefill)
+	visionPath        string        // -vision: dir holding the vision tower (SigLIP + projector) for a multimodal --model
+	noSelfTest        bool          // -no-selftest: skip the startup self-tests
+	visionMaxPixels   int           // -vision-max-pixels: lowers GLM-OCR's image pixel budget (0 = the model's own 4.82 MP ceiling)
+	visionQuant       string        // -vision-quant: "" (unset: f32; Gemma 3 on cuda may fall back to int8) | "f32" (explicit) | "int8" (W8A8; only faster on AVX512-VNNI — a WASH on AVX2)
+	visionDevice      string        // -vision-device: "auto" (default: the backend's device tower when it has one) | "cpu" | "gpu" (as auto, and it also puts on the device the towers auto keeps on the CPU under webgpu: on a discrete GPU, and a Qwen3.5+ .gguf mmproj tower)
+	// decisions: POST /v1/systemone's label-scoring template, and an
 	// optional calibration.json of per-kind temperatures ("" = none: every answer is uncalibrated).
 	decisionsTemplate string
 	decisionsCal      string
@@ -336,8 +338,8 @@ type config struct {
 	// toolFormat is -tool-format (auto | hermes | template): how a family whose own template declares a native tool form (Qwen3.5, Gemma 4's canonical
 	// template) has its tools put in the prompt (chat/qwen_xml_tools.go, chat/gemma4_tools.go). Applied to the model's template at load, like -thinking.
 	toolFormat string
-	// lenientToolCalls is -lenient-tool-calls: also read ONE fenced JSON call at the end of a reply as a tool call, on the <tool_call> families
-	// (chat.Template.WithLenientToolCalls, docs/queue-correctness.md G39). Off by default. Applied to the model's template at load.
+	// lenientToolCalls is -lenient-tool-calls: also read ONE fenced JSON call at the end of a reply as a tool call, on the <tool_call> families.
+	// Off by default. Applied to the model's template at load.
 	lenientToolCalls bool
 
 	embedPath  string // encoder (-embed-model); "" = no /v1/embeddings
@@ -377,19 +379,19 @@ func registerFlags(fs *flag.FlagSet) *serveFlags {
 	sf.tlsCert = fs.String("tls-cert", "", "PEM certificate file; with -tls-key, serves HTTPS instead of plaintext HTTP. Without it, -api-key and every prompt/completion travel in cleartext — fine on loopback, not on a shared network. For ACME/auto-renewal, put a reverse proxy (Caddy, nginx, Traefik) in front instead and leave this unset.")
 	sf.tlsKey = fs.String("tls-key", "", "PEM private key file, paired with -tls-cert")
 	fs.StringVar(&cfg.sessionDir, "session-dir", "", "optional dir to persist/restore KV sessions across restarts (.giw-kv snapshots)")
-	fs.StringVar(&cfg.jobDir, "job-dir", "", "J2 (task-work-queue-2026-09.md): optional dir for a durable job journal — one JSONL line per generation state transition (pending/running/done/failed/cancelled), 0700/0600 permissions matching -session-dir. On restart, any job still 'running' at the last recorded transition is marked 'interrupted', never silently 'failed'. Off by default: every generation still gets an in-memory job record, just no durability across a restart")
+	fs.StringVar(&cfg.jobDir, "job-dir", "", "optional dir for a durable job journal — one JSONL line per generation state transition (pending/running/done/failed/cancelled), 0700/0600 permissions matching -session-dir. On restart, any job still 'running' at the last recorded transition is marked 'interrupted', never silently 'failed'. Off by default: every generation still gets an in-memory job record, just no durability across a restart")
 	fs.BoolVar(&cfg.web, "web", false, "serve a local browser UI at / — chat with the loaded model, and pull and load GGUF files or whole safetensors checkpoints from HuggingFace, on the same server and the same /v1 routes any other client uses (one embedded HTML file; no external assets, so it works offline). Off by default: the page is static, but its pull route starts a caller-named multi-gigabyte download and writes it to disk. On a non-loopback bind the existing -api-key requirement applies as usual")
 	fs.BoolVar(&cfg.allowAdmin, "allow-admin", false, "enable /admin/* on THIS (TCP) listener — model load/unload (loads attacker-named paths), GET /admin/generations, POST /admin/generations/{id}/cancel, POST /admin/halt, POST /admin/resume (deliberate opt-in; requires -api-key). A /v1 client holding the same key can reach every one of these routes too, including halt/resume. Ignored when -admin-socket is set: /admin/* is then not registered on TCP at all (a request 404s, not 403s — this listener does not admit the surface exists), and is served on the socket instead with no key check")
 	fs.StringVar(&cfg.allowedHosts, "allowed-hosts", "", "comma-separated Host names, beyond localhost, 127.0.0.1, [::1] and the -addr host, that a listener bound to the loopback answers (default none). A request whose Host is any other name gets 421: that is what stops a web page from reaching a loopback server by DNS rebinding. Set it when a reverse proxy on this machine forwards a public name to the loopback port. Has no effect on a listener bound beyond the loopback, which answers any Host and is protected by -api-key")
-	fs.BoolVar(&cfg.logRequests, "log-requests", false, "write one line to stderr per generation request (/v1/chat/completions, /v1/completions, /v1/responses, /v1/messages) when it finishes: route, model, status, prompt and completion tokens, time to first token and total time, then the first generation's KV reuse (reused, the slot's length before the request, and div, where the prompt left it), canon (1 when the generated ids are the tokenizer's own split of their text), and on /v1/responses and /v1/messages the carried token ids (ids=<used>/<carried>, ids_fallback, the reason for each turn that re-tokenized, and ids_fmt when used turns replaced template-owned formatting). Off by default; a request that failed before generating shows `-` for the model and token counts")
+	fs.BoolVar(&cfg.logRequests, "log-requests", false, "write one line to stderr per generation request (/v1/chat/completions, /v1/completions, /v1/responses, /v1/messages) when it finishes: route, model, status, prompt and completion tokens, time to first token and total time, then the first generation's KV reuse (reused, the slot's length before the request, and div, where the prompt left it), canon (1 when the generated ids are the tokenizer's own split of their text), and on /v1/responses and /v1/messages the carried token ids (ids=<used>/<carried>, ids_fallback, the reason for each turn that re-tokenized, and ids_fmt when used turns replaced template-owned formatting), spec=<drafted>/<accepted> on a request that speculated, and lazy=armed when a speculating server's auto tool turn took the constrained path at its call opener. Off by default; a request that failed before generating shows `-` for the model and token counts")
 	fs.StringVar(&cfg.logTokenIDs, "log-token-ids", "", "for measurement runs: append one JSON line per generation to this file — time, route, response id, the prompt's length and SHA-256 (of its ids as little-endian uint32s), reused and slot positions, the generated token ids, and whether they are the tokenizer's own encoding of their text. The file holds the model's output as token ids; it is created 0600. Off by default")
 	fs.Var(invertedBool{&cfg.noCarryIDs}, "carry-ids", "carry a /v1/responses reply's generated token ids back to the server in its reasoning item's encrypted_content (signed), and use them when the reply is echoed, so it re-tokenizes to the ids the model generated. false writes the text-only blob and re-tokenizes every echoed turn, as before this existed")
 	fs.BoolVar(&cfg.fastAlias, "fast-alias", true, "a served model N is also reachable as N-fast: the same weights, template and KV slot, with thinking off and nothing else different, for the side requests an agent sends for its own bookkeeping (a session title). connect points Claude Code's small-model setting and opencode's small_model at it. false turns the alias off")
 	fs.StringVar(&cfg.idsKeyFile, "ids-key-file", "", "a file holding the key (32 bytes or more, mode 0600) that signs the token ids a /v1/responses reply carries back in its reasoning item's encrypted_content, so an echoed reply re-tokenizes to the ids the model generated. Default: a random key made at start and never written, so after a restart, or on another server, older replies fall back to re-tokenizing their text (counted as `key`). Set it to keep carried ids valid across restarts or between servers that share it")
-	fs.StringVar(&cfg.haltFile, "halt-file", "", "K2: poll this path every 250ms — present halts the server (every inference route 503s, in-flight generations are cancelled), absent resumes it. No HTTP call, socket, or signal needed; a supervisor halts with `touch` and resumes with `rm`. The model stays loaded either way; resume is instant. Off by default")
-	fs.IntVar(&cfg.haltExitCode, "halt-exit-code", 0, "K2: when nonzero, any halt (admin, -halt-file, or SIGUSR1) exits the process with this code once every cancelled generation has actually stopped, instead of staying up halted. For a supervisor whose restart policy must not undo a deliberate halt (RestartPreventExitStatus=N or the equivalent). 0 (default) means halt never exits the process")
-	fs.StringVar(&cfg.adminSocket, "admin-socket", "", fmt.Sprintf("K5: serve /admin/* (load/unload plus K1/K2's cancel/list/halt/resume) on a Unix socket instead of the TCP listener — mode 0600, unlinked and recreated fresh at start, no -api-key check (the socket's file permissions are the auth, so its directory must be one nobody else can rewrite: not writable by its group or by everyone, unless it is sticky like /tmp). Removes /admin/* from the TCP listener entirely (404, not 403) — see -allow-admin. Suggested path: %s. Off by default (empty = /admin/* stays on TCP, gated by -allow-admin as before). Control it with the same binary: `%[2]s status|ls|cancel <id>|halt [reason]|resume` talks to this socket (defaults to the suggested path above when -admin-socket is not repeated on that command line)", defaultAdminSocketPath(), filepath.Base(os.Args[0])))
-	fs.StringVar(&cfg.visionPath, "vision", "", "vision tower dir for a multimodal --model (auto-discovered per family: SigLIP+projector for Gemma 3, Qwen2.5-VL's own ViT, or Gemma 4's own encoder — N-35, docs/audit-2026-09-10.md); enables image content parts. Defaults to the --model dir when it contains a vision tower")
+	fs.StringVar(&cfg.haltFile, "halt-file", "", "poll this path every 250ms — present halts the server (every inference route 503s, in-flight generations are cancelled), absent resumes it. No HTTP call, socket, or signal needed; a supervisor halts with `touch` and resumes with `rm`. The model stays loaded either way; resume is instant. Off by default")
+	fs.IntVar(&cfg.haltExitCode, "halt-exit-code", 0, "when nonzero, any halt (admin, -halt-file, or SIGUSR1) exits the process with this code once every cancelled generation has actually stopped, instead of staying up halted. For a supervisor whose restart policy must not undo a deliberate halt (RestartPreventExitStatus=N or the equivalent). 0 (default) means halt never exits the process")
+	fs.StringVar(&cfg.adminSocket, "admin-socket", "", fmt.Sprintf("serve /admin/* (load/unload, cancel/list, halt/resume) on a Unix socket instead of the TCP listener — mode 0600, unlinked and recreated fresh at start, no -api-key check (the socket's file permissions are the auth, so its directory must be one nobody else can rewrite: not writable by its group or by everyone, unless it is sticky like /tmp). Removes /admin/* from the TCP listener entirely (404, not 403) — see -allow-admin. Suggested path: %s. Off by default (empty = /admin/* stays on TCP, gated by -allow-admin as before). Control it with the same binary: `%[2]s status|ls|cancel <id>|halt [reason]|resume` talks to this socket (defaults to the suggested path above when -admin-socket is not repeated on that command line)", defaultAdminSocketPath(), filepath.Base(os.Args[0])))
+	fs.StringVar(&cfg.visionPath, "vision", "", "vision tower dir for a multimodal --model (auto-discovered per family: SigLIP+projector for Gemma 3, Qwen2.5-VL's own ViT, or Gemma 4's own encoder); enables image content parts. Defaults to the --model dir when it contains a vision tower")
 	fs.StringVar(&cfg.decisionsTemplate, "decisions-template", "chat-v1", "POST /v1/systemone's prompt template: chat-v1 (the model's chat template; for instruct models) or bare-v1 (JEV's own, no chat template)")
 	fs.StringVar(&cfg.decisionsCal, "decisions-calibration", "", "calibration.json with per-kind temperatures for /v1/systemone (from goinfer-chat decisions-calibrate, fitted under the same template); none: every answer is uncalibrated")
 	fs.StringVar(&cfg.thinking, "thinking", "template", "default thinking mode for a model whose chat template has a recognised thinking control (Qwen3, Qwen3.5, Gemma 4): template (what the checkpoint's own template renders — Qwen3.5-0.8B: off, Qwen3.5-9B: on), asis (the prompt bytes serve rendered before thinking was modelled: nothing written, the model decides), on, or off. A request overrides it with chat_template_kwargs.enable_thinking, reasoning_effort, or Anthropic's thinking. A model whose template control is not recognised ignores this.")
@@ -399,8 +401,8 @@ func registerFlags(fs *flag.FlagSet) *serveFlags {
 	fs.StringVar(&cfg.reasoningFmt, "reasoning-format", "deepseek", "how a reply's reasoning reaches the client: deepseek (content is the clean answer, reasoning goes in reasoning_content / Anthropic thinking blocks), deepseek-legacy (reasoning_content is filled and content keeps the raw <think> tags), or none (nothing is separated: the raw text is the content). A request may override it with reasoning_format.")
 	fs.BoolVar(&cfg.noSelfTest, "no-selftest", false, "skip the startup self-tests: a kernel check against a reference that steps a CPU kernel tier down, or declines a GPU backend, when its output disagrees. On by default; skip it only if it misjudges a healthy machine (and tell us: `check --hardware` prints what it found).")
 	fs.IntVar(&cfg.visionMaxPixels, "vision-max-pixels", 0, "GLM-OCR only: lower the image pixel budget to this many pixels (0 = the model's own ceiling, 4.82 MP; it is never raised). The CPU tower costs about 29 s at 1 MP, 92 s at 2 MP and 7 min at 4.8 MP on an M1 Pro.")
-	fs.StringVar(&cfg.visionDevice, "vision-device", "auto", "where the vision towers and the Whisper-style audio encoder (Whisper, Voxtral) run: auto (default: on the --backend's GPU when this binary has one there, else the CPU; under --backend webgpu every vision tower stays on the CPU) | cpu (the CPU whatever the backend; the language model keeps its own backend) | gpu (as auto, and under --backend webgpu the towers that have a WebGPU form run on the GPU in float32: Gemma 3's, Gemma 4's, Qwen2.5-VL's, Qwen3.5+'s, Qwen3-VL's and GLM-OCR's)")
-	fs.StringVar(&cfg.visionQuant, "vision-quant", "", "vision encoder weight quant: f32 (bit-exact) | int8 (W8A8; lossy: relative L2 0.14-0.52 against f32, docs/measurements/vision-tower-int8-fidelity-*) — int8 only speeds the compute-bound ViT prefill on AVX512-VNNI; on AVX2 it's a wash. Unset (the default) is f32 everywhere; on CUDA Gemma 3 is int8 instead (with a note) if the card cannot hold the decoder, one KV slot and the float32 tower, or if that tower fails to attach (an explicit f32 never falls back). Under --backend webgpu Gemma 3's unset default runs the float32 tower on the CPU; f32 or int8 given explicitly puts that tower on the GPU")
+	fs.StringVar(&cfg.visionDevice, "vision-device", "auto", "where the vision towers and the Whisper-style audio encoder (Whisper, Voxtral) run: auto (default: on the --backend's GPU when this binary has one there, else the CPU; under --backend webgpu that is Gemma 3's, Gemma 4's, Qwen2.5-VL's, Qwen3.5+'s, Qwen3-VL's and GLM-OCR's towers, in float32, on a unified-memory Mac; a discrete GPU and a Qwen3.5+ .gguf mmproj tower keep the CPU) | cpu (the CPU whatever the backend; the language model keeps its own backend) | gpu (as auto, and it also puts on the device the towers auto keeps on the CPU under webgpu: on a discrete GPU, and a Qwen3.5+ .gguf mmproj tower)")
+	fs.StringVar(&cfg.visionQuant, "vision-quant", "", "vision encoder weight quant: f32 (bit-exact) | int8 (W8A8; lossy: relative L2 0.14-0.52 against f32, docs/measurements/vision-tower-int8-fidelity-*) — int8 only speeds the compute-bound ViT prefill on AVX512-VNNI; on AVX2 it's a wash. Unset (the default) is f32 everywhere; on CUDA Gemma 3 is int8 instead (with a note) if the card cannot hold the decoder, one KV slot and the float32 tower, or if that tower fails to attach (an explicit f32 never falls back). Under --backend webgpu Gemma 3's unset default is the float32 tower on the GPU on a unified-memory Mac (a discrete GPU keeps the CPU tower, and an explicit f32 or int8 asks for the device); int8 given explicitly puts the int8 one there")
 	fs.Var(&cfg.models, "model", "generative model: a .gguf/.giw file, an HF dir, or a reference that is fetched on first use — hf:<owner>/<repo>:<quant> (e.g. hf:Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF:q4_k_m), hf:<owner>/<repo>:safetensors (a safetensors checkpoint, fetched as a verified set) or demo:<tier>. A reference is sha256-verified and cached; a path is used as-is. Repeatable\n"+
 		"as `name=path` to serve a model zoo from one process; requests route on the\n"+
 		"OpenAI `model` field. Append comma-separated per-model overrides of the global\n"+
@@ -408,16 +410,16 @@ func registerFlags(fs *flag.FlagSet) *serveFlags {
 		"streams only the big MoE. Keys: quant,lora,kv,kv-quant,ctx,stream,weight-cache,embed-int4,head.\n"+
 		"head=DIR attaches a trained decision head (autotrust's JEV layout): POST /v1/systemone on that model\n"+
 		"answers with it (Route B), and an unmerged head's adapter is merged into the model at load. The model loads\n"+
-		"at "+decoder.DecisionHeadQuant+" unless quant= or -quant chooses otherwise (the default for decision models, D6b).\n"+
+		"at "+decoder.DecisionHeadQuant+" unless quant= or -quant chooses otherwise (the default for decision models).\n"+
 		"A model directory that carries joint_head.safetensors is a Clef decision model (Route C): POST /v1/systemone on it\n"+
 		"answers with its joint head, one backbone pass for every question, and it loads at the same default.\n"+
 		"(Paths may not contain commas.)")
-	fs.IntVar(&cfg.drafterWidth, "drafter-width", 0, "verify width for --drafter: how many block positions the target verifies per round (the anchor and width-1 drafts). 0 keeps the default of 8; the drafter's block caps it. The best width depends on the pairing and the box: on nobara's RTX 2070 SUPER, Qwen3.5-9B with z-lab's DFlash measured 1.46x at 4 (docs/measurements/sp2-2026-10/README.md), where SP0 projected 1.17x at 8. Widths under 4 are refused (a round then commits too few tokens for the acceptance guard, so most turns fall back to plain decode), and so is a width the target cannot verify (past a recurrent model's fold rows).")
+	fs.IntVar(&cfg.drafterWidth, "drafter-width", 0, "verify width for --drafter: how many block positions the target verifies per round (the anchor and width-1 drafts). 0 keeps the default of 8; the drafter's block caps it. The best width depends on the pairing and the box: a narrower width can beat the default (docs/measurements/sp2-2026-10/README.md). Widths under 4 are refused (a round then commits too few tokens for the acceptance guard, so most turns fall back to plain decode), and so is a width the target cannot verify (past a recurrent model's fold rows).")
 	fs.StringVar(&cfg.drafter, "drafter", "", "directory of a pretrained BLOCK drafter (z-lab DFlash) paired with --model: the drafter proposes a whole block of tokens per round and the target verifies them in ONE batched pass, measured 1.6-1.8x on code/math and ~0.96x on open chat (docs/spec/08). LOSSLESS — every emitted token is one the target's own argmax produced, so output is identical to plain greedy. Greedy only: a request with temperature, penalties or logit bias falls back to normal decoding automatically. Requires a resident GPU backend (--backend cuda); declines with a reason otherwise serve-only; goinfer-chat offers --spec ngram and --draft instead.")
 	sf.showVersion = fs.Bool("version", false, "print version, the backends COMPILED INTO this binary, and the Go toolchain, then exit. `backends:` is the compiled-in truth — --backend accepts names this build cannot run and falls back to cpu")
 	// The model-loading flags goinfer-chat shares — one registration, so the two binaries cannot drift.
 	sf.lf = loadflags.Register(fs, loadflags.Serve)
-	fs.BoolVar(&cfg.requireBE, "require-backend", false, "strict mode: exit non-zero at startup if a model did not resolve to the requested --backend's fast paths — no resident decode path, or a prefill that declined to the sequential per-token loop (e.g. native f32 on cuda, ~9x slower TTFT — N-35, docs/audit-2026-09-10.md: every quantized mode gets batched CUDA prefill, see -quant's own help above; only f32 falls back). Both fall back silently by design; a batch client should fail at second zero instead of discovering it under load. Under -backend auto it also refuses to start when auto passed over a GPU backend this binary has (no device answered) rather than run on the CPU; -backend cpu runs strict on the CPU")
+	fs.BoolVar(&cfg.requireBE, "require-backend", false, "strict mode: exit non-zero at startup if a model did not resolve to the requested --backend's fast paths — no resident decode path, or a prefill that declined to the sequential per-token loop (e.g. native f32 on cuda, a much slower time to first token: every quantized mode gets batched CUDA prefill, see -quant's own help above; only f32 falls back). Both fall back silently by design; a batch client should fail at second zero instead of discovering it under load. Under -backend auto it also refuses to start when auto passed over a GPU backend this binary has (no device answered) rather than run on the CPU; -backend cpu runs strict on the CPU")
 	fs.StringVar(&cfg.kvQuant, "kv-quant", "", "DEPRECATED — use --kv, which now covers the CPU cache too. When given, overrides the CPU KV cache alone: f32 | i8")
 	fs.Var(&cfg.adapters, "adapter", "compute-time LoRA adapter sharing a base model's resident weights: `serveName=baseName=dir`.\n"+
 		"Repeatable. Unlike --lora (merged, one base per fine-tune), N adapters of one base cost ~base + N\n"+
@@ -429,7 +431,7 @@ func registerFlags(fs *flag.FlagSet) *serveFlags {
 	fs.IntVar(&cfg.kvDemotedMax, "kv-demoted-max", 64, "tiered KV: max demoted (on-disk) sessions to keep; older ones are dropped (only with -kv-idle-demote)")
 	fs.IntVar(&cfg.maxQueue, "max-queue", 8, "per-model backpressure: max queued requests before 429 (0 = unbounded)")
 	fs.IntVar(&cfg.maxConcurrent, "max-concurrent", 4, "generations one CPU model may run at once, each on its own session KV (capped by -kv-sessions; GPU-resident, weight-streaming and vision models always run one; 1 = serialized)")
-	fs.Func("cpu-batch", "auto|on|off: whether concurrent CPU generations of one model join their decode tokens into one batched forward (MC3c step 2; replies are bit-identical either way). auto (the default) batches models with at least 2 GiB of dense weights, where it measured 2.25-2.41x the independent workers on a 7B (1.38-1.54x on an M1 Pro), and keeps smaller models on the workers", func(v string) error {
+	fs.Func("cpu-batch", "auto|on|off: whether concurrent CPU generations of one model join their decode tokens into one batched forward (replies are bit-identical either way). auto (the default) batches models with at least 2 GiB of dense weights, where batching beats independent workers, and keeps smaller models on the workers", func(v string) error {
 		switch v {
 		case "auto":
 			cfg.cpuBatch = decoder.CPUBatchAuto
@@ -442,14 +444,15 @@ func registerFlags(fs *flag.FlagSet) *serveFlags {
 		}
 		return nil
 	})
-	fs.StringVar(&cfg.kvHostBytesFlag, "kv-host-bytes", "auto", "host memory the server may hold as prefix snapshots on a GPU-resident model: after a cold first prefill of a long prompt, the prompt's KV is copied to pinned host memory, and a later request that starts with the same ids restores it instead of prefilling it. auto (the default) is a tenth of the machine's RAM, at most 8 GiB; 0 turns it off; or a byte count with an optional K, M or G. Memory is pinned only while a snapshot is held, so an idle server holds none. A budget named here (not auto) also keeps a released idle conversation's rows in host memory on CUDA, and they come back when it returns; that is experimental, and a slot holding a wrapped upload is not kept. -kv-share off turns snapshots off too")
+	fs.StringVar(&cfg.kvHostBytesFlag, "kv-host-bytes", "auto", "host memory the server may hold as prefix snapshots on a GPU-resident model: after a cold first prefill of a long prompt, the prompt's KV is copied to host memory, and a later request that starts with the same ids restores it instead of prefilling it. auto (the default) is a tenth of the machine's RAM, at most 8 GiB; 0 turns it off; or a byte count with an optional K, M or G. Memory is held only while a snapshot is, so an idle server holds none. A budget named here (not auto) also keeps a released idle conversation's rows in host memory on CUDA, and they come back when it returns; that is experimental, and a slot holding a wrapped upload is not kept. -kv-share off turns snapshots off too")
 	fs.StringVar(&cfg.kvShare, "kv-share", "on", "on|off: whether a conversation may reuse KV rows another conversation computed, such as a shared system prompt, on a GPU-resident model (on: a new conversation copies the shared rows instead of prefilling them; off: a request reuses only its own conversation's rows). Sharing makes time to first token reveal something about what another client sent, so it is off whatever this says when the server answers the network without -api-key (an -allowed-hosts name on a loopback bind)")
-	fs.IntVar(&cfg.prefillChunk, "prefill-chunk", 512, "on a GPU-resident model running several generations at once (MC3), prefill a long prompt that arrives while others are decoding in chunks of this many tokens, one decode step between chunks, instead of stalling them for the whole prompt (replies are unchanged: Metal's prefill is chunk-invariant; 512 graded 2026-09-27: the decoders' longest stall 0.23x); 0 = off")
+	fs.IntVar(&cfg.prefillChunk, "prefill-chunk", 512, "on a GPU-resident model running several generations at once, prefill a long prompt that arrives while others are decoding in chunks of this many tokens, one decode step between chunks, instead of stalling them for the whole prompt (replies are unchanged: Metal's prefill is chunk-invariant; 512 keeps the other decoders' longest stall well below a whole prompt's); 0 = off")
 	fs.IntVar(&cfg.maxInflight, "max-inflight", 128, "global cap on concurrent inference requests, bounding the pre-queue stage (JSON+image decode, tokenization, template render, vision Forward) that runs before the per-model queue; a full cap returns 503 Retry-After (0 = unbounded)")
+	fs.Int64Var(&cfg.maxFileStoreBytes, "max-file-store-bytes", 1<<30, "cap on the bytes of uploaded files and batch results held in memory. The oldest go first, and the newest upload or batch's result files are always kept, so a dropped file's id answers 404: download a batch's results before uploading much more. 0 = no limit on bytes (the store still keeps at most 256 files)")
 	fs.Int64Var(&cfg.maxBodyBytes, "max-body-bytes", 0, "cap on request body size in bytes; a larger body is rejected 413 before it is read. 0 = derive from the model's context window (a body that could never fit is rejected up front). The vision endpoints get at least 32 MiB on top for base64 image data")
 	fs.DurationVar(&cfg.unloadDrainWait, "unload-drain-wait", 5*time.Second, "how long POST /admin/models/unload waits for in-flight requests to drain before returning 202 (native memory is freed as they finish either way; the model is unroutable immediately). ?wait=false returns 202 at once")
 	fs.StringVar(&cfg.spec, "spec", "", "speculative decoding: \"\" (off) | ngram — lossless n-gram (prompt-lookup) drafting with adaptive depth. Wins on copy-heavy traffic (code edits / RAG / agent loops) on the CPU and Metal backends; output is identical (greedy bit-exact, sampled in-distribution incl. temperature/top-k/p/min-p + repetition penalties + logit bias). On greedy constrained/tool requests (response_format / tool grammar) it switches to grammar-fused drafting — the grammar's forced bytes are drafted for free, fused with the n-gram source. Auto-falls back to plain decode per-request when the sampler isn't yet supported on the spec path (e.g. constrained + temperature>0) goinfer-chat has the same --spec ngram, and additionally --draft (a separate small draft model).")
-	fs.BoolVar(&cfg.specAdaptive, "spec-adaptive", false, "MC4 candidate (docs/tasks/task-concurrency-2026-09.md): with -spec ngram on a resident whose decode can batch (MC3), keep MC3's concurrency instead of forcing one generation at a time — a generation speculates only while it is alone, joining MC3's batched decode at a round boundary when others arrive, and resumes speculating after 8 consecutive rounds alone. Output is unaffected (the same lossless verify either way). No effect without -spec ngram, or on a resident MC3 cannot batch.")
+	fs.BoolVar(&cfg.specAdaptive, "spec-adaptive", false, "Experimental, opt-in: with -spec ngram on a resident whose decode can batch, keep concurrent generations instead of forcing one at a time — a generation speculates only while it is alone, joins the batched decode at a round boundary when others arrive, and resumes speculating after 8 consecutive rounds alone. Measured cost under load (CUDA, 4 clients, docs/measurements/mc4-candidate-cuda-2026-10-01.md): 0.858x batching alone on chat traffic, and 0.80x plain -spec ngram on copy traffic; alone it is faster than batching (copy 2.13x, chat 1.26x). No effect without -spec ngram, or on a resident that cannot batch.")
 	fs.StringVar(&cfg.embedPath, "embed-model", "", "embedding model for /v1/embeddings: a CodeRankEmbed/NomicBert HF dir (config.json + model.safetensors + tokenizer.json), a decoder-as-embedder .gguf, or a HuggingFace reference: hf:<owner>/<repo>:safetensors fetches a NomicBert encoder checkpoint (anything else is refused before the weights), hf:<owner>/<repo>:<quant> a GGUF")
 	fs.StringVar(&cfg.embedQuant, "embed-quant", "f32", "embedding weight precision: f32 | q8")
 	fs.StringVar(&cfg.embedName, "embed-served-model-name", "", "embedding model id reported by /v1/models (default: dir basename)")
@@ -472,6 +475,9 @@ func (srv *server) restoreSessions(cfg config) {
 	}
 }
 
+// sessionNoticeOut is where a session checkpoint that could not be written is said; a test swaps it.
+var sessionNoticeOut io.Writer = os.Stderr
+
 // checkpointSessions saves each model's KV sessions to -session-dir at shutdown. The caller has already cancelled
 // the generations in flight; a model one of them still holds after five seconds is skipped, not waited for.
 func (srv *server) checkpointSessions(cfg config) {
@@ -485,7 +491,9 @@ func (srv *server) checkpointSessions(cfg config) {
 			fmt.Fprintf(os.Stderr, "shutdown: model %q still busy — skipping its session checkpoint\n", lm.name)
 			continue
 		}
-		_ = lm.sessions.save(sessionSubdir(cfg.sessionDir, lm.fp))
+		if err := lm.sessions.save(sessionSubdir(cfg.sessionDir, lm.fp)); err != nil {
+			fmt.Fprintf(sessionNoticeOut, "shutdown: model %q: session checkpoint not written (%v); its sessions will not restore\n", lm.name, err)
+		}
 		lm.sessions.removeColdFiles() // the cold tier is in-process; clear its scratch
 		lm.sessMu.Unlock()
 	}
@@ -517,6 +525,9 @@ func (cfg config) validate() error {
 		return fmt.Errorf("-drafter-width %d: want 0 (the default) or at least %d: under %d a round commits too few tokens for the "+
 			"acceptance guard's bar, so most turns fall back to plain decode", cfg.drafterWidth, minDrafterWidth, minDrafterWidth)
 	}
+	if cfg.maxFileStoreBytes < 0 {
+		return fmt.Errorf("-max-file-store-bytes %d: want a size in bytes, or 0 for no limit on bytes", cfg.maxFileStoreBytes)
+	}
 	if _, ok := chat.ParseThinkMode(cfg.thinking); !ok {
 		return fmt.Errorf("-thinking %q: want asis, template, on or off", cfg.thinking)
 	}
@@ -524,7 +535,7 @@ func (cfg config) validate() error {
 		return fmt.Errorf("-tool-format %q: want hermes or template", cfg.toolFormat)
 	}
 	if _, err := parseBudgetFlag(cfg.reasoningBudget); err != nil {
-		return fmt.Errorf("-reasoning-budget %q: %v", cfg.reasoningBudget, err)
+		return fmt.Errorf("-reasoning-budget %q: %w", cfg.reasoningBudget, err)
 	}
 	if _, ok := parseReasoningFormat(cfg.reasoningFmt); !ok {
 		return fmt.Errorf("-reasoning-format %q: want deepseek, deepseek-legacy or none", cfg.reasoningFmt)
@@ -539,17 +550,21 @@ func (cfg config) validate() error {
 			err = fmt.Errorf("fitted under template %q, not -decisions-template %q", cal.Template, cfg.decisionsTemplate)
 		}
 		if err != nil {
-			return fmt.Errorf("-decisions-calibration %s: %v", cfg.decisionsCal, err)
+			return fmt.Errorf("-decisions-calibration %s: %w", cfg.decisionsCal, err)
 		}
 	}
 	return nil
 }
 
 // routes builds the server's route table: every endpoint behind its auth check, halt gate, inflight cap and body cap.
-// authKey "" disables the auth check, and reqLog nil the per-request log lines. It returns the mux and the text body cap,
-// which the admin socket's routes share. The listener's own concerns (the Host guard, TLS, timeouts, signals) are the
-// caller's.
-func (srv *server) routes(cfg config, authKey string, reqLog io.Writer) (*http.ServeMux, int64) {
+// authKey "" disables the auth check. With cfg.logRequests set, each generation request writes its line to stderr. It returns
+// the mux and the text body cap, which the admin socket's routes share. The listener's own concerns (the Host guard, TLS,
+// timeouts, signals) are the caller's.
+func (srv *server) routes(cfg config, authKey string, stderr io.Writer) (*http.ServeMux, int64) {
+	var reqLog io.Writer
+	if cfg.logRequests {
+		reqLog = stderr
+	}
 	// Every POST body is size-bounded: the chat/messages endpoints carry base64 image_url data, so they get the larger
 	// vision cap; the rest a few MB. auth wraps a handler with the optional shared-secret check (no-op when authKey is "");
 	// every route below goes through it so a set key protects the whole surface.
@@ -574,11 +589,11 @@ func (srv *server) routes(cfg config, authKey string, reqLog io.Writer) (*http.S
 	mux.HandleFunc("GET /health", auth(srv.handleHealth))
 	// haltGate runs AFTER auth (a bad key is still rejected during a halt) and BEFORE inf (a halt must not wait for an
 	// inflight slot). /admin/* and /health are deliberately NOT wrapped in it: an operator must always be able to resume and
-	// check status (docs/tasks/task-halt-2026-09.md).
+	// check status.
 	// These routes are registered whether or not a model is loaded at startup: a server started with only --web,
 	// --allow-admin or --admin-socket loads its model later, and the mux is built once. Every handler resolves its model
 	// through resolveAndLock, which answers an unknown or absent model with the OpenAI-shaped 404 "model not found (served:
-	// ...)".
+	// ..)".
 	// -log-requests wraps the four generation routes OUTERMOST, so a request the auth, halt or queue gates turned away is
 	// logged with its status too.
 	rl := func(h http.HandlerFunc) http.HandlerFunc { return srv.traceRequests(reqLog, h) }
@@ -594,12 +609,12 @@ func (srv *server) routes(cfg config, authKey string, reqLog io.Writer) (*http.S
 	mux.HandleFunc("POST /v1/audio/transcriptions", rl(auth(srv.haltGate(inf(maxBytes(audioCap, srv.handleTranscriptions))))))
 	mux.HandleFunc("POST /v1/messages/count_tokens", auth(srv.haltGate(inf(maxBytes(textCap, srv.handleCountTokens)))))
 	// POST /v1/systemone is TypeSafe's wire shape, served by label scoring (internal/decide), so jevx and the TypeSafe SDKs
-	// work against goinfer through their base-URL override (docs/tasks/task-constrained-confidence.md).
+	// work against goinfer through their base-URL override.
 	mux.HandleFunc("POST /v1/systemone", auth(srv.haltGate(inf(maxBytes(textCap, srv.handleSystemOne)))))
 	// Submitting a job starts new admission, so POST /v1/jobs gets the same haltGate/inf/maxBytes stack as every other POST
 	// above. Polling (GET), the event stream and cancel (DELETE) are not new inference work: haltGate would 503 a client
 	// trying to learn that its job was halted, and inf's cap bounds pre-queue decode and tokenization, which these do not
-	// do. They get auth only (docs/tasks/task-work-queue-2026-09.md).
+	// do. They get auth only.
 	mux.HandleFunc("POST /v1/jobs", auth(srv.haltGate(inf(maxBytes(textCap, srv.handleCreateJob)))))
 	mux.HandleFunc("GET /v1/jobs/{id}", auth(srv.handleGetJob))
 	mux.HandleFunc("GET /v1/jobs/{id}/events", auth(srv.handleJobEvents))
@@ -627,7 +642,7 @@ func (srv *server) routes(cfg config, authKey string, reqLog io.Writer) (*http.S
 			"the body cap bounds their total", maxEmbedInputs, maxEmbedInputBytes))))))
 	// /admin/* lives on EITHER the TCP listener (auth + -allow-admin) OR the admin socket when -admin-socket is set, never
 	// both, so a request against the surface that was not chosen 404s instead of being refused: a 403 would confirm the
-	// surface exists. See admin_socket.go for the socket side (docs/tasks/task-halt-2026-09.md).
+	// surface exists. See admin_socket.go for the socket side.
 	if cfg.adminSocket == "" {
 		registerAdminRoutes(mux, srv, textCap, func(h http.HandlerFunc) http.HandlerFunc { return auth(srv.requireAdmin(h)) })
 	}
@@ -635,14 +650,13 @@ func (srv *server) routes(cfg config, authKey string, reqLog io.Writer) (*http.S
 		// "GET /{$}" matches the root path EXACTLY; a bare "GET /" is a catch-all that would answer every unknown GET with the
 		// UI page instead of a 404.
 		// UNAUTHENTICATED on purpose: the page embeds no secrets (handleWebUI) and is the only place a user can type the key in,
-		// so auth() here would make the key unenterable whenever -api-key is set. auth stays on the routes below, which act
-		// (docs/completed/review-2026-09-04.md, V-02).
+		// so auth() here would make the key unenterable whenever -api-key is set. auth stays on the routes below, which act.
 		mux.HandleFunc("GET /{$}", srv.handleWebUI)
-		// The page's own CSS and JS (docs/tasks/task-web-ui-2026-09.md §6.1), unauthenticated for the same reason as the page.
+		// The page's own CSS and JS, unauthenticated for the same reason as the page.
 		// {file} is one path segment, so "GET /ui/{file}" cannot become a catch-all.
 		mux.HandleFunc("GET /ui/{file}", srv.handleWebAsset)
 		// sameOrigin: on the key-free loopback default auth() alone is a no-op, and these routes act (pull starts a caller-named
-		// multi-gigabyte download). See sameOrigin in webui.go (docs/completed/review-2026-09-04.md, V-20).
+		// multi-gigabyte download). See sameOrigin in webui.go.
 		mux.HandleFunc("POST /web/models/list", sameOrigin(auth(maxBytes(textCap, srv.handleWebList))))
 		// Live search-as-you-type suggestions over the repo box (pull.Search): read-only, same origin/auth stack as list.
 		mux.HandleFunc("POST /web/models/search", sameOrigin(auth(maxBytes(textCap, srv.handleWebSearch))))
@@ -682,7 +696,7 @@ func Main() {
 		os.Exit(connect.Run(os.Args[2:], filepath.Base(os.Args[0]), os.Stdout))
 	}
 	// `status|ls|cancel|halt|resume` are a CLIENT talking to a RUNNING server's admin socket (-admin-socket), not the
-	// server itself: the same dispatch shape as pull/check above (docs/tasks/task-halt-2026-09.md).
+	// server itself: the same dispatch shape as pull/check above.
 	if len(os.Args) > 1 && isAdminCLICmd(os.Args[1]) {
 		os.Exit(runAdminCLI(os.Args[1], os.Args[2:], filepath.Base(os.Args[0])))
 	}
@@ -691,8 +705,8 @@ func Main() {
 	// disclosed. This adds a map ABOVE it rather than trimming it. Do not shorten the flag help to fix a long --help.
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
-		// The examples use the name the binary was actually INVOKED as, not a hardcoded "goinfer-serve": `go install
-		// .../cmd/serve@latest` installs a binary called `serve`.
+		// The examples use the name the binary was actually INVOKED as, not a hardcoded "goinfer-serve": `go install.
+		// ../cmd/serve@latest` installs a binary called `serve`.
 		self := filepath.Base(os.Args[0])
 		fmt.Fprintf(out, `%[1]s — OpenAI/Anthropic-compatible local inference server.
 
@@ -809,13 +823,9 @@ All %[2]d flags, with the trade-offs each one makes, follow.
 	}
 	srv.restoreSessions(cfg)
 
-	var reqLogOut io.Writer
-	if cfg.logRequests {
-		reqLogOut = os.Stderr
-	}
-	mux, textCap := srv.routes(cfg, authKey, reqLogOut)
+	mux, textCap := srv.routes(cfg, authKey, os.Stderr)
 
-	// The admin socket (docs/tasks/task-halt-2026-09.md). closeAdminSock is a no-op when -admin-socket is unset, so the
+	// The admin socket. closeAdminSock is a no-op when -admin-socket is unset, so the
 	// shutdown handler below can call it unconditionally.
 	closeAdminSock := func() {}
 	if cfg.adminSocket != "" {
@@ -911,8 +921,8 @@ All %[2]d flags, with the trade-offs each one makes, follow.
 		srv.checkpointSessions(cfg)
 	}()
 
-	// SIGUSR1 halts, SIGUSR2 resumes, so a supervisor can pull this switch without a socket or an HTTP client
-	// (docs/tasks/task-halt-2026-09.md). Separate from the one-shot SIGINT/SIGTERM channel above: these repeat for the life
+	// SIGUSR1 halts, SIGUSR2 resumes, so a supervisor can pull this switch without a socket or an HTTP client.
+	// Separate from the one-shot SIGINT/SIGTERM channel above: these repeat for the life
 	// of the process, so they get their own Notify and a loop. Platform-specific (haltsignal_unix.go /
 	// haltsignal_windows.go): SIGUSR1/SIGUSR2 are undefined identifiers on Windows.
 	startHaltSignalLoop(srv)
@@ -979,7 +989,7 @@ func newServer(cfg config) (*server, error) {
 	}
 	// 256 matches responseStore's own bound (newResponseStore(256), just below) — no dedicated
 	// -job-cap flag yet; a job past this many jobs old is only evicted once terminal (evictLocked).
-	jobs, err := newJobStore(cfg.jobDir, 256)
+	jobs, err := jobs.NewStore(cfg.jobDir, 256)
 	if err != nil {
 		return nil, fmt.Errorf("-job-dir %q: %w", cfg.jobDir, err)
 	}
@@ -994,7 +1004,7 @@ func newServer(cfg config) (*server, error) {
 		jobs:      jobs,
 		// 256 matches the bounds above: no dedicated -file-cap/-batch-cap flag, and a record past this many old is only evicted
 		// once terminal.
-		files:   newFileStore(256),
+		files:   newFileStore(256, cfg.maxFileStoreBytes),
 		batches: newBatchStore(256),
 	}
 	if !cfg.noCarryIDs {
@@ -1066,8 +1076,7 @@ func newServer(cfg config) (*server, error) {
 		}
 	}
 	// Armed last, after every startup load that could itself grow swap has finished: the guard's baseline should be steady
-	// state after startup, not a mid-load reading that counts every startup byte as its own delta
-	// (docs/tasks/task-never-swap-2026-09.md).
+	// state after startup, not a mid-load reading that counts every startup byte as its own delta.
 	s.startSwapGuard()
 	return s, nil
 }
@@ -1117,14 +1126,72 @@ func (s *server) loadAdapters(cfg config) error {
 	return nil
 }
 
-// towerBackend is the backend a device vision tower is chosen for: the model's own, unless -vision-device cpu keeps the
+// towerBackend is the backend a device tower (vision or audio) is chosen for: the model's own, unless -vision-device cpu keeps the
 // tower on the CPU, which also isolates the tower in a served comparison with the language model on the same backend in
-// both arms (docs/tasks/task-multimodal-support-2026-10.md).
+// both arms.
 func (cfg config) towerBackend() string {
 	if cfg.visionDevice == "cpu" {
 		return "cpu"
 	}
 	return cfg.load.Backend
+}
+
+// visionRoute is where one vision tower is routed under the flags and the machine: the backend handed to the family loader, and
+// the one stderr line (or "") that says a WebGPU-capable tower was kept on the CPU.
+type visionRoute struct {
+	Backend string
+	Note    string
+}
+
+const (
+	discreteKeptNote = "note: under --backend webgpu on a discrete GPU the vision tower runs on the CPU: its device memory cannot be priced against the card, so --vision-device gpu puts it on the GPU"
+	mmprojKeptNote   = "note: a Qwen3.5+ .gguf mmproj tower runs on the CPU under --backend webgpu (it has no config.json to price); --vision-device gpu puts it on WebGPU"
+)
+
+// routeVisionTower is the one place the vision tower's backend and its note are decided (family is visionModelType's answer;
+// mmproj is a Qwen3.5+ GGUF mmproj tower, which has no config.json). Rules, in order:
+//   - not --backend webgpu, or -vision-device cpu: towerBackend, no note;
+//   - an int8 tower other than Gemma 3's is the CPU's by the quant (-vision-quant int8; the family's default never is): the backend is left alone so the family loader says
+//     so, and refuses under -require-backend; no note, since --vision-device gpu would not move it;
+//   - -vision-device gpu asks for the device: the backend, no note;
+//   - an mmproj tower stays on the CPU (towerReserve cannot price a tower with no config.json), with a note when this binary has
+//     a WebGPU Qwen3.5+ tower;
+//   - a unified-memory machine runs the device tower by default;
+//   - a discrete GPU keeps the CPU (WebGPU has no free-VRAM query, so the tower cannot be priced against the card) unless Gemma 3
+//     is given an explicit -vision-quant, whose int8 form is the one WebGPU int8 tower; the note is printed only for a family this
+//     binary has a WebGPU tower for.
+//
+// An audio encoder does not come through here (towerBackend).
+func (cfg config) routeVisionTower(family string, mmproj bool) visionRoute {
+	be := cfg.towerBackend()
+	if be != "webgpu" {
+		return visionRoute{Backend: be}
+	}
+	quantFamily := family
+	if mmproj {
+		quantFamily = "qwen3_5"
+	}
+	if cfg.visionQuant == "int8" && quantFamily != "gemma3" {
+		return visionRoute{Backend: be}
+	}
+	if cfg.visionDevice == "gpu" {
+		return visionRoute{Backend: be}
+	}
+	if mmproj {
+		r := visionRoute{Backend: "cpu"}
+		if webgpuTowerRegistered(quantFamily) {
+			r.Note = mmprojKeptNote
+		}
+		return r
+	}
+	if webgpuTowerUnified() || (family == "gemma3" && cfg.visionQuant != "") {
+		return visionRoute{Backend: be}
+	}
+	r := visionRoute{Backend: "cpu"}
+	if webgpuTowerRegistered(family) {
+		r.Note = discreteKeptNote
+	}
+	return r
 }
 
 // loadVisionTower attaches a vision tower to the (single) loaded model, making it vision-capable (serve then accepts
@@ -1158,7 +1225,7 @@ func (s *server) loadVisionTower(cfg config) error {
 					dir = cand
 				} else if visionModelType(cand) == "mistral3" { // Ministral 3's Pixtral tower
 					dir = cand
-				} else if visionModelType(cand) == "lfm2_vl" { // LFM2-VL's SigLIP2 NaFlex tower (S10)
+				} else if visionModelType(cand) == "lfm2_vl" { // LFM2-VL's SigLIP2 NaFlex tower
 					dir = cand
 				} else if _, err := multimodal.LoadProjector(cand); err == nil {
 					dir = cand
@@ -1178,18 +1245,33 @@ func (s *server) loadVisionTower(cfg config) error {
 	if len(cfg.models) != 1 {
 		return fmt.Errorf("-vision needs exactly one --model (got %d)", len(cfg.models))
 	}
+	// A WebGPU tower shares the decoder's device memory, which towerReserve priced into the KV slots before the load: on a
+	// unified-memory machine a tower that needs more than the memory available refuses the load (webgpu_tower_fit.go).
+	if err := webgpuTowerFits(cfg, dir); err != nil {
+		return err
+	}
 	if fi, err := os.Stat(dir); err == nil && !fi.IsDir() && strings.HasSuffix(strings.ToLower(dir), ".gguf") {
-		return s.loadQwen35MMProj(dir, towerInt8("qwen3_5", cfg.visionQuant, cfg.towerBackend()), cfg.towerBackend(), cfg.visionDevice == "gpu", cfg.requireBE)
+		route := cfg.routeVisionTower("qwen3_5", true)
+		be := route.Backend
+		if route.Note != "" {
+			fmt.Fprintln(os.Stderr, route.Note)
+		}
+		return s.loadQwen35MMProj(dir, towerInt8("qwen3_5", cfg.visionQuant, be), be, cfg.requireBE)
 	}
 	mt := visionModelType(dir)
-	// cfg.towerBackend(), not the model's backend: -vision-device cpu keeps Gemma 3's SigLIP tower on the CPU, in f32, under
-	// --backend cuda or webgpu too.
-	int8Tower := towerInt8(mt, cfg.visionQuant, cfg.towerBackend())
+	// the tower backend, not the model's backend: -vision-device cpu keeps Gemma 3's SigLIP tower on the CPU, in f32, under
+	// --backend cuda or webgpu too, and a discrete GPU under webgpu keeps a tower on the CPU until the device is asked for.
+	route := cfg.routeVisionTower(mt, false)
+	vbe := route.Backend
+	if route.Note != "" {
+		fmt.Fprintln(os.Stderr, route.Note)
+	}
+	int8Tower := towerInt8(mt, cfg.visionQuant, vbe)
 	if mt == "qwen2_5_vl" {
-		return s.loadQwenVisionTower(dir, int8Tower, cfg.towerBackend(), cfg.visionDevice == "gpu", cfg.requireBE)
+		return s.loadQwenVisionTower(dir, int8Tower, vbe, cfg.requireBE)
 	}
 	if mt == "qwen3_5" || mt == "qwen3_5_moe" || mt == "qwen3_vl" || mt == "qwen3_vl_moe" { // qwen3_vl, qwen3_vl_moe: the same tower plus DeepStack; literals, which the support-table loader test reads
-		return s.loadQwen35VisionTower(dir, int8Tower, cfg.towerBackend(), cfg.visionDevice == "gpu", cfg.requireBE)
+		return s.loadQwen35VisionTower(dir, int8Tower, vbe, cfg.requireBE)
 	}
 	if mt == "qwen3_asr" { // speech to text; the audio encoder is in the model's own directory
 		return s.loadQwenASR(dir)
@@ -1198,10 +1280,10 @@ func (s *server) loadVisionTower(cfg config) error {
 		return s.loadVoxtral(dir, cfg.towerBackend())
 	}
 	if mt == "glm_ocr" {
-		return s.loadGlmOcrVisionTower(dir, int8Tower, cfg.visionMaxPixels, cfg.towerBackend(), cfg.visionDevice == "gpu", cfg.requireBE)
+		return s.loadGlmOcrVisionTower(dir, int8Tower, cfg.visionMaxPixels, vbe, cfg.requireBE)
 	}
 	if mt == "gemma4" {
-		return s.loadGemma4VisionTower(dir, int8Tower, cfg.towerBackend(), cfg.visionDevice == "gpu", cfg.requireBE)
+		return s.loadGemma4VisionTower(dir, int8Tower, vbe, cfg.requireBE)
 	}
 	if mt == "mistral3" { // Ministral 3's Pixtral tower, on the CPU in float32
 		return s.loadPixtralVisionTower(dir)
@@ -1213,10 +1295,9 @@ func (s *server) loadVisionTower(cfg config) error {
 	// attaches the int8 device tower instead of leaving the CPU one (an explicit -vision-quant never falls back). The unset
 	// default was settled before the plan was made: resolveGemma3VisionQuant makes it int8 on a card too tight for the
 	// decoder, one KV slot and the float32 tower. Both are in gemma3_tower.go. The CUDA default is float32 because the int8
-	// tower changes the reply, at the cost of about 1.7 GiB of VRAM against 0.56 (docs/tasks/task-multimodal-support-2026-10.md,
-	// "Gemma 3's CUDA default is now float32"). The CUDA resident tower registers its factory with vision.RegisterResident
+	// tower changes the reply, at the cost of about 1.7 GiB of VRAM against 0.56. The CUDA resident tower registers its factory with vision.RegisterResident
 	// (cuda/vision_register.go) through cuda/cmd/serve's blank import.
-	towerBE := gemma3TowerBackend(cfg, int8Tower, os.Stderr)
+	towerBE := vbe
 	enc, int8Tower, residentOK, err := attachGemma3Tower(siglipLoader(dir, towerBE == "metal"), int8Tower, gemma3FloatDefault(cfg, int8Tower), towerBE, cfg.requireBE, os.Stderr)
 	if err != nil {
 		return err
@@ -1226,12 +1307,12 @@ func (s *server) loadVisionTower(cfg config) error {
 		return fmt.Errorf("load vision projector (%s): %w", dir, err)
 	}
 	for _, lm := range s.models {
-		lm.venc, lm.vproj, lm.vcfg = enc, proj, vision.Gemma3()
-		lm.vimgTok = -1
+		g := &gemma3Vision{enc: enc, proj: proj, cfg: vision.Gemma3(), imgTok: -1}
+		lm.vision = g
 		if id, ok := lm.tk.TokenID(imageSoftToken); ok {
-			lm.vimgTok = id
+			g.imgTok = id
 		}
-		if lm.vimgTok < 0 {
+		if g.imgTok < 0 {
 			return fmt.Errorf("vision: tokenizer has no %q token (needed to place image embeddings)", imageSoftToken)
 		}
 		vq := "f32"
@@ -1241,15 +1322,15 @@ func (s *server) loadVisionTower(cfg config) error {
 		if residentOK {
 			vq += "/" + towerBE + "-resident"
 		}
-		fmt.Fprintf(os.Stderr, "loaded vision tower for %q (%d image tokens/image, soft-token id %d, encoder %s) from %s\n", lm.name, proj.MMTokens(), lm.vimgTok, vq, dir)
+		fmt.Fprintf(os.Stderr, "loaded vision tower for %q (%d image tokens/image, soft-token id %d, encoder %s) from %s\n", lm.name, proj.MMTokens(), g.imgTok, vq, dir)
 	}
 	return nil
 }
 
 // towerInt8 says whether a vision tower loads with int8 matmul weights. Gemma 3's SigLIP defaults to float32 on every
 // backend, because the int8 tower is lossy at real size (docs/measurements/siglip-int8-fidelity-2026-10-07.md). Under
-// WebGPU the default tower runs on the CPU (gemma3TowerBackend), where it measured faster than either device tower;
-// -vision-quant f32 or int8 asks for a device one (docs/tasks/task-multimodal-support-2026-10.md, S12.3a).
+// WebGPU the default is the float32 device tower (its speed gate: docs/completed/task-multimodal-support-2026-10.md,
+// the float32 SigLIP tower on WebGPU); -vision-quant int8 asks for the int8 one.
 // Every other tower gets int8 only when asked for, whatever the backend: its device towers are float32 and its gates ran
 // float32, and forcing int8 under cuda/webgpu bought no speed (the CPU int8 tower is not faster) and cost fidelity
 // (docs/measurements/vision-tower-int8-fidelity-2026-10-02.md). A new vision model type must be added to the list below,
@@ -1266,20 +1347,6 @@ func towerInt8(modelType, visionQuant, backend string) bool {
 		return false
 	}
 	return (backend == "webgpu" || backend == "cuda") && modelType != "gemma3" // gemma3: float32 by default everywhere
-}
-
-// gemma3TowerBackend is where Gemma 3's SigLIP tower attaches: the tower backend, except that WebGPU's unset default
-// is the float32 tower on the CPU, by choice and not by a failed attach. An explicit -vision-quant keeps the tower on
-// WebGPU: f32 attaches its float32 device tower and int8 its int8 one; -vision-device gpu attaches the float32 one.
-// Which of the CPU and the float32 device tower is the default is decided by a speed gate
-// (docs/tasks/task-multimodal-support-2026-10.md, G-S12.3a-4).
-func gemma3TowerBackend(cfg config, int8Tower bool, note io.Writer) string {
-	be := cfg.towerBackend()
-	if be == "webgpu" && cfg.visionQuant == "" && !int8Tower && cfg.visionDevice != "gpu" {
-		fmt.Fprintln(note, "note: under --backend webgpu Gemma 3's vision tower runs on the CPU in float32; --vision-device gpu (or --vision-quant f32) puts the float32 tower on the GPU, --vision-quant int8 the int8 one (lossy against float32)")
-		return "cpu"
-	}
-	return be
 }
 
 // enableResidentTower attaches the device-resident vision tower when the backend is webgpu, cuda or metal and reports
@@ -1311,7 +1378,7 @@ func attachResidentTower(family string, enc interface{ EnableResident() error },
 // load them again on its CPU path's first use (aikit's ReleaseBlocks).
 type blockReleaser interface{ ReleaseBlocks() error }
 
-// releaseTowerBlocks drops a device-attached tower's host blocks (D2, docs/tasks/task-memory-campaign-2026-10.md §7): the
+// releaseTowerBlocks drops a device-attached tower's host blocks: the
 // device tower serves the images, and a CPU fallback reloads them. Called once per tower, after its device tower is built
 // and before any request runs it. A variable so a test can count the calls.
 var releaseTowerBlocks = func(family string, enc any) {
@@ -1356,7 +1423,7 @@ func (s *server) soleModelSource(cfg config) string {
 // encoder; preprocessing + m-RoPE are Qwen-specific (the image path branches on
 // qwenEnc). Image placeholders use <|image_pad|>, expanded per image to the merged
 // patch count.
-func (s *server) loadQwenVisionTower(dir string, int8Tower bool, backend string, asked, require bool) error {
+func (s *server) loadQwenVisionTower(dir string, int8Tower bool, backend string, require bool) error {
 	enc, err := vision.LoadQwenVisionEncoder(dir, int8Tower)
 	if err != nil {
 		return fmt.Errorf("load qwen2.5-vl vision encoder (%s): %w", dir, err)
@@ -1372,7 +1439,7 @@ func (s *server) loadQwenVisionTower(dir string, int8Tower bool, backend string,
 		if ok {
 			where = "Metal"
 		}
-	} else if where, err = qwenTowerPlacement(backend, int8Tower, asked, require, enc.EnableResident, os.Stderr); err != nil {
+	} else if where, err = qwenTowerPlacement(backend, int8Tower, require, enc.EnableResident, os.Stderr); err != nil {
 		return err
 	}
 	if !strings.HasPrefix(where, "CPU") {
@@ -1383,18 +1450,15 @@ func (s *server) loadQwenVisionTower(dir string, int8Tower bool, backend string,
 		return fmt.Errorf("qwen2.5-vl preprocessor config (%s): %w", dir, err)
 	}
 	for _, lm := range s.models {
-		lm.qwenEnc = enc
-		lm.qwenRequire = require
-		lm.qwenPP = pp
-		lm.qwenMerge = enc.Cfg.SpatialMergeSize
-		lm.qwenImgTok = -1
+		q := &qwen25Vision{qwenGrid: qwenGrid{pp: pp, merge: enc.Cfg.SpatialMergeSize, imgTok: -1}, enc: enc, require: require}
+		lm.vision = q
 		if id, ok := lm.tk.TokenID(multimodal.QwenImagePad); ok {
-			lm.qwenImgTok = id
+			q.imgTok = id
 		}
-		if lm.qwenImgTok < 0 {
+		if q.imgTok < 0 {
 			return fmt.Errorf("vision: tokenizer has no %q token (needed to place image embeddings)", multimodal.QwenImagePad)
 		}
-		fmt.Fprintf(os.Stderr, "loaded Qwen2.5-VL vision tower for %q (merge %d, image-pad id %d, tower on %s) from %s\n", lm.name, lm.qwenMerge, lm.qwenImgTok, where, dir)
+		fmt.Fprintf(os.Stderr, "loaded Qwen2.5-VL vision tower for %q (merge %d, image-pad id %d, tower on %s) from %s\n", lm.name, q.merge, q.imgTok, where, dir)
 	}
 	return nil
 }
@@ -1403,9 +1467,9 @@ func (s *server) loadQwenVisionTower(dir string, int8Tower bool, backend string,
 // projector: Gemma4Encoder.Forward bakes in the embed_vision projection. decoder.GenerateGemma4VL implements two
 // forwards, chosen by the checkpoint's use_bidirectional_attention: unset (the E2B/E4B-class sequential/causal path)
 // and "vision" (the 26B-A4B/31B-class batched path, decoder/forward_gemma4_batched.go). Any other value is refused at
-// load rather than served with the wrong mask. Placement is chooseGemma4Tower's (asked: -vision-device gpu); aikit's
+// load rather than served with the wrong mask. Placement is chooseGemma4Tower's; aikit's
 // Gemma4Encoder has no EnableResident method.
-func (s *server) loadGemma4VisionTower(dir string, int8Tower bool, backend string, asked, require bool) error {
+func (s *server) loadGemma4VisionTower(dir string, int8Tower bool, backend string, require bool) error {
 	for _, lm := range s.models {
 		if bd := lm.mdl().Config().UseBidirectionalAttention; bd != "" && bd != "vision" {
 			return fmt.Errorf("gemma4 vision: %q sets use_bidirectional_attention=%q, not the supported %q value; GenerateGemma4VL only implements the E2B/E4B-class causal case (unset) and the 26B-A4B/31B-class %q blockwise case", lm.name, bd, "vision", "vision")
@@ -1419,7 +1483,7 @@ func (s *server) loadGemma4VisionTower(dir string, int8Tower bool, backend strin
 	if err != nil {
 		return fmt.Errorf("gemma4 vision preprocessor config (%s): %w", dir, err)
 	}
-	tower, where, err := chooseGemma4Tower(enc, int8Tower, backend, asked, require)
+	tower, where, err := chooseGemma4Tower(enc, int8Tower, backend, require)
 	if err != nil {
 		return err
 	}
@@ -1431,26 +1495,26 @@ func (s *server) loadGemma4VisionTower(dir string, int8Tower bool, backend strin
 		releaseTowerBlocks("Gemma 4", enc)
 	}
 	for _, lm := range s.models {
-		lm.gemma4Enc, lm.gemma4Tower, lm.gemma4Swap = enc, tower, swap
-		lm.gemma4MaxSoft = pp.MaxSoftTokens
-		lm.gemma4ImgTok = -1
+		g := &gemma4Vision{enc: enc, tower: tower, swap: swap, maxSoft: pp.MaxSoftTokens, imgTok: -1}
+		lm.vision = g
 		if id, ok := lm.tk.TokenID(multimodal.Gemma4ImageSoftToken); ok {
-			lm.gemma4ImgTok = id
+			g.imgTok = id
 		}
-		if lm.gemma4ImgTok < 0 {
+		if g.imgTok < 0 {
 			return fmt.Errorf("vision: tokenizer has no %q token (needed to place image embeddings)", multimodal.Gemma4ImageSoftToken)
 		}
-		fmt.Fprintf(os.Stderr, "loaded Gemma 4 vision tower for %q (max %d soft tokens/image, soft-token id %d, tower on %s) from %s\n", lm.name, lm.gemma4MaxSoft, lm.gemma4ImgTok, where, dir)
+		fmt.Fprintf(os.Stderr, "loaded Gemma 4 vision tower for %q (max %d soft tokens/image, soft-token id %d, tower on %s) from %s\n", lm.name, g.maxSoft, g.imgTok, where, dir)
 		// A checkpoint with an audio_config also takes audio clips; its tower loads on the first one.
 		if hasAudioConfig(dir) {
 			id, ok := lm.tk.TokenID(multimodal.Gemma4AudioSoftToken)
 			if !ok {
 				return fmt.Errorf("audio: %s has an audio tower but its tokenizer has no %q token", dir, multimodal.Gemma4AudioSoftToken)
 			}
-			lm.gemma4AudioDir, lm.gemma4AudioTok = dir, id
+			at := &gemma4Audio{dir: dir, tok: id}
+			lm.audio = at
 			where := "CPU"
 			if backend == "metal" && slices.Contains(embeddinggemma2.AudioAccelerators(), "metal") { // the conformer blocks run on Metal
-				lm.gemma4AudioDevice, where = "metal", "Metal (the conformer blocks; subsample and tail on the CPU)"
+				at.device, where = "metal", "Metal (the conformer blocks; subsample and tail on the CPU)"
 			}
 			fmt.Fprintf(os.Stderr, "Gemma 4 audio input on for %q (audio-token id %d; the tower loads on the first clip, %s) from %s\n", lm.name, id, where, dir)
 		}
@@ -1467,7 +1531,7 @@ func (s *server) loadQwenASR(dir string) error {
 		if !ok {
 			return fmt.Errorf("audio: %s is a Qwen3-ASR checkpoint but its tokenizer has no <|audio_pad|> token", dir)
 		}
-		lm.qwenASRDir, lm.qwenASRTok = dir, id
+		lm.audio = &qwenASRAudio{dir: dir}
 		fmt.Fprintf(os.Stderr, "Qwen3-ASR audio input on for %q (audio-pad id %d; the encoder loads on the first clip, CPU float32) from %s\n", lm.name, id, dir)
 	}
 	return nil
@@ -1480,7 +1544,7 @@ func (s *server) loadVoxtral(dir, backend string) error {
 		if _, ok := lm.tk.TokenID("[AUDIO]"); !ok {
 			return fmt.Errorf("audio: %s is a Voxtral checkpoint but its tokenizer has no [AUDIO] token (a Tekken tokenizer is needed: tekken.json beside the weights)", dir)
 		}
-		lm.voxtralDir, lm.voxtralBackend = dir, backend
+		lm.audio = &voxtralAudio{dir: dir, backend: backend}
 		fmt.Fprintf(os.Stderr, "Voxtral audio input on for %q (the encoder loads on the first clip, float32, on %s when this binary has a device encoder for it, else the CPU; a clip over %d s is refused) from %s\n", lm.name, backend, voxtralMaxSeconds, dir)
 	}
 	return nil
@@ -1530,18 +1594,15 @@ func gemma4TowerSwap(models map[string]*loadedModel, enc *vision.Gemma4Encoder, 
 	return &towerSwap{enc: enc, backend: backend, model: m, reserve: towerVRAMEstimate("gemma4", d, 0)}
 }
 
-// chooseGemma4Tower puts Gemma 4's vision tower on the GPU when the backend is Metal or CUDA and this binary registers
-// a tower for it, and says where it runs. The device tower is float32, so an int8 tower (-vision-quant int8) stays on
-// the CPU; a tower that fails to start falls back to the CPU with the reason, unless -require-backend asks for a
-// refusal. Under WebGPU the device tower follows the same rules only when asked for (-vision-device gpu) and the CPU
-// tower is otherwise the choice, not a fallback: which of the two is the default is decided by a speed gate
-// (docs/tasks/task-multimodal-support-2026-10.md, G-S12.3d-4). Other backends run it on the CPU.
-func chooseGemma4Tower(enc *vision.Gemma4Encoder, int8Tower bool, backend string, asked, require bool) (multimodal.Gemma4TowerAccelerator, string, error) {
+// chooseGemma4Tower puts Gemma 4's vision tower on the GPU when the backend is Metal, CUDA or WebGPU and this binary
+// registers a tower for it, and says where it runs. The device tower is float32, so an int8 tower (-vision-quant int8)
+// stays on the CPU; a tower that fails to start falls back to the CPU with the reason, unless -require-backend asks for a
+// refusal. WebGPU's device tower is the default like the others' (its speed gate:
+// docs/completed/task-multimodal-support-2026-10.md, Gemma 4's vision tower on WebGPU); -vision-device cpu arrives here
+// as backend "cpu". Other backends run it on the CPU.
+func chooseGemma4Tower(enc *vision.Gemma4Encoder, int8Tower bool, backend string, require bool) (multimodal.Gemma4TowerAccelerator, string, error) {
 	name, ok := deviceTowerName(backend)
 	if backend == "webgpu" {
-		if !asked {
-			return nil, "CPU (-vision-device gpu puts it on WebGPU)", nil
-		}
 		name, ok = "WebGPU", true
 	}
 	if !ok {
@@ -1620,7 +1681,7 @@ func loadDecoder(ctx context.Context, spec modelSpec, cfg config) (*loadedModel,
 	// sizes against live free VRAM (CUDA's expert-cache slots, its unpinned ctx-by-default) cannot know it is coming unless
 	// something prices it first. So the drafter is opened HERE, before decoder.Load, and Options.ExtraResidentBytes carries
 	// its size into BuildResident: without that a 26B auto-sizes its expert cache to every free byte and the later attach
-	// fails with nowhere left to go (docs/tasks/task-fit-to-hardware.md §2). Opened, not loaded (OpenDFlashDrafter): its header
+	// fails with nowhere left to go. Opened, not loaded (OpenDFlashDrafter): its header
 	// prices it, and the attach streams its matrices from the file, so the host never holds the drafter beside the target's
 	// load. Opened once and reused at the attach call site, so pricing and the actual attach see the same weights.
 	var drafter *decoder.DFlashDrafter
@@ -1818,7 +1879,7 @@ var resolveEmbedModel = func(ctx context.Context, spec string) (string, error) {
 func (s *server) loadEncoder(cfg config) error {
 	// A causal decoder used as an embedder (qwen3-embedding / embeddinggemma) arrives as a .gguf
 	// FILE; the aikit encoder path takes an HF directory. Dispatch on that rather than adding
-	// another flag — see docs/completed/task-decoder-as-embedder.md.
+	// another flag —
 	if fi, statErr := os.Stat(cfg.embedPath); statErr == nil && !fi.IsDir() {
 		return s.loadDecoderEmbedder(cfg)
 	}
@@ -2011,19 +2072,15 @@ func visionPathError(dir string) error {
 }
 
 // qwenTowerPlacement decides where Qwen2.5-VL's vision tower runs and attaches it: the device tower under --backend
-// cuda when the binary registers one (cuda/vision_towers.go imports aikit's gpu/qwencuda) and the tower is float32;
-// the CPU everywhere else, with the reason named (docs/tasks/task-multimodal-support-2026-10.md). -require-backend turns
-// each CPU fallback on a device backend into a refusal. Under --backend webgpu the device tower follows the same rules
-// only when asked for (-vision-device gpu); otherwise the CPU tower is the choice, not a fallback. -vision-device cpu
-// arrives here as backend "cpu". Metal's tower is attached by loadQwenVisionTower.
-func qwenTowerPlacement(backend string, int8Tower, asked, require bool, attach func() error, warn io.Writer) (string, error) {
+// cuda or webgpu when the binary registers one (cuda/vision_towers.go imports aikit's gpu/qwencuda) and the tower is
+// float32; the CPU everywhere else, with the reason named.
+// -require-backend turns each CPU fallback on a device backend into a refusal. -vision-device cpu arrives here as backend
+// "cpu". Metal's tower is attached by loadQwenVisionTower.
+func qwenTowerPlacement(backend string, int8Tower, require bool, attach func() error, warn io.Writer) (string, error) {
 	name := "CUDA"
 	switch backend {
 	case "cuda":
 	case "webgpu":
-		if !asked {
-			return "CPU (-vision-device gpu puts it on WebGPU)", nil
-		}
 		name = "WebGPU"
 	default:
 		return "CPU", nil
@@ -2046,7 +2103,7 @@ func qwenTowerPlacement(backend string, int8Tower, asked, require bool, attach f
 
 // kvShareOffFor is whether requests may not take KV rows another conversation computed (decoder.Options.KVShareOff):
 // when -kv-share is off, and when the server answers the network without an API key. serve has one key, so every
-// request that passes it is one sharing scope (docs/tasks/task-kv-architecture-2026-10.md §8, D4). Without a key
+// request that passes it is one sharing scope. Without a key
 // only loopback may be bound, but a loopback bind answering an -allowed-hosts name is a reverse proxy's public
 // face, and is treated as the network.
 func kvShareOffFor(kvShare, apiKey, addr, allowedHosts string) bool {

@@ -11,7 +11,7 @@ import (
 	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 )
 
-// Compute-time LoRA on the resident path (docs/tasks/task-gpu-paths-2026-09.md). Like Metal and unlike WebGPU:
+// Compute-time LoRA on the resident path. Like Metal and unlike WebGPU:
 // launchToken re-issues live kernel launches every token (segA/segB/segBFFN), so binding or clearing an adapter is a
 // Go-side `if r.loraLayers != nil` at each of the 7 projection sites, with no fixed dispatch plan to rebuild (contrast
 // gpu/lora_resident.go's rebuildSteps). CUDA graphs are the exception: a captured graph replays the launches recorded
@@ -64,6 +64,29 @@ func (r *cudaResident) releaseLoraLayers(layers []cudaLoraLayer) {
 	}
 }
 
+// loraAllocFailAfterForTest, when > 0, makes the Nth LoRA buffer allocation of a bind fail as a device OOM (test seam; zero in
+// production). It counts down as buffers are allocated.
+var loraAllocFailAfterForTest int
+
+// loraPanicAfterForTest, when > 0, makes the Nth LoRA buffer allocation of a bind panic with a value that is not a device allocation
+// failure (test seam; zero in production).
+var loraPanicAfterForTest int
+
+// upLora uploads one LoRA matrix.
+func (r *cudaResident) upLora(v []float32) Buffer {
+	if loraAllocFailAfterForTest > 0 {
+		if loraAllocFailAfterForTest--; loraAllocFailAfterForTest == 0 {
+			panic(allocFailureForTest())
+		}
+	}
+	if loraPanicAfterForTest > 0 {
+		if loraPanicAfterForTest--; loraPanicAfterForTest == 0 {
+			panic("lora: test seam panic that is not an allocation failure")
+		}
+	}
+	return r.up32(v)
+}
+
 // loraCacheDisabled is the escape hatch / A-B switch for the adapter device cache, in the convention of
 // GOINFER_NO_RESIDENT_REUSE: with it set, every bind uploads and every clear frees.
 func (r *cudaResident) loraCacheDisabled() bool { return r.knobValue("GOINFER_NO_LORA_CACHE") != "" }
@@ -101,7 +124,7 @@ func sameLoraKey(x, y [][7]loraProjKey) bool {
 	return true
 }
 
-// SetAdapter implements decoder.ResidentAdapter: binds (layers != nil) or clears (layers == nil) the compute-time LoRA
+// SetAdapter implements decoder.ResidentRuntimeSubsystem: binds (layers != nil) or clears (layers == nil) the compute-time LoRA
 // delta for every subsequent Forward call, until the next SetAdapter. It runs on the executor thread (r.do), like every
 // device-touching call here: CUDA contexts are thread-affine.
 //
@@ -145,31 +168,57 @@ func (r *cudaResident) SetAdapter(layers []decoder.ResidentAdapterLayer) error {
 		r.releaseLoraLayers(r.lora.cache) // a different adapter: return the cached one first
 		r.lora.cache, r.lora.key = nil, nil
 		built := make([]cudaLoraLayer, len(layers))
-		for i := range layers {
-			projs := projForCUDA(&layers[i])
-			dst := []**cudaLoraProj{&built[i].q, &built[i].k, &built[i].v, &built[i].o, &built[i].gate, &built[i].up, &built[i].down}
-			for j, proj := range projs {
-				if proj == nil {
-					continue
-				}
-				if proj.R <= 0 || proj.R > loraRMax {
-					r.releaseLoraLayers(built[:i+1])
-					return fmt.Errorf("cuda: SetAdapter: LoRA rank %d out of range (want 1..%d)", proj.R, loraRMax)
-				}
-				*dst[j] = &cudaLoraProj{a: r.up32(proj.A), b: r.up32(proj.B), rank: proj.R, outn: proj.Out, scale: proj.Scale}
-				if r.setupErr != nil {
-					err := r.setupErr
-					r.setupErr = nil
-					r.releaseLoraLayers(built[:i+1])
-					return fmt.Errorf("cuda: SetAdapter: uploading layer %d projection %d: %w", i, j, err)
-				}
+		complete := false
+		defer func() {
+			if !complete {
+				r.releaseLoraLayers(built) // whatever the failed or panicking upload had already allocated
 			}
+		}()
+		if err := r.uploadLoraLayers(built, layers); err != nil {
+			return err
 		}
 		r.lora.uploads++
 		r.lora.cache, r.lora.key = built, key
 		r.loraLayers = built
+		complete = true
 		return nil
 	})
+}
+
+// uploadLoraLayers uploads every projection of layers into built. Each projection is stored in built before its buffers are
+// allocated, so on any error the caller's releaseLoraLayers(built) returns every buffer allocated so far. A device allocation
+// failure, which the allocator reports by panicking, is returned as an error; any other panic propagates.
+func (r *cudaResident) uploadLoraLayers(built []cudaLoraLayer, layers []decoder.ResidentAdapterLayer) (err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			if !mem.DeviceAllocFailed(v) {
+				panic(v)
+			}
+			err = fmt.Errorf("cuda: SetAdapter: %v", v)
+		}
+	}()
+	for i := range layers {
+		projs := projForCUDA(&layers[i])
+		dst := []**cudaLoraProj{&built[i].q, &built[i].k, &built[i].v, &built[i].o, &built[i].gate, &built[i].up, &built[i].down}
+		for j, proj := range projs {
+			if proj == nil {
+				continue
+			}
+			if proj.R <= 0 || proj.R > loraRMax {
+				return fmt.Errorf("cuda: SetAdapter: LoRA rank %d out of range (want 1..%d)", proj.R, loraRMax)
+			}
+			p := &cudaLoraProj{rank: proj.R, outn: proj.Out, scale: proj.Scale}
+			*dst[j] = p
+			p.a = r.upLora(proj.A)
+			p.b = r.upLora(proj.B)
+			if r.setupErr != nil {
+				err := r.setupErr
+				r.setupErr = nil
+				return fmt.Errorf("cuda: SetAdapter: uploading layer %d projection %d: %w", i, j, err)
+			}
+		}
+	}
+	return nil
 }
 
 // applyLora dispatches one projection's compute-time LoRA delta into dst, ADDITIVELY — no-op if

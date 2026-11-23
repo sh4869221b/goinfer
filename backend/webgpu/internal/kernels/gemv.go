@@ -147,7 +147,7 @@ func (c *Context) ensureGEMVBias() error {
 		sh.Release()
 		return fmt.Errorf("gpu: create GEMV-bias pipeline: %w", err)
 	}
-	c.track(sh.Release, pl.Release) // audit C-26: register at creation
+	c.track(sh.Release, pl.Release) // registered at creation, so Close releases them
 	c.gemvBiasShader = sh
 	c.gemvBiasPipeline = pl
 	c.gemvBiasLayout = c.bgl(pl)
@@ -173,7 +173,7 @@ func (c *Context) ensureGEMV() error {
 		sh.Release()
 		return fmt.Errorf("gpu: create GEMV pipeline: %w", err)
 	}
-	c.track(sh.Release, pl.Release) // audit C-26: register at creation
+	c.track(sh.Release, pl.Release) // registered at creation, so Close releases them
 	c.gemvShader = sh
 	c.gemvPipeline = pl
 	c.gemvLayout = c.bgl(pl)
@@ -244,7 +244,11 @@ func (c *Context) BatchGEMV(aq []int8, aScale float32, rms []DecodeWeight) ([][]
 		}
 	}
 
-	enc, _ := c.device.TryCreateCommandEncoder(nil)
+	enc, err := c.device.TryCreateCommandEncoder(nil)
+	if err != nil {
+		release()
+		return nil, fmt.Errorf("gpu: BatchGEMV: command encoder: %w", err)
+	}
 	defer enc.Release()
 	pass := enc.BeginComputePass(nil)
 	for i, rm := range rms {
@@ -256,7 +260,7 @@ func (c *Context) BatchGEMV(aq []int8, aScale float32, rms []DecodeWeight) ([][]
 			return nil, fmt.Errorf("gpu: BatchGEMV dst: %w", err)
 		}
 		dims, err := c.tryCreateBufferInit(mem.LineScratch, &wgpu.BufferInitDescriptor{Label: "batch-dims", Contents: wgpu.ToBytes([]uint32{1, uint32(rm.kPad()), uint32(N), 0}), Usage: wgpu.BufferUsageUniform})
-		if err != nil { // nil dims → nil-panic in CreateBindGroup / the cleanup Release below (audit R-06)
+		if err != nil { // nil dims → nil-panic in CreateBindGroup / the cleanup Release below
 			releaseBuf(dst)
 			pass.Release()
 			release()
@@ -304,7 +308,11 @@ func (c *Context) BatchGEMV(aq []int8, aScale float32, rms []DecodeWeight) ([][]
 			return nil, fmt.Errorf("gpu: BatchGEMV copy: %w", err)
 		}
 	}
-	cmd, _ := enc.TryFinish(nil)
+	cmd, err := enc.TryFinish(nil)
+	if err != nil {
+		release()
+		return nil, fmt.Errorf("gpu: BatchGEMV: finish: %w", err)
+	}
 	defer cmd.Release()
 	c.queue.Submit(cmd)
 
@@ -436,7 +444,10 @@ func (r *GEMVRunner) Run(aq []int8, aScale float32) ([]float32, error) {
 	if err := c.queue.TryWriteBuffer(r.asBuf, 0, wgpu.ToBytes([]float32{aScale})); err != nil {
 		return nil, fmt.Errorf("gpu: GEMVRunner write scale: %w", err)
 	}
-	enc, _ := c.device.TryCreateCommandEncoder(nil)
+	enc, err := c.device.TryCreateCommandEncoder(nil)
+	if err != nil {
+		return nil, fmt.Errorf("gpu: Run: command encoder: %w", err)
+	}
 	defer enc.Release()
 	pass := enc.BeginComputePass(nil)
 	pass.SetPipeline(r.rm.gPipe(c))
@@ -451,7 +462,10 @@ func (r *GEMVRunner) Run(aq []int8, aScale float32) ([]float32, error) {
 	if err := enc.TryCopyBufferToBuffer(r.dstBuf, 0, r.stag, 0, uint64(r.n*4)); err != nil {
 		return nil, fmt.Errorf("gpu: GEMVRunner copy: %w", err)
 	}
-	cmd, _ := enc.TryFinish(nil)
+	cmd, err := enc.TryFinish(nil)
+	if err != nil {
+		return nil, fmt.Errorf("gpu: Run: finish: %w", err)
+	}
 	defer cmd.Release()
 	c.queue.Submit(cmd)
 	status := wgpu.MapAsyncStatus(0)
@@ -470,7 +484,7 @@ func (r *GEMVRunner) Run(aq []int8, aScale float32) ([]float32, error) {
 	return out, nil
 }
 
-// Release frees the runner's buffers (not the resident weight).
+// Close frees the runner's buffers (not the resident weight).
 func (r *GEMVRunner) Close() error {
 	r.c.releaseOwned(func() {
 		releaseBuf(r.aBuf)
@@ -483,7 +497,7 @@ func (r *GEMVRunner) Close() error {
 	return nil
 }
 
-// gemvGrid maps N output columns to a 2D workgroup grid (X capped at 32768 so
+// GemvGrid maps N output columns to a 2D workgroup grid (X capped at 32768 so
 // vocab-sized N stays under the 65535/dimension limit). The kernel reconstructs
 // n = x + y*32768.
 func GemvGrid(n int) (uint32, uint32) {
@@ -558,7 +572,10 @@ func (c *Context) MatmulW8A8GEMV(aq []int8, aScale float32, rm *ResidentW8A8) ([
 		return nil, fmt.Errorf("gpu: GEMV bind: %w", err)
 	}
 	defer bg.Release()
-	enc, _ := c.device.TryCreateCommandEncoder(nil)
+	enc, err := c.device.TryCreateCommandEncoder(nil)
+	if err != nil {
+		return nil, fmt.Errorf("gpu: MatmulW8A8GEMV: command encoder: %w", err)
+	}
 	defer enc.Release()
 	pass := enc.BeginComputePass(nil)
 	pass.SetPipeline(c.gemvPipeline)
@@ -573,7 +590,10 @@ func (c *Context) MatmulW8A8GEMV(aq []int8, aScale float32, rm *ResidentW8A8) ([
 	if err := enc.TryCopyBufferToBuffer(dstBuf, 0, stage, 0, uint64(N*4)); err != nil {
 		return nil, fmt.Errorf("gpu: GEMV copy: %w", err)
 	}
-	cmd, _ := enc.TryFinish(nil)
+	cmd, err := enc.TryFinish(nil)
+	if err != nil {
+		return nil, fmt.Errorf("gpu: MatmulW8A8GEMV: finish: %w", err)
+	}
 	defer cmd.Release()
 	c.queue.Submit(cmd)
 	status := wgpu.MapAsyncStatus(0)

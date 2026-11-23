@@ -15,13 +15,17 @@ import (
 // — a real device write there is out-of-bounds and, on unified memory, silently corrupts adjacent
 // MTLBuffers. Pure logic (checkCap only reads ctxCap()), so no Metal device is needed. A
 // zero-value &metalResident{} (r == nil) deliberately exercises ctxCap()'s nil-safe fallback to
-// metalCtxCapDefault (G6, docs/tasks/task-gpu-paths-2026-09.md added resident.ctxCap as a per-build,
+// metalCtxCapDefault (G6 added resident.ctxCap as a per-build,
 // request-aware value; this test predates that and is meant to keep testing "the historical
 // ceiling" as pure logic, not require a real *resident).
 func TestMetalResidentCheckCap(t *testing.T) {
 	r := &metalResident{}
 	if r.ContextCap() != metalCtxCapDefault {
 		t.Fatalf("ContextCap = %d, want %d", r.ContextCap(), metalCtxCapDefault)
+	}
+	// ResidentCaps reads every field, so each must answer on a resident with no device.
+	if c := r.ResidentCaps(); c.ContextCap != metalCtxCapDefault || c.KernelFloor != 0 || !c.HasKernelFloor || c.BatchGreedyDraw {
+		t.Fatalf("ResidentCaps on a zero-value resident = %+v, want ContextCap %d, a kernel floor of 0 and no batch greedy draw", c, metalCtxCapDefault)
 	}
 	for _, c := range []struct {
 		pos, n int
@@ -37,8 +41,8 @@ func TestMetalResidentCheckCap(t *testing.T) {
 	}
 }
 
-// TestResolveMetalCtxCap is G6's own gate for the real, pre-existing gap found scoping it
-// (docs/tasks/task-gpu-paths-2026-09.md): Metal never read decoder.Model.ResidentContextRequest() at
+// TestResolveMetalCtxCap is G6's own gate for the real, pre-existing gap found scoping it:
+// Metal never read decoder.Model.ResidentContextRequest() at
 // all, so an explicit -ctx was silently ignored, always using metalCtxCapDefault. Uses
 // testdata/llama-tiny (TRACKED in git, max_position_embeddings=128), so every case runs in CI
 // unconditionally — no device needed, resolveMetalCtxCap is pure logic over decoder.Model state.
@@ -55,7 +59,7 @@ func TestResolveMetalCtxCap(t *testing.T) {
 
 	t.Run("unset ⇒ metalCtxCapDefault, unchanged historical default", func(t *testing.T) {
 		m := load(t, 0)
-		got, err := resolveMetalCtxCap(m)
+		got, err := resolveMetalCtxCap(m, metalCtxPlan{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -66,7 +70,7 @@ func TestResolveMetalCtxCap(t *testing.T) {
 
 	t.Run("explicit, fits both the kernel ceiling and the model window ⇒ honoured exactly", func(t *testing.T) {
 		m := load(t, 64) // llama-tiny's window is 128; 64 < both ceilings
-		got, err := resolveMetalCtxCap(m)
+		got, err := resolveMetalCtxCap(m, metalCtxPlan{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -78,7 +82,7 @@ func TestResolveMetalCtxCap(t *testing.T) {
 
 	t.Run("explicit, exceeds the model's own window ⇒ clamped to the window, not refused", func(t *testing.T) {
 		m := load(t, 200) // > llama-tiny's 128-position window, but well under metalCtxCapMax
-		got, err := resolveMetalCtxCap(m)
+		got, err := resolveMetalCtxCap(m, metalCtxPlan{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -89,7 +93,7 @@ func TestResolveMetalCtxCap(t *testing.T) {
 
 	t.Run("explicit, exceeds the kernel's hard ceiling ⇒ REFUSED with the numbers, never silently clamped", func(t *testing.T) {
 		m := load(t, metalCtxCapMax+1)
-		_, err := resolveMetalCtxCap(m)
+		_, err := resolveMetalCtxCap(m, metalCtxPlan{})
 		if err == nil {
 			t.Fatal("resolveMetalCtxCap succeeded for a request above metalCtxCapMax — should refuse")
 		}
@@ -148,11 +152,8 @@ func TestMetalBuildResident_explicitCtxHonoured(t *testing.T) {
 		t.Fatalf("BuildResident(ResidentContext=%d): ok=%v err=%v", want, ok, err)
 	}
 	defer b.Close()
-	capped, isCapped := rf.(decoder.ResidentCapped)
-	if !isCapped {
-		t.Fatalf("resident does not implement decoder.ResidentCapped: %T", rf)
-	}
-	if got := capped.ContextCap(); got != want {
+	capped := decoder.SubsystemsOf(rf).Runtime
+	if got := capped.ResidentCaps().ContextCap; got != want {
 		t.Fatalf("ContextCap() = %d, want %d — the explicit request did not reach the built resident", got, want)
 	}
 	// A real forward pass at the smaller cap must still produce finite, sane logits — not just

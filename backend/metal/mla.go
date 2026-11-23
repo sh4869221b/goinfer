@@ -10,8 +10,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// MLA, DeepSeek and Kimi's multi-head latent attention, on the resident decode path (docs/tasks/task-forward-architecture-
-// 2026-10.md §4.7, OP2a), in gpu/mla.go's absorbed form: kernels/mla_kernels_msl.go has the four kernels. A layer's KV cache is
+// MLA, DeepSeek and Kimi's multi-head latent attention, on the resident decode path, in gpu/mla.go's absorbed form: kernels/mla_kernels_msl.go has the four kernels. A layer's KV cache is
 // one latent row per position, [cn (kvLoRA) | krj (qkRope)] f32, held in r.kc[l] so the KV slot code gives each slot its own
 // rows (r.vc[l] aliases it; MLA stores no separate V). The projections run on the int8 GEMV (W8A8), as WebGPU's do; W_UK and
 // W_UV, sliced from kv_b on the host, stay f32 for the per-head matvecs.
@@ -35,10 +34,12 @@ type mlaLayer struct {
 
 // buildMLA returns the model's MLA geometry, (nil, nil) for a model without MLA, or the reason this resident cannot run it.
 func buildMLA(m *decoder.Model, nH, H int) (*mlaParams, error) {
-	qLoRA, kvLoRA, qkNope, qkRope, vHead, interleave, attnScale, ropeScale, ok := m.MLAResidentParams()
+	spec, ok := m.BackendView().MLA()
 	if !ok {
 		return nil, nil
 	}
+	qLoRA, kvLoRA, qkNope, qkRope, vHead := spec.QLoRARank, spec.KVLoRARank, spec.QKNopeHeadDim, spec.QKRopeHeadDim, spec.VHeadDim
+	interleave, attnScale, ropeScale := spec.RopeInterleave, spec.AttnScale, spec.RopeScale
 	p := &mlaParams{nH: nH, qLoRA: qLoRA, rank: kvLoRA, qkNope: qkNope, qkRope: qkRope, vHead: vHead, interleave: interleave,
 		attnScale: float32(attnScale), ropeScale: float32(ropeScale)}
 	p.qkHead, p.latDim = qkNope+qkRope, kvLoRA+qkRope
@@ -50,7 +51,7 @@ func buildMLA(m *decoder.Model, nH, H int) (*mlaParams, error) {
 	case H%4 != 0 || qLoRA%4 != 0 || (nH*vHead)%4 != 0:
 		return nil, fmt.Errorf("metal: MLA widths (hidden %d, q_lora_rank %d, heads·v_head_dim %d) are not multiples of 4, which the int8 GEMV reads", H, qLoRA, nH*vHead)
 	}
-	if inv := m.RopeInvFreq(); len(inv) != qkRope/2 {
+	if inv := m.BackendView().RopeInvFreq(); len(inv) != qkRope/2 {
 		return nil, fmt.Errorf("metal: MLA's rope table has %d frequencies, want qk_rope_head_dim/2 = %d", len(inv), qkRope/2)
 	}
 	return p, nil
@@ -67,7 +68,7 @@ func int8Proj(d *Device, f []float32, rows, cols int, name string, l int) (Buffe
 
 // buildMLALayer uploads layer l's MLA weights.
 func buildMLALayer(d *Device, m *decoder.Model, l, H int, p *mlaParams) (*mlaLayer, error) {
-	qA, qANorm, qB, qProj, kvA, kvANorm, kvB, oProj := m.MLALayerWeights(l)
+	qA, qANorm, qB, qProj, kvA, kvANorm, kvB, oProj := m.BackendView().Layer(l).MLAWeights()
 	qAQ, qBQ, qQ, kvAQ, oQ := m.MLALayerInt8(l)
 	// proj uploads a projection's int8 form when the load holds one (the codes int8Proj would make from the f32), else quantizes the f32.
 	proj := func(q *linalg.WeightMat, f []float32, rows, cols int, name string) (Buffer, Buffer, error) {
@@ -133,38 +134,18 @@ type mlaScratch struct {
 	uQLoRA, uOK, uZero, uRopeScale, uScale             Buffer
 }
 
-func buildMLAScratch(d *Device, m *decoder.Model, p *mlaParams) *mlaScratch {
-	b := func(v bool) uint32 {
-		if v {
-			return 1
-		}
-		return 0
-	}
-	s := &mlaScratch{
-		qa: d.NewBufferLenOn(mem.LineScratch, max(p.qLoRA, 1)), qaQ: byteBufOn(mem.LineScratch, d, max(p.qLoRA, 4)), qaSc: d.NewBufferLenOn(mem.LineScratch, 1),
-		q: d.NewBufferLenOn(mem.LineScratch, p.nH*p.qkHead), kv: d.NewBufferLenOn(mem.LineScratch, p.latDim), qAbs: d.NewBufferLenOn(mem.LineScratch, p.nH*p.latDim),
-		wsum: d.NewBufferLenOn(mem.LineScratch, p.nH*p.rank), ctx: d.NewBufferLenOn(mem.LineScratch, p.nH*p.vHead), ctxQ: byteBufOn(mem.LineScratch, d, p.nH*p.vHead), ctxSc: d.NewBufferLenOn(mem.LineScratch, 1),
-		invf: NewBufferFloatsOn(mem.LineDense, d, m.RopeInvFreq()),
-	}
-	s.uStore = NewBufferUint32sOn(mem.LineScratch, d, []uint32{uint32(p.rank), uint32(p.qkRope), b(p.interleave)})
-	s.uAbsorb = NewBufferUint32sOn(mem.LineScratch, d, []uint32{uint32(p.nH), uint32(p.rank), uint32(p.qkNope), uint32(p.qkHead), uint32(p.latDim)})
-	s.uLift = NewBufferUint32sOn(mem.LineScratch, d, []uint32{uint32(p.nH), uint32(p.vHead), uint32(p.rank), uint32(p.rank), uint32(p.vHead)})
-	s.uQRope = NewBufferUint32sOn(mem.LineScratch, d, []uint32{uint32(p.nH), uint32(p.qkHead), uint32(p.qkNope), uint32(p.qkRope), uint32(p.rank), uint32(p.latDim), b(p.interleave)})
-	s.uAttn = NewBufferUint32sOn(mem.LineScratch, d, []uint32{uint32(p.nH), uint32(p.latDim), uint32(p.rank)})
-	s.uQLoRA, s.uOK, s.uZero = NewBufferU32On(mem.LineScratch, d, uint32(p.qLoRA)), NewBufferU32On(mem.LineScratch, d, uint32(p.nH*p.vHead)), NewBufferU32On(mem.LineScratch, d, 0)
-	s.uRopeScale, s.uScale = NewBufferFloatsOn(mem.LineScratch, d, []float32{p.ropeScale}), NewBufferFloatsOn(mem.LineScratch, d, []float32{p.attnScale})
-	return s
+// buildMLAScratch holds the latent rope table, on the dense line. The rows and uniforms of mlaScratch are decode's scratch: the decode
+// list allocates them (decodeShape.buffers).
+func buildMLAScratch(d *Device, m *decoder.Model) *mlaScratch {
+	return &mlaScratch{invf: NewBufferFloatsOn(mem.LineDense, d, m.BackendView().RopeInvFreq())}
 }
 
 // mlaKVCopyDeclineOffForTest removes CopyKV's MLA decline: the guard test's planted defect.
 var mlaKVCopyDeclineOffForTest bool
 
-// encodeMLAMixer is an MLA layer's attention block: the input norm, q (q-LoRA or direct) and the KV down-projection, the
-// latent stored at uPos, q absorbed through W_UK and its rope slice rotated, attention over the slot's latent rows, the lift
-// through W_UV, the output projection, and the residual add into x.
-func (r *resident) encodeMLAMixer(e *Encoder, l int, L *residLayer, x, uPos, uRopePos, uNKeys Buffer) {
+// encodeMLACore is the MLA mixer from its normed input in aq and aSc through the output projection, into dO.
+func (r *resident) encodeMLACore(e *Encoder, l int, L *residLayer, uPos, uRopePos, uNKeys Buffer) {
 	p, M, s := r.mla, L.mla, r.mlaS
-	r.encodeNorm(e, x, L.preNorm, L.preNormBias, r.aq, r.aSc)
 	if p.qLoRA > 0 {
 		e.Dispatch(r.pGemvW8, p.qLoRA*32, 32, r.aq, r.aSc, M.qAW, M.qAS, s.qa, r.uH)
 		e.Dispatch(r.pRms, tgReduceNorm, tgReduceNorm, s.qa, M.qANorm, s.qaQ, s.qaSc, s.uQLoRA, r.uEps, s.uZero)
@@ -173,12 +154,11 @@ func (r *resident) encodeMLAMixer(e *Encoder, l int, L *residLayer, x, uPos, uRo
 		e.Dispatch(r.pGemvW8, p.nH*p.qkHead*32, 32, r.aq, r.aSc, M.qW, M.qS, s.q, r.uH)
 	}
 	e.Dispatch(r.pGemvW8, p.latDim*32, 32, r.aq, r.aSc, M.kvAW, M.kvAS, s.kv, r.uH)
-	e.Dispatch(r.pMlaStore, 64, 64, s.kv, M.kvANorm, s.invf, r.kc[l], s.uStore, uPos, uRopePos, r.uEps, s.uRopeScale)
+	e.Dispatch(r.pMlaStore, 64, 64, s.kv, M.kvANorm, s.invf, r.kc[l].At(0), s.uStore, uPos, uRopePos, r.uEps, s.uRopeScale, r.kvKT(l))
 	e.Dispatch(r.pMlaHeadMV, p.nH*p.rank*32, 256, s.q, M.wuk, s.qAbs, s.uAbsorb)
 	e.Dispatch(r.pMlaQRope, p.nH*(p.qkRope/2), 64, s.q, s.invf, s.qAbs, s.uQRope, uRopePos, s.uRopeScale)
-	e.Dispatch(r.pMlaAttn, p.nH*128, 128, s.qAbs, r.kc[l], s.wsum, s.uAttn, uNKeys, s.uScale)
+	e.Dispatch(r.pMlaAttn, p.nH*128, 128, s.qAbs, r.kc[l].At(0), s.wsum, s.uAttn, uNKeys, s.uScale, r.kvKT(l))
 	e.Dispatch(r.pMlaHeadMV, p.nH*p.vHead*32, 256, s.wsum, M.wuv, s.ctx, s.uLift)
 	e.Dispatch(r.pQv, 256, 256, s.ctx, s.ctxQ, s.ctxSc, s.uOK)
 	e.Dispatch(r.pGemvW8, r.H*32, 32, s.ctxQ, s.ctxSc, M.oW, M.oS, r.dO, s.uOK)
-	e.Dispatch(r.pRes, r.H, 256, x, r.dO)
 }

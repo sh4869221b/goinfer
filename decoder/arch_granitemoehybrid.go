@@ -25,7 +25,7 @@ func nopePredicate(kind string) func(int) bool {
 // the Mixtral path, so moeMLP serves it unchanged once the fused tensors are split
 // at load. Dedicated loader (buildGraniteWeights); its program is Architecture.graniteLayerOps.
 func graniteArchitecture(cfg *Config) (*Architecture, *tensorSchema, error) {
-	if err := cfg.validateGranite(); err != nil {
+	if err := cfg.ValidateGranite(); err != nil {
 		return nil, nil, err
 	}
 	// RoPE: the tiny fixture (built by instantiating GraniteMoeHybridConfig on a current
@@ -37,7 +37,7 @@ func graniteArchitecture(cfg *Config) (*Architecture, *tensorSchema, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if cfg.NumHeads <= 0 { // hd = hidden/heads below — a hostile config.json has no validateGGUFDims gate (M16)
+	if cfg.NumHeads <= 0 { // hd = hidden/heads below — a hostile config.json has no validateGGUFDims gate
 		return nil, nil, fmt.Errorf("decoder(granite): num_attention_heads must be > 0, got %d", cfg.NumHeads)
 	}
 	hd := cfg.HiddenDim / cfg.NumHeads

@@ -6,8 +6,24 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/engine"
+	"github.com/townsendmerino/goinfer/engine/enginetest"
 	"github.com/townsendmerino/goinfer/tokenizer"
 )
+
+// scriptedEngine is lm's scripted seam as its engine: Start streams lm.scripted (read at each call, so a test may set it
+// after building the model) and reports the prompt and KV scope to lm.onScripted and lm.onScriptedScope.
+type scriptedEngine struct{ lm *loadedModel }
+
+func (e scriptedEngine) Start(ctx context.Context, req engine.Request) *engine.Stream {
+	return enginetest.Scripted{IDs: e.lm.scripted, OnStart: func(req engine.Request) {
+		if e.lm.onScripted != nil {
+			e.lm.onScripted(req.PromptIDs)
+		}
+		if e.lm.onScriptedScope != nil {
+			e.lm.onScriptedScope(req.Scope)
+		}
+	}}.Start(ctx, req)
+}
 
 // nilReportEngine streams ids on a stream with no report function at all, which the engine contract allows (a Stream's
 // Report is then nil).
@@ -26,10 +42,9 @@ func (e nilReportEngine) Start(context.Context, engine.Request) *engine.Stream {
 // report function streams and finishes like the scripted seam (no logprobs, no reuse, no error) instead of panicking.
 func TestDrive_engineWithNoReportFunc(t *testing.T) {
 	lm := &loadedModel{tk: &tokenizer.Tokenizer{}, fakeEngine: nilReportEngine{}}
-	finish, n, lps, stopHit, reused, cancelReason, err := lm.drive(context.Background(), genRequest{maxTokens: 4}, nil, nil, func(string) {})
-	if finish != "stop" || n != 0 || lps != nil || stopHit != "" || reused != (prefillReuse{}) || cancelReason != "" || err != nil {
-		t.Fatalf("drive on a nil-report engine = (%q, %d, %v, %q, %d, %q, %v), want a clean stop and nothing else",
-			finish, n, lps, stopHit, reused, cancelReason, err)
+	res, err := lm.drive(context.Background(), genRequest{maxTokens: 4}, nil, nil, func(string) {})
+	if res.finish != "stop" || res.nComp != 0 || res.logprobs != nil || res.stopHit != "" || res.reused != (prefillReuse{}) || res.cancelReason != "" || err != nil {
+		t.Fatalf("drive on a nil-report engine = (%+v, %v), want a clean stop and nothing else", res, err)
 	}
 }
 
@@ -68,14 +83,14 @@ func TestDriveVL_mediaRequest(t *testing.T) {
 		{"bidirectional", with(one, func(v *visionInput) { v.spans = multi }), engine.MediaImage, multi, false, nil, 0},
 	} {
 		var got engine.Request
-		lm := &loadedModel{tk: &tokenizer.Tokenizer{}, fakeEngine: mediaEngine{&got}, qwenMerge: 2, qwenImgTok: 151655}
+		lm := &loadedModel{tk: &tokenizer.Tokenizer{}, fakeEngine: mediaEngine{&got}, vision: &qwen25Vision{qwenGrid: qwenGrid{merge: 2, imgTok: 151655}}}
 		ran := false
 		c.vi.features = func() ([]float32, error) { ran = true; return nil, nil }
 		gr := genRequest{promptIDs: []int{1, 2, 3}, maxTokens: 4}
 		gr.sp.Temperature, gr.sp.TopK = 0.7, 5
-		finish, n, lps, stopHit, reused, cancelReason, err := lm.driveVL(context.Background(), gr, c.vi, nil, nil, func(string) {})
-		if finish != "stop" || n != 0 || lps != nil || stopHit != "" || reused != (prefillReuse{}) || cancelReason != "" || err != nil {
-			t.Errorf("%s: driveVL on a no-report engine = (%q, %d, %v, %q, %d, %q, %v), want a clean stop", c.name, finish, n, lps, stopHit, reused, cancelReason, err)
+		res, err := lm.driveVL(context.Background(), gr, c.vi, nil, nil, func(string) {})
+		if res.finish != "stop" || res.nComp != 0 || res.logprobs != nil || res.stopHit != "" || res.reused != (prefillReuse{}) || res.cancelReason != "" || err != nil {
+			t.Errorf("%s: driveVL on a no-report engine = (%+v, %v), want a clean stop", c.name, res, err)
 		}
 		md := got.Media
 		if md == nil {

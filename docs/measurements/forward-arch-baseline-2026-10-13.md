@@ -90,6 +90,8 @@ func main() {
 
 ## 2. Why each family decodes on the CPU, per GPU backend
 
+**Superseded 2026-11-07** by `docs/measurements/forward-arch-census-2026-11-07.md`, which re-runs this walk against program-based admission (CPU-only families by `ResidentEligible`, the basis of the counts below: 8 / 8 / 13 now on CUDA / Metal / WebGPU, from 10 / 12 / 16; the new record also gives the `Admit(...).Why` rows). This section is kept as the 10-13 reading.
+
 **Result:**
 - The registry has 52 keys and 43 distinct `Architecture.Name`s, which are the hardware matrix's 43 rows.
 - Families that decode CPU-only: 10 under CUDA, 12 under Metal and 16 under WebGPU.
@@ -129,7 +131,7 @@ since `9593bd70`). The first test prints only the runner-shape reason when that 
 - **A hazard, not a decline: Spark-X2.5's activation.**
   - Spark-X2.5 is a gated MLP with exact-erf GELU (`ActGelu`, `gegluExact` in `decoder/mlp.go`).
   - `residentFeatures` maps any gated non-SiLU activation to `gated-gelu`, which every backend implements as tanh-GELU.
-  - `decoder/residency.go:Model.GatedActResident` passes the activation's ordinal (3 for `ActGelu`) to a CUDA kernel that knows
+  - `decoder/backend_view.go:backendModelView.GatedAct` passes the activation's ordinal (3 for `ActGelu`) to a CUDA kernel that knows
     0 (tanh-GELU) and 1 (SiLU). `decoder/arch.go`'s comment on `ActGelu`, "Only non-gated archs reach it today", predates
     Spark-X2.5.
   - Nothing runs wrong today: the runner shape and `attn-output-gate` decline Spark-X2.5 first. Once both are lifted, it would

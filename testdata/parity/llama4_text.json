@@ -7,12 +7,13 @@
   ],
   "own": [
     "decoder/forward_llama4.go",
-    "decoder/arch_llama4_text.go"
+    "decoder/arch_llama4_text.go",
+    "decoder/gguf_build_llama4.go"
   ],
   "programs": [
     "testdata/llama4-tiny"
   ],
-  "deps_hash": "sha256:b1d1ab516a8f7a5560727f0927ad0e9e8e879dcfdc899ba38a082fda54e875d6",
+  "deps_hash": "sha256:d1e35a43869cbd2c2471ee9c7f9740731ae94a377a8529d3b7cc2add28e0803a",
   "status": "experimental",
   "validated_at": "3f23c96",
   "date": "2026-06-16",

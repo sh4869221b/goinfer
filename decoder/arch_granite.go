@@ -9,10 +9,10 @@ import (
 // byte-identical to llama's, so llamaTensorSchema is reused) plus Granite's four scalar multipliers, three of them generic on Architecture
 // (embedding_multiplier → EmbedScale, attention_multiplier → AttnScale in place of 1/√d, logits_scaling → LogitScale). residual_multiplier
 // is the exception: granitemoehybrid's own forward applies it via graniteParams.ResidMul, and the generic uniform-layer forward this family
-// rides has no such hook. All three released sizes ship residual_multiplier 1.0 (identity), so validateGraniteDense rejects anything else
-// rather than silently dropping it, the discipline validateLlama applies to attention bias.
+// rides has no such hook. All three released sizes ship residual_multiplier 1.0 (identity), so ValidateGraniteDense rejects anything else
+// rather than silently dropping it, the discipline ValidateLlama applies to attention bias.
 func graniteDenseArchitecture(cfg *Config) (*Architecture, *tensorSchema, error) {
-	if err := cfg.validateGraniteDense(); err != nil {
+	if err := cfg.ValidateGraniteDense(); err != nil {
 		return nil, nil, err
 	}
 	// RoPE: the released checkpoints carry both a nested rope_parameters and a redundant
@@ -24,7 +24,7 @@ func graniteDenseArchitecture(cfg *Config) (*Architecture, *tensorSchema, error)
 	if base <= 0 {
 		return nil, nil, fmt.Errorf("decoder(granite): rope_theta must be >0, got %v", base)
 	}
-	hd := cfg.headDim()
+	hd := cfg.EffectiveHeadDim()
 	attnMul := cfg.AttentionMultiplier
 	if attnMul == 0 {
 		attnMul = math.Pow(float64(hd), -0.5) // HF default when unset

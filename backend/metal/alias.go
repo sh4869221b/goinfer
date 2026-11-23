@@ -14,7 +14,7 @@ import (
 
 // weightAlias binds a dense int4 weight in place instead of copying it a second time. Without it a weight is copied twice at
 // build (the .giw's mapping, a heap []uint32, then a StorageModeShared MTLBuffer), and the MTLBuffer copy is a large part of a
-// Metal load's dirty IOAccelerator memory (docs/tasks/task-never-swap-2026-09.md). For a canonical int4 array that lives in the
+// Metal load's dirty IOAccelerator memory. For a canonical int4 array that lives in the
 // mapping it wraps the array's pages in a no-copy MTLBuffer (newBufferWithBytesNoCopy) and binds the array at its offset inside
 // that window, so the GPU reads the nibbles straight from the page cache. Same bytes, same kernels, same bind order; only who
 // owns the memory changes.
@@ -29,7 +29,7 @@ import (
 // pages with write intent, so over a MAP_PRIVATE mapping every GPU-read page becomes a wired anonymous copy-on-write copy:
 // aliasing then saves nothing, and fork() copies the whole mapping (docs/measurements/s6-alias-2026-09-24.md, "MAP_SHARED").
 //
-// On by default, by owner decision after the S6 gates; not every gate read as passed (docs/code-notes/metal.md#weightAlias).
+// On by default, by owner decision; not every one of its gates read as passed (docs/code-notes/metal.md#weightAlias).
 // GOINFER_METAL_ALIAS=0 turns it off: this type is then nil and int4Buf is byte-for-byte the copy path.
 type weightAlias struct {
 	m    *decoder.Model

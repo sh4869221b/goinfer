@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""queue_citation_lint.py — every citation in docs/QUEUE.md must resolve, and its target must match.
+"""queue_citation_lint.py — every citation in the queue must resolve, and its target must match.
 
-Commit citations (sha -> subject) are recorded in a generated index (docs/citation-index.md) and compared on every run. Code
-citations come in two forms since CC0 (docs/tasks/task-code-comments-2026-10.md):
+The queue is queues/QUEUE.md in the private notes checkout (a sibling ../goinfer-notes, or --notes PATH) when that holds one, else
+docs/QUEUE.md; with neither, the queue's commit citations are skipped and the run says so.
+
+Commit citations (sha -> subject) are recorded in a generated index (citation-index.md, beside the queue) and compared on every run. Code
+citations come in two forms since CC0 (docs/completed/task-code-comments-2026-10.md):
 
   - `path.go:Name` / `path.go:Type.Method` in a LIVE doc names a declaration, and the lint checks the file declares it NOW. Nothing is
     recorded and nothing goes stale when lines move above it.
@@ -92,7 +95,56 @@ def index_path():
     from QUEUE at call time so a test that points QUEUE at a scratch repo moves the index with it.
     A QUEUE.md that still carries the old in-file block is migrated by the next --update (the block
     is moved out; everything around it, including anything after it, is kept)."""
-    return QUEUE.parent / "citation-index.md"
+    return (queue_file() or QUEUE).parent / "citation-index.md"
+
+
+def notes_root():
+    """The private notes checkout, or None: `--notes PATH` on the command line, else a sibling `../goinfer-notes`. No
+    environment variable: where a checkout sits is a property of the command, not of the shell. The notes hold the task, queue,
+    plan and scoping docs once they leave this repository; CI has no checkout, so anything CI runs must pass without it."""
+    argv = sys.argv
+    if "--notes" in argv and argv.index("--notes") + 1 < len(argv):
+        cand = pathlib.Path(argv[argv.index("--notes") + 1]).expanduser()
+    else:
+        cand = ROOT.parent / "goinfer-notes"
+    return cand.resolve() if cand.is_dir() else None
+
+
+def queue_file():
+    """The queue the SHA index is checked against: queues/QUEUE.md in the notes checkout when it has one, else docs/QUEUE.md
+    here, else None (the queue lives only in the notes and no checkout is present: the commit citations in it are skipped, and
+    main() says so)."""
+    n = notes_root()
+    if n and (n / "queues" / "QUEUE.md").is_file():
+        return n / "queues" / "QUEUE.md"
+    return QUEUE if QUEUE.exists() else None
+
+
+def doc_label(f):
+    """A document's name in a message: its path under ROOT, or `notes:` and its path under the notes checkout."""
+    try:
+        return str(f.relative_to(ROOT))
+    except ValueError:
+        return "notes:" + str(f.relative_to(notes_root()))
+
+
+_notes_tracked_cache = {}
+
+
+def _is_tracked(f):
+    """Is f a git-tracked file of the repository it sits in? True when git cannot say (the pre-J0 degrade)."""
+    n = notes_root()
+    if n and (n in f.parents):
+        if n not in _notes_tracked_cache:
+            try:
+                out = subprocess.run(["git", "ls-files", "-z"], cwd=n, capture_output=True, check=True, env=_repo_env())
+                _notes_tracked_cache[n] = {p for p in out.stdout.decode("utf-8", "replace").split("\0") if p}
+            except Exception:
+                _notes_tracked_cache[n] = None
+        t, rel = _notes_tracked_cache[n], str(f.relative_to(n))
+    else:
+        t, rel = _tracked_files(), str(f.relative_to(ROOT))
+    return t is None or rel in t
 
 
 _TRACKED_SENTINEL = object()
@@ -125,9 +177,13 @@ def _candidate_docs():
     split — one filesystem walk instead of two, and the single place the docs/internal/ and
     testdata/ exclusions live."""
     out = []
-    for f in sorted(ROOT.rglob("*.md")):
+    q = queue_file()
+    n = notes_root()
+    # the notes checkout's docs are live documents too, except its archive (completed/), which ages like docs/completed/
+    notes_docs = [f for f in sorted(n.rglob("*.md")) if f.relative_to(n).parts[0] != "completed"] if n else []
+    for f in sorted(ROOT.rglob("*.md")) + notes_docs:
         # the index is GENERATED from citations; linting its rows as citations would be circular
-        if "/.git/" in str(f) or "docs/completed/" in str(f) or f == QUEUE or f == index_path():
+        if "/.git/" in str(f) or "docs/completed/" in str(f) or f in (QUEUE, q) or f in (QUEUE.parent / "citation-index.md", index_path()):
             continue
         # docs/internal/ is EXCLUDED, and the reason is not tidiness. That directory is
         # DELIBERATELY UNCOMMITTED (.gitignore), so every path inside it resolves on exactly one
@@ -166,10 +222,10 @@ def live_docs():
     prints that set rather than silencing it — a false red traded for an invisible hole would repeat
     the same failure one door down.
     """
-    tracked = _tracked_files()
-    out = [QUEUE]
+    q = queue_file()
+    out = [q] if q else []
     for f in _candidate_docs():
-        if tracked is not None and str(f.relative_to(ROOT)) not in tracked:
+        if not _is_tracked(f):
             continue
         out.append(f)
     return out
@@ -179,10 +235,9 @@ def untracked_live_docs():
     """The live-doc-shaped .md files live_docs() is skipping because git does not track them —
     printed once by main(), never silently. Empty when git is unusable (there is nothing to skip on
     that basis; the degrade-to-everything note covers that case instead)."""
-    tracked = _tracked_files()
-    if tracked is None:
+    if _tracked_files() is None:
         return []
-    return [f for f in _candidate_docs() if str(f.relative_to(ROOT)) not in tracked]
+    return [f for f in _candidate_docs() if not _is_tracked(f)]
 MARK_BEGIN = "<!-- CITATION-INDEX: generated by scripts/queue_citation_lint.py --update; do not edit by hand -->"
 MARK_END = "<!-- /CITATION-INDEX -->"
 
@@ -615,7 +670,7 @@ def resolve_path(rel: str, line: int):
 BARE_RE = re.compile(r"(?<![\w/])((?:[a-z0-9_]+/)*[a-z0-9_]+\.(?:go|sh|py))(?![\w:])")
 
 
-# ---- SYMBOL CITATIONS (CC0.b, docs/tasks/task-code-comments-2026-10.md) ----
+# ---- SYMBOL CITATIONS (CC0.b, docs/completed/task-code-comments-2026-10.md) ----
 #
 # A live doc names a declaration, not a line: `decoder/forwardn.go:Model.forwardN`, `gpu/residency.go:residentDecoder.PrefillLast`,
 # `scripts/x.py:Tool.run`. The check is that the file DECLARES that name. It survives every edit that does not rename the declaration
@@ -867,7 +922,9 @@ def _git_show(commit: str, rel: str):
 def modules_at(commit: str):
     """{module: version} the aikit modules goinfer required AT that commit — what the record's aikit paths were about."""
     out = {}
-    for mod_file, want in (("go.mod", "github.com/townsendmerino/aikit"), ("cuda/go.mod", "github.com/townsendmerino/aikit/gpu")):
+    for mod_file, want in (("go.mod", "github.com/townsendmerino/aikit"),
+                           ("cuda/go.mod", "github.com/townsendmerino/aikit/gpu"),
+                           ("backend/cuda/go.mod", "github.com/townsendmerino/aikit/gpu")):
         t = _git_show(commit, mod_file)
         if t is None:
             continue
@@ -877,14 +934,52 @@ def modules_at(commit: str):
     return out
 
 
+_PSEUDO_VER_RE = re.compile(r"^v\d+\.\d+\.\d+-(?:0\.|\d+\.)?\d{14}-([0-9a-f]{12})(?:\+incompatible)?$")
+
+
+def _aikit_sibling_repo():
+    for r in sibling_repos():
+        if pathlib.Path(r) != ROOT.resolve() and repo_name(r) == "aikit" and (pathlib.Path(r) / ".git").exists():
+            return str(r)
+    return None
+
+
+def _aikit_git_file_at(mod: str, ver: str, rel: str):
+    """Resolve (mod, ver, rel) from the sibling aikit git checkout when GOMODCACHE does not hold mod@ver.
+    Returns (searched: bool, text: str | None)."""
+    repo = _aikit_sibling_repo()
+    if repo is None:
+        return False, None
+    m = _PSEUDO_VER_RE.match(ver)
+    if m:
+        ref = m.group(1)
+    elif mod.endswith("/gpu"):
+        ref = f"gpu/{ver}"
+    else:
+        ref = ver
+    chk = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+                         capture_output=True, text=True, cwd=repo, env=_repo_env())
+    if chk.returncode != 0:
+        return False, None
+    if mod.endswith("/gpu"):
+        git_rel = f"gpu/{rel}"
+    elif rel.startswith("gpu/"):
+        return True, None
+    else:
+        git_rel = rel
+    r = subprocess.run(["git", "show", f"{ref}:{git_rel}"], capture_output=True, cwd=repo, env=_repo_env())
+    return True, (r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None)
+
+
 class CannotSearch(Exception):
     """A module the commit required is not in the module cache: the search did not happen, so the answer is not 'absent'."""
 
 
 def file_at(commit: str, rel: str):
     """(label, text) of `rel` as it was at `commit`: this repo first, then the aikit module(s) at the version that commit's go.mod
-    required, read from the module cache. None when the file existed in neither. Raises CannotSearch when it was not found AND a
-    required module is not downloaded — a missing download is not an absence, and calling it one would be a green that covers nothing.
+    required, read from the module cache (or the sibling aikit git repository at that exact tag/commit when the module cache does not
+    hold it). None when the file existed in neither. Raises CannotSearch when it was not found AND a required module cannot be searched
+    — a missing download is not an absence, and calling it one would be a green that covers nothing.
 
     This repo wins when a path exists in both: a goinfer record cites goinfer first, and the live-doc resolver's aikit-first order
     exists to pin versions, which a commit already does."""
@@ -901,10 +996,16 @@ def file_at(commit: str, rel: str):
         PINNED_MODULES_NEEDED.update(f"{mod}@{ver}" for mod, ver in mods.items())  # all of them, whatever is cached here
         for mod, ver in mods.items():
             d = modcache_dir(mod, ver)
-            if d is None:
+            if d is not None:
+                if (d / rel).is_file():
+                    hit = (repo_name(d), (d / rel).read_text(errors="replace"))
+                    break
+                continue
+            searched, txt = _aikit_git_file_at(mod, ver, rel)
+            if not searched:
                 missing.append(f"{mod}@{ver}")
-            elif (d / rel).is_file():
-                hit = (repo_name(d), (d / rel).read_text(errors="replace"))
+            elif txt is not None:
+                hit = (mod.rstrip("/").split("/")[-1], txt)
                 break
         if hit is None and missing:
             raise CannotSearch(f"{rel} is not in this repository at {commit[:10]}, and the module(s) it may belong to are not downloaded: "
@@ -1046,6 +1147,8 @@ def gitignored_destinations():
         return []
     cands, hits = {}, []
     for doc in live_docs():
+        if ROOT not in doc.parents:
+            continue  # a notes-checkout document is not this repository's: its own gitignore is not ours to apply
         rel = str(doc.relative_to(ROOT))
         if rel not in tracked:
             continue  # only COMMITTED documents make this claim
@@ -1105,12 +1208,13 @@ def pinned_modules() -> int:
     PINNED_MODULES_NEEDED.clear()
     PINNED_FILE_CACHE.clear()
     pallow = path_allowlist()
-    body = body_without_index(QUEUE.read_text()) if QUEUE.exists() else ""
+    queue = queue_file()
+    body = body_without_index(queue.read_text()) if queue else ""
     for doc in live_docs():
-        dbody = body if doc == QUEUE else doc.read_text(errors="replace")
+        dbody = body if doc == queue else doc.read_text(errors="replace")
         commit, _ = pinned_marker(dbody)
         if commit and commit_resolves(commit):
-            check_pinned(str(doc.relative_to(ROOT)), commit, dbody, pallow)
+            check_pinned(doc_label(doc), commit, dbody, pallow)
     PINNED_FILE_CACHE.clear()  # a later lint run in this process must look again, with whatever has been downloaded since
     for m in sorted(PINNED_MODULES_NEEDED):
         print(m)
@@ -1121,7 +1225,22 @@ def _main() -> int:
     if "--pinned-modules" in sys.argv:
         return pinned_modules()
     update = "--update" in sys.argv
-    text = QUEUE.read_text()
+    queue = queue_file()
+    notes = notes_root()
+    # Said on every run, so a skip and a pass never look alike (CI has no notes checkout).
+    if notes is None:
+        print("queue_citation_lint: no notes checkout (a sibling ../goinfer-notes, or --notes PATH): the task, queue, plan and "
+              "scoping docs kept there were NOT examined here.")
+    else:
+        print(f"queue_citation_lint: notes checkout {notes}: its markdown documents are examined with this repository's "
+              f"(its completed/ is excluded like docs/completed/).")
+    if queue is None:
+        print("queue_citation_lint: PRIVATE ROWS SKIPPED — no queue file (docs/QUEUE.md is absent and no notes checkout holds "
+              "queues/QUEUE.md): the queue's commit citations were NOT checked here.")
+        if update:
+            print("queue_citation_lint --update: no queue, so no index to write.")
+            return 0
+    text = queue.read_text() if queue else ""
     body = body_without_index(text)
     # itext is the generated index: its own file, or (before the migration's first --update) the
     # legacy block still inside QUEUE.md. Every index READ below goes through itext.
@@ -1141,7 +1260,7 @@ def _main() -> int:
             print(f"queue_citation_lint: note: {len(untracked)} untracked doc(s) not linted (commit "
                   f"them to bring their citations under the gate):")
             for f in untracked:
-                print(f"    {f.relative_to(ROOT)}")
+                print(f"    {doc_label(f)}")
 
     found = []
     for m in SHA_RE.finditer(body):
@@ -1150,7 +1269,7 @@ def _main() -> int:
             found.append(tok)
     found.sort()
 
-    if not found:
+    if not found and queue is not None:
         # Zero citations is indistinguishable from "the regexp stopped matching". Refuse.
         sys.stderr.write("queue_sha_lint: found ZERO SHA citations — the queue always cites some, "
                          "so the extractor is broken rather than the file being clean.\n")
@@ -1160,8 +1279,8 @@ def _main() -> int:
     pallow = path_allowlist()
     for doc in live_docs():
         dtxt = doc.read_text(errors="replace")
-        dbody = body if doc == QUEUE else dtxt
-        rel_doc = str(doc.relative_to(ROOT))
+        dbody = body if doc == queue else dtxt
+        rel_doc = doc_label(doc)
         # A PINNED record is checked at its commit and then left alone: its citations never enter the path index, --update never
         # reaches it (repoint_citation is only ever called for a key in `paths`), and HEAD's version of the code is irrelevant to it.
         commit, perr = pinned_marker(dbody)
@@ -1432,16 +1551,16 @@ def _main() -> int:
             out = body.rstrip("\n") + "\n"
             if tail.strip():
                 out = out + "\n" + tail.lstrip("\n")
-            QUEUE.write_text(out)
+            queue.write_text(out)
         print(f"queue_sha_lint: indexed {len(resolved)} SHAs ({len(unresolved)} unresolved)")
         return 1 if unresolved else 0
 
-    if MARK_END not in itext:
+    if MARK_END not in itext and queue is not None:
         sys.stderr.write("queue_sha_lint: no citation index (docs/citation-index.md) — run with --update\n")
         return 1
 
     index = {}
-    for line in itext.split(MARK_BEGIN, 1)[1].splitlines():
+    for line in (itext.split(MARK_BEGIN, 1)[1].splitlines() if MARK_BEGIN in itext else []):
         m = re.match(r"\|\s*`([0-9a-f]{7,40})`\s*\|\s*(.*?)\s*\|$", line.strip())
         if m:
             index[m.group(1)] = m.group(2)
@@ -1479,7 +1598,7 @@ def _main() -> int:
             bad.append(f"  {sha}  indexed but no longer cited — run --update")
 
     pindex = {}
-    for line in itext.split(MARK_BEGIN, 1)[1].splitlines():
+    for line in (itext.split(MARK_BEGIN, 1)[1].splitlines() if MARK_BEGIN in itext else []):
         m = re.match(r"\|\s*`([^`]+:\d+)`\s*\|\s*([^|]*?)\s*\|\s*`(.*)`\s*\|$", line.strip())
         if m:
             pindex[m.group(1)] = (m.group(2), m.group(3))
@@ -1564,7 +1683,7 @@ def _main() -> int:
                        f"something the file no longer supports.")
 
     bindex = {}
-    for line in itext.split(MARK_BEGIN, 1)[1].splitlines():
+    for line in (itext.split(MARK_BEGIN, 1)[1].splitlines() if MARK_BEGIN in itext else []):
         m = re.match(r"\|\s*`([^`]+\.(?:go|sh|py))`\s*\|\s*([^|]*?)\s*\|$", line.strip())
         if m:
             bindex[m.group(1)] = m.group(2)
@@ -1623,7 +1742,7 @@ def _main() -> int:
     # citation(s) across K live document(s)") let "across K live documents" read as covering both
     # clauses; it covers only the second.
     print(f"queue_citation_lint: VALIDATED {len(resolved) - len(allowed)} commit citation(s) in "
-          f"docs/QUEUE.md, {len(paths) - len(unkeyable)} path:line citation(s) across {ndocs} live "
+          f"the queue, {len(paths) - len(unkeyable)} path:line citation(s) across {ndocs} live "
           f"document(s), and {len(bresolved)} bare file reference(s) in the queue (existence only).")
     if unkeyable:
         print(f"  {len(unkeyable)} path citation(s) are EXISTENCE-CHECKED ONLY — their line content "

@@ -9,7 +9,7 @@ package chat
 //     ThinkSplitter separates it into reasoning and content, chunk-boundary safe, so a wire layer can put the answer in
 //     `content` and the reasoning somewhere a client can ignore.
 //
-// Why it is per checkpoint (docs/tasks/task-qwen35-think-prompt-2026-09.md): the generic ChatML renderer writes nothing after
+// Why it is per checkpoint: the generic ChatML renderer writes nothing after
 // "<|im_start|>assistant\n", but Qwen3.5's own template writes a think block there, and WHICH block depends on the checkpoint: the
 // 0.8B defaults to thinking OFF (closed empty block), the 9B to ON (open `<think>\n`), Qwen3 to ON with nothing written. The same knob
 // (`enable_thinking`) means different things per family and size, so nothing here hard-wires "Qwen does X".
@@ -309,7 +309,10 @@ func (t *Template) renderThinking(system string, turns []Turn) []Segment {
 	r := t.reason
 	if r.gemma4 {
 		on, _ := r.effectiveOn(t.think)
-		return gemma4Segments(system, turns, on, r.hist == histGemma4 || r.oldGemma4, r.oldGemma4, r.offScaffold())
+		return gemma4Segments(system, turns, gemma4Opts{think: on, hist: r.hist == histGemma4 || r.oldGemma4, old: r.oldGemma4, scaffold: r.offScaffold()})
+	}
+	if t.name == "flint" {
+		return t.render(system, turns)
 	}
 	segs := chatMLSegments(system, turns, r.hist)
 	return append(segs[:len(segs):len(segs)], r.suffix(t.think)...)

@@ -5,6 +5,9 @@ import (
 	"os"
 	"strconv"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TestGemma4_12B_trace drives the 12B GGUF over the HF trace's prompt and dumps a last-position per-layer residual trace and
@@ -13,7 +16,7 @@ import (
 //
 //	G4_ALLOW_KV=1 G4_TRACE=1 go test ./decoder/ -run TestGemma4_12B_trace -v
 func TestGemma4_12B_trace(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	if os.Getenv("G4_TRACE") == "" {
 		t.Skip("set G4_TRACE=1 to run the 12B trace dump")
 	}
@@ -74,7 +77,7 @@ func TestGemma4_12B_trace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("forward: %v", err)
 	}
-	got := argmax(logits)
+	got := sampling.Argmax(logits)
 	t.Logf("goinfer 12B argmax = %d (logit %.4f) | HF argmax = %d", got, logits[got], hf.Argmax)
 	if got == hf.Argmax {
 		t.Logf("ARGMAX MATCHES HF — 12B forward looks correct!")

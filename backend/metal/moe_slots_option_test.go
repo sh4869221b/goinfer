@@ -11,8 +11,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// TestMoESlotsViaOptions_engagesPaging is Phase 2's own gate (docs/tasks/task-gpu-paths-2026-09.md —
-// "Metal slots become an Option and a flag"): decoder.Options.MoECacheSlots (the SAME
+// TestMoESlotsViaOptions_engagesPaging is Phase 2's own gate: decoder.Options.MoECacheSlots (the SAME
 // --moe-cache-slots CUDA's own auto-cap already reads) must reach the REAL dispatch-building code
 // in metal/moe.go and metal/gemma4_moe.go, not just residentNeedBytes' guard estimate
 // (TestMetalMoESlotsFromEnv, metal/resident_memguard_test.go, already covers the guard half in
@@ -58,7 +57,7 @@ func TestMoESlotsViaOptions_engagesPaging(t *testing.T) {
 	if got := m.MoECacheSlotsRequest(); got != N {
 		t.Fatalf("MoECacheSlotsRequest() = %d, want %d — Options.MoECacheSlots not wired through decoder.Load", got, N)
 	}
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("BuildResident: %v", err)
 	}
@@ -88,7 +87,8 @@ func TestMoESlotsViaOptions_engagesPaging_genericMoE(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load probe: %v", err)
 	}
-	nE, topK, _, _, _, _, _, _, _, _, ok := mProbe.MoEResidentParams()
+	mo, ok := mProbe.BackendView().MoE()
+	nE, topK := mo.NumExperts, mo.TopK
 	mProbe.Close()
 	if !ok || nE <= topK {
 		t.Fatalf("fixture nE=%d topK=%d (ok=%v) — expected a real paging-eligible MoE shape", nE, topK, ok)
@@ -106,7 +106,7 @@ func TestMoESlotsViaOptions_engagesPaging_genericMoE(t *testing.T) {
 	if got := m.MoECacheSlotsRequest(); got != N {
 		t.Fatalf("MoECacheSlotsRequest() = %d, want %d — Options.MoECacheSlots not wired through decoder.Load", got, N)
 	}
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("BuildResident: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestMoESlotsViaOptions_engagesPaging_genericMoE(t *testing.T) {
 	}
 }
 
-// TestMoESlotsViaOptions_belowTopKRefusesWithNumbers is G6 (docs/tasks/task-gpu-paths-2026-09.md §6):
+// TestMoESlotsViaOptions_belowTopKRefusesWithNumbers is G6:
 // an explicit --moe-cache-slots below top-k cannot be honoured (one token's own routed set must
 // be simultaneously resident) — it must be REFUSED, with the numbers, never silently rounded up
 // or ignored. Uses testdata/mixtral-tiny (tracked, runs in CI unconditionally); the request comes
@@ -136,7 +136,8 @@ func TestMoESlotsViaOptions_belowTopKRefusesWithNumbers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load probe: %v", err)
 	}
-	_, topK, _, _, _, _, _, _, _, _, ok := mProbe.MoEResidentParams()
+	mo, ok := mProbe.BackendView().MoE()
+	topK := mo.TopK
 	mProbe.Close()
 	if !ok || topK < 1 {
 		t.Fatalf("fixture has no usable topK (topK=%d, ok=%v)", topK, ok)
@@ -152,7 +153,7 @@ func TestMoESlotsViaOptions_belowTopKRefusesWithNumbers(t *testing.T) {
 	}
 	defer m.Close()
 
-	_, err = buildResident(m)
+	_, err = buildResident(m, metalCtxPlan{})
 	if err == nil {
 		t.Fatalf("BuildResident succeeded with MoECacheSlots=%d < topK=%d — should have refused", below, topK)
 	}

@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-// TestKSD1_splitKernel is D1-G1 (docs/tasks/task-kernel-survey-2026-10.md, "KS-D1 gates"): attention_prefill_steel_split at head
+// TestKSD1_splitKernel is D1-G1: attention_prefill_steel_split at head
 // dims 256 and 512 against an f64 attention over the same half inputs, at random q, k, v; M = 100 and 300; start 0 and 37;
 // window 0 and 64 (at 256); 8 query heads over 1 KV head. PASS iff every output is finite and max-abs <= 4e-3, mean-abs <=
 // 2e-4 in every cell. It also checks (not a registered gate) that a 300-row pass equals the same rows run as two passes of 150,
@@ -63,7 +63,7 @@ func TestKSD1_splitKernel(t *testing.T) {
 						e := q.Begin()
 						e.Dispatch(p, nH*((rows+bq-1)/bq)*256, 256, bQ.At(rowOff*stride*2), bK, bV, out, NewBufferU32(d, nH),
 							NewBufferU32(d, nKV), NewBufferU32(d, uint32(hd)), NewBufferU32(d, uint32(st)), NewBufferFloats(d, []float32{scale}),
-							NewBufferU32(d, uint32(stride)), NewBufferU32(d, uint32(window)), NewBufferU32(d, uint32(rows)))
+							NewBufferU32(d, uint32(stride)), NewBufferU32(d, uint32(window)), NewBufferU32(d, uint32(rows)), kvIdentityTable(d))
 						e.End()
 						return slices.Clone(out.U16s()[:rows*qDim])
 					}

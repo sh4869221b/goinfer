@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/aikit/linalg"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // mlaMainF32Hash is main's deepseek-tiny f32 CPU logits over 32 positions, hashed, before MEM11-int8 (the f32 load must not move).
@@ -45,7 +47,7 @@ func mlaPairs(ref, got *mlaWeights) []struct {
 	}{{"q_a", ref.qAProj, &got.qAQ}, {"q_b", ref.qBProj, &got.qBQ}, {"q", ref.qProj, &got.qQ}, {"kv_a", ref.kvAProj, &got.kvAQ}, {"o", ref.oProj, &got.oQ}}
 }
 
-// TestMEM11_mlaInt8Holding is I8M-G1 and I8M-G2's host half (docs/tasks/task-memory-campaign-2026-10.md, "MEM11-int8 gates"): on
+// TestMEM11_mlaInt8Holding is I8M-G1 and I8M-G2's host half: on
 // deepseek-tiny, a quantized load holds q (or the q-LoRA pair), kv-A and o as int8 and kv-B f32, an f32 load holds all six f32 with
 // logits unchanged from main's, ResidentWeightBytes falls by exactly the difference, and the int8 codes and scales, and a bundle
 // round trip's, equal linalg.QuantizeInt8 of the f32 arm's projections.
@@ -136,7 +138,7 @@ func TestMEM11_mlaInt8FidelityTiny(t *testing.T) {
 //
 //	GOINFER_HEAVY_TESTS=1 go test -count=1 -run '^TestMEM11_mlaInt8FidelitySlice$' -v ./decoder/
 func TestMEM11_mlaInt8FidelitySlice(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	home, _ := os.UserHomeDir()
 	path := filepath.Join(home, "models", "deepseek-v2-lite-gguf", "DeepSeek-V2-Lite-Chat-Q4_K_M.slice-0-1.gguf")
 	if _, err := os.Stat(path); err != nil {

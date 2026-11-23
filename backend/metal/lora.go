@@ -10,7 +10,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// Compute-time LoRA on the resident path (G3, docs/tasks/task-gpu-paths-2026-09.md).
+// Compute-time LoRA on the resident path.
 //
 // A LoRA delta is additive: y[o] += scale·Σ_r B[o,r]·(A·x)[r], applied AFTER the base projection's matmul on the SAME input
 // x the base matmul consumed (decoder/lora.go's applyLoRA, the CPU reference this mirrors). On Metal that input is the
@@ -97,7 +97,7 @@ func loraLayersIdentical(layers, cached []decoder.ResidentAdapterLayer) bool {
 	return true
 }
 
-// SetAdapter implements decoder.ResidentAdapter: uploads (layers != nil) or clears (layers == nil) the compute-time LoRA
+// SetAdapter implements decoder.ResidentRuntimeSubsystem: uploads (layers != nil) or clears (layers == nil) the compute-time LoRA
 // delta for every subsequent Forward/ForwardN call until the next SetAdapter. A bind that returns an error leaves NO adapter
 // bound (r.loraLayers is nil), which is what generateInto's fallback-to-CPU path assumes.
 //

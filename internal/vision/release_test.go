@@ -143,7 +143,7 @@ func releasables(t *testing.T) []releasable {
 	return out
 }
 
-// TestReleaseBlocks_reloadsTheSameTower is TWR-G1 (goinfer's docs/tasks/task-memory-campaign-2026-10.md, MEM4(b) gates):
+// TestReleaseBlocks_reloadsTheSameTower is TWR-G1:
 // after ReleaseBlocks the heap falls by at least 80% of the blocks' bytes, the next forward is byte-equal to the one before
 // and reloads the blocks, and the export after it hashes the same as before.
 //
@@ -204,7 +204,7 @@ func TestReleaseBlocks_reloadsTheSameTower(t *testing.T) {
 func TestReleaseBlocks_refusesACallersSource(t *testing.T) {
 	ref, err := LoadQwen3VisionEncoder("testdata/qwen35vl-vision-tiny", false)
 	if err != nil {
-		t.Skipf("no Qwen3.5 tiny tower: %v", err)
+		t.Fatalf("load testdata/qwen35vl-vision-tiny: %v", err)
 	}
 	st, err := openWeights("testdata/qwen35vl-vision-tiny")
 	if err != nil {

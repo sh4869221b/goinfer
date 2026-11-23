@@ -108,7 +108,7 @@ var autoOrder = []string{"cuda", "metal"}
 // than opening a device, so what auto actually checks for it is the architecture.
 var autoFound = map[string]string{
 	"cuda":  "auto: a CUDA device answered",
-	"metal": "auto: Apple silicon; metal runs int4 models, other precisions stay on the CPU", // autoMetalPrecision
+	"metal": "auto: Apple silicon; metal runs int4 and q4k models, other precisions stay on the CPU", // autoMetalPrecision
 }
 
 // AutoChoice is what a backend of "auto" resolved to on this binary and machine.
@@ -138,7 +138,7 @@ func autoBackend(linked []string, probe func(string) (int64, bool), goarch strin
 			continue
 		}
 		if b == "metal" && goarch != "arm64" {
-			// Intel Macs were scoped out (docs/completed/task-metal-cgofree-spike.md) and no record has run Metal on one, though the
+			// Intel Macs were scoped out and no record has run Metal on one, though the
 			// darwin/amd64 release asset links it.
 			passed = append(passed, "metal is built in, but has only been run on Apple silicon; -backend metal asks for it")
 			continue
@@ -236,7 +236,7 @@ func NewBackend(name string) (Backend, error) {
 		// Options.Validate accepts "metal", so an untagged build reaching here falls back to CPU rather than returning a nil backend.
 		return &cpuBackend{}, fmt.Errorf("decoder: metal backend not built in; build the submodule entrypoint (go build github.com/townsendmerino/goinfer/backend/metal/cmd/serve, darwin) — not `-tags metal` on the root cmd/serve; using cpu")
 	}
-	return nil, fmt.Errorf("decoder: unknown backend %q (have: cpu, webgpu, cuda, metal)", name)
+	return nil, errorOfKind(ErrUnknownBackend, "decoder: unknown backend %q (have: cpu, webgpu, cuda, metal)", name)
 }
 
 // cpuBackend dispatches the matmul to linalg.MatmulBT (SIMD dot kernels parallelized across output columns).

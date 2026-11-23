@@ -16,8 +16,8 @@ import (
 // tokenizer — same convention as gemma3ParityPrompt/gptOssParityPrompt.
 var nemotronMoEParityPrompt = []int{1, 7, 42, 20, 5, 30, 13, 40}
 
-// TestNemotronMoEResidentParityWebGPU is the gate for Nemotron-H's fourth block kind
-// (docs/tasks/task-gpu-paths-2026-09.md, G7 part 2): the MoE FFN (routed NON-GATED relu² experts
+// TestNemotronMoEResidentParityWebGPU is the gate for Nemotron-H's fourth block kind:
+// the MoE FFN (routed NON-GATED relu² experts
 // plus an always-on ungated shared expert of the same shape, NOT moeMLP's gated SwiGLU) against
 // testdata/nemotron3nano-tiny, whose 6-layer block pattern (linear_attention, moe,
 // linear_attention, full_attention, moe, linear_attention) exercises mamba, attention AND moe
@@ -96,7 +96,7 @@ func TestNemotronMoEResidentParityWebGPU(t *testing.T) {
 
 // TestNemotronMoEResident_noSharedExpertBuilds pins that a Nemotron-H MoE block with
 // n_shared_experts=0 builds resident. That is a real, validator-accepted config shape
-// (decoder/config.go's validateNemotron only errors on the opposite combination,
+// (decoder/config's Config.ValidateNemotron only errors on the opposite combination,
 // n_shared_experts>0 with the intermediate size unset), yet the case-3 branch of the per-layer
 // switch once projected SharedExpert.Up/.Down unconditionally, so a zero-value SharedExpert hit
 // proj() with nothing to wrap and BuildResident failed with "unsupported projection precision".

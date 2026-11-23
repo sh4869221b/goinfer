@@ -7,11 +7,11 @@ import (
 	"testing"
 )
 
-// KV7 step 2's policy (docs/tasks/task-kv7-step2-boundary-snapshot-2026-10.md §8, M4) on the hash fake: a prompt whose tail after the stable section is
+// KV7 step 2's policy on the hash fake: a prompt whose tail after the stable section is
 // longer than the rollback takes its snapshot at the boundary, between two passes of the cold prefill; one whose tail fits takes step one's end snapshot;
 // a request restores the snapshot its window can serve, not the longest match; and there is one snapshot per prompt.
 
-// PrefillMarkAlign and PrefillLastMarked make snapFake a decoder.ResidentPrefillMarked.
+// PrefillMarkAlign and PrefillLastMarked make snapFake serve PrefillMarkedAvailable.
 func (f *snapFake) PrefillMarkAlign() int { return f.markAlign }
 
 func (f *snapFake) PrefillLastMarked(ctx context.Context, embs [][]float32, startPos, mark int, at func(pos int)) ([]float32, error) {

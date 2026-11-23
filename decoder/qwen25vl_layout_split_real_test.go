@@ -1,6 +1,6 @@
 //go:build realckpt
 
-// G-S3c's root-cause probe (docs/tasks/task-multimodal-support-2026-10.md, S3): the Qwen2.5-VL image turn's first token
+// G-S3c's root-cause probe: the Qwen2.5-VL image turn's first token
 // comes from the CPU prefill in both arms (Metal has no resident m-RoPE prefill), and it differed between `--backend
 // metal` and `--backend cpu`. The suspect is the CPU's int4 layout, which Load keys on Options.Backend: canonical int4
 // under "metal" (wantsRow4Fallback false), the arm64 row4 repack under "cpu".
@@ -33,6 +33,8 @@ import (
 	"github.com/townsendmerino/goinfer/internal/vision"
 	"github.com/townsendmerino/goinfer/multimodal"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 type layoutArm struct {
@@ -111,7 +113,7 @@ func layoutPiece(tk *tokenizer.Tokenizer, id int) string {
 func freeNow() { runtime.GC(); debug.FreeOSMemory() }
 
 func TestQwen25VLLayoutSplit(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ckpt := assetPath(t, "GOINFER_QWEN25VL_3B")
 	if strings.HasPrefix(ckpt, "/Volumes/") || strings.HasPrefix(ckpt, "/srv/models") {
 		t.Fatalf("%s is the archive", ckpt)

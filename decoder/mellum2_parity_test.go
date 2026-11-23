@@ -7,6 +7,9 @@ import (
 	"math"
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // runMellum2Golden loads the unquantized Mellum2 (int8int8, the serve default)
@@ -14,7 +17,7 @@ import (
 // oracle. Skips cleanly without the golden or the ~24 GB checkpoint.
 func runMellum2Golden(t *testing.T, goldenPath string, cosFloor float64, emit bool) {
 	t.Helper()
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	if testing.Short() {
 		t.Skip("slow: 12B forward on the naive backend")
 	}
@@ -57,7 +60,7 @@ func runMellum2Golden(t *testing.T, goldenPath string, cosFloor float64, emit bo
 		t.Fatalf("got %d logits, want vocab %d", len(logits), g.Vocab)
 	}
 
-	got := argmax(logits)
+	got := sampling.Argmax(logits)
 	t.Logf("argmax: got %d (logit %.4f) | want %d (golden logit %.4f)", got, logits[got], g.Argmax, logits[g.Argmax])
 	if got != g.Argmax {
 		t.Errorf("argmax = %d, want %d", got, g.Argmax)

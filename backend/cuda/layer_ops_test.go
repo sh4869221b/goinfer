@@ -9,7 +9,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// OP2b step 2a and 2d (docs/tasks/task-forward-architecture-2026-10.md §4.7): BuildResident takes each layer's mixer and feed-forward flag from
+// OP2b step 2a and 2d: BuildResident takes each layer's mixer and feed-forward flag from
 // decoder.Model.ResidentLayerOps and nothing else decides a layer's kind. This test builds a fixture of every family the builder knows and checks each
 // layer's built kind against a source independent of ResidentLayerOps (the family's own layer predicate or block kind), so a builder that filled the field
 // wrongly, or a ResidentLayerOps that drifted from the family, is red here.
@@ -28,19 +28,19 @@ func TestLayerOps_buildTheKindsTheFamilyHas(t *testing.T) {
 		{"llama-tiny", func(*decoder.Model, int) kind { return kind{decoder.MixerAttention, true} }},
 		{"deepseek-tiny", func(*decoder.Model, int) kind { return kind{decoder.MixerMLA, true} }},
 		{"qwen35-tiny", func(m *decoder.Model, l int) kind {
-			if m.Qwen35LinearLayer(l) {
+			if m.BackendView().Layer(l).Qwen35Linear() {
 				return kind{decoder.MixerDeltaNet, true}
 			}
 			return kind{decoder.MixerAttention, true}
 		}},
 		{"olmo_hybrid-tiny", func(m *decoder.Model, l int) kind {
-			if m.Qwen35LinearLayer(l) {
+			if m.BackendView().Layer(l).Qwen35Linear() {
 				return kind{decoder.MixerDeltaNet, true}
 			}
 			return kind{decoder.MixerAttention, true}
 		}},
 		{"nemotron-tiny", func(m *decoder.Model, l int) kind {
-			switch m.NemotronBlockKind(l) {
+			switch m.BackendView().Layer(l).NemotronBlockKind() {
 			case 0:
 				return kind{decoder.MixerMamba, false}
 			case 1:

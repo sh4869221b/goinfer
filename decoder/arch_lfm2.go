@@ -22,7 +22,7 @@ func lfm2FFNDim(cfg *Config) int {
 
 // lfm2Architecture expresses LFM2 / LFM2.5 (model_type lfm2): a gated-short-convolution + softmax-attention hybrid. Every layer has a SwiGLU
 // FFN; layer_types decides whether its mixer is a conv block or GQA attention with per-head RMSNorm on Q and K. EXPERIMENTAL tier: validated
-// against the HF reference on a real checkpoint, not against a full-model T3.
+// against the HF reference on a real checkpoint, not by a full-model real-checkpoint parity manifest row.
 //
 // Checked against the released LFM2.5-2.6B rather than inherited from the scoping brief: QK-norm is RMSNorm, not LayerNorm (the reference
 // uses Lfm2RMSNorm(head_dim) per head and the checkpoint carries q_layernorm.weight with no bias tensor), which is the difference between
@@ -30,7 +30,7 @@ func lfm2FFNDim(cfg *Config) int {
 // block_multiple_of, so the block_ffn_dim_multiplier / block_multiple_of machinery is inert here and is not read.
 // LFM2-VL's text_config sets block_auto_adjust_ff_dim, in which case the width is computed (lfm2FFNDim: 12288 -> 8192).
 func lfm2Architecture(cfg *Config) (*Architecture, *tensorSchema, error) {
-	if err := cfg.validateLFM2(); err != nil {
+	if err := cfg.ValidateLFM2(); err != nil {
 		return nil, nil, err
 	}
 	cfg.IntermediateDim = lfm2FFNDim(cfg)
@@ -68,7 +68,7 @@ func lfm2Architecture(cfg *Config) (*Architecture, *tensorSchema, error) {
 		RotaryDim:       0, // full rotary
 		TiedLMHead:      true,
 		// conv_dim is optional and absent from Lfm2Config-written checkpoints; hidden_size is
-		// what upstream's Lfm2ShortConv actually uses. validateLFM2 has already refused any
+		// what upstream's Lfm2ShortConv actually uses. ValidateLFM2 has already refused any
 		// non-zero conv_dim that disagrees with hidden_size, so this is a default, not a guess.
 		lfm2:        &lfm2Params{ConvDim: cfg.HiddenDim, ConvLCache: cfg.ConvLCache},
 		layerIsConv: func(i int) bool { return i < len(types) && types[i] == "conv" },

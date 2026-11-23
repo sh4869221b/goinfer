@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"sync/atomic"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
 // SpecStats accumulates CPU speculative-decoding telemetry for one Generate run. The GPU backend's batched-verify
@@ -47,6 +49,14 @@ func (s *SpecStats) TokensPerRound() float64 {
 	return float64(s.Emitted) / float64(s.Rounds)
 }
 
+// defaultSpecDepth is the draft depth K a draft-model or n-gram speculative call takes when it passes none: those drafts
+// are accepted less often the deeper they go, and every rejected token is verify work thrown away.
+const defaultSpecDepth = 4
+
+// defaultGrammarSpecDepth is the grammar-speculative call's K when it passes none: a grammar-forced draft is the masked
+// argmax wherever the grammar leaves one choice, so it is accepted whole far more often and a deeper draft pays.
+const defaultGrammarSpecDepth = 8
+
 // GenerateSpeculative runs greedy speculative decoding: the small draft model proposes K tokens autoregressively, and
 // this (target) model verifies them in one batched forward pass, keeping the matching prefix and replacing the first
 // mismatch with its own token. The streamed output is token-identical to plain target greedy
@@ -77,7 +87,7 @@ func (target *Model) GenerateSpeculative(ctx context.Context, prompt []int, maxT
 		return nil, nil, fmt.Errorf("decoder.GenerateSpeculative: empty prompt")
 	}
 	if K < 1 {
-		K = 4
+		K = defaultSpecDepth
 	}
 	// Rollback safety: verify advances the target's KV by K per round and rolls back the rejected tail, which a recurrent
 	// (Mamba-2 / Gated DeltaNet) or staged sliding-window cache cannot losslessly restore. Every speculative entry point
@@ -114,9 +124,8 @@ func (target *Model) GenerateSpeculative(ctx context.Context, prompt []int, maxT
 		// Claim the single shared resident KV before any device write: a second concurrent Generate on the same *Model would
 		// otherwise prefill into the same positional device KV, interleaving writes and corrupting both streams, against a
 		// Model doc that promises concurrent distinct sequences. On loss, fall back to the staged CPU cache. The draft is a
-		// separate Model with its own claim. tryClaimResident, not a bare CAS on resBusy: MC3's batched holders never set
-		// resBusy, so only the claim that also requires no holder keeps this off a resident mid-batch
-		// (docs/completed/task-audit-followups-2026-10-06.md, A1).
+		// separate Model with its own claim. tryClaimResident, not a bare CAS on resBusy: the batched decode's holders never set
+		// resBusy, so only the claim that also requires no holder keeps this off a resident mid-batch.
 		if resident {
 			if target.tryClaimResident() {
 				defer atomic.StoreInt32(&target.resBusy, 0)
@@ -173,7 +182,7 @@ func draftSpecLoop(ctx context.Context, tf, df Forward, isStop func(int) bool, c
 	}
 	// cur is the next confirmed token to feed; it is NOT yet in either cache
 	// (matching plain decode's "pending next token" invariant).
-	cur := argmax(seedLogits)
+	cur := sampling.Argmax(seedLogits)
 
 	// emit streams a confirmed token; returns false when generation should end
 	// (EOS/stop, maxTokens, or ctx cancel — the latter sets g.err).
@@ -213,7 +222,7 @@ func draftSpecLoop(ctx context.Context, tf, df Forward, isStop func(int) bool, c
 				g.err = err
 				return
 			}
-			draftTok[i] = argmax(dl)
+			draftTok[i] = sampling.Argmax(dl)
 			d = draftTok[i]
 		}
 
@@ -237,7 +246,7 @@ func draftSpecLoop(ctx context.Context, tf, df Forward, isStop func(int) bool, c
 		allAccept := true
 		var nextTok int
 		for i := range kRound {
-			ti := argmax(logitsN[i])
+			ti := sampling.Argmax(logitsN[i])
 			if draftTok[i] == ti {
 				accepted++
 				continue
@@ -251,7 +260,7 @@ func draftSpecLoop(ctx context.Context, tf, df Forward, isStop func(int) bool, c
 			stats.Evaluated++ // ...plus the one rejection this round (EvalAcceptanceRate)
 		}
 		if allAccept {
-			nextTok = argmax(logitsN[kRound]) // bonus token (kRound==0: cur's own verified next)
+			nextTok = sampling.Argmax(logitsN[kRound]) // bonus token (kRound==0: cur's own verified next)
 		}
 		stats.Accepted += accepted
 

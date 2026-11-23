@@ -9,7 +9,7 @@ import (
 )
 
 // TestAttentionPrefillFused checks attention_prefill_fused (the simdgroup_matrix flash-attention
-// twin of attention_prefill, L2-Metal — docs/completed/task-prefill-gap.md §4) against the exact scalar
+// twin of attention_prefill, L2-Metal — ) against the exact scalar
 // kernel across GQA, non-multiple-of-8 M (ragged last row-tile), sliding window, a mid-context
 // startPos offset, and a small hd (single MMA tile). NOT bit-identical by design (online-softmax
 // rescale reorders the sum vs. the exact kernel's single final normalize — same P19 category as
@@ -81,12 +81,12 @@ func TestAttentionPrefillFused(t *testing.T) {
 
 			q := d.NewCommandQueue()
 			e := q.Begin()
-			e.Dispatch(pExact, c.M*c.nH*128, 128, dQkv, dKc, dVc, dOutExact, uNH, uNKV, uHd, uStartPos, uScale, uQStride, uWindow)
+			e.Dispatch(pExact, c.M*c.nH*128, 128, dQkv, dKc, dVc, dOutExact, uNH, uNKV, uHd, uStartPos, uScale, uQStride, uWindow, kvIdentityTable(d))
 			numRowTiles := (c.M + 7) / 8
 			const sgpt = 4
 			total := c.nH * numRowTiles
 			total = (total + sgpt - 1) / sgpt * sgpt * 32
-			e.Dispatch(pFused, total, sgpt*32, dQkv, dKc, dVc, dOutFused, uNH, uNKV, uHd, uStartPos, uScale, uQStride, uWindow, uM)
+			e.Dispatch(pFused, total, sgpt*32, dQkv, dKc, dVc, dOutFused, uNH, uNKV, uHd, uStartPos, uScale, uQStride, uWindow, uM, kvIdentityTable(d))
 			e.End()
 
 			exact := dOutExact.U16s()

@@ -8,9 +8,11 @@ import (
 	"time"
 
 	"github.com/townsendmerino/goinfer/decoder"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// TestR14DrafterArgmaxProfile is R14's step 0 (docs/tasks/red-october.md): what does the spec
+// TestR14DrafterArgmaxProfile is R14's step 0: what does the spec
 // loop's sync → M×vocab D2H → host-argmax tail cost, at a real block width on a real model, as a
 // share of the spec round it sits in? Both sites are profiled — the drafter's DraftTokens and the
 // verify's batchedHeadArgmax, which has the identical shape — because a round pays both.
@@ -20,7 +22,7 @@ import (
 //	GOINFER_HEAVY_TESTS=1 go test -tags 'cuda goinfer_testhooks' ./cuda/ -run TestR14DrafterArgmaxProfile -v -timeout 30m
 func TestR14DrafterArgmaxProfile(t *testing.T) {
 	needsFreshProcess(t, "prefill scratch out of device memory (M=23) in the one-process heavy tier; passes alone")
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	tgt := os.Getenv("GOINFER_CUDA_MODEL")
 	if tgt == "" {
 		tgt = os.ExpandEnv("$HOME/models/qwen3-4b")

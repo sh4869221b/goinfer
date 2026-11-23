@@ -1,4 +1,4 @@
-// Package site builds goinfer.dev from the repository (docs/tasks/task-site-2026-09.md, S8a). It reads the generated
+// Package site builds goinfer.dev from the repository. It reads the generated
 // capability matrix, the curated release tiers and the site's own two small data files, and writes plain static files.
 // Nothing here talks to the network, and nothing is hand-listed that the repo can say for itself: a new family, a new
 // checkpoint or a new curated tier appears on the next build.
@@ -101,8 +101,7 @@ type Source struct {
 	Heading string `json:"heading"`
 }
 
-// DecisionClaim is one checkpoint's measured decision figures (the S2 decisions row, D9 of
-// docs/tasks/parked/task-constrained-confidence.md): label scoring (Route A) through POST /v1/systemone, top-1 and ECE on a
+// DecisionClaim is one checkpoint's measured decision figures: label scoring (Route A) through POST /v1/systemone, top-1 and ECE on a
 // labelled sample, both of which must appear in the cited record, as a speed must.
 type DecisionClaim struct {
 	ID         string `json:"id"`

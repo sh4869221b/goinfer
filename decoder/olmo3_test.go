@@ -7,9 +7,11 @@ import (
 	"math"
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
-// G2 (docs/completed/task-families-2026-09.md, batch 2) Olmo 3 parity (allenai/Olmo-3-{7B,32B}, model_type
+// G2 Olmo 3 parity (allenai/Olmo-3-{7B,32B}, model_type
 // "olmo3"): two real departures from every existing family, verified against the real
 // modeling_olmo3.py — NormPostOnly (no pre-norm at all; only the sublayer OUTPUT is normalized
 // before the residual add) and QKNormWhole (QK-norm over the FULL projected q/k vector, not
@@ -82,7 +84,7 @@ func TestOlmo3_forwardParity(t *testing.T) {
 		t.Fatalf("got %d logits, want vocab %d", len(logits), g.Vocab)
 	}
 
-	if got := argmax(logits); got != g.Argmax {
+	if got := sampling.Argmax(logits); got != g.Argmax {
 		t.Errorf("argmax = %d, want %d (logit[got]=%.4f logit[want]=%.4f)",
 			got, g.Argmax, logits[got], logits[g.Argmax])
 	}
@@ -108,6 +110,6 @@ func TestOlmo3_forwardParity(t *testing.T) {
 
 	cos := fullCosine(t, logits, olmo3ForwardFullPath)
 	t.Logf("olmo3: argmax=%d (want %d) | maxSampleΔ=%.5f | cosine=%v",
-		argmax(logits), g.Argmax, maxSampleΔ, cos)
+		sampling.Argmax(logits), g.Argmax, maxSampleΔ, cos)
 	emitParityRow(t, "olmo3", "tiny-golden", "HF f32 (olmo3-tiny seeded fixture, NormPostOnly + QKNormWhole + YaRN-on-full-only)", 100.0, cos, cos)
 }

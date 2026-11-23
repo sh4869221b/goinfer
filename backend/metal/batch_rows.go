@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// MC3 S3 (docs/tasks/task-concurrency-2026-09.md): multi-row forms of the per-row kernels a batched step runs once per
+// Multi-row forms of the per-row kernels a batched step runs once per
 // sequence (rmsnorm_quant, quant_vec, swiglu_quant, rope2). Each of those small dispatches ran a single threadgroup, one
 // sequence after another; one dispatch over all rows runs them side by side (cost figures:
 // docs/code-notes/metal.md#mc3RowsKernels).
@@ -18,6 +18,10 @@ import (
 // when their code shape changes, see rmsnorm_quant's own notes, which is why they are not hand-copied), and a production
 // signature edit panics here at init instead of silently diverging. They compile into the resident's main library with the
 // originals' fast-math setting.
+
+// stepRowsNR is the output rows a simdgroup computes in the step's Q4_K and Q5_K GEMVs (grid ceil(rows/stepRowsNR) simdgroups,
+// batch.go:q4kStepGemv). 2 to 4 measure alike; 6 and 8 spill.
+const stepRowsNR = 2
 
 // mc3RowsKernels is the derived source, appended to allKernels when the resident's library is compiled.
 var mc3RowsKernels = deriveRowsKernels()
@@ -144,7 +148,7 @@ func deriveRowsKernels() string {
 			"    device const float* q = q_rows + mc3_row*(nH*hd + 2u*nKV*hd); device float* out = out_rows + mc3_row*(nH*hd);\n"+
 			"    uint nKeys = nKeys_rows[mc3_row]; device const uint* kt = kt_all + tabOff[mc3_row];"))
 	b.WriteString("\n")
-	// qk_norm (E-P07, Qwen3's per-head Q/K RMSNorm): one threadgroup per (row, head); a row's fused qkv advances
+	// qk_norm (Qwen3's per-head Q/K RMSNorm): one threadgroup per (row, head); a row's fused qkv advances
 	// qkvStride floats, and the head is the threadgroup's index within its row.
 	b.WriteString(edit(extractKernel(allKernels, "qk_norm"),
 		"kernel void qk_norm(device float* qkv[[buffer(0)]]",
@@ -155,7 +159,7 @@ func deriveRowsKernels() string {
 		"    uint head = mc3_gid % (nH + nKV); device float* qkv = qkv_rows + (mc3_gid / (nH + nKV))*qkvStride;\n    threadgroup float red[128];"))
 	b.WriteString("\n")
 
-	// E-P05: the first pass of decode's flash attention (attention_fa, attention_fa_blk<G>, attention_fa_blk64<G>) for
+	// The first pass of decode's flash attention (attention_fa, attention_fa_blk<G>, attention_fa_blk64<G>) for
 	// M rows at attention_fa depth in one dispatch. Row j serves batch row rowmap[j]: its own q (a row of the fused qkv
 	// buffer, qStride floats), its own table (tabOff), its key count and split count, and its own region of the
 	// partial buffer (partStride floats). The grid is M rows of nKV*maxS threadgroups; a threadgroup past its row's own
@@ -202,7 +206,7 @@ func deriveRowsKernels() string {
 			"    device float* out = out_rows + mc3_row*outStride;"))
 	b.WriteString("\n")
 
-	// int8 slice 3b (docs/tasks/task-metal-int8-2026-10.md): the native int8 path's projection for B rows of the batched
+	// int8 slice 3b: the native int8 path's projection for B rows of the batched
 	// step, each weight row read ONCE for all B activation rows. One simdgroup per output row keeps B integer
 	// accumulators; W8A8 sums are exact, so any order gives decode's integer, and each row's epilogue is decode's own
 	// statement (W8A8_SA_BODY / W8A8_COAL_BODY: float(acc)*aScale*wScale through simd_broadcast_first, then the site's
@@ -240,7 +244,7 @@ kernel void mc3_gemv_w8a8_rows(device const char* bq[[buffer(0)]], device const 
 		fmt.Fprintf(&b, "template [[host_name(\"mc3_gemv_w8a8_rows%d\")]] kernel decltype(mc3_gemv_w8a8_rows<%d>) mc3_gemv_w8a8_rows<%d>;\n", B, B, B)
 	}
 
-	// D-P03: decode's k selected experts in one dispatch per stage instead of one per slot. The grid is k slots of
+	// Decode's k selected experts in one dispatch per stage instead of one per slot. The grid is k slots of
 	// rowsPerExpert/(tgs/32) threadgroups; a threadgroup's slot is its index divided by that, and within the slot it
 	// is the threadgroup production's per-slot dispatch had. Needs rowsPerExpert % (tgs/32) == 0 (encodeMoEExperts
 	// checks it). Gate|up: each slot writes its own [gate | up] row of out_k (2I apart), which mc3_swiglu_quant_rows
@@ -278,7 +282,7 @@ kernel void mc3_gemv_w8a8_rows(device const char* bq[[buffer(0)]], device const 
 }
 `)
 
-	// The q4k lane's step (docs/tasks/task-forward-architecture-2026-10.md §4.7, OP6): its norm and SwiGLU derived as
+	// The q4k lane's step: its norm and SwiGLU derived as
 	// above, and its two projections for B rows, each weight read once for all rows. A rows GEMV keeps its decode
 	// kernel's per-lane loop, statement for statement, and simd_sum per row (q4k_rows_acc, w8f32_rows_acc), so each row is
 	// decode's bits. Activation row b starts at ax_rows + b*lda, output row b at out_rows + b*ldo. mode: 0 store, 1
@@ -302,35 +306,34 @@ kernel void mc3_gemv_w8a8_rows(device const char* bq[[buffer(0)]], device const 
 	b.WriteString("\n")
 	b.WriteString(q4kRowsSrc)
 	for B := 1; B <= 8; B++ {
-		fmt.Fprintf(&b, "template [[host_name(\"mc3_gemv_q4k_f32_rows%d\")]] kernel decltype(mc3_gemv_q4k_f32_rows<%d>) mc3_gemv_q4k_f32_rows<%d>;\n", B, B, B)
+		fmt.Fprintf(&b, "template [[host_name(\"mc3_gemv_q4k_f32_rows%d\")]] kernel decltype(mc3_gemv_q4k_f32_rows<%d, %d>) mc3_gemv_q4k_f32_rows<%d, %d>;\n", B, B, stepRowsNR, B, stepRowsNR)
 		fmt.Fprintf(&b, "template [[host_name(\"mc3_gemv_w8_f32_rows%d\")]] kernel decltype(mc3_gemv_w8_f32_rows<%d>) mc3_gemv_w8_f32_rows<%d>;\n", B, B, B)
-		fmt.Fprintf(&b, "template [[host_name(\"mc3_gemv_q5k_f32_rows%d\")]] kernel decltype(mc3_gemv_q5k_f32_rows<%d>) mc3_gemv_q5k_f32_rows<%d>;\n", B, B, B)
+		fmt.Fprintf(&b, "template [[host_name(\"mc3_gemv_q5k_f32_rows%d\")]] kernel decltype(mc3_gemv_q5k_f32_rows<%d, %d>) mc3_gemv_q5k_f32_rows<%d, %d>;\n", B, B, stepRowsNR, B, stepRowsNR)
 		fmt.Fprintf(&b, "template [[host_name(\"mc3_gemv_q6k_f32_rows%d\")]] kernel decltype(mc3_gemv_q6k_f32_rows<%d>) mc3_gemv_q6k_f32_rows<%d>;\n", B, B, B)
 	}
 
 	return b.String()
 }
 
-const q4kRowsSrc = `template <uint B>
+const q4kRowsSrc = `// The step's Q4_K and Q5_K GEMVs run the B activation rows one after another inside the simdgroup (a loop the compiler is told
+// not to unroll), NR output rows at a time. A full unroll over the rows held every row's activation fragments live at once and
+// spilled from B = 5 on (the cost grew 6x from B = 4 to 8), and an output row's weights and the activation row's loads and sums are
+// shared across the NR rows instead. Each (output row, activation row) pair runs the same arithmetic in the same order as decode's
+// rows kernel: a lane takes super-blocks ix, ix+4, ..., then simd_sum, so the bits are decode's.
+template <uint B, uint NR>
 kernel void mc3_gemv_q4k_f32_rows(device const uchar* wq[[buffer(0)]], device const float* ax_rows[[buffer(1)]],
     device float* out_rows[[buffer(2)]], constant uint& K[[buffer(3)]], constant uint& N[[buffer(4)]],
     constant uint& lda[[buffer(5)]], constant uint& ldo[[buffer(6)]], device const float* bias[[buffer(7)]],
     constant uint& mode[[buffer(8)]], uint tgid[[threadgroup_position_in_grid]],
     uint sgid[[simdgroup_index_in_threadgroup]], uint lane[[thread_index_in_simdgroup]]) {
 #pragma clang fp reassociate(off)
-    uint row = tgid*8u + sgid;
-    if (row >= N) return;
+    uint row0 = (tgid*8u + sgid)*NR;
+    if (row0 >= N) return;
     const uint NB = K >> 8u, ix = lane >> 3u, j = (lane & 7u) >> 1u, h = lane & 1u;
-    device const uchar* wr = wq + (ulong)row*(ulong)NB*144ul;
-    float acc[B];
-    SA_ROWS_UNROLL for (uint r = 0u; r < B; r++) acc[r] = 0.0f;
-    for (uint b = ix; b < NB; b += 4u) {
-        device const uchar* blk = wr + b*144u;
-        half2 dd = as_type<half2>(*(device const uint*)blk);
-        float sc0, m0, sc1, m1; q4k_scale_min2(j, blk + 4, sc0, m0, sc1, m1);
-        uint4 q = *(device const uint4*)(blk + 16u + j*32u + h*16u);
-        float d = float(dd.x), dm = float(dd.y);
-        SA_ROWS_UNROLL for (uint r = 0u; r < B; r++) {
+    _Pragma("clang loop unroll(disable)") for (uint r = 0u; r < B; r++) {
+        float acc[NR];
+        SA_ROWS_UNROLL for (uint n = 0u; n < NR; n++) acc[n] = 0.0f;
+        for (uint b = ix; b < NB; b += 4u) {
             device const float4* alo4 = (device const float4*)(ax_rows + r*lda + b*256u + j*64u + h*16u);
             float4 al[4], ah[4];
             float slo = 0.0f, shi = 0.0f;
@@ -339,22 +342,30 @@ kernel void mc3_gemv_q4k_f32_rows(device const uchar* wq[[buffer(0)]], device co
                 slo += (al[i].x + al[i].y) + (al[i].z + al[i].w);
                 shi += (ah[i].x + ah[i].y) + (ah[i].z + ah[i].w);
             }
-            float dlo = 0.0f, dhi = 0.0f;
-            for (uint i = 0u; i < 4u; i++) {
-                uint w = q[i];
-                dlo += dot(float4(float(w & 15u), float((w >> 8u) & 15u), float((w >> 16u) & 15u), float((w >> 24u) & 15u)), al[i]);
-                dhi += dot(float4(float((w >> 4u) & 15u), float((w >> 12u) & 15u), float((w >> 20u) & 15u), float(w >> 28u)), ah[i]);
+            SA_ROWS_UNROLL for (uint n = 0u; n < NR; n++) {
+                if (row0 + n >= N) break;
+                device const uchar* blk = wq + (ulong)(row0 + n)*(ulong)NB*144ul + b*144u;
+                half2 dd = as_type<half2>(*(device const uint*)blk);
+                float sc0, m0, sc1, m1; q4k_scale_min2(j, blk + 4, sc0, m0, sc1, m1);
+                uint4 q = *(device const uint4*)(blk + 16u + j*32u + h*16u);
+                float dlo = 0.0f, dhi = 0.0f;
+                for (uint i = 0u; i < 4u; i++) {
+                    uint w = q[i];
+                    dlo += dot(float4(float(w & 15u), float((w >> 8u) & 15u), float((w >> 16u) & 15u), float((w >> 24u) & 15u)), al[i]);
+                    dhi += dot(float4(float((w >> 4u) & 15u), float((w >> 12u) & 15u), float((w >> 20u) & 15u), float(w >> 28u)), ah[i]);
+                }
+                float d = float(dd.x), dm = float(dd.y);
+                acc[n] += d*sc0*dlo + d*sc1*dhi - dm*(m0*slo + m1*shi);
             }
-            acc[r] += d*sc0*dlo + d*sc1*dhi - dm*(m0*slo + m1*shi);
         }
-    }
-    SA_ROWS_UNROLL for (uint r = 0u; r < B; r++) {
-        float s = simd_sum(acc[r]);
-        if (lane==0) {
-            device float* out = out_rows + r*ldo;
-            if (mode == 0u) out[row] = s;
-            else if (mode == 1u) out[row] = s + bias[row];
-            else out[row] += s;
+        SA_ROWS_UNROLL for (uint n = 0u; n < NR; n++) {
+            float s = simd_sum(acc[n]);
+            if (lane==0 && row0 + n < N) {
+                device float* out = out_rows + r*ldo;
+                if (mode == 0u) out[row0 + n] = s;
+                else if (mode == 1u) out[row0 + n] = s + bias[row0 + n];
+                else out[row0 + n] += s;
+            }
         }
     }
 }
@@ -382,33 +393,35 @@ kernel void mc3_gemv_w8_f32_rows(device const char* wq[[buffer(0)]], device cons
         }
     }
 }
-template <uint B>
+template <uint B, uint NR>
 kernel void mc3_gemv_q5k_f32_rows(device const uchar* wq[[buffer(0)]], device const float* ax_rows[[buffer(1)]],
     device float* out_rows[[buffer(2)]], constant uint& K[[buffer(3)]], constant uint& N[[buffer(4)]],
     constant uint& lda[[buffer(5)]], constant uint& ldo[[buffer(6)]], device const float* bias[[buffer(7)]],
     constant uint& mode[[buffer(8)]], uint tgid[[threadgroup_position_in_grid]],
     uint sgid[[simdgroup_index_in_threadgroup]], uint lane[[thread_index_in_simdgroup]]) {
 #pragma clang fp reassociate(off)
-    uint row = tgid*8u + sgid;
-    if (row >= N) return;
+    uint row0 = (tgid*8u + sgid)*NR;
+    if (row0 >= N) return;
     const uint NB = K >> 8u, ix = lane >> 3u, j = (lane & 7u) >> 1u, h = lane & 1u;
-    device const uchar* wr = wq + (ulong)row*(ulong)NB*176ul;
-    float acc[B];
-    SA_ROWS_UNROLL for (uint r = 0u; r < B; r++) acc[r] = 0.0f;
-    for (uint b = ix; b < NB; b += 4u) {
-        SA_ROWS_UNROLL for (uint r = 0u; r < B; r++) {
+    _Pragma("clang loop unroll(disable)") for (uint r = 0u; r < B; r++) {
+        float acc[NR];
+        SA_ROWS_UNROLL for (uint n = 0u; n < NR; n++) acc[n] = 0.0f;
+        for (uint b = ix; b < NB; b += 4u) {
             float4 al[4], ah[4]; float slo, shi;
             q4k_lane_act(ax_rows + r*lda, b, j, h, al, ah, slo, shi);
-            acc[r] += q5k_blk(wr + b*176u, j, h, al, ah, slo, shi);
+            SA_ROWS_UNROLL for (uint n = 0u; n < NR; n++) {
+                if (row0 + n >= N) break;
+                acc[n] += q5k_blk(wq + (ulong)(row0 + n)*(ulong)NB*176ul + b*176u, j, h, al, ah, slo, shi);
+            }
         }
-    }
-    SA_ROWS_UNROLL for (uint r = 0u; r < B; r++) {
-        float s = simd_sum(acc[r]);
-        if (lane==0) {
-            device float* out = out_rows + r*ldo;
-            if (mode == 0u) out[row] = s;
-            else if (mode == 1u) out[row] = s + bias[row];
-            else out[row] += s;
+        SA_ROWS_UNROLL for (uint n = 0u; n < NR; n++) {
+            float s = simd_sum(acc[n]);
+            if (lane==0 && row0 + n < N) {
+                device float* out = out_rows + r*ldo;
+                if (mode == 0u) out[row0 + n] = s;
+                else if (mode == 1u) out[row0 + n] = s + bias[row0 + n];
+                else out[row0 + n] += s;
+            }
         }
     }
 }

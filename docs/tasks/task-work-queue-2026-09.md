@@ -2,7 +2,7 @@
 
 > **Status: J0/J1/J2/J3/J4 DONE 2026-09-15 (J3/J4 text-chat scope only); J6 KILLED 2026-09-15
 > (measured 1.024× against a 1.3–2.0× pass band, not shipped); J8 FOLDED 2026-09-26 into
-> `task-concurrency-2026-09.md` MC2 (owner decision); J7/J9 unstarted (J5 built 2026-09-30).** This doc
+> `parked/task-concurrency-2026-09.md` MC2 (owner decision); J7/J9 unstarted (J5 built 2026-09-30).** This doc
 > was first written 2026-09-12 and was never committed. It was deleted the next morning by a
 > workaround, not by a decision — see "How this doc was lost" below, which is kept because the
 > failure is structural and the fix was J0. The rebuild is faithful to the J1–J9 scope as filed,
@@ -14,11 +14,27 @@
 > closure note for the measurement discipline that applies just as much here). Both remain fully
 > open.
 >
+> **Note 2026-11-09:** both have since closed: J5 was built 2026-09-30, and J8 folded into MC2 on 2026-09-26.
+>
 > Sibling: [`task-halt-2026-09.md`](task-halt-2026-09.md) (K1–K9) — this doc **reuses** K1 (cancel
 > by id), K2 (global halt), K4 (budgets) and K5 (the admin socket) rather than restating them, and
 > nothing here is worth building before those are stable. Also adjacent:
-> [`task-web-ui-2026-09.md`](task-web-ui-2026-09.md) W27, whose "re-attach to a generation after a
+> `task-web-ui-2026-09.md` W27, whose "re-attach to a generation after a
 > reload" is J3's browser-side consumer and has no other route to existing.
+
+<!-- ledger -->
+| id | state | next | evidence |
+|---|---|---|---|
+| J0 | done | — | `scripts/queue_citation_lint.py:untracked_live_docs` |
+| J1 | done | — | `internal/runtime/scheduler/admission.go:Admission`; `internal/app/serveapp/admission_test.go:TestAdmission_waiterLeavesOnContextCancelWithoutWaitingForHolder` |
+| J2 | done | — | `internal/app/serveapp/jobs/jobjournal.go:Journal`; `-job-dir` in `internal/app/serveapp/main.go:registerFlags` |
+| J3 | done | unbuilt: vision and tool bodies, the `user` key (needs K4), `-job-cap` | `internal/app/serveapp/jobs_http_test.go:TestJobs_submitPollReattachMatchesSyncRun` |
+| J4 | done | unbuilt: vision and tool lines, non-chat endpoints | `internal/app/serveapp/batches_http_test.go:TestBatches_openAIRoundTrip` |
+| J5 | done | — | `internal/app/chatapp/batch.go:planBatch`; `internal/app/serveapp/batch_cli_parity_test.go:TestBatch_cliAndServeAgree` |
+| J6 | killed | — | `docs/measurements/j6-prefix-scheduling-2026-09-15.md` |
+| J7 | blocked | parked (Francis, 2026-11-09) until K4 (`task-halt-2026-09.md`, itself parked): classes and deadlines in `internal/runtime/scheduler` | `internal/runtime/scheduler/admission.go:Admission` has no priority, class or deadline |
+| J8 | moved | MC2 of `parked/task-concurrency-2026-09.md` | `docs/measurements/concurrency-mc2-2026-09-26.md` |
+| J9 | open | `/admin/queue` on the admin socket, a `-job-dir` banner line, the job routes in `docs/server.md` | the ARCHITECTURE "Jobs and batches" box is done; `internal/app/serveapp/banner.go:bannerFacts` has no job field |
 
 ---
 
@@ -70,7 +86,7 @@ each one spends its first hours untracked.
 - Gate: a mutation test — create an untracked `.md` with a deliberately bogus `path:line`
   citation, confirm exit 0 with the note, `git add` it, confirm exit 1 naming that citation.
 
-Brief for this is at [`../prompts/citation-lint-untracked.md`](../prompts/citation-lint-untracked.md).
+Brief for this is at [`../completed/citation-lint-untracked.md`](../completed/citation-lint-untracked.md).
 
 **Status: DONE 2026-09-14** (`0c74a161`, `main`). `scripts/queue_citation_lint.py`'s `live_docs()`
 now filters on `git ls-files -z`, cached once per process; `untracked_live_docs()` feeds `main()`'s
@@ -80,7 +96,7 @@ matching advice line (edited in the generator, not the generated `.git/hooks/pre
 built exactly as specified in `scripts/test_queue_citation_lint.py`, against an isolated temp git
 repo — mutation-checked: reverted the filter, confirmed the test reds exactly as this doc's own
 loss incident describes, restored, green. Verified against the real repo: this doc's own sibling,
-`docs/queue-presentation.md`, was genuinely untracked at the time and was correctly skipped-and-
+a private queue, was genuinely untracked at the time and was correctly skipped-and-
 reported rather than reddening the lint.
 
 ---
@@ -127,6 +143,9 @@ Not rebuilt below; this is the floor J1–J9 build on.
    removed on the way to a queue; concurrency across requests is J8's measurement to earn, on its
    own, against the roadmap's kill-or-earn rule. Everything else here is about *which* request the
    one worker takes next, and about surviving a disconnect.
+   > **Note 2026-11-09:** superseded by MC3c (`parked/task-concurrency-2026-09.md`): `serve -max-concurrent` (default 4,
+   > registered in `internal/app/serveapp/main.go:registerFlags`) runs several generations on a CPU model, through
+   > `internal/runtime/scheduler`. The "What exists today" section below describes the tree before J1.
 2. **Compatibility is the promise for `serve`** (`docs/api-tiers.md`). J4 implements the two batch
    APIs as specified, including their quirks; it does not invent a third.
 3. **Additive and Experimental until v1.0.** No Hard-tier name changes. `-job-dir` unset means the
@@ -164,7 +183,7 @@ from touching `sessionLRU` while a generation was using it. `admission` is a FIF
 lockable mutex a background goroutine can take on a whim, so this needed a second, dedicated field
 (`loadedModel.sessMu`), held for the identical `tryEnter..exit` span the old `lm.mu` covered — the
 safety property is unchanged; only the *wait for a turn* gained context-awareness. **Superseded
-2026-09-26 by MC3c** (`task-concurrency-2026-09.md`, `serve -max-concurrent`): `sessMu` now covers LRU operations only,
+2026-09-26 by MC3c** (`parked/task-concurrency-2026-09.md`, `serve -max-concurrent`): `sessMu` now covers LRU operations only,
 and the same safety property comes from checking the in-use session out (`sessionLRU.busy`). The LRU never hands
 out, evicts, demotes, saves or reads a session a generation holds, and admission is N-wide on a CPU model.
 
@@ -274,7 +293,7 @@ original spec named — K4 (budgets), which that key was "the one proposed for",
 size flag (`-job-cap`, currently a hardcoded 256 matching `responseStore`'s own bound). J4/J5 (the
 batch APIs, over this same store) and J6–J9 remain open.
 
-**Additions 2026-09-15, for the web UI's W27/W28** (`docs/tasks/task-web-ui-2026-09.md` §7). All additive.
+**Additions 2026-09-15, for the web UI's W27/W28**. All additive.
 - **The events stream now closes the way `/v1/chat/completions` does:** a `finish_reason` chunk and a
   usage chunk, or an OpenAI-style `{"error":…}` event for a failed job (`jobTerminalEvents`,
   `internal/app/serveapp/jobs_run.go`). Before, it sent the text and `[DONE]`, so a re-attaching client had to
@@ -472,7 +491,7 @@ would plausibly turn a clean 1.024× into 1.3×, so not chased further).
 
 ## J8 — N decode workers per model: kill or earn
 
-**Folded 2026-09-26 into [`task-concurrency-2026-09.md`](parked/task-concurrency-2026-09.md) MC2 (owner decision 2).** J8's
+**Folded 2026-09-26 into [`parked/task-concurrency-2026-09.md`](parked/task-concurrency-2026-09.md) MC2 (owner decision 2).** J8's
 N-independent-workers cell is measured there, in the same session as batched decode, so the two answers land side by
 side. Its band below is kept. It is not built as a feature either way. **Measured 2026-09-26 (Mac CPU,
 `concurrency-mc2-2026-09-26.md`):** 4 workers reach 2.00–2.48× aggregate, clearing the 1.25× half. **The p99 half, measured
@@ -531,7 +550,7 @@ check, `drive`) · `internal/app/serveapp/helpers.go:limitInflight` (`-max-infli
 (the session LRU J6 schedules around) · `internal/app/serveapp/embeddings.go:maxEmbedInputs` (the one existing bulk
 surface) · `internal/app/chatapp/main.go:Main` (the CLI J5 extends) ·
 [`task-halt-2026-09.md`](task-halt-2026-09.md) K1/K2/K4/K5/K9 ·
-[`task-embed-and-harness-ux.md`](task-embed-and-harness-ux.md) §3.3 ·
-[`task-web-ui-2026-09.md`](task-web-ui-2026-09.md) W27–W31 · `docs/api-tiers.md` (what `serve` promises)
+`task-embed-and-harness-ux.md` §3.3 ·
+`task-web-ui-2026-09.md` W27–W31 · `docs/api-tiers.md` (what `serve` promises)
 
-<!-- doc-reviewed: 2026-09-13 -->
+<!-- doc-reviewed: 2026-11-09 -->

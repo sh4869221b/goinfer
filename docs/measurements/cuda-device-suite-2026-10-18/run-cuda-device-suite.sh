@@ -37,14 +37,16 @@ if [ -d backend/cuda ]; then BK=backend/cuda; WG=backend/webgpu; MT=backend/meta
 go work init . "./$WG" "./$BK" "./$MT" ./demo/agent || { echo "FATAL: go work init"; exit 2; }
 { echo "rev:      $(git rev-parse HEAD) ($REV)"; echo "started:  $(date '+%F %T %Z')"; echo "fixtures: $fixtures"
   echo "go:       $(go version)"; echo "gpu:      $(nvidia-smi --query-gpu=name,driver_version,memory.used --format=csv,noheader)"; } | tee "$LOG/provenance.txt"
+# The previous passing set (--state) is kept on this box, for origin/main runs only: a test that passed then and skips now is NEW SKIPS in the verdict.
+STATE=(); [ "$REV" = "origin/main" ] && STATE=(--state "$HOME/goinfer-logs/cuda-device-suite.state.json")
 # The runner is the SRC checkout's copy, so a REV from before it existed can still be judged by it.
-CGO_ENABLED=0 python3 "$SRC/scripts/cuda_device_suite.py" --cwd "$WT/$BK" --raw "$LOG/go-test.jsonl" -- \
+CGO_ENABLED=0 python3 "$SRC/scripts/cuda_device_suite.py" ${STATE[@]+"${STATE[@]}"} --cwd "$WT/$BK" --raw "$LOG/go-test.jsonl" -- \
   go test -json -count=1 -p 1 -timeout 25m -tags 'cuda goinfer_testhooks' ${TESTARGS:-} ./... 2>&1 | tee "$LOG/verdict.log"
 rc=${PIPESTATUS[0]}
 # The verdict becomes a GitHub issue (red: open one or comment on the open one; green: close it). A failure here is reported, not fatal: the verdict is the job's.
 # Only main's run is the standing verdict: a run of another REV (a branch checked before it merges) files no issue and closes none.
 if [ "$REV" = "origin/main" ]; then
-  python3 "$SRC/scripts/cuda_device_suite_issue.py" --verdict-log "$LOG/verdict.log" --sha "$(git -C "$WT" rev-parse --short=8 HEAD)" 2>&1 | tee -a "$LOG/verdict.log.issue"
+  python3 "$SRC/scripts/cuda_device_suite_issue.py" --verdict-log "$LOG/verdict.log" --box nobara --backend cuda --sha "$(git -C "$WT" rev-parse --short=8 HEAD)" 2>&1 | tee -a "$LOG/verdict.log.issue"
 else
   echo "REV is $REV, not origin/main: no GitHub issue is filed or closed for this run" | tee -a "$LOG/verdict.log.issue"
 fi

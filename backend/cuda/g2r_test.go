@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"github.com/townsendmerino/goinfer/decoder"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// G2-R on CUDA, as registered in docs/tasks/task-forward-architecture-2026-10.md §4.6a: a model-level sanity gate for real Gemma 2 2B, and
+// G2-R on CUDA, as registered: a model-level sanity gate for real Gemma 2 2B, and
 // not a softcap test. On Metal the cap barely acted on the gate's prompts (a plant that dropped it passed the rule), so the CUDA
 // declaration rests on G2-K, G2-D and G2-L; this test records the same arms beside them.
 //
@@ -29,7 +31,7 @@ import (
 //
 //	GOINFER_HEAVY_TESTS=1 go test -count=1 -timeout 40m -tags 'cuda goinfer_testhooks' -run '^TestG2R_cuda$' -v ./cuda/
 func TestG2R_cuda(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	const bar, band = 0.88, 0.03
 	home := os.ExpandEnv("$HOME/models")
 	g2 := home + "/gemma-2-2b-it-Q8_0.gguf"
@@ -240,7 +242,7 @@ func g2rHookChanged(t *testing.T, path string, seed []int) bool {
 //
 //	GOINFER_HEAVY_TESTS=1 go test -count=1 -timeout 20m -tags 'cuda goinfer_testhooks' -run '^TestG2R_fitCheck$' -v ./cuda/
 func TestG2R_fitCheck(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	home := os.ExpandEnv("$HOME/models")
 	for _, c := range []struct{ path, quant string }{
 		{home + "/gemma-2-2b-it-Q8_0.gguf", "int8int8"}, {home + "/gemma-2-2b-it-Q8_0.gguf", "int4"},

@@ -9,7 +9,7 @@ import (
 	gpu "github.com/townsendmerino/goinfer/backend/cuda/internal/gpudev"
 )
 
-// CUDA expert-major MoE prefill (docs/queue-performance.md P20, docs/measurements/p20-expert-locality-2026-09-21.md).
+// CUDA expert-major MoE prefill (docs/measurements/p20-expert-locality-2026-09-21.md).
 // Generic MoE path only (Ly.isMoE, moeMLPPre/moeMLPPost's shape); gemma4's parallel dense||MoE FFN is
 // moe_expert_major_gemma4.go.
 //
@@ -110,7 +110,7 @@ func (r *cudaResident) prefillMoEExpertMajorRun(ctx interface{ Err() error }, Ly
 	st.mqAll = ai(M * hidden / 4)
 	st.mScAll = af(M)
 	st.wgtAll = af(M * r.topK)
-	idxAll := au(M * r.topK) // the route kernel writes each row's expert ids here; read back ONCE after the loop (audit R-22)
+	idxAll := au(M * r.topK) // the route kernel writes each row's expert ids here; read back ONCE after the loop
 	st.emSlot = au(1)
 	st.scratch = make([]Buffer, r.topK)
 	grouped := r.prefillMoERowsEligible()
@@ -295,7 +295,7 @@ func (r *cudaResident) prefillMoEExpertMajorRun(ctx interface{ Err() error }, Ly
 			return e
 		}
 	}
-	if Ly.hasShared {
+	if Ly.walk.FFN.FFN.MoE.SharedIntermediateDim > 0 {
 		for m := range M {
 			if e := ctx.Err(); e != nil {
 				return e

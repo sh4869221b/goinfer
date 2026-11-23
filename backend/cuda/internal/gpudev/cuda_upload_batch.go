@@ -77,7 +77,7 @@ func UploadBatch(copies []HostCopy) error {
 		}
 	}
 	// Pre-sync once for the whole batch — the write-after-read hazard
-	// Buffer.upload documents (audit C-01): queued launches may still be reading
+	// Buffer.upload documents: queued launches may still be reading
 	// these destinations.
 	if cx != nil {
 		if err := cx.Synchronize(bg); err != nil {
@@ -88,6 +88,9 @@ func UploadBatch(copies []HostCopy) error {
 	for i, c := range copies {
 		if len(c.Src) == 0 {
 			continue
+		}
+		if TraceForTest != nil {
+			TraceForTest(TraceEvent{Op: TraceUpload, Dst: c.Dst.BindAddr(), Bytes: len(c.Src), Src: c.Src})
 		}
 		if err := c.Dst.b.CopyFromAt(bg, int(c.Dst.off), c.Src); err != nil {
 			return fmt.Errorf("cuda: upload %d of %d: %w", i, len(copies), err)
@@ -114,7 +117,7 @@ func checkHostCopy(c HostCopy, cx *gc.Context) error {
 	if c.Dst.b == nil {
 		return fmt.Errorf("cuda: upload into a nil buffer")
 	}
-	if got, want := c.Dst.b.Bytes(), uint64(c.Dst.off)+uint64(len(c.Src)); got < want {
+	if got, want := c.Dst.bytes(), uint64(c.Dst.off)+uint64(len(c.Src)); got < want {
 		return fmt.Errorf("cuda: upload of %d bytes at offset %d overruns a %d-byte buffer",
 			len(c.Src), c.Dst.off, got)
 	}

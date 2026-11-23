@@ -15,10 +15,13 @@ package decoder
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 func TestCohereAyaReal_gate(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	// assetPath, not a hand-rolled env+fallback. os.Stat on the DIRECTORY was the weaker check the
 	// registry exists to replace: a directory that exists but holds no shards satisfied it.
 	ckpt := assetPath(t, "GOINFER_COHERE_AYA")
@@ -57,7 +60,7 @@ func TestCohereAyaReal_gate(t *testing.T) {
 			t.Fatalf("forward: %v", err)
 		}
 	}
-	gotArg := argmax(logits)
+	gotArg := sampling.Argmax(logits)
 	cos := logitCosine(logits, g.LastLogits)
 	t.Logf("aya-expanse parity: argmax got=%d want=%d | logit cosine=%.6f", gotArg, g.Argmax, cos)
 	if gotArg != g.Argmax {
@@ -69,7 +72,7 @@ func TestCohereAyaReal_gate(t *testing.T) {
 
 	got := make([]int, 0, g.NNew)
 	for range g.NNew {
-		id := argmax(logits)
+		id := sampling.Argmax(logits)
 		got = append(got, id)
 		if logits, err = m.forward(id, cache); err != nil {
 			t.Fatalf("continuation forward: %v", err)

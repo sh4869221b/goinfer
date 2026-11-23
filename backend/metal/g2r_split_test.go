@@ -14,9 +14,11 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/decoder"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// G2-R in two processes (docs/tasks/task-forward-architecture-2026-10.md §4.6, "G2-R amendment, 2026-10-15"):
+// G2-R in two processes:
 // TestG2R_cpuReference loads only CPU models and saves everything the arms read on the CPU to $GOINFER_G2R_REF;
 // TestG2R_registered then loads only Metal models and compares against that file. Each process's loads meet the fit
 // guard and Metal's memory guard alone. $GOINFER_G2R_COMMIT names the build both processes run; a file made at another
@@ -110,7 +112,7 @@ func g2rCPUArmFrom(t *testing.T, load, quant string, seed []int, steps int, soft
 	m := g2rLoad(t, load, "", quant)
 	decoder.SetAttnSoftcapOffForTest(was)
 	defer m.Close()
-	if got := m.AttnLogitSoftcapResident(); wantCap && (got == 0) != softcapOff {
+	if got := m.BackendView().AttnLogitSoftcap(); wantCap && (got == 0) != softcapOff {
 		t.Fatalf("VOID: the CPU model's cap is %v with the softcap removed = %v", got, softcapOff)
 	}
 	_, nL, _, nKV, hd, _, _ := m.Dims()
@@ -135,15 +137,15 @@ func g2rCPUArmFrom(t *testing.T, load, quant string, seed []int, steps int, soft
 
 // TestG2R_cpuReference is the CPU process: the hook check, then every arm's CPU side, saved to $GOINFER_G2R_REF.
 func TestG2R_cpuReference(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	out, commit := g2rRefEnv(t)
 	g2, g3, dense := g2rPaths()
 	ref := g2rRef{Commit: commit, SHA256: g2rHashes(t, g2, g3, dense), Arms: map[string]g2rArm{}, PStats: map[string]g2rPStats{}}
 	ref.GIW = g2rHashes(t, g2rCPUPath(t, g2, "int8int8"), g2rCPUPath(t, g2, "int4"), g2rCPUPath(t, g3, "int8int8"),
 		g2rCPUPath(t, dense, "int8int8"), g2rCPUPath(t, dense, "int4"))
 
-	// The precondition (amendment 2): the .giw route is the direct .gguf route, bit for bit, on the dense 1.5B (whose
-	// .gguf the fit guard admits directly), at both quants, on the gate's prompt and 24 steps. A difference voids the run.
+	// The precondition (amendment 2): the .giw route is the direct .gguf route, bit for bit, on the dense 1.5B (whose.
+	// gguf the fit guard admits directly), at both quants, on the gate's prompt and 24 steps. A difference voids the run.
 	dseed := seedPrompt(t, dense, probeText)
 	for _, q := range []string{"int8int8", "int4"} {
 		direct := g2rCPUArmFrom(t, dense, q, dseed, 24, false, false)

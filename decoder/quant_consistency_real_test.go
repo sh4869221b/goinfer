@@ -1,6 +1,6 @@
 //go:build realckpt
 
-// G-31a2 of docs/tasks/task-multimodal-support-2026-10.md ("Gemma 4 31B on nobara ... G-31a"): how well a checkpoint's int4 CPU decode agrees with its OWN
+// G-31a2: how well a checkpoint's int4 CPU decode agrees with its OWN
 // int8int8 CPU decode. 12 fixed chat prompts go through the checkpoint's real chat template (quantisation is judged only through the template); the int8int8 arm decodes up to 32 greedy tokens
 // per prompt (stopping at a stop token), recording its path and, at every step, the margin between its top-1 and top-2 probabilities; the int4 arm is then teacher-forced along that path. The statistic is
 // the fraction of positions where the int4 argmax equals the int8int8 argmax; every logit must be finite. The arms are loaded one after the other, never together (the 31B's int8int8 arm is 31 GB).
@@ -25,6 +25,9 @@ import (
 
 	"github.com/townsendmerino/goinfer/chat"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 var qcPrompts = []string{
@@ -66,7 +69,7 @@ type qcResult struct {
 }
 
 func TestQuantConsistency_real(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	dir := os.Getenv("GOINFER_QC_DIR")
 	if dir == "" {
 		t.Skip("set GOINFER_QC_DIR to a checkpoint directory (or a tiny fixture for the plumbing control)")
@@ -152,7 +155,7 @@ func TestQuantConsistency_real(t *testing.T) {
 				nonFinite++
 			}
 			lp := logSoftmax64(l)
-			a := argmax(l)
+			a := sampling.Argmax(l)
 			p1, p2 := 0.0, 0.0
 			for _, v := range lp {
 				p := math.Exp(v)

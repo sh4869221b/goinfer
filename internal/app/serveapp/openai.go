@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/townsendmerino/goinfer/internal/app/serveapp/jobs"
 	"maps"
 	"math"
 	"math/rand"
@@ -22,18 +23,14 @@ import (
 	"github.com/townsendmerino/goinfer/chat"
 	"github.com/townsendmerino/goinfer/constrain"
 	"github.com/townsendmerino/goinfer/decoder"
-	"github.com/townsendmerino/goinfer/embeddinggemma2"
 	"github.com/townsendmerino/goinfer/engine"
 	"github.com/townsendmerino/goinfer/internal/app/connect"
-	"github.com/townsendmerino/goinfer/internal/audio"
 	"github.com/townsendmerino/goinfer/internal/clef"
 	"github.com/townsendmerino/goinfer/internal/cost"
 	"github.com/townsendmerino/goinfer/internal/decide"
 	"github.com/townsendmerino/goinfer/internal/guard/swapguard"
 	samplingp "github.com/townsendmerino/goinfer/internal/runtime/sampling"
 	"github.com/townsendmerino/goinfer/internal/runtime/scheduler"
-	"github.com/townsendmerino/goinfer/internal/vision"
-	"github.com/townsendmerino/goinfer/multimodal"
 	"github.com/townsendmerino/goinfer/tokenizer"
 )
 
@@ -113,79 +110,20 @@ type loadedModel struct {
 	// concurrent is how many generations of this model may run at once (see setConcurrency); 1 = serialized.
 	concurrent int
 
-	// Vision tower (--vision): nil unless a multimodal model is loaded. A model with one is vision-capable: serve
-	// accepts image content parts, runs them through preprocess, encoder and projector, and routes the turn to
-	// GenerateVL.
-	venc    *vision.Encoder
-	vproj   *multimodal.Projector
-	vcfg    vision.Config
-	vimgTok int // image-soft-token id (the placeholder embed-by-vector overrides); -1 if unresolved
-
-	// Qwen2.5-VL vision tower (nil for Gemma 3 or text). The merger is in the encoder (no separate projector);
-	// preprocessing and m-RoPE are Qwen-specific, so the image path branches on qwenEnc != nil.
-	qwenEnc     *vision.QwenVisionEncoder
-	qwenDevMu   sync.Mutex // serializes the Qwen2.5-VL tower and its CPU fallback (device_fallback.go)
-	qwenRequire bool       // -require-backend: a device-memory failure of the Qwen2.5-VL tower fails the request instead of falling back to the CPU
-	qwenPP      multimodal.QwenPreprocessConfig
-	qwenMerge   int // spatial_merge_size
-	qwenImgTok  int // <|image_pad|> id
-
-	// Qwen3.5+ vision tower (nil: not Qwen3.5, or no tower). It shares qwenPP/qwenMerge/qwenImgTok and the
-	// GenerateQwenVL route with the Qwen2.5-VL path above, but loads lazily on the first image request (qwen3Tower):
-	// every Qwen3.5 checkpoint carries one, so eager loading would tax every text-only user's startup and memory.
-	qwen3 *qwen3Tower
+	// vision is the entry's image input (--vision; nil: the model takes no image). A model with one is vision-capable:
+	// serve accepts image content parts, runs them through the family's preprocessing and tower, and routes the turn to
+	// the family's generator.
+	vision visionTower
 
 	// visionShare counts the entries holding this entry's startup vision tower (nil: none shares it); the last to unload
 	// closes it.
 	visionShare *visionShare
 
-	// GLM-OCR vision tower (nil: not GLM-OCR, or no tower). It shares qwenPP/qwenMerge/qwenImgTok and the
-	// GenerateQwenVL route with the two Qwen paths above, but its tower, prompt block and template are GLM's
-	// (glm_ocr_vision.go). Loaded lazily.
-	glm *glmOcrTower
+	// audio is the entry's audio input (nil: the model takes no audio clip): a Gemma 4 checkpoint with an audio_config,
+	// Qwen3-ASR or Voxtral Mini. Its encoder loads on the first clip.
+	audio audioTower
 
-	// Ministral 3's Pixtral image path (nil: not Ministral 3, or no tower); see pixtral_vision.go.
-	pixtral *pixtralTower
-
-	// LFM2-VL's image path (nil: not LFM2-VL, or no tower), lfm2vl_vision.go.
-	lfm2vl *lfm2vlTower
-
-	// Gemma 4 vision tower (nil: not gemma4, or no tower). There is no separate projector: Gemma4Encoder.Forward
-	// includes the embed_vision projection. gemma4MaxSoft is the checkpoint's vision_soft_tokens_per_image budget
-	// (vision.Gemma4Preprocess's maxSoftTokens); the actual per-image token count is data-dependent and computed per
-	// request via multimodal.Gemma4PooledTokens.
-	gemma4Enc     *vision.Gemma4Encoder
-	gemma4Tower   multimodal.Gemma4TowerAccelerator // nil: the CPU tower (docs/multimodal.md)
-	gemma4Swap    *towerSwap                        // non-nil: the device tower loads for each encode (towerSwap)
-	gemma4MaxSoft int
-	gemma4ImgTok  int // <|image|> id
-	// Gemma 4 audio: set when the checkpoint has an audio_config. The tower loads on the first audio request
-	// (gemma4AudioEncoder), so a server that never hears audio never pays its memory. gemma4AudioTok is <|audio|>.
-	gemma4AudioDir string
-	// Qwen3-ASR: the checkpoint directory (its audio encoder is in the same safetensors as the decoder), the
-	// <|audio_pad|> id, and the encoder, loaded on the first clip.
-	qwenASRDir  string
-	qwenASRTok  int
-	qwenASR     *audio.QwenASREncoder
-	qwenASRErr  error
-	qwenASROnce sync.Once
-	// Voxtral Mini: the checkpoint directory (the audio tower and projector are in its own safetensors) and the encoder, loaded on the first clip.
-	voxtralDir      string
-	voxtralBackend  string // the backend the tower is placed on at its load (-vision-device cpu makes it "cpu")
-	voxtralDevice   audio.WhisperDevice
-	voxtral         *audio.VoxtralAudio
-	voxtralErr      error
-	voxtralOnce     sync.Once
-	gemma4AudioTok  int
-	gemma4AudioOnce sync.Once
-	gemma4Audio     *audio.Gemma4AudioEncoder
-	gemma4AudioErr  error
-	// gemma4AudioDevice is "metal" when the tower's conformer blocks run on Metal (EmbeddingGemma 2's accelerator),
-	// "" for the CPU; gemma4AudioAcc is that accelerator once built, nil if it declined (the CPU then, said once).
-	gemma4AudioDevice string
-	gemma4AudioAcc    embeddinggemma2.AudioAccelerator
-
-	// scripted is a test seam: when non-nil, drive streams these token ids (at most the request's max tokens; the end of the
+	// scripted is a test seam (a test sets fakeEngine to scriptedEngine): when non-nil, drive streams these token ids (at most the request's max tokens; the end of the
 	// slice is the model's end of turn) instead of running model. Production never sets it.
 	scripted []int
 	// onScripted, when set with scripted, receives each scripted generation's prompt ids.
@@ -324,12 +262,12 @@ func (lm *loadedModel) setConcurrency(cfg config) (line string) {
 
 // audioCapable reports whether this model can take an audio clip (a Gemma 4 checkpoint with an audio tower, a Qwen3-ASR checkpoint, or Voxtral Mini).
 func (lm *loadedModel) audioCapable() bool {
-	return lm.gemma4AudioDir != "" || lm.qwenASRDir != "" || lm.voxtralDir != ""
+	return lm.audio != nil
 }
 
 // visionCapable reports whether this model has a loaded vision tower.
 func (lm *loadedModel) visionCapable() bool {
-	return (lm.venc != nil && lm.vproj != nil) || lm.qwenEnc != nil || lm.qwen3 != nil || lm.glm != nil || lm.gemma4Enc != nil || lm.pixtral != nil || lm.lfm2vl != nil
+	return lm.vision != nil
 }
 
 // tryEnter claims a queue slot, then waits for this model's turn. It returns (false, "") when the queue is full, so
@@ -350,10 +288,10 @@ func (lm *loadedModel) tryEnter(ctx context.Context, rec admissionRecord, haltSt
 			return "", false
 		}
 	}
-	rec.clock.queue()
+	rec.clock.Queue()
 	ok, haltReason = scheduler.Admit(ctx, &lm.turns.Admission, lm.queue, scheduler.Record{PromptIDs: rec.promptIDs, ID: rec.id}, halted)
 	if ok {
-		rec.clock.admit()
+		rec.clock.Admit()
 	}
 	return ok, haltReason
 }
@@ -411,7 +349,7 @@ type server struct {
 	// liveness tracks, per underlying *decoder.Model, the request holders (rw) and the number of registry entries
 	// backed by it (refs), so unload can drain in-flight work before freeing native memory instead of racing it into
 	// a use-after-free. A base and its compute-time adapters share one *decoder.Model and thus one entry. Guarded by
-	// regMu; see liveness.go and docs/completed/task-admin-unload-drain.md.
+	// regMu; see liveness.go.
 	liveness map[modelHandle]*modelLiveness
 	// draining is the set of served names whose entry has been unpublished but whose native memory
 	// is not yet freed (the detached drain is still running). Surfaced by /health so an operator can
@@ -443,25 +381,25 @@ type server struct {
 	// tokenLog is --log-token-ids' file, nil when the flag is off.
 	tokenLog *tokenIDLog
 
-	// gens is the cancel-by-id registry (docs/tasks/task-halt-2026-09.md), shared by every generation surface. Never
+	// gens is the cancel-by-id registry, shared by every generation surface. Never
 	// nil after newServer.
 	gens *generationRegistry
 
-	// jobs is the job registry (docs/tasks/task-work-queue-2026-09.md), shared by every generation surface the way
+	// jobs is the job registry, shared by every generation surface the way
 	// gens is. Never nil after newServer: every generation gets a job whether or not -job-dir is set; jobs.journal is
 	// what is nil without it.
-	jobs *jobStore
+	jobs *jobs.Store
 
 	// files and batches hold OpenAI's uploaded and assembled files and both dialects' batch records. Never nil after
 	// newServer.
 	files   *fileStore
 	batches *batchStore
 
-	// halted is the global halt state (docs/tasks/task-halt-2026-09.md); nil = running normally. See halt.go. The
+	// halted is the global halt state; nil = running normally. See halt.go. The
 	// zero value is nil, so newServer needs no init.
 	halted atomic.Pointer[haltInfo]
 
-	// swapGuardTripped and swapWatch are the serving-side swap tripwire (docs/tasks/task-never-swap-2026-09.md); see
+	// swapGuardTripped and swapWatch are the serving-side swap tripwire; see
 	// swapguard.go. The zero values mean not armed yet: startSwapGuard sets swapWatch during newServer, and a nil
 	// swapWatch (GOINFER_SWAP_GUARD=off) is a valid, permanent state.
 	swapGuardTripped atomic.Bool
@@ -630,14 +568,14 @@ type sampling struct {
 	// before sampling; -100 bans the token in practice. /v1/messages takes it as a goinfer extension.
 	LogitBias      map[string]float64 `json:"logit_bias"`
 	ResponseFormat *respFormat        `json:"response_format"`
-	// Confidence is the goinfer_confidence vendor extension (docs/tasks/task-constrained-confidence.md): with
+	// Confidence is the goinfer_confidence vendor extension: with
 	// response_format json_schema, the response carries each enum, boolean and integer field's confidence. Only the
 	// routes that write it back set confidenceOK; prepare refuses the flag everywhere else, so no route can accept it
 	// and silently drop the result.
 	Confidence   bool `json:"goinfer_confidence"`
 	confidenceOK bool
-	// Goinfer is the request's "goinfer" vendor object (vendorOptions): {"cost": true} asks for the turn's cost report.
-	Goinfer *vendorOptions `json:"goinfer"`
+	// Goinfer is the request's "goinfer" vendor object (jobs.VendorOptions): {"cost": true} asks for the turn's cost report.
+	Goinfer *jobs.VendorOptions `json:"goinfer"`
 	// minP has no request field; withRecommended sets it from the model's recommended sampling.
 	minP *float64
 	// fixedTokens measures the request's fixed part (system prompt and tool definitions) in tokens, for a route that
@@ -816,32 +754,11 @@ type completionReq struct {
 
 // --- response shapes ---
 
-type usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-	// PrefillReusedTokens is a goinfer vendor extension (not part of the OpenAI schema; the same convention as
-	// pathFields's decode_path and prefill_path on /v1/models): how many leading prompt tokens this generation's
-	// prefill skipped because a prior turn left them resident (decoder.Generation.PrefillReused). 0 on a cold
-	// prefill, on a path that does not track reuse, or when nothing was reused; the number alone cannot tell those
-	// apart. An unrecognised JSON key, so any standard OpenAI client ignores it.
-	PrefillReusedTokens int `json:"prefill_reused_tokens"`
-	// PrefillReuse is the vendor extension beside it that says where those tokens came from
-	// (docs/tasks/task-kv-architecture-2026-10.md §5.16); absent when nothing was reused.
-	PrefillReuse *prefillReuseSources `json:"prefill_reuse,omitempty"`
-}
-
-// prefillReuseSources splits prefill_reused_tokens by source. own_tokens were already in the KV record the request ran on (its own
-// continuation, or a previous conversation's matching prefix left in that slot), shared_tokens came from another slot's KV (a copy or a
-// shared block), host_tokens a host snapshot restored onto the device, disk_tokens the disk tier. promoted_blocks counts blocks that came back from host memory, the slot's own or a copy's source; the
-// slot's own rows count in host_tokens with a host snapshot's, and rows that came through a copy in shared_tokens. The disk tier is KV7-rest's, so disk_tokens is 0 until it lands.
-type prefillReuseSources struct {
-	OwnTokens      int `json:"own_tokens"`
-	SharedTokens   int `json:"shared_tokens"`
-	HostTokens     int `json:"host_tokens"`
-	DiskTokens     int `json:"disk_tokens"`
-	PromotedBlocks int `json:"promoted_blocks"`
-}
+// usage and prefillReuseSources are the generation accounting a job records (internal/app/serveapp/jobs).
+type (
+	usage               = jobs.Usage
+	prefillReuseSources = jobs.PrefillReuseSources
+)
 
 // prefillReuse is how many leading prompt tokens a generation's prefill skipped, and from which source (engine.Report's PrefillReused,
 // PrefillShared, KVSnapRestored and KVPromotedRows).
@@ -862,6 +779,19 @@ func (r prefillReuse) sources() *prefillReuseSources {
 		return nil
 	}
 	return &prefillReuseSources{OwnTokens: max(r.Tokens-r.Shared-r.Host, 0), SharedTokens: r.Shared, HostTokens: r.Host, PromotedBlocks: r.Promoted}
+}
+
+// turnResult is what drive and driveVL report about one generation, which each route's wire encoder reads: the finish
+// reason ("stop", "length" or "cancelled"), the completion token count, the per-token logprobs (nil with no engine
+// report), the stop string that ended the turn ("" for none), the prefill reuse (zero when the path does not track it),
+// and the admin-cancel reason ("" unless an admin cancel, not a client disconnect or shutdown, ended the turn).
+type turnResult struct {
+	finish       string
+	nComp        int
+	logprobs     []decoder.SampleInfo
+	stopHit      string
+	reused       prefillReuse
+	cancelReason string
 }
 
 // newUsage is the OpenAI usage block for a generation of nComp tokens over prompt tokens, with r's reuse.
@@ -997,14 +927,11 @@ func (s *server) serveChatText(w http.ResponseWriter, r *http.Request, req chatR
 		return
 	}
 	req.sampling.confidenceOK = true // written back below
-	req.sampling.fixedTokens = func() int { return lm.fixedPromptTokens(tm, system, nil) }
-	gr, err := lm.prepare(req.sampling, ids, lm.residentPath())
+	gr, err := lm.prepareTurn(req.sampling, tm, system, turns, nil, ids)
 	if err != nil {
 		writePrepareErr(w, err)
 		return
 	}
-	gr.boundary = lm.prefixBoundary(tm, system, turns, nil, ids)
-	gr.keep = lm.recurrentKeep(tm, system, turns, nil, ids)
 	if req.Stream && req.Logprobs { // the stream path has no logprobs field — reject rather than silently drop
 		writeErr(w, http.StatusBadRequest, "logprobs is not supported together with stream:true")
 		return
@@ -1030,7 +957,7 @@ func (s *server) serveChatText(w http.ResponseWriter, r *http.Request, req chatR
 		s.routeThink(lm, &gr, tm, turns, ts, func(t string) {
 			sseSend(ss, chatChunk(id, created, lm.name, delta{ReasoningContent: t}, nil))
 		})
-		finish, nComp, _, stopHit, reused, cancelReason, gerr := lm.drive(r.Context(), gr, s.gens, s.jobs, func(t string) {
+		res, gerr := lm.drive(r.Context(), gr, s.gens, s.jobs, func(t string) {
 			sseSend(ss, chatChunk(id, created, lm.name, delta{Content: t}, nil))
 		})
 		stopBeat()
@@ -1039,30 +966,30 @@ func (s *server) serveChatText(w http.ResponseWriter, r *http.Request, req chatR
 			sseDone(ss)
 			return
 		}
-		sseSend(ss, finishChunk(id, created, lm.name, finish, emptyAnswerOf(gr, finish, stopHit, 0, nComp), false))
+		sseSend(ss, finishChunk(id, created, lm.name, res.finish, emptyAnswerOf(gr, res.finish, res.stopHit, 0, res.nComp), false))
 		if gr.conf != nil {
 			sseSend(ss, map[string]any{"id": id, "goinfer_confidence": gr.conf.payload()})
 		}
-		if cancelReason != "" {
+		if res.cancelReason != "" {
 			// One final SSE event naming the reason, so a client cannot mistake this for a natural stop even though
 			// finish_reason is already "cancelled" above.
-			sseSend(ss, map[string]any{"goinfer_cancelled": map[string]any{"id": id, "reason": cancelReason}})
+			sseSend(ss, map[string]any{"goinfer_cancelled": map[string]any{"id": id, "reason": res.cancelReason}})
 		}
 		sendUsage(ss, gr.clock, req.StreamOptions, id, created, lm.name,
-			newUsage(len(gr.promptIDs), nComp, reused))
+			newUsage(len(gr.promptIDs), res.nComp, res.reused))
 		sseDone(ss)
 		return
 	}
 
 	var sb, rb strings.Builder
 	s.routeThink(lm, &gr, tm, turns, ts, func(t string) { rb.WriteString(t) })
-	finish, nComp, lps, stopHit, reused, cancelReason, gerr := lm.drive(r.Context(), gr, s.gens, s.jobs, func(t string) { sb.WriteString(t) })
+	res, gerr := lm.drive(r.Context(), gr, s.gens, s.jobs, func(t string) { sb.WriteString(t) })
 	if gerr != nil {
 		writeServerErr(w, "generation failed: "+gerr.Error())
 		return
 	}
-	if cancelReason != "" {
-		writeErr(w, statusCancelled, "generation cancelled: "+cancelReason)
+	if res.cancelReason != "" {
+		writeErr(w, statusCancelled, "generation cancelled: "+res.cancelReason)
 		return
 	}
 	msg := map[string]any{"role": "assistant", "content": sb.String()}
@@ -1072,23 +999,23 @@ func (s *server) serveChatText(w http.ResponseWriter, r *http.Request, req chatR
 	choice := map[string]any{
 		"index":         0,
 		"message":       msg,
-		"finish_reason": finish,
+		"finish_reason": res.finish,
 	}
-	if e := emptyAnswerOf(gr, finish, stopHit, 0, nComp); e != nil {
+	if e := emptyAnswerOf(gr, res.finish, res.stopHit, 0, res.nComp); e != nil {
 		choice["goinfer_empty_answer"] = e
 	}
 	if req.Logprobs {
-		choice["logprobs"] = lm.logprobs(lps)
+		choice["logprobs"] = lm.logprobs(res.logprobs)
 	}
 	resp := map[string]any{
 		"id": id, "object": "chat.completion", "created": created, "model": lm.name,
 		"choices": []any{choice},
-		"usage":   newUsage(len(gr.promptIDs), nComp, reused),
+		"usage":   newUsage(len(gr.promptIDs), res.nComp, res.reused),
 	}
 	if gr.conf != nil {
 		resp["goinfer_confidence"] = gr.conf.payload()
 	}
-	writeJSON(w, http.StatusOK, gr.clock.addTurn(resp))
+	writeJSON(w, http.StatusOK, gr.clock.AddTurn(resp))
 }
 
 func (s *server) handleCompletions(w http.ResponseWriter, r *http.Request) {
@@ -1155,7 +1082,7 @@ func (s *server) serveCompletion(w http.ResponseWriter, r *http.Request, req com
 		}
 		// Same prefill silence as the chat stream: heartbeat until the first token.
 		stopBeat := sseHeartbeat(ss)
-		finish, nComp, _, _, reused, cancelReason, gerr := lm.drive(r.Context(), gr, s.gens, s.jobs, func(t string) {
+		res, gerr := lm.drive(r.Context(), gr, s.gens, s.jobs, func(t string) {
 			sseSend(ss, completionChunk(id, created, lm.name, t, nil))
 		})
 		stopBeat()
@@ -1164,37 +1091,37 @@ func (s *server) serveCompletion(w http.ResponseWriter, r *http.Request, req com
 			sseDone(ss)
 			return
 		}
-		sseSend(ss, completionChunk(id, created, lm.name, "", &finish))
+		sseSend(ss, completionChunk(id, created, lm.name, "", &res.finish))
 		if gr.conf != nil {
 			sseSend(ss, map[string]any{"id": id, "goinfer_confidence": gr.conf.payload()})
 		}
-		if cancelReason != "" {
-			sseSend(ss, map[string]any{"goinfer_cancelled": map[string]any{"id": id, "reason": cancelReason}})
+		if res.cancelReason != "" {
+			sseSend(ss, map[string]any{"goinfer_cancelled": map[string]any{"id": id, "reason": res.cancelReason}})
 		}
 		sendUsage(ss, gr.clock, req.StreamOptions, id, created, lm.name,
-			newUsage(len(gr.promptIDs), nComp, reused))
+			newUsage(len(gr.promptIDs), res.nComp, res.reused))
 		sseDone(ss)
 		return
 	}
 	var sb strings.Builder
-	finish, nComp, _, _, reused, cancelReason, gerr := lm.drive(r.Context(), gr, s.gens, s.jobs, func(t string) { sb.WriteString(t) })
+	res, gerr := lm.drive(r.Context(), gr, s.gens, s.jobs, func(t string) { sb.WriteString(t) })
 	if gerr != nil {
 		writeServerErr(w, "generation failed: "+gerr.Error())
 		return
 	}
-	if cancelReason != "" {
-		writeErr(w, statusCancelled, "generation cancelled: "+cancelReason)
+	if res.cancelReason != "" {
+		writeErr(w, statusCancelled, "generation cancelled: "+res.cancelReason)
 		return
 	}
 	resp := map[string]any{
 		"id": id, "object": "text_completion", "created": created, "model": lm.name,
-		"choices": []any{map[string]any{"index": 0, "text": sb.String(), "finish_reason": finish}},
-		"usage":   newUsage(len(gr.promptIDs), nComp, reused),
+		"choices": []any{map[string]any{"index": 0, "text": sb.String(), "finish_reason": res.finish}},
+		"usage":   newUsage(len(gr.promptIDs), res.nComp, res.reused),
 	}
 	if gr.conf != nil {
 		resp["goinfer_confidence"] = gr.conf.payload()
 	}
-	writeJSON(w, http.StatusOK, gr.clock.addTurn(resp))
+	writeJSON(w, http.StatusOK, gr.clock.AddTurn(resp))
 }
 
 // genRequest is a prepared generation: prompt ids, sampling params (with the
@@ -1208,7 +1135,8 @@ type genRequest struct {
 	// drive/driveVL. "" (the zero value) skips registration, so a caller not wired for cancellation (or a test
 	// calling drive/driveVL directly) is unaffected.
 	id     string
-	masker *constrain.Masker // set on constrained requests (response_format / tool grammar); enables grammar-spec
+	masker *constrain.Masker     // set on constrained requests (response_format / tool grammar); enables grammar-spec
+	lazy   *constrain.LazyMasker // an auto turn's lazy tool union on a speculating server (armLazy); engine.Request.Lazy
 	// conf, when the request asked for goinfer_confidence, receives the per-field confidences once streamTokens
 	// has drained the generation. Its presence also keeps drive on plain constrained decode: the grammar-fused
 	// speculative path drives the masker without Process, which is where the capture records.
@@ -1224,14 +1152,17 @@ type genRequest struct {
 	// keep is how many leading ids of promptIDs the next turn's prompt repeats (loadedModel.recurrentKeep), 0 when unknown or not a recurrent model
 	// whose snapshots carry its state. It reaches the decoder as KVScope.Keep, where the state is kept for the next turn.
 	keep int
+	// msgBoundary is how many leading ids of promptIDs come before the last turn's content (loadedModel.recurrentMsgBoundary), 0 when unknown or not
+	// a recurrent model whose snapshots carry its state. It reaches the decoder as KVScope.MsgBoundary.
+	msgBoundary int
 	// fromModel names the sampling fields prepare took from the model's recommended sampling (withRecommended).
 	fromModel []string
 	// callPostCheck is a must-call tool_choice on a family with no JSON call form (forcedCallEnforcement "post-check"):
 	// runToolTurn streams no prose and returns errNoForcedCall when the reply holds no call.
 	callPostCheck bool
-	// clock is the turn's stage boundaries and, when asked, its cost counter (turn_timings.go). Set by prepare; shared by the
+	// clock is the turn's stage boundaries and, when asked, its cost counter (jobs/turn_timings.go). Set by prepare; shared by the
 	// copies a genRequest value makes as it is passed along.
-	clock *turnClock
+	clock *jobs.TurnClock
 }
 
 // kvScope is the request's KV sharing scope, of which the shell sets Boundary, the end of the system-and-tools section a
@@ -1239,7 +1170,9 @@ type genRequest struct {
 type kvScope = decoder.KVScope
 
 // kvScope is the KV sharing scope the request hands the engine.
-func (gr *genRequest) kvScope() kvScope { return kvScope{Boundary: gr.boundary, Keep: gr.keep} }
+func (gr *genRequest) kvScope() kvScope {
+	return kvScope{Boundary: gr.boundary, Keep: gr.keep, MsgBoundary: gr.msgBoundary}
+}
 
 // confResult is a generation's per-field confidence (or why there is none).
 type confResult struct {
@@ -1381,7 +1314,7 @@ func (lm *loadedModel) prepare(sm sampling, promptIDs []int, residentPath bool) 
 		stopStrings: stops,
 		outcome:     &turnOutcome{},
 		fromModel:   fromModel,
-		clock:       newTurnClock(sm.Goinfer.wantsCost()),
+		clock:       jobs.NewTurnClock(sm.Goinfer.WantsCost()),
 	}
 	// Reject a prompt that does not fit the context window, then clamp max_tokens to the room left (clampMaxTokens).
 	if lm.model != nil {
@@ -1593,18 +1526,14 @@ func genErr(err error) error {
 }
 
 // drive runs the generation, applying stop strings and UTF-8 holdback, and calls onText with each newly completed
-// text fragment. It returns the finish reason ("stop", "length" or "cancelled"), the completion token count, the
-// per-token logprobs (non-stream), the stop string that was hit (empty unless a stop sequence ended the turn), how
-// many leading prompt tokens the prefill skipped through resident or session reuse (decoder.Generation.PrefillReused;
-// 0 when nothing was reused or the path does not track it), the admin-cancel reason (empty unless an admin cancel,
-// not a client disconnect or shutdown, ended the turn), and the terminal generation error (nil on a clean end; see
-// genErr). It cancels its derived context on a stop-string hit to end generation.
+// text fragment. It returns the turn's turnResult and the terminal generation error (nil on a clean end; see genErr).
+// It cancels its derived context on a stop-string hit to end generation.
 //
 // gens is the server's cancel-by-id registry; nil, or gr.id == "", skips registration. Every generation funnels
 // through here or driveVL, so that bookkeeping lives here and not at each call site (see generations.go). jobs is the
 // job store, nil only in a unit test calling drive directly; it is gated on the same gr.id != "" and shares the id,
 // so the job and registry records join by id.
-func (lm *loadedModel) drive(parent context.Context, gr genRequest, gens *generationRegistry, jobs *jobStore, onText func(string)) (finish string, nComp int, logprobs []decoder.SampleInfo, stopHitOut string, prefillReused prefillReuse, cancelReason string, err error) {
+func (lm *loadedModel) drive(parent context.Context, gr genRequest, gens *generationRegistry, js *jobs.Store, onText func(string)) (res turnResult, err error) {
 	defer lm.logExpertCache(lm.expertCacheNow())
 	var g *generation
 	if gens != nil && gr.id != "" {
@@ -1624,48 +1553,47 @@ func (lm *loadedModel) drive(parent context.Context, gr genRequest, gens *genera
 			gr.think.onReasoning = func(t string) { g.tokens.Add(1); wr(t) }
 		}
 	}
-	if jobs != nil && gr.id != "" {
-		j := jobs.getOrCreate(gr.id, lm.name, gr.promptIDs)
+	if js != nil && gr.id != "" {
+		j := js.GetOrCreate(gr.id, lm.name, gr.promptIDs)
 		// The job's result text accumulates independently of whatever the caller's own onText does, so every job gets
 		// one uniformly.
 		var resultText strings.Builder
 		wrapped := onText
 		onText = func(t string) { resultText.WriteString(t); wrapped(t) }
-		// Reads the named return values, so it sees the final finish, nComp, prefillReused, cancelReason and err
-		// whichever return statement ran.
+		// Reads the named return values, so it sees the final res and err whichever return statement ran.
 		defer func() {
-			state := jobDone
+			state := jobs.Done
 			var errMsg string
 			switch {
-			case cancelReason != "":
-				state = jobCancelled
+			case res.cancelReason != "":
+				state = jobs.Cancelled
 			case err != nil:
-				state, errMsg = jobFailed, err.Error()
+				state, errMsg = jobs.Failed, err.Error()
 			}
-			u := newUsage(len(gr.promptIDs), nComp, prefillReused)
-			jobs.finishTurn(j, state, &u, gr.clock, errMsg, &jobResult{Content: resultText.String(), FinishReason: finish, StopSeq: stopHitOut})
+			u := newUsage(len(gr.promptIDs), res.nComp, res.reused)
+			js.FinishTurn(j, state, &u, gr.clock, errMsg, &jobs.Result{Content: resultText.String(), FinishReason: res.finish, StopSeq: res.stopHit})
 		}()
 	}
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	gr.clock.start()
-	st := lm.genEngine().Start(cost.WithCounter(ctx, gr.clock.costCounter()), engine.Request{
-		PromptIDs: gr.promptIDs, MaxTokens: gr.maxTokens, Sampling: decoder.SamplingParams(gr.sp), Masker: gr.masker,
+	gr.clock.Start()
+	st := lm.genEngine().Start(cost.WithCounter(ctx, gr.clock.CostCounter()), engine.Request{
+		PromptIDs: gr.promptIDs, MaxTokens: gr.maxTokens, Sampling: decoder.SamplingParams(gr.sp), Masker: gr.masker, Lazy: gr.lazy,
 		NoSpeculation: gr.conf != nil, Scope: gr.kvScope(),
 	})
 	defer st.Close()
 	finish, n, stopHit := lm.streamTokens(parent, cancel, st.Tokens(), gr, st.Report, onText)
-	gr.clock.end()
+	gr.clock.End()
 	rep := st.Report()
 	if rep == nil { // an engine that keeps no report (the scripted seam): no cancelled finish, logprobs, reuse or error
-		return finish, n, nil, stopHit, prefillReuse{}, cancelledReason(g, parent, stopHit), nil
+		return turnResult{finish: finish, nComp: n, stopHit: stopHit, cancelReason: cancelledReason(g, parent, stopHit)}, nil
 	}
 	cr := cancelledReason(g, parent, stopHit)
 	if cr != "" {
 		finish = "cancelled"
 	}
 	logKVCopy(rep)
-	return finish, n, rep.Logprobs, stopHit, reuseOf(rep), cr, genErr(rep.Err)
+	return turnResult{finish: finish, nComp: n, logprobs: rep.Logprobs, stopHit: stopHit, reused: reuseOf(rep), cancelReason: cr}, genErr(rep.Err)
 }
 
 // cancelledReason reports the admin-cancel reason for this generation's finish, or "" if it was not an admin cancel.
@@ -1686,7 +1614,7 @@ func cancelledReason(g *generation, parent context.Context, stopHit string) stri
 // prefix reuse), but on a resident backend GenerateVL and GenerateQwenVL reuse the resident GPU KV when the same
 // image is resent, and vi.features is then never invoked. Its results and its gens and jobs parameters are drive's;
 // see drive.
-func (lm *loadedModel) driveVL(parent context.Context, gr genRequest, vi visionInput, gens *generationRegistry, jobs *jobStore, onText func(string)) (finish string, nComp int, logprobs []decoder.SampleInfo, stopHitOut string, prefillReused prefillReuse, cancelReason string, err error) {
+func (lm *loadedModel) driveVL(parent context.Context, gr genRequest, vi visionInput, gens *generationRegistry, js *jobs.Store, onText func(string)) (res turnResult, err error) {
 	defer lm.logExpertCache(lm.expertCacheNow())
 	var g *generation
 	if gens != nil && gr.id != "" {
@@ -1699,22 +1627,22 @@ func (lm *loadedModel) driveVL(parent context.Context, gr genRequest, vi visionI
 		wrapped := onText
 		onText = func(t string) { g.tokens.Add(1); wrapped(t) }
 	}
-	if jobs != nil && gr.id != "" {
-		j := jobs.getOrCreate(gr.id, lm.name, gr.promptIDs)
+	if js != nil && gr.id != "" {
+		j := js.GetOrCreate(gr.id, lm.name, gr.promptIDs)
 		var resultText strings.Builder
 		wrapped := onText
 		onText = func(t string) { resultText.WriteString(t); wrapped(t) }
 		defer func() {
-			state := jobDone
+			state := jobs.Done
 			var errMsg string
 			switch {
-			case cancelReason != "":
-				state = jobCancelled
+			case res.cancelReason != "":
+				state = jobs.Cancelled
 			case err != nil:
-				state, errMsg = jobFailed, err.Error()
+				state, errMsg = jobs.Failed, err.Error()
 			}
-			u := newUsage(len(gr.promptIDs), nComp, prefillReused)
-			jobs.finishTurn(j, state, &u, gr.clock, errMsg, &jobResult{Content: resultText.String(), FinishReason: finish, StopSeq: stopHitOut})
+			u := newUsage(len(gr.promptIDs), res.nComp, res.reused)
+			js.FinishTurn(j, state, &u, gr.clock, errMsg, &jobs.Result{Content: resultText.String(), FinishReason: res.finish, StopSeq: res.stopHit})
 		}()
 	}
 	ctx, cancel := context.WithCancel(parent)
@@ -1724,8 +1652,8 @@ func (lm *loadedModel) driveVL(parent context.Context, gr genRequest, vi visionI
 	if len(spans) == 0 {
 		spans, grids = []decoder.ImageSpan{{Pos: vi.imgPos, Len: vi.imgLen, Hash: vi.imgHash}}, [][3]int{vi.grid}
 	}
-	gr.clock.start()
-	st := lm.genEngine().Start(cost.WithCounter(ctx, gr.clock.costCounter()), engine.Request{
+	gr.clock.Start()
+	st := lm.genEngine().Start(cost.WithCounter(ctx, gr.clock.CostCounter()), engine.Request{
 		PromptIDs: gr.promptIDs, MaxTokens: gr.maxTokens, Sampling: decoder.SamplingParams(gr.sp),
 		Media: vi.media(spans, grids, lm),
 	})
@@ -1734,10 +1662,10 @@ func (lm *loadedModel) driveVL(parent context.Context, gr genRequest, vi visionI
 		onText(vi.replyPrefix)
 	}
 	finish, n, stopHit := lm.streamTokens(parent, cancel, st.Tokens(), gr, st.Report, onText)
-	gr.clock.end()
+	gr.clock.End()
 	rep := st.Report()
 	if rep == nil { // an engine that keeps no report (the scripted seam): no cancelled finish, logprobs, reuse or error
-		return finish, n, nil, stopHit, prefillReuse{}, cancelledReason(g, parent, stopHit), nil
+		return turnResult{finish: finish, nComp: n, stopHit: stopHit, cancelReason: cancelledReason(g, parent, stopHit)}, nil
 	}
 	if len(spans) > 1 && rep.ImgPrefillDecline != "" { // say why a multi-span turn prefilled on the CPU
 		fmt.Fprintf(os.Stderr, "vision: %d image(s), %d spans; the resident image prefill declined (%s), so the CPU prefill ran and was uploaded\n", max(vi.images, 1), len(spans), rep.ImgPrefillDecline)
@@ -1758,7 +1686,7 @@ func (lm *loadedModel) driveVL(parent context.Context, gr genRequest, vi visionI
 		finish = "cancelled"
 	}
 	logKVCopy(rep)
-	return finish, n, rep.Logprobs, stopHit, reuseOf(rep), cr, genErr(rep.Err)
+	return turnResult{finish: finish, nComp: n, logprobs: rep.Logprobs, stopHit: stopHit, reused: reuseOf(rep), cancelReason: cr}, genErr(rep.Err)
 }
 
 // media is vi as the engine's Media over spans and grids (driveVL's, with the one-media fallback), the kind chosen by
@@ -1769,7 +1697,8 @@ func (vi visionInput) media(spans []decoder.ImageSpan, grids [][3]int, lm *loade
 	case vi.asr: // Qwen3-ASR, Voxtral: the encoder's embeddings replace the audio run, causal prefill, CPU decode
 		md.Kind = engine.MediaAudio
 	case vi.qwen: // Qwen2.5-VL, Qwen3-VL (with DeepStack sets), GLM-OCR
-		md.Kind, md.Grids, md.Merge, md.ImageToken, md.DeepSets = engine.MediaQwen, grids, lm.qwenMerge, lm.qwenImgTok, vi.deepSets
+		g := lm.qwenGrid()
+		md.Kind, md.Grids, md.Merge, md.ImageToken, md.DeepSets = engine.MediaQwen, grids, g.merge, g.imgTok, vi.deepSets
 	case vi.gemma4:
 		md.Kind = engine.MediaGemma4
 	case vi.causal: // causal image tokens (Ministral 3, LFM2-VL), one span per run
@@ -1842,7 +1771,7 @@ func (lm *loadedModel) streamTokens(parent context.Context, cancel context.Cance
 	}
 	tr := traceFrom(parent) // -log-requests (reqlog.go); nil when it is off
 	for id := range stream {
-		gr.clock.firstToken() // the turn's first token received; later calls keep it
+		gr.clock.FirstToken() // the turn's first token received; later calls keep it
 		if stopping {
 			continue // drain so the generation goroutine exits cleanly
 		}
@@ -1942,7 +1871,7 @@ func jsonLogprob(x float64) float64 {
 func (lm *loadedModel) tokenText(id int) string { return string(lm.tk.TokenText(id)) }
 
 // logKVCopy reports a generation that took KV rows from another conversation's slot, or whose copy was declined: the
-// rows and the copy's wall time are the sharing gate's copy cost (docs/measurements/kv2-2026-10-14.md, G7).
+// rows and the copy's wall time are the sharing gate's copy cost (docs/measurements/kv2-2026-10-14.md, "The copy's cost, and admission's").
 // expertCacheNow reads the resident's MoE expert-cache counters, for logExpertCache to difference after the turn.
 func (lm *loadedModel) expertCacheNow() (decoder.ExpertCacheStats, bool) {
 	if lm.model == nil {

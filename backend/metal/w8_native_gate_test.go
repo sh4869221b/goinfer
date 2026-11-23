@@ -9,15 +9,18 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/decoder/fit"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// Gates F2 and F3 of docs/tasks/task-metal-int8-2026-10.md, pre-registered: does a dense int8 model on
+// Gates F2 and F3, pre-registered: does a dense int8 model on
 // Metal's native int8 path (r.w8) agree with the CPU at the same quant, and is it as close to f32 as the CPU's int8?
 // They run on the 0.5B coder by day; GOINFER_W8_GATE_MODEL names another checkpoint (the 1.5B runs with gate S).
 
 func w8GateModel(t *testing.T) string {
 	t.Helper()
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	useNativeInt8(t, true)
 	path := os.ExpandEnv("$HOME/models/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf")
 	if p := os.Getenv("GOINFER_W8_GATE_MODEL"); p != "" {
@@ -147,7 +150,7 @@ func cpuLogitsAt(t *testing.T, path, quant string, seed []int, steps int, forced
 func cpuLogitsAtKV(t *testing.T, path, quant string, seed []int, steps int, forced []int, f16KV bool) ([][]float32, []int) {
 	t.Helper()
 	m, err := decoder.Load(path, decoder.Options{Quant: quant, ResidentContext: 1024})
-	if errors.Is(err, decoder.ErrWontFitResident) { // the machine's memory right now, not the gate's answer
+	if errors.Is(err, fit.ErrWontFitResident) { // the machine's memory right now, not the gate's answer
 		t.Skipf("the fit guard refused the CPU %q load on this machine now: %v", quant, err)
 	}
 	if err != nil {

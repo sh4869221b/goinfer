@@ -7,8 +7,8 @@ import (
 )
 
 // prefixBoundary is how many leading ids of ids, the prompt rendered from (system, turns, tools), come before the first conversation turn's content: the
-// stable system-and-tools section, which every session of one client shares and which a prefix snapshot is taken at during the cold prefill
-// (docs/tasks/task-kv7-step2-boundary-snapshot-2026-10.md). 0 when there is none to find or the server cannot use one.
+// stable system-and-tools section, which every session of one client shares and which a prefix snapshot is taken at during the cold prefill.
+// 0 when there is none to find or the server cannot use one.
 //
 // It is found without knowing the family's markers: the prompt is rendered again with the first turn's content changed, and the segments that
 // render identically are the stable section (the first turn's opening marker is in it; the content that differs is not). The ids of those
@@ -22,7 +22,7 @@ func (lm *loadedModel) prefixBoundary(tm *chat.Template, system string, turns []
 
 // recurrentKeep is how many leading ids of ids, the prompt rendered from (system, turns, tools), the next turn's prompt repeats: ids rendered
 // again with a reply and a new user message after them (chat.NextTurns) share that many leading ids with ids. A recurrent model's state is
-// kept there (KVScope.Keep, docs/queue-engineering.md B35), because a template that rewrites the end of the prompt in its history render
+// kept there, because a template that rewrites the end of the prompt in its history render
 // (Qwen3.5's empty think block) leaves no other point the next turn continues from. 0 for a model whose snapshots do not carry its state,
 // when the next prompt repeats all of ids (the slot's own state serves it), or when nothing is shared.
 func (lm *loadedModel) recurrentKeep(tm *chat.Template, system string, turns []chat.Turn, tools []chat.Tool, ids []int) int {
@@ -48,6 +48,39 @@ func (lm *loadedModel) recurrentKeep(tm *chat.Template, system string, turns []c
 		return 0
 	}
 	return k
+}
+
+// recurrentMsgBoundary is how many leading ids of ids, the prompt rendered from (system, turns, tools), come before the last turn's content: the
+// part a next prompt that keeps every earlier turn and rewrites the last one still repeats (KVScope.MsgBoundary, docs/measurements/kv8-msgboundary-2026-11).
+// Found as prefixBoundaryOf finds the system section, by rendering again with the last turn's content changed. 0 for a model whose snapshots
+// do not carry its state, for a single turn (the system section is Boundary's), or when the ids of the shared segments are not a prefix of ids.
+func (lm *loadedModel) recurrentMsgBoundary(tm *chat.Template, system string, turns []chat.Turn, tools []chat.Tool, ids []int) int {
+	if !lm.keepsRecurrentSnapshots() || tm == nil || len(turns) < 2 {
+		return 0
+	}
+	render := func(ts []chat.Turn) []chat.Segment {
+		if len(tools) > 0 {
+			return tm.RenderToolsSegments(system, ts, tools)
+		}
+		return tm.RenderSegments(system, ts)
+	}
+	a := render(turns)
+	changed := slices.Clone(turns)
+	last := len(changed) - 1
+	changed[last].Content = "\x01" + changed[last].Content
+	b := render(changed)
+	k := 0
+	for k < len(a) && k < len(b) && a[k] == b[k] {
+		k++
+	}
+	if k == 0 || k == len(a) {
+		return 0
+	}
+	pre, err := lm.tk.EncodeSegments(a[:k], false)
+	if err != nil || len(pre) == 0 || len(pre) >= len(ids) || !slices.Equal(pre, ids[:len(pre)]) {
+		return 0
+	}
+	return len(pre)
 }
 
 // keepsRecurrentSnapshots reports whether the model's snapshots carry its recurrent state, so a Keep is worth computing.
@@ -85,4 +118,19 @@ func (lm *loadedModel) prefixBoundaryOf(tm *chat.Template, system string, turns 
 		return 0
 	}
 	return len(pre)
+}
+
+// prepareTurn is a text route's turn setup after its prompt is encoded: prepare on the resident path, with the request's
+// fixed part priced from (system, tools), then the three KV boundaries of ids. Its error is prepare's, unchanged, for the
+// route to render in its own dialect (writePrepareErr, writeAnthropicPrepareErr, writeResponsesPrepareErr).
+func (lm *loadedModel) prepareTurn(sm sampling, tm *chat.Template, system string, turns []chat.Turn, tools []chat.Tool, ids []int) (genRequest, error) {
+	sm.fixedTokens = func() int { return lm.fixedPromptTokens(tm, system, tools) }
+	gr, err := lm.prepare(sm, ids, lm.residentPath())
+	if err != nil {
+		return gr, err
+	}
+	gr.boundary = lm.prefixBoundary(tm, system, turns, tools, ids)
+	gr.keep = lm.recurrentKeep(tm, system, turns, tools, ids)
+	gr.msgBoundary = lm.recurrentMsgBoundary(tm, system, turns, tools, ids)
+	return gr, nil
 }

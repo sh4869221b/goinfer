@@ -8,7 +8,7 @@ import (
 	"github.com/townsendmerino/goinfer/internal/vision"
 )
 
-// Device towers for the grid-based vision encoders, Qwen3.5+ and GLM-OCR (S2 of docs/tasks/task-multimodal-support-2026-10.md),
+// Device towers for the grid-based vision encoders, Qwen3.5+ and GLM-OCR,
 // on the pattern of the Gemma 4 registry (gemma4_tower.go): a backend module registers a tower built from aikit's export
 // (the encoder's Weights, RopeTables, VisionSegments) here, the tower runs the patch embed and the blocks on its
 // device, and the tail (Qwen3's merger; GLM-OCR's post-norm, downsample and merger) stays aikit's FinishHidden.
@@ -22,8 +22,8 @@ type GridTowerAccelerator interface {
 	Close() error
 }
 
-// GridTowerTapper is a GridTowerAccelerator that can also return chosen blocks' outputs: Qwen3-VL's DeepStack taps
-// (S10). A device tower without it cannot run a DeepStack tower (the sets would be lost).
+// GridTowerTapper is a GridTowerAccelerator that can also return chosen blocks' outputs: Qwen3-VL's DeepStack taps.
+// A device tower without it cannot run a DeepStack tower (the sets would be lost).
 type GridTowerTapper interface {
 	HiddenTaps(pixels []float32, gridTHW [][3]int, blocks []int) (last []float32, taps [][]float32, err error)
 }

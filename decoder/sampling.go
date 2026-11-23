@@ -167,7 +167,7 @@ func (s *Sampler) NextDraw() (seed, draw uint64) {
 	return s.impl.NextDraw()
 }
 
-// SampleEligible reports whether this sampler's configuration can be drawn on-device by ResidentSample:
+// SampleEligible reports whether this sampler's configuration can be drawn on-device by SampleAvailable:
 // temperature-only sampling with nothing that needs or rewrites the full row (logprobs, bias, penalties). The
 // decode loop additionally requires no LogitProcessor.
 func (s *Sampler) SampleEligible() bool {
@@ -211,9 +211,3 @@ func (s *Sampler) needsHistory() bool { return s.impl.NeedsHistory() }
 func (s *Sampler) specStep(p []float64, x int) (int, bool) { return s.impl.SpecStep(p, x) }
 
 func (s *Sampler) topPActive() bool { return s.impl.TopPActive() }
-
-func argmax(logits []float32) int { return sampling.Argmax(logits) }
-
-func softmaxStable(logits []float32, temperature float64) []float64 {
-	return sampling.SoftmaxStable(logits, temperature)
-}

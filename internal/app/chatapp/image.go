@@ -17,7 +17,7 @@ import (
 	"github.com/townsendmerino/goinfer/multimodal"
 )
 
-// --image (O5, docs/tasks/task-glm-ocr-2026-10.md): one image, one answer, in the terminal.
+// --image: one image, one answer, in the terminal.
 //
 //	goinfer-chat --model ~/models/glm-ocr --image invoice.png --schema invoice.schema.json
 //
@@ -41,7 +41,7 @@ type imageInput struct {
 	grid   [3]int
 	nImg   int
 	tower  *vision.GlmOcrVisionEncoder // loaded on first use
-	// device is the backend whose GLM-OCR tower runs the blocks (S2: "metal" or "cuda", when this binary registered one;
+	// device is the backend whose GLM-OCR tower runs the blocks ("metal" or "cuda", when this binary registered one;
 	// towerDevice), "" for aikit's CPU tower. acc is that tower once built; nil runs on the CPU.
 	device string
 	acc    multimodal.GridTowerAccelerator

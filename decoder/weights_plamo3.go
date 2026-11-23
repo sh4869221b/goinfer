@@ -21,7 +21,7 @@ func foldPlamoNorm(st *embed.SafetensorsFile, name string, size int, offset floa
 	return out, nil
 }
 
-func buildPlamo3Weights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, sink *giwWriter, id string) (*Weights, error) {
+func buildPlamo3Weights(cfg *Config, arch *Architecture, st *embed.SafetensorsFile, quant quantMode, embedInt4, needCanonical, skipRow4 bool, sink *giwWriter, id string, abort <-chan struct{}) (*Weights, error) {
 	hidden, inter, vocab := arch.HiddenDim, arch.IntermediateDim, arch.VocabSize
 	hd := arch.HeadDim
 	qDim, kvDim := arch.NumHeads*hd, arch.NumKVHeads*hd
@@ -90,5 +90,5 @@ func buildPlamo3Weights(cfg *Config, arch *Architecture, st *embed.SafetensorsFi
 		l.DownProj = q(l.DownProj)
 		return nil
 	}
-	return finishLayers(w, arch, loadLayer, sink, id)
+	return finishLayers(w, arch, loadLayer, sink, id, abort)
 }

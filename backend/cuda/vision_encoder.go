@@ -20,6 +20,7 @@ import (
 
 	"github.com/townsendmerino/aikit/linalg"
 	gpu "github.com/townsendmerino/goinfer/backend/cuda/internal/gpudev"
+	"github.com/townsendmerino/goinfer/backend/cuda/internal/wpack"
 	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 	"github.com/townsendmerino/goinfer/internal/vision"
 )
@@ -37,11 +38,9 @@ type visionLayer struct {
 // VisionEncoder is a device-resident SigLIP forward, uploaded once from vision.GPUWeights.
 type VisionEncoder struct {
 	dev    *Device
-	stream Queue // created once at setup (M-18, docs/audit-2026-09-10.md) — ForwardPatches used to
-	// call r.dev.NewCommandQueue() per invocation, matching neither cudaResident's own
-	// once-per-lifetime r.stream (cuda/resident.go) nor this tower's own scratch-buffer lifetime.
-	reqCh chan func() error
-	ackCh chan error
+	stream Queue // created once at setup, like cudaResident's once-per-lifetime r.stream and this tower's scratch buffers
+	reqCh  chan func() error
+	ackCh  chan error
 
 	bLayerNormQuant Pipeline // layernorm_quant_batched
 	bLayerNormF32   Pipeline // layernorm_f32_batched (the tower's final post-LN)
@@ -70,7 +69,7 @@ type VisionEncoder struct {
 // matching cudaResident's own reqCh/ackCh discipline (CUDA contexts are thread-affine).
 func (ve *VisionEncoder) do(j func() error) error {
 	ve.reqCh <- j
-	return <-ve.ackCh
+	return ackJob(<-ve.ackCh)
 }
 
 // NewVisionEncoder uploads a loaded SigLIP tower (vision.LoadEncoder(dir, quant=true) +
@@ -81,6 +80,7 @@ func (ve *VisionEncoder) do(j func() error) error {
 func NewVisionEncoder(w vision.GPUWeights) (ve *VisionEncoder, err error) {
 	defer func() {
 		if p := recover(); p != nil {
+			mem.RepanicBug(p)
 			ve, err = nil, fmt.Errorf("cuda vision: NewVisionEncoder recovered from panic: %v", p)
 		}
 	}()
@@ -194,7 +194,7 @@ func (r *VisionEncoder) up32(v []float32) Buffer {
 }
 
 func (r *VisionEncoder) upW8(q8 []int8, scales []float32, N, K int) cudaWQ {
-	wpk := packI8(q8, N, K)
+	wpk := wpack.PackI8(q8, N, K)
 	b := gpu.NewBufferLenOfOn[uint32](r.dev, mem.LineCompanion, len(wpk))
 	if err := gpu.Upload(b, wpk); err != nil {
 		panic(err)

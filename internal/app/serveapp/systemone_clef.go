@@ -1,6 +1,6 @@
 package serveapp
 
-// Route C of POST /v1/systemone (docs/tasks/task-constrained-confidence.md): a model directory that carries
+// Route C of POST /v1/systemone: a model directory that carries
 // joint_head.safetensors is Cloudflare's Clef decision model, and one backbone pass over the whole record answers every
 // question (internal/clef). The request is the same TypeSafe shape; what differs is that it is read as the reference's encoder
 // reads it, from the raw body, and answered in the reference's own shape (systemone_answer in the checkpoint's
@@ -44,7 +44,7 @@ func isClefDir(path string) bool {
 // section 7). Other quants are not refused here: f32 and int8int8 are graded, int4mix is simply not measured.
 func clefQuantRefusal(quant string) error {
 	if quant == "int4" {
-		return fmt.Errorf("a Clef model is not served at int4: D13 measured it at mean KL 0.051 and top-1 agreement 0.840 against the f32 reference (int8int8, the default: 0.0165 and 0.907); use quant=int8int8 or quant=f32")
+		return fmt.Errorf("a Clef model is not served at int4: it reads clearly worse than int8int8, the default, against the f32 reference (docs/measurements/decisions-d13-clef-fidelity-2026-10-03.md, section 7); use quant=int8int8 or quant=f32")
 	}
 	return nil
 }

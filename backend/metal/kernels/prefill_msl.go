@@ -7,13 +7,13 @@ package kernels
 const PrefillKernels = `
 #include <metal_stdlib>
 using namespace metal;
-` + AttnScoreMSL + `
+` + AttnScoreMSL + KVRowMSL + `
 // gemm_w4f16_store: blocked int4→f16 MMA GEMM with a fused epilogue (mode 0 = plain store, 1 =
 // +bias for fused QKV, 2 = +residual for o-proj/down) — C[M×N] = A[M×K](f16) · Wᵀ, W = resident
 // int4/W4A8 (packed nibbles + f16 group scales), dequanted in-kernel. Dispatched as a 2-D grid of
 // threadgroups, (ceil(N/64), ceil(M/64)) × 128 threads — see gemmGrid in PrefillLast.
 //
-// R16 (docs/tasks/red-october.md; docs/measurements/metal-prefill-gemm-s2-2026-09-25.md): restructured
+// R16 (docs/measurements/metal-prefill-gemm-s2-2026-09-25.md): restructured
 // 2026-09-25 in the shape of llama.cpp's classic kernel_mul_mm. The previous kernel (each simdgroup an
 // island that fetched its own activations from device memory inside the MMA loop, K stepped by 8) ran
 // the MLP projections at ~0.75 TFLOPS under sustained load; this one runs them at ~2.7–2.9, measured
@@ -66,20 +66,28 @@ inline void gemm_stage_w(threadgroup half* sa, uint2 wv, float sc, bool wok, ush
     }
 }
 
-inline void gemm_epilogue(threadgroup float* myc, simdgroup_float8x8 acc, uint mb, uint nb, uint M, uint N,
-    device half* C, device const float* bias, uint mode, ushort lane) {
+// gemm_epilogue_ld stores one 8x8 accumulator into columns [coff, coff+N) of C, whose rows are ldc halves apart; the bias is
+// indexed by the column in C. gemm_epilogue is the whole-width case (ldc = N, coff = 0).
+inline void gemm_epilogue_ld(threadgroup float* myc, simdgroup_float8x8 acc, uint mb, uint nb, uint M, uint N, uint ldc,
+    uint coff, device half* C, device const float* bias, uint mode, ushort lane) {
     simdgroup_store(acc, myc, 8);
     simdgroup_barrier(mem_flags::mem_threadgroup);
     for (ushort e = lane; e < 64; e += 32) {
         const uint m = mb + e/8, n = nb + e%8;
         if (m < M && n < N) {
+            const uint o = m*ldc + coff + n;
             float v = myc[e];
-            if (mode == 1u) v += bias[n];                 // fused bias (QKV)
-            if (mode == 2u) v += float(C[m*N + n]);       // residual (o / down)
-            C[m*N + n] = half(v);
+            if (mode == 1u) v += bias[coff + n];          // fused bias (QKV)
+            if (mode == 2u) v += float(C[o]);             // residual (o / down)
+            C[o] = half(v);
         }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+inline void gemm_epilogue(threadgroup float* myc, simdgroup_float8x8 acc, uint mb, uint nb, uint M, uint N,
+    device half* C, device const float* bias, uint mode, ushort lane) {
+    gemm_epilogue_ld(myc, acc, mb, nb, M, N, N, 0u, C, bias, mode, lane);
 }
 
 kernel void gemm_w4f16_store(device const half* A[[buffer(0)]], device const uint* W[[buffer(1)]],
@@ -154,6 +162,15 @@ inline float glu_act_f16(float x, uint act); // defined with swiglu_f16, below
 // same order as the two-step form, so the output is the same bits, and guF is never written. grid = (ceil(I/32), ceil(M/64)).
 // W8 (KS-D5c, gemm_w8f16_swiglu) stages the native int8 path's weights as gemm_w4f16_tile<64, 64, true> does, so it is
 // gemm_w8f16_m64n64 + swiglu_f16 bit for bit.
+// w8Block is one 8-k block of a native int8 weight row, the codes at byte offset off (a multiple of 4): zero when the row is
+// out (ok false) or the block starts at or past K, and its upper word zero when only four of its codes are inside K. A native
+// int8 row is any multiple of 4 bytes, so a 32-wide slab can end inside a row's last block or past it; two word loads never
+// read past the row.
+inline uint2 w8Block(device const uint* W, uint off, uint kk, uint K, bool ok) {
+    if (!ok || kk >= K) return uint2(0u);
+    return uint2(W[off/4u], kk + 8u <= K ? W[off/4u + 1u] : 0u);
+}
+
 template <bool W8>
 kernel void gemm_swiglu(device const half* A[[buffer(0)]], device const uint* W[[buffer(1)]],
     device const half* WS[[buffer(2)]], device half* C[[buffer(3)]],
@@ -190,7 +207,7 @@ kernel void gemm_swiglu(device const half* A[[buffer(0)]], device const uint* W[
             const float sc = wok ? reinterpret_cast<device const float*>(WS)[ncol] : 0.0f;
             for (ushort w = 0; w < 2; w++) {
                 const ushort kb = kh*2 + w;
-                const uint2 wd = wok ? *reinterpret_cast<device const uint2*>(W + (ncol*K + k0 + kb*8u)/4u) : uint2(0u);
+                const uint2 wd = w8Block(W, ncol*K + k0 + kb*8u, k0 + kb*8u, K, wok);
                 const char4 c0 = as_type<char4>(wd.x), c1 = as_type<char4>(wd.y);
                 threadgroup half* p = sa + (fb*4 + kb)*72 + nl;
                 for (ushort kl = 0; kl < 8; kl++) {
@@ -206,9 +223,10 @@ kernel void gemm_swiglu(device const half* A[[buffer(0)]], device const uint* W[
         for (ushort j = 0; j < 2; j++) {
             const ushort kb = kh2*2 + j;
             threadgroup half4* d4 = (threadgroup half4*)(sb + (tb*4 + kb)*64 + rl*8);
-            if (aok) {
-                device const half4* s4 = (device const half4*)(A + mrow*K + k0 + kb*8u);
-                d4[0] = s4[0]; d4[1] = s4[1];
+            const uint kk = k0 + kb*8u;
+            if (aok && (!W8 || kk < K)) {
+                device const half4* s4 = (device const half4*)(A + mrow*K + kk);
+                d4[0] = s4[0]; d4[1] = (!W8 || kk + 8u <= K) ? s4[1] : half4(0.0h);
             } else {
                 d4[0] = half4(0.0h); d4[1] = half4(0.0h);
             }
@@ -295,12 +313,12 @@ kernel void gemm_w4f16_tile(device const half* A[[buffer(0)]], device const uint
     for (uint k0 = 0; k0 < K; k0 += 32u) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if constexpr (W8) {
-            // int8 slice 2 (docs/tasks/task-metal-int8-2026-10.md): W is the native int8 path's row-major int8 codes,
+            // int8 slice 2: W is the native int8 path's row-major int8 codes,
             // K bytes a row, and WS its per-row f32 scales; an 8-k block is two words.
             float sc = wok ? reinterpret_cast<device const float*>(WS)[ncol] : 0.0f;
             for (ushort w = 0; w < WPT; w++) {
                 const ushort kb = kq*WPT + w;
-                const uint2 wd = wok ? *reinterpret_cast<device const uint2*>(W + (ncol*K + k0 + kb*8u)/4u) : uint2(0u);
+                const uint2 wd = w8Block(W, ncol*K + k0 + kb*8u, k0 + kb*8u, K, wok);
                 const char4 c0 = as_type<char4>(wd.x), c1 = as_type<char4>(wd.y);
                 threadgroup half* p = sa + (fb*4 + kb)*72 + nl;
                 for (ushort kl = 0; kl < 8; kl++) {
@@ -332,9 +350,10 @@ kernel void gemm_w4f16_tile(device const half* A[[buffer(0)]], device const uint
         for (ushort j = 0; j < BPT && (TM >= 32 || tr < TM); j++) {
             const ushort kb = kq2*BPT + j;
             threadgroup half4* d4 = (threadgroup half4*)(sb + (tb*4 + kb)*64 + rl*8);
-            if (aok) {
-                device const half4* s4 = (device const half4*)(A + mrow*K + k0 + kb*8u);
-                d4[0] = s4[0]; d4[1] = s4[1];
+            const uint kk = k0 + kb*8u;
+            if (aok && (!W8 || kk < K)) {
+                device const half4* s4 = (device const half4*)(A + mrow*K + kk);
+                d4[0] = s4[0]; d4[1] = (!W8 || kk + 8u <= K) ? s4[1] : half4(0.0h);
             } else {
                 d4[0] = half4(0.0h); d4[1] = half4(0.0h);
             }
@@ -369,6 +388,143 @@ template [[host_name("gemm_w8f16_m64n32")]] kernel decltype(gemm_w4f16_tile<64, 
 template [[host_name("gemm_w8f16_m32n32")]] kernel decltype(gemm_w4f16_tile<32, 32, true>) gemm_w4f16_tile<32, 32, true>;
 template [[host_name("gemm_w8f16_m16n32")]] kernel decltype(gemm_w4f16_tile<16, 32, true>) gemm_w4f16_tile<16, 32, true>;
 
+// --- the q4k lane's MMA GEMM ---
+// gemm_kq_tile is gemm_w4f16_tile over one segment of a q4k-lane projection (q4kSeg: a run of rows of one kind): the same
+// tile, the same 32-k slabs staged once into threadgroup memory, the same MMA chain and epilogue; only the weight staging
+// differs. Each staged weight is the value the lane's decode kernels compute with, rounded once to half:
+//   KIND 0, Q4_K super-blocks (144 bytes): d*sc*q - dmin*m;  KIND 1, Q5_K (176 bytes): the same with q's fifth bit from qh;
+//   KIND 2, Q6_K in the lane's planes over the segment (q6kPlanarRow): d*sc*(q - 32);  KIND 3, int8 rows: q*scale (WS, f32 a row).
+// d*sc*q and dmin*m are exact in f32 (at most 22 significant bits), so the difference rounds once to f32, then to half:
+// TestGemmKQ_stagesDecodeWeights reads every staged weight back through the kernel. The output goes to columns
+// [coff, coff+N) of C, rows ldc halves apart, so a fused group's segments write one buffer. K % 256 == 0 for the block kinds.
+inline void kq_scale_min(uint j, device const uchar* q, thread float& sc, thread float& m) {
+    if (j < 4u) { sc = float(q[j] & 63u); m = float(q[j+4u] & 63u); }
+    else { sc = float((q[j+4u] & 15u) | ((q[j-4u] >> 6u) << 4u)); m = float((q[j+4u] >> 4u) | ((q[j] >> 6u) << 4u)); }
+}
+
+// kq_stage8 writes the 8 weights k0+8kb .. k0+8kb+7 of row ncol to p[0], p[8], ..., p[56].
+template <uint KIND>
+inline void kq_stage8(device const uchar* W, device const float* WS, uint ncol, uint N, uint K, uint k0, ushort kb,
+    threadgroup half* p) {
+#pragma clang fp contract(off)
+    const uint NB = K >> 8u, sb = k0 >> 8u, j = (k0 & 255u) >> 5u;
+    if constexpr (KIND == 0u || KIND == 1u) {
+        const ulong bb = KIND == 0u ? 144ul : 176ul;
+        device const uchar* blk = W + ((ulong)ncol*NB + sb)*bb;
+        const half2 dd = as_type<half2>(*(device const uint*)blk);
+        float sc, m; kq_scale_min(j, blk + 4, sc, m);
+        const float dsc = float(dd.x)*sc, dmm = float(dd.y)*m;
+        const uint qoff = (KIND == 0u ? 16u : 48u) + (j >> 1u)*32u + uint(kb)*8u;
+        const uint2 q = *(device const uint2*)(blk + qoff);
+        uint2 h = uint2(0u);
+        if constexpr (KIND == 1u) h = *(device const uint2*)(blk + 16u + uint(kb)*8u);
+        const uint sh = (j & 1u)*4u;
+        for (ushort kl = 0; kl < 8; kl++) {
+            const uint by = (kl < 4 ? q.x : q.y) >> (8u*(kl & 3u));
+            uint v = (by >> sh) & 15u;
+            if constexpr (KIND == 1u) v |= ((((kl < 4 ? h.x : h.y) >> (8u*(kl & 3u))) >> j) & 1u) << 4u;
+            p[kl*8] = half(dsc*float(v) - dmm);
+        }
+    } else if constexpr (KIND == 2u) {
+        const uint T = N*NB, g = ncol*NB + sb;
+        const uint e = (k0 & 255u) + uint(kb)*8u, n = e >> 7u, qq = (e & 127u) >> 5u, l = e & 31u;
+        const uint2 ql = *(device const uint2*)(W + (ulong)g*128ul + n*64u + (qq & 1u)*32u + l);
+        const uint2 qh = *(device const uint2*)(W + (ulong)T*128ul + (ulong)g*64ul + n*32u + l);
+        const float sc = float(as_type<char>(W[(ulong)T*192ul + (ulong)g*16ul + n*8u + l/16u + 2u*qq]));
+        const float d = float(*(device const half*)(W + (ulong)T*208ul + (ulong)g*2ul));
+        const float dsc = d*sc;
+        const uint shl = (qq >> 1u)*4u, shh = 2u*qq;
+        for (ushort kl = 0; kl < 8; kl++) {
+            const uint s8 = 8u*(kl & 3u);
+            const uint v = (((kl < 4 ? ql.x : ql.y) >> s8 >> shl) & 15u) | ((((kl < 4 ? qh.x : qh.y) >> s8 >> shh) & 3u) << 4u);
+            p[kl*8] = half(dsc*float(int(v) - 32));
+        }
+    } else {
+        const float sc = WS[ncol];
+        const uint2 wd = *(device const uint2*)(W + (ulong)ncol*K + k0 + uint(kb)*8u);
+        const char4 c0 = as_type<char4>(wd.x), c1 = as_type<char4>(wd.y);
+        for (ushort kl = 0; kl < 8; kl++) p[kl*8] = half(float(kl < 4 ? c0[kl] : c1[kl - 4]) * sc);
+    }
+}
+
+template <ushort TM, ushort TN, uint KIND>
+kernel void gemm_kq_tile(device const half* A[[buffer(0)]], device const uchar* W[[buffer(1)]],
+    device const float* WS[[buffer(2)]], device half* C[[buffer(3)]],
+    constant uint& M[[buffer(4)]], constant uint& N[[buffer(5)]], constant uint& K[[buffer(6)]],
+    device const float* bias[[buffer(7)]], constant uint& mode[[buffer(8)]],
+    constant uint& ldc[[buffer(9)]], constant uint& coff[[buffer(10)]],
+    uint2 tgp[[threadgroup_position_in_grid]], ushort tid[[thread_index_in_threadgroup]],
+    ushort sg[[simdgroup_index_in_threadgroup]], ushort lane[[thread_index_in_simdgroup]]) {
+    constexpr ushort TT = TM/16, TF = TN/16;
+    constexpr ushort WT = 128/TN, WPT = 4/WT;
+    constexpr ushort AT = TM >= 32 ? 128/TM : 4, BPT = 4/AT;
+    threadgroup half sa[(TN/8)*4*72];
+    threadgroup half sb[(TM/8)*4*64];
+    threadgroup float cs[4*64];
+
+    const uint n0 = tgp.x*uint(TN), m0 = tgp.y*uint(TM);
+    const ushort fh = sg & 1, th = sg >> 1;
+    simdgroup_float8x8 acc[TT*TF];
+    for (ushort i = 0; i < TT*TF; i++) acc[i] = make_filled_simdgroup_matrix<float,8,8>(0.0f);
+
+    const ushort fr = tid / WT, kq = tid % WT;
+    const ushort fb = fr >> 3, nl = fr & 7;
+    const uint ncol = n0 + fr;
+    const bool wok = ncol < N;
+    const ushort tr = tid / AT, kq2 = tid % AT;
+    const ushort tb = tr >> 3, rl = tr & 7;
+    const uint mrow = m0 + tr;
+    const bool aok = mrow < M;
+
+    for (uint k0 = 0; k0 < K; k0 += 32u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (ushort w = 0; w < WPT; w++) {
+            const ushort kb = kq*WPT + w;
+            threadgroup half* p = sa + (fb*4 + kb)*72 + nl;
+            if (wok) {
+                kq_stage8<KIND>(W, WS, ncol, N, K, k0, kb, p);
+            } else {
+                for (ushort kl = 0; kl < 8; kl++) p[kl*8] = 0.0h;
+            }
+        }
+        for (ushort j = 0; j < BPT && (TM >= 32 || tr < TM); j++) {
+            const ushort kb = kq2*BPT + j;
+            threadgroup half4* d4 = (threadgroup half4*)(sb + (tb*4 + kb)*64 + rl*8);
+            if (aok) {
+                device const half4* s4 = (device const half4*)(A + mrow*K + k0 + kb*8u);
+                d4[0] = s4[0]; d4[1] = s4[1];
+            } else {
+                d4[0] = half4(0.0h); d4[1] = half4(0.0h);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (ushort ik = 0; ik < 4; ik++) {
+            simdgroup_half8x8 a[TT], b[TF];
+            for (ushort t = 0; t < TT; t++) simdgroup_load(a[t], sb + ((th*TT + t)*4 + ik)*64, 8);
+            for (ushort f = 0; f < TF; f++) simdgroup_load(b[f], sa + ((fh*TF + f)*4 + ik)*72, 8);
+            for (ushort t = 0; t < TT; t++)
+                for (ushort f = 0; f < TF; f++)
+                    simdgroup_multiply_accumulate(acc[t*TF + f], a[t], b[f], acc[t*TF + f]);
+        }
+    }
+
+    threadgroup float* myc = cs + sg*64;
+    for (ushort t = 0; t < TT; t++)
+        for (ushort f = 0; f < TF; f++)
+            gemm_epilogue_ld(myc, acc[t*TF + f], m0 + (th*TT + t)*8u, n0 + (fh*TF + f)*8u, M, N, ldc, coff, C, bias, mode, lane);
+}
+#define KQ_TILES(KIND, NAME) \
+template [[host_name("gemm_kq_" NAME "_m64n64")]] kernel decltype(gemm_kq_tile<64, 64, KIND>) gemm_kq_tile<64, 64, KIND>; \
+template [[host_name("gemm_kq_" NAME "_m32n64")]] kernel decltype(gemm_kq_tile<32, 64, KIND>) gemm_kq_tile<32, 64, KIND>; \
+template [[host_name("gemm_kq_" NAME "_m64n32")]] kernel decltype(gemm_kq_tile<64, 32, KIND>) gemm_kq_tile<64, 32, KIND>; \
+template [[host_name("gemm_kq_" NAME "_m32n32")]] kernel decltype(gemm_kq_tile<32, 32, KIND>) gemm_kq_tile<32, 32, KIND>; \
+template [[host_name("gemm_kq_" NAME "_m16n32")]] kernel decltype(gemm_kq_tile<16, 32, KIND>) gemm_kq_tile<16, 32, KIND>;
+KQ_TILES(0u, "q4k")
+KQ_TILES(1u, "q5k")
+KQ_TILES(2u, "q6k")
+KQ_TILES(3u, "int8")
+
 // rmsnorm_quant_f16: RMSNorm a single f16 row and fused-quantize it to int8 + f32 scale — the
 // f16-input twin of the decode path's rmsnorm_quant. Prefill's LM head is the SAME int8-pinned,
 // logit-critical head the decode path uses (weights int8, not int4), so the last token's
@@ -397,7 +553,7 @@ kernel void rmsnorm_quant_f16(device const half* x[[buffer(0)]], device const fl
 
 // rmsnorm_f16: one threadgroup per row. out[m] = x[m]*rsqrt(mean(x[m]²)+eps)*w (w f32).
 // addOne selects Gemma's (1+w) RMS offset vs plain w — mirrors decoder's rmsnorm.go / the decode
-// path's rmsnorm_quant (kernels.go). G8 (docs/tasks/task-gpu-paths-2026-09.md): added so this kernel
+// path's rmsnorm_quant (kernels.go). G8: added so this kernel
 // can serve BOTH a GEMV-input norm (Llama/Qwen, addOne=0) and Gemma's sandwich norm on a sublayer
 // OUTPUT (addOne=1) — same math either way, only the weight convention differs.
 kernel void rmsnorm_f16(device const half* x[[buffer(0)]], device const float* w[[buffer(1)]],
@@ -414,7 +570,20 @@ kernel void rmsnorm_f16(device const half* x[[buffer(0)]], device const float* w
     for(uint i=tid;i<H;i+=tgs){ float g=addOne!=0u?(1.0f+w[i]):w[i]; orow[i]=half(float(xr[i])*rms*g); }
 }
 
-// layernorm_f16 / layernorm_quant_f16 (docs/tasks/task-metal-pairwise-followups-2026-10.md, Part B): rmsnorm_f16 and
+// rmsnorm_f16_f32out is rmsnorm_f16 on one row with an f32 output, the q4k lane head's input (decode's rmsnorm_f32_out, whose
+// precise rsqrt it takes).
+kernel void rmsnorm_f16_f32out(device const half* x[[buffer(0)]], device const float* w[[buffer(1)]],
+    device float* out[[buffer(2)]], constant uint& H[[buffer(3)]], constant float& eps[[buffer(4)]],
+    constant uint& addOne[[buffer(5)]], uint tid[[thread_index_in_threadgroup]], uint tgs[[threads_per_threadgroup]]) {
+    threadgroup float red[256];
+    float ss=0; for(uint i=tid;i<H;i+=tgs){ float v=float(x[i]); ss+=v*v; }
+    red[tid]=ss; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint s=tgs/2u;s>0u;s>>=1u){ if(tid<s) red[tid]+=red[tid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float rms=precise::rsqrt(red[0]/float(H)+eps);
+    for(uint i=tid;i<H;i+=tgs){ float g=addOne!=0u?(1.0f+w[i]):w[i]; out[i]=float(x[i])*rms*g; }
+}
+
+// layernorm_f16 / layernorm_quant_f16: rmsnorm_f16 and
 // rmsnorm_quant_f16 for a bias-free LayerNorm (Cohere / Command-R7B): out = (x - mean) * rsqrt(var + eps) * w, the math of
 // the decode path's layernorm_quant with hasBias 0. Same signatures as the RMSNorm twins (addOne is accepted and unused:
 // no LayerNorm family carries Gemma's 1+w), so a dispatch site only swaps the pipeline. A biased LayerNorm (GPT-2) does not
@@ -469,7 +638,7 @@ kernel void residual_f16(device half* x[[buffer(0)]], device const half* y[[buff
 kernel void residual_f16_scaled(device half* x[[buffer(0)]], device const half* y[[buffer(1)]], constant float& inv[[buffer(2)]],
     uint i[[thread_position_in_grid]]) { x[i]=half(float(x[i])+float(y[i])*inv); }
 
-// residual_f16_from_f32: x += y, x is f16, y is f32 (G8, docs/tasks/task-gpu-paths-2026-09.md). The
+// residual_f16_from_f32: x += y, x is f16, y is f32. The
 // batched-prefill MoE row loop's expert-combine dispatches (encodeMoEExperts/
 // encodeMoESharedExpert, metal/moe.go) are F32-only — reused UNCHANGED for the per-row loop by
 // pointing their accumulate target at an isolated F32 scratch buffer instead of prefill's own F16
@@ -531,7 +700,7 @@ kernel void rope_f16(device half* x[[buffer(0)]], device const float* invf[[buff
     x[base+dd]=half(x0*c-x1*s); x[base+rhalf+dd]=half(x0*s+x1*c);
 }
 
-// rope_mrope_f16 (S16, docs/tasks/task-multimodal-support-2026-10.md): rope_f16 for Qwen's multimodal RoPE. Each row has
+// rope_mrope_f16: rope_f16 for Qwen's multimodal RoPE. Each row has
 // three positions (temporal, height, width) in pos3[m*3..], and rotary pair dd turns by pos3[m*3 + axis[dd]]. axis is the
 // host's own table from decoder's mropeComponent / mropeComponentInterleaved (contiguous sections for Qwen2.5-VL, strided
 // for Qwen3.5+/Qwen3-VL), built once per model, so the kernel carries no layout formula of its own. A text row has three
@@ -551,10 +720,10 @@ kernel void rope_mrope_f16(device half* x[[buffer(0)]], device const float* invf
     x[base+dd]=half(x0*c-x1*s); x[base+rhalf+dd]=half(x0*s+x1*c);
 }
 
-// rope_f16_pw / rope_mrope_f16_pw (docs/tasks/task-metal-pairwise-rope-2026-10.md): rope_f16 / rope_mrope_f16 for GPT-J
+// rope_f16_pw / rope_mrope_f16_pw: rope_f16 / rope_mrope_f16 for GPT-J
 // PAIRWISE rotation, pair dd = dims (2dd, 2dd+1), as decoder's rope.go's applyRoPEInterleaved and applyMRoPEPairwise (GLM-OCR's
 // contiguous m-RoPE sections come in through the same host axis table). Same arguments and grid; bound for a model whose
-// decoder.Model.PairwiseRoPEResident() is true, and nowhere else.
+// decoder.Model.BackendView().PairwiseRoPE() is true, and nowhere else.
 kernel void rope_f16_pw(device half* x[[buffer(0)]], device const float* invf[[buffer(1)]],
     constant uint& hd[[buffer(2)]], device const uint* positions[[buffer(3)]],
     constant uint& total[[buffer(4)]], constant uint& stride[[buffer(5)]],
@@ -615,6 +784,7 @@ kernel void attention_prefill(device const half* qkv[[buffer(0)]], device const 
     device const half* vc[[buffer(2)]], device half* out[[buffer(3)]], constant uint& nH[[buffer(4)]],
     constant uint& nKV[[buffer(5)]], constant uint& hd[[buffer(6)]], constant uint& startPos[[buffer(7)]],
     constant float& scale[[buffer(8)]], constant uint& qStride[[buffer(9)]], constant uint& window[[buffer(10)]],
+    device const uint* kt[[buffer(11)]],
     uint gid[[threadgroup_position_in_grid]], uint tid[[thread_index_in_threadgroup]],
     uint tgs[[threads_per_threadgroup]]) {
     uint m = gid / nH, qh = gid % nH;
@@ -628,7 +798,7 @@ kernel void attention_prefill(device const half* qkv[[buffer(0)]], device const 
     threadgroup float sc[4096];
     threadgroup float red[128];
     for (uint s=winStart+tid; s<nKeys; s+=tgs) {
-        float a=0; device const half* k=kb+s*kvDim; uint d=0;
+        float a=0; device const half* k=kb+kv_row(kt,s)*kvDim; uint d=0;
         // half4 vectorized K-read (coalescing fix, bit-identical; guarded on hd%4==0, scalar tail).
         if ((hd&3u)==0u) for (; d<hd; d+=4u){ half4 k4=*((device const half4*)(k+d)); a+=float(qr[d])*float(k4.x); a+=float(qr[d+1u])*float(k4.y); a+=float(qr[d+2u])*float(k4.z); a+=float(qr[d+3u])*float(k4.w); }
         for (; d<hd; d++) a += float(qr[d])*float(k[d]);
@@ -648,7 +818,7 @@ kernel void attention_prefill(device const half* qkv[[buffer(0)]], device const 
     red[tid]=ls; threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint st=tgs/2u; st>0u; st>>=1u){ if(tid<st) red[tid]+=red[tid+st]; threadgroup_barrier(mem_flags::mem_threadgroup); }
     float sum=red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint d=tid; d<hd; d+=tgs){ float a=0; for(uint s=winStart;s<nKeys;s++) a += sc[s]*float(vb[s*kvDim+d]); out[m*qDim + qh*hd + d]=half(a/sum); }
+    for (uint d=tid; d<hd; d+=tgs){ float a=0; for(uint s=winStart;s<nKeys;s++) a += sc[s]*float(vb[kv_row(kt,s)*kvDim+d]); out[m*qDim + qh*hd + d]=half(a/sum); }
 }
 
 // attention_prefill_tiled: attention_prefill for a pass past its 4,096-score buffer (P28). The scores go through sc[] one tile of
@@ -668,7 +838,7 @@ kernel void attention_prefill_tiled(device const half* qkv[[buffer(0)]], device 
     device const half* vc[[buffer(2)]], device half* out[[buffer(3)]], constant uint& nH[[buffer(4)]],
     constant uint& nKV[[buffer(5)]], constant uint& hd[[buffer(6)]], constant uint& startPos[[buffer(7)]],
     constant float& scale[[buffer(8)]], constant uint& qStride[[buffer(9)]], constant uint& window[[buffer(10)]],
-    constant uint& tile[[buffer(11)]],
+    constant uint& tile[[buffer(11)]], device const uint* kt[[buffer(12)]],
     uint gid[[threadgroup_position_in_grid]], uint tid[[thread_index_in_threadgroup]],
     uint tgs[[threads_per_threadgroup]]) {
     uint m = gid / nH, qh = gid % nH;
@@ -682,7 +852,7 @@ kernel void attention_prefill_tiled(device const half* qkv[[buffer(0)]], device 
     threadgroup float sc[4096];
     threadgroup float red[128];
     float mmax=-INFINITY;
-    for (uint s=winStart+tid; s<nKeys; s+=tgs) mmax=max(mmax, prefill_score(qr, kb+s*kvDim, hd, scale));
+    for (uint s=winStart+tid; s<nKeys; s+=tgs) mmax=max(mmax, prefill_score(qr, kb+kv_row(kt,s)*kvDim, hd, scale));
     mmax = simd_max(mmax);
     uint sgidA = tid >> 5u, laneA = tid & 31u;
     if (laneA == 0) red[sgidA] = mmax;
@@ -696,9 +866,9 @@ kernel void attention_prefill_tiled(device const half* qkv[[buffer(0)]], device 
     for (uint t0=winStart; t0<nKeys; t0+=tile) {
         uint t1 = min(t0+tile, nKeys);
         uint own = t0 + (tid + tgs - (t0-winStart)%tgs) % tgs; // this thread's first key in the tile: s - winStart == tid mod tgs
-        for (uint s=own; s<t1; s+=tgs){ float p=exp(prefill_score(qr, kb+s*kvDim, hd, scale)-mx); sc[s-t0]=p; ls+=p; }
+        for (uint s=own; s<t1; s+=tgs){ float p=exp(prefill_score(qr, kb+kv_row(kt,s)*kvDim, hd, scale)-mx); sc[s-t0]=p; ls+=p; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint j=0u, d=tid; d<hd; j++, d+=tgs){ float a=acc[j]; for(uint s=t0;s<t1;s++) a += sc[s-t0]*float(vb[s*kvDim+d]); acc[j]=a; }
+        for (uint j=0u, d=tid; d<hd; j++, d+=tgs){ float a=acc[j]; for(uint s=t0;s<t1;s++) a += sc[s-t0]*float(vb[kv_row(kt,s)*kvDim+d]); acc[j]=a; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     red[tid]=ls; threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -707,7 +877,7 @@ kernel void attention_prefill_tiled(device const half* qkv[[buffer(0)]], device 
     for (uint j=0u, d=tid; d<hd; j++, d+=tgs) out[m*qDim + qh*hd + d]=half(acc[j]/sum);
 }
 
-// attention_prefill_img (S17's Metal image prefill, docs/tasks/task-multimodal-support-2026-10.md): attention_prefill with
+// attention_prefill_img (S17's Metal image prefill): attention_prefill with
 // image blocks [b.x, b.y) in absolute positions that attend BIDIRECTIONALLY, as the CPU's KVCache.attendHi and CUDA's
 // PrefillImageLast: a query inside a block sees keys up to that block's b.y - 1 (its own block only; several blocks for
 // several images, S11), every other query stays causal, and the sliding window's lower bound stays at the causal
@@ -717,7 +887,7 @@ kernel void attention_prefill_img(device const half* qkv[[buffer(0)]], device co
     device const half* vc[[buffer(2)]], device half* out[[buffer(3)]], constant uint& nH[[buffer(4)]],
     constant uint& nKV[[buffer(5)]], constant uint& hd[[buffer(6)]], constant uint& startPos[[buffer(7)]],
     constant float& scale[[buffer(8)]], constant uint& qStride[[buffer(9)]], constant uint& window[[buffer(10)]],
-    device const uint2* blocks[[buffer(11)]], constant uint& nBlocks[[buffer(12)]],
+    device const uint2* blocks[[buffer(11)]], constant uint& nBlocks[[buffer(12)]], device const uint* kt[[buffer(13)]],
     uint gid[[threadgroup_position_in_grid]], uint tid[[thread_index_in_threadgroup]],
     uint tgs[[threads_per_threadgroup]]) {
     uint m = gid / nH, qh = gid % nH;
@@ -734,7 +904,7 @@ kernel void attention_prefill_img(device const half* qkv[[buffer(0)]], device co
     threadgroup float sc[4096];
     threadgroup float red[128];
     for (uint s=winStart+tid; s<nKeys; s+=tgs) {
-        float a=0; device const half* k=kb+s*kvDim; uint d=0;
+        float a=0; device const half* k=kb+kv_row(kt,s)*kvDim; uint d=0;
         if ((hd&3u)==0u) for (; d<hd; d+=4u){ half4 k4=*((device const half4*)(k+d)); a+=float(qr[d])*float(k4.x); a+=float(qr[d+1u])*float(k4.y); a+=float(qr[d+2u])*float(k4.z); a+=float(qr[d+3u])*float(k4.w); }
         for (; d<hd; d++) a += float(qr[d])*float(k[d]);
         sc[s]=attn_score(a*scale);
@@ -753,11 +923,11 @@ kernel void attention_prefill_img(device const half* qkv[[buffer(0)]], device co
     red[tid]=ls; threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint st=tgs/2u; st>0u; st>>=1u){ if(tid<st) red[tid]+=red[tid+st]; threadgroup_barrier(mem_flags::mem_threadgroup); }
     float sum=red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint d=tid; d<hd; d+=tgs){ float a=0; for(uint s=winStart;s<nKeys;s++) a += sc[s]*float(vb[s*kvDim+d]); out[m*qDim + qh*hd + d]=half(a/sum); }
+    for (uint d=tid; d<hd; d+=tgs){ float a=0; for(uint s=winStart;s<nKeys;s++) a += sc[s]*float(vb[kv_row(kt,s)*kvDim+d]); out[m*qDim + qh*hd + d]=half(a/sum); }
 }
 
-// attention_prefill_fused: the simdgroup_matrix (MMA) flash-attention twin of attention_prefill
-// (L2-Metal, docs/completed/task-prefill-gap.md §4). One simdgroup per (query head, 8-row query tile);
+// attention_prefill_fused: the simdgroup_matrix (MMA) flash-attention twin of attention_prefill.
+// One simdgroup per (query head, 8-row query tile);
 // QKᵀ and PV are both 8×8-tiled MMA matmuls (hd/8 tiles each), replacing attention_prefill's
 // per-key scalar dot products and its fully-serial PV scan. K is read K^T-transposed straight
 // from the row-major cache via simdgroup_load's transpose flag (confirmed against
@@ -789,7 +959,7 @@ kernel void attention_prefill_fused(device const half* qkv[[buffer(0)]], device 
     device const half* vc[[buffer(2)]], device half* out[[buffer(3)]], constant uint& nH[[buffer(4)]],
     constant uint& nKV[[buffer(5)]], constant uint& hd[[buffer(6)]], constant uint& startPos[[buffer(7)]],
     constant float& scale[[buffer(8)]], constant uint& qStride[[buffer(9)]], constant uint& window[[buffer(10)]],
-    constant uint& M[[buffer(11)]],
+    constant uint& M[[buffer(11)]], device const uint* kt[[buffer(12)]],
     uint tgid[[threadgroup_position_in_grid]], uint sgid[[simdgroup_index_in_threadgroup]],
     uint sgpt[[simdgroups_per_threadgroup]], uint lane[[thread_index_in_simdgroup]]) {
     uint numRowTiles = (M + 7u) / 8u;
@@ -832,7 +1002,7 @@ kernel void attention_prefill_fused(device const half* qkv[[buffer(0)]], device 
             simdgroup_float8x8 Sacc = make_filled_simdgroup_matrix<float,8,8>(0.0);
             for (uint kk=0; kk<hdTiles; kk++) {
                 simdgroup_half8x8 kT;
-                simdgroup_load(kT, kBase + j0*kvDim + kk*8u, kvDim, ulong2(0,0), true);
+                simdgroup_load(kT, kBase + kv_row(kt,j0)*kvDim + kk*8u, kvDim, ulong2(0,0), true);
                 simdgroup_multiply_accumulate(Sacc, qTile[kk], kT, Sacc);
             }
             simdgroup_store(Sacc, sScr[sgid] + sub*8u, ATTN_KTILE);
@@ -876,7 +1046,7 @@ kernel void attention_prefill_fused(device const half* qkv[[buffer(0)]], device 
             for (uint sub=0; sub<nsub; sub++) {
                 simdgroup_half8x8 pTile, vTile;
                 simdgroup_load(pTile, pScr[sgid] + sub*8u, ATTN_KTILE);
-                simdgroup_load(vTile, vBase + (j0s+sub*8u)*kvDim + cc*8u, kvDim);
+                simdgroup_load(vTile, vBase + kv_row(kt,j0s+sub*8u)*kvDim + cc*8u, kvDim);
                 simdgroup_multiply_accumulate(pvAcc, pTile, vTile, pvAcc);
             }
             simdgroup_store(pvAcc, sScr[sgid], 8); // scratch reuse: this group's scores are consumed
@@ -900,7 +1070,7 @@ kernel void attention_prefill_fused(device const half* qkv[[buffer(0)]], device 
     }
 }
 
-// attention_prefill_steel (R19, docs/tasks/red-october.md): prefill attention in the shape of MLX 0.32.0's
+// attention_prefill_steel: prefill attention in the shape of MLX 0.32.0's
 // steel_attention (bq32 bk16 bd128), for head dim 128. One threadgroup per (query head, 32 query rows); its 4 simdgroups
 // own 8 rows each, and each 16-key K/V block is staged ONCE in padded threadgroup memory and read by all 32 rows. O stays
 // in registers (16 8x8 fragments per simdgroup, rescaled in place); the online softmax runs on every lane through the
@@ -919,7 +1089,7 @@ kernel void attention_prefill_steel(device const half* qkv[[buffer(0)]], device 
     device const half* vc[[buffer(2)]], device half* out[[buffer(3)]], constant uint& nH[[buffer(4)]],
     constant uint& nKV[[buffer(5)]], constant uint& hd[[buffer(6)]], constant uint& startPos[[buffer(7)]],
     constant float& scale[[buffer(8)]], constant uint& qStride[[buffer(9)]], constant uint& window[[buffer(10)]],
-    constant uint& M[[buffer(11)]],
+    constant uint& M[[buffer(11)]], device const uint* kt[[buffer(12)]],
     uint tgid[[threadgroup_position_in_grid]], ushort sgid[[simdgroup_index_in_threadgroup]],
     ushort lane[[thread_index_in_simdgroup]], ushort tid[[thread_index_in_threadgroup]]) {
     constexpr ushort LD = HD + 8;
@@ -971,8 +1141,9 @@ kernel void attention_prefill_steel(device const half* qkv[[buffer(0)]], device 
             uint j = j0 + key;
             half4 kv4 = half4(0.0h), vv4 = half4(0.0h);
             if (j < jEnd) {
-                kv4 = *(device const half4*)(kc + j * kvDim + kvh * HD + d4);
-                vv4 = *(device const half4*)(vc + j * kvDim + kvh * HD + d4);
+                uint jr = kv_row(kt, j);
+                kv4 = *(device const half4*)(kc + jr * kvDim + kvh * HD + d4);
+                vv4 = *(device const half4*)(vc + jr * kvDim + kvh * HD + d4);
             }
             *(threadgroup half4*)(Ks + key * LD + d4) = kv4;
             *(threadgroup half4*)(Vs + key * LD + d4) = vv4;
@@ -1058,7 +1229,7 @@ kernel void attention_prefill_steel_split(device const half* qkv[[buffer(0)]], d
     device const half* vc[[buffer(2)]], device half* out[[buffer(3)]], constant uint& nH[[buffer(4)]],
     constant uint& nKV[[buffer(5)]], constant uint& hd[[buffer(6)]], constant uint& startPos[[buffer(7)]],
     constant float& scale[[buffer(8)]], constant uint& qStride[[buffer(9)]], constant uint& window[[buffer(10)]],
-    constant uint& M[[buffer(11)]],
+    constant uint& M[[buffer(11)]], device const uint* kt[[buffer(12)]],
     uint tgid[[threadgroup_position_in_grid]], ushort sgid[[simdgroup_index_in_threadgroup]],
     ushort lane[[thread_index_in_simdgroup]], ushort tid[[thread_index_in_threadgroup]]) {
     constexpr ushort NS = HD / 128, NR = 8 / NS, BQ = NR * 8;
@@ -1109,8 +1280,9 @@ kernel void attention_prefill_steel_split(device const half* qkv[[buffer(0)]], d
             uint j = j0 + key;
             half4 kv4 = half4(0.0h), vv4 = half4(0.0h);
             if (j < jEnd) {
-                kv4 = *(device const half4*)(kc + j * kvDim + kvh * HD + d4);
-                vv4 = *(device const half4*)(vc + j * kvDim + kvh * HD + d4);
+                uint jr = kv_row(kt, j);
+                kv4 = *(device const half4*)(kc + jr * kvDim + kvh * HD + d4);
+                vv4 = *(device const half4*)(vc + jr * kvDim + kvh * HD + d4);
             }
             *(threadgroup half4*)(Ks + key * LD + d4) = kv4;
             *(threadgroup half4*)(Vs + key * LD + d4) = vv4;
@@ -1199,12 +1371,12 @@ template [[host_name("attention_prefill_steel_hd512")]] kernel decltype(attentio
 kernel void kv_store_f16(device const half* qkv[[buffer(0)]], device half* kc[[buffer(1)]],
     device half* vc[[buffer(2)]], device const uint* positions[[buffer(3)]],
     constant uint& kvDim[[buffer(4)]], constant uint& stride[[buffer(5)]],
-    constant uint& kOff[[buffer(6)]], constant uint& vOff[[buffer(7)]],
+    constant uint& kOff[[buffer(6)]], constant uint& vOff[[buffer(7)]], device const uint* kt[[buffer(8)]],
     uint gid[[thread_position_in_grid]]) {
     uint m = gid / kvDim, i = gid % kvDim;
-    uint pos = positions[m];
-    kc[pos*kvDim + i] = qkv[m*stride + kOff + i];
-    vc[pos*kvDim + i] = qkv[m*stride + vOff + i];
+    uint row = kv_row(kt, positions[m]);
+    kc[row*kvDim + i] = qkv[m*stride + kOff + i];
+    vc[row*kvDim + i] = qkv[m*stride + vOff + i];
 }
 
 // router_gemm_f16: batched router projection — normF[M×H](f16) · routerWᵀ[nE×H](f32) → logits[M×nE](f32).

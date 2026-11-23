@@ -1,7 +1,6 @@
 package decoder
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 )
@@ -18,7 +17,7 @@ import (
 // topk_group of n_group groups (noaux_tc), while V2/V2-Lite use softmax + plain greedy
 // top-k. first_k_dense_replace dense-MLP prefix, ungated shared expert (the GLM path).
 func deepseekArchitecture(cfg *Config) (*Architecture, *tensorSchema, error) {
-	if err := cfg.validateDeepseek(); err != nil {
+	if err := cfg.ValidateDeepseek(); err != nil {
 		return nil, nil, err
 	}
 	// RoPE: the tiny synthetic carries rope_parameters {rope_theta, rope_type}; the real
@@ -56,7 +55,9 @@ func deepseekArchitecture(cfg *Config) (*Architecture, *tensorSchema, error) {
 			Mscale       *float64 `json:"mscale"`
 			MscaleAllDim *float64 `json:"mscale_all_dim"`
 		}
-		_ = json.Unmarshal(raw, &y)
+		if err := rereadRope(cfg.ModelType, raw, &y); err != nil {
+			return nil, nil, err
+		}
 		if y.Mscale != nil || y.MscaleAllDim != nil {
 			m, mAll := 1.0, 1.0
 			if y.Mscale != nil {

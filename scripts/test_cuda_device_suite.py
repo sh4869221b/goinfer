@@ -37,13 +37,13 @@ def failing(name):
     return [ev("run", name), ev("output", name, "    x_test.go:9: boom\n"), ev("fail", name)]
 
 
-def run(events, rc=0):
+def run(events, rc=0, *extra):
     """The runner on a fake `go test -json` that prints the events and exits rc. Returns (exit, output)."""
     with tempfile.TemporaryDirectory() as d:
         fake = os.path.join(d, "fake.py")
         with open(fake, "w") as f:
             f.write("import sys\nfor l in %r:\n    print(l)\nsys.exit(%d)\n" % (events, rc))
-        p = subprocess.run([sys.executable, os.path.join(HERE, "cuda_device_suite.py"), "--", sys.executable, fake],
+        p = subprocess.run([sys.executable, os.path.join(HERE, "cuda_device_suite.py"), *extra, "--", sys.executable, fake],
                            capture_output=True, text=True)
     return p.returncode, p.stdout
 
@@ -91,6 +91,124 @@ class Verdict(unittest.TestCase):
         rc, out = run(passing("TestA"), rc=2)
         self.assertEqual(rc, 1, out)
         self.assertIn("exited 2", out)
+
+
+class Metal(unittest.TestCase):
+    """--backend metal: the Metal module's own skip wording is a device skip, and the summary line carries the backend."""
+
+    def test_eachMetalDeviceSkipWordingIsRed(self):
+        for why in ("no metal device: x", "no Metal device: x", "no GPU device: x", "device: open failed", "EnableResident: nope (no Metal device?)",
+                    "not resident on Metal: tiny"):
+            rc, out = run(passing("TestA") + skipping("TestNeedsGPU", why), 0, "--backend", "metal")
+            self.assertEqual(rc, 1, why)
+            self.assertIn("metal-device-suite: 1 passed, 0 failed, 1 device skips", out)
+            self.assertIn("VERDICT: RED", out)
+
+    def test_theCudaPatternDoesNotCatchMetalWordingAndViceVersa(self):
+        rc, _ = run(passing("TestA") + skipping("TestNeedsGPU", "no metal device: x"), 0)
+        self.assertEqual(rc, 0)
+        rc, _ = run(passing("TestA") + skipping("TestNeedsGPU", "no CUDA device"), 0, "--backend", "metal")
+        self.assertEqual(rc, 1)  # "no CUDA device" still matches the shared "no ... device" arm
+
+    def test_assetAndMemoryGuardSkipsAreGreen(self):
+        for why in ("GOINFER_HEAVY_TESTS not set", "model not found under ~/models",
+                    "not run: the Metal memory guard declined the resident build on this machine right now (x)", "this device makes no residency set: x",
+                    "Metal does not build this fixture resident"):
+            rc, out = run(passing("TestA") + skipping("TestAsset", why), 0, "--backend", "metal")
+            self.assertEqual(rc, 0, (why, out))
+
+    def test_aFailingMetalTestIsRedAndNamed(self):
+        rc, out = run(passing("TestA") + failing("TestBroken"), 1, "--backend", "metal")
+        self.assertEqual(rc, 1)
+        self.assertIn("TestBroken", "\n".join(out.splitlines()[-25:]))
+
+
+class NewSkips(unittest.TestCase):
+    """--state: a test that passed last run and skips now is NEW SKIPS; a reason that is not an asset or opt-in is red, and stays red until it passes."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.state = os.path.join(self.d, "state.json")
+
+    def night(self, events, rc=0):
+        return run(events, rc, "--state", self.state)
+
+    def test_theFirstRunHasNothingToCompareWithAndWritesTheState(self):
+        rc, out = self.night(passing("TestA") + passing("TestB"))
+        self.assertEqual(rc, 0)
+        self.assertNotIn("NEW SKIPS", out)
+        self.assertEqual(sorted(json.load(open(self.state))["passed"]), [PKG + ".TestA", PKG + ".TestB"])
+
+    def test_aTestThatPassedAndNowSkipsForAnUnexplainedReasonIsRed(self):
+        self.night(passing("TestA") + passing("TestB"))
+        rc, out = self.night(passing("TestA") + skipping("TestB", "resident path declined"))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NEW SKIPS, passed last time", out)
+        self.assertIn(PKG + ".TestB", "\n".join(out.splitlines()[-25:]))
+
+    def test_itStaysRedUntilTheTestPassesAgain(self):
+        self.night(passing("TestA") + passing("TestB"))
+        self.night(passing("TestA") + skipping("TestB", "resident path declined"))
+        rc, _ = self.night(passing("TestA") + skipping("TestB", "resident path declined"))
+        self.assertEqual(rc, 1)
+        rc, _ = self.night(passing("TestA") + passing("TestB"))
+        self.assertEqual(rc, 0)
+
+    def test_anAssetOrOptInReasonIsCountedNotRed(self):
+        for why in ("GOINFER_HEAVY_TESTS not set", "no checkpoint at ~/models/x", "model not found"):
+            self.setUp()
+            self.night(passing("TestA") + passing("TestB"))
+            rc, out = self.night(passing("TestA") + skipping("TestB", why))
+            self.assertEqual(rc, 0, (why, out))
+            self.assertIn("NEW SKIPS, asset or opt-in wording", out)
+
+    def test_aTestThatWasAlwaysSkippedIsNotNew(self):
+        self.night(passing("TestA") + skipping("TestB", "resident path declined"))
+        rc, out = self.night(passing("TestA") + skipping("TestB", "resident path declined"))
+        self.assertEqual(rc, 0, out)
+
+    def test_aFailedRunWithNoPassesLeavesTheStateAlone(self):
+        self.night(passing("TestA"))
+        self.night(failing("TestA"), 1)
+        self.assertEqual(json.load(open(self.state))["passed"], [PKG + ".TestA"])
+
+    def test_withoutAStateFileNothingChanges(self):
+        rc, out = run(passing("TestA") + skipping("TestB", "resident path declined"))
+        self.assertEqual(rc, 0)
+        self.assertNotIn("NEW SKIPS", out)
+
+
+class Tokens(unittest.TestCase):
+    """internal/testgate's leading tokens decide before the wording patterns, on both backends: SKIP-DEVICE is a device skip
+    whatever follows it, and SKIP-HEAVY / SKIP-ASSET are asset or opt-in skips even when the message mentions a device."""
+
+    def judge(self, why, backend, prev=None):
+        events = [json.loads(l) for l in passing("TestA") + skipping("TestB", why)]
+        return cds.judge(events, 0, [], backend=backend, prev_passed=prev)
+
+    def test_skipDeviceIsRedWhateverItsWording(self):
+        for backend in ("cuda", "metal"):
+            red, lines = self.judge("SKIP-DEVICE: primary ctx: CUDA_ERROR_INVALID_CONTEXT", backend)
+            self.assertTrue(red, (backend, lines))
+            self.assertIn("1 device skips", "\n".join(lines))
+
+    def test_skipHeavyAndSkipAssetAreNotDeviceSkips(self):
+        for backend in ("cuda", "metal"):
+            for why in ("SKIP-HEAVY: no device needed until GOINFER_HEAVY_TESTS=1", "SKIP-ASSET: no cuda device tower at ~/models/x"):
+                red, lines = self.judge(why, backend)
+                self.assertFalse(red, (backend, why, lines))
+
+    def test_aTokenedNewSkipIsCountedNotRed(self):
+        for why in ("SKIP-ASSET: tower.bin gone", "SKIP-HEAVY: opt in"):
+            red, lines = self.judge(why, "cuda", prev={f"{PKG}.TestB"})
+            self.assertFalse(red, (why, lines))
+            self.assertIn("NEW SKIPS, asset or opt-in wording", "\n".join(lines))
+
+    def test_theTokensAreTestgates(self):
+        with open(os.path.join(os.path.dirname(HERE), "internal", "testgate", "testgate.go")) as f:
+            src = f.read()
+        for tok in (cds.TOKEN_DEVICE, cds.TOKEN_HEAVY, cds.TOKEN_ASSET):
+            self.assertIn(f'"{tok}"', src)
 
 
 class Plant(unittest.TestCase):

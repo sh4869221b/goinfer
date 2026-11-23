@@ -23,10 +23,13 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 func TestGptOss120_sliceLoads(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	const ckpt = "testdata/gptoss120-slice"
 	if _, err := os.Stat(filepath.Join(ckpt, "model.safetensors")); errors.Is(err, fs.ErrNotExist) {
 		t.Skipf("no 120b slice at %s — build it from a partial openai/gpt-oss-120b download", ckpt)
@@ -125,5 +128,5 @@ func TestGptOss120_sliceLoads(t *testing.T) {
 		t.Fatalf("logits: %d/%d finite, %d non-zero", finite, len(logits), nz)
 	}
 	t.Logf("gpt-oss-120b slice: %d layers x %d experts loaded; argmax %d over %d finite logits",
-		a.NumLayers, a.MoE.NumExperts, argmax(logits), finite)
+		a.NumLayers, a.MoE.NumExperts, sampling.Argmax(logits), finite)
 }

@@ -3,6 +3,7 @@ package serveapp
 import (
 	"bytes"
 	"fmt"
+	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 	"io"
 	"os"
 	"path/filepath"
@@ -21,7 +22,7 @@ type attachableTower interface {
 
 // attachGemma3Tower loads Gemma 3's SigLIP encoder (load(true) is the int8 one) and attaches its device-resident form.
 //
-// On CUDA the unset default is the float32 tower (docs/tasks/task-multimodal-support-2026-10.md, "Night 2026-10-08"); a
+// On CUDA the unset default is the float32 tower; a
 // card without room for it would drop the request to the much slower CPU tower, worse than the int8 device tower. So
 // when fallback is set (float32 was the DEFAULT, not asked for) a float32 attach that does not take is released and the
 // int8 tower is attached in its place, with a line saying why. An explicit `-vision-quant f32` sets fallback false:
@@ -99,8 +100,8 @@ func resolveGemma3VisionQuant(cfg config, note io.Writer) config {
 		return cfg
 	}
 	cfg.visionQuant = "int8"
-	fmt.Fprintf(note, "note: the float32 Gemma 3 vision tower is the CUDA default, but this card has %.1f GB free and the decoder, one KV slot and that tower need about %.1f GB: using the int8 device tower "+
-		"(-vision-quant f32 forces float32)\n", float64(free)/1e9, float64(need)/1e9)
+	fmt.Fprintf(note, "note: the float32 Gemma 3 vision tower is the CUDA default, but this card has %s free and the decoder, one KV slot and that tower need about %s: using the int8 device tower "+
+		"(-vision-quant f32 forces float32)\n", mem.GiB(free), mem.GiB(need))
 	return cfg
 }
 
@@ -144,7 +145,7 @@ func resolveGemma3VisionQuantMetal(cfg config, note io.Writer) config {
 		// The sidecar the load will look for: the RESOLVED quant and embed-int4 (Options: off by default on Metal, whose
 		// resident takes no int4 head), not the raw flags, which asked for the ".e4h" sidecar a Metal load never reads.
 		o := cfg.load.Options()
-		if _, fresh := sidecarFresh(path, o.Quant, "metal", o.EmbedInt4); !fresh {
+		if _, fresh := sidecarFresh(path, o.Quant, "metal", decoder.EmbedInt4For(path, o)); !fresh {
 			dec *= 2 // a heap load: the host copy stays beside the device one
 		}
 	}
@@ -154,8 +155,8 @@ func resolveGemma3VisionQuantMetal(cfg config, note io.Writer) config {
 		return cfg
 	}
 	cfg.visionQuant = "int8"
-	fmt.Fprintf(note, "note: this Mac's resident budget is %.1f GB and the decoder, one KV slot and the f16 Gemma 3 vision tower need about %.1f GB: using the int8 Metal tower "+
-		"(weights in groups of 32, activations f32; -vision-quant f32 forces f16)\n", float64(free)/1e9, float64(need)/1e9)
+	fmt.Fprintf(note, "note: this Mac's resident budget is %s and the decoder, one KV slot and the f16 Gemma 3 vision tower need about %s: using the int8 Metal tower "+
+		"(weights in groups of 32, activations f32; -vision-quant f32 forces f16)\n", mem.GiB(free), mem.GiB(need))
 	return cfg
 }
 

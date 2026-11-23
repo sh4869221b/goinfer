@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -202,7 +203,7 @@ func (p webgpuProbe) record() *webgpuProbeRecord {
 // stays free of the gpu build tag and its cgo dependency. It is independent of detectBackend's cuda|metal|none choice on
 // purpose: a CUDA Linux box can also have a working Vulkan adapter. A software adapter (CI's lavapipe/llvmpipe) counts as
 // present: the group's own tests skip hardware-sensitive cases on one (newOrSkipHW). A probe that never answered is not
-// "no adapter": group W grades it as a failure (V-21, docs/code-notes/cmd-gate.md#detectWebGPU).
+// "no adapter": group W grades it as a failure (docs/code-notes/cmd-gate.md#detectWebGPU).
 func detectWebGPU(w io.Writer) webgpuProbe {
 	if os.Getenv("GOINFER_GATE_SKIP_WEBGPU") != "" {
 		return webgpuProbe{optOut: true}
@@ -635,6 +636,14 @@ func partitionHeavy(listed []string, modelsDir string) ([]heavyGroup, []string, 
 	return groups, problems, nil
 }
 
+// heavyGroupEnv is the environment of every heavy-tier main-group process. GOINFER_KV10_DEPTHS pins KV10's harness to
+// the depths the gate runs; its deepest default is a by-hand measurement (docs/code-notes/cmd-gate.md, "cudaHeavy: the
+// kv10 group"). It overrides a value in the calling environment.
+func heavyGroupEnv() map[string]string {
+	return map[string]string{"CGO_ENABLED": "0", "GOINFER_HEAVY_TESTS": "1", "GOINFER_ISOLATE_DEFER": "1",
+		"GOINFER_KV10_DEPTHS": "3900,65536"}
+}
+
 // runHeavyGroup runs one main-group process with its test binary's memory sampled. An all-skip group is not marked
 // vacuous here: a family whose checkpoints are absent skips whole, and the tier's skip census names each test.
 func (g *gpuGate) runHeavyGroup(h heavyGroup) (*results, cellResult, string, procPeak) {
@@ -651,7 +660,7 @@ func (g *gpuGate) runHeavyGroup(h heavyGroup) (*results, cellResult, string, pro
 	c := cell{
 		Name: "cuda-heavy-" + h.Label, Pkgs: []string{pkg}, Tags: []string{"cuda", "goinfer_testhooks"},
 		Serial: true, Timeout: "120m", Run: h.Run,
-		Env: map[string]string{"CGO_ENABLED": "0", "GOINFER_HEAVY_TESTS": "1", "GOINFER_ISOLATE_DEFER": "1"},
+		Env: heavyGroupEnv(),
 		OnStart: func(pid int) func() {
 			stop := startProcSampler(pid, res.inFlight)
 			return func() { peak = stop() }
@@ -830,10 +839,10 @@ func readPTX(keepDir string) ptxInput {
 		base := strings.TrimSuffix(filepath.Base(f), ".ptx")
 		// kernel is what build_ptx.sh is asked for. <k>_kv16.ptx has no source of its own name: it is <k>.cu built with
 		// the KV cache as f16, and <k>_cap.ptx and <k>_kv16_cap.ptx are <k>.cu built with the attention softcap (at f32 and at f16
-		// KV); build_ptx.sh writes each whenever it builds <k>.
+		// KV); <k>_kv8.ptx is <k>.cu built with the KV cache as int8 (-DKV_I8). build_ptx.sh writes each whenever it builds <k>.
 		kernel := base
 		if _, err := os.Stat(filepath.Join("backend", "cuda", base+".cu")); err != nil {
-			for _, suffix := range []string{"_kv16_cap", "_cap", "_kv16"} {
+			for _, suffix := range []string{"_kv16_cap", "_cap", "_kv16", "_kv8"} {
 				if k := strings.TrimSuffix(base, suffix); k != base {
 					kernel = k
 					break
@@ -1222,7 +1231,7 @@ func readRepo() repoInput {
 	in.LintOK, in.LintOut = err == nil, string(out)
 	rows, err := exec.Command("python3", "scripts/ci_checks.py").Output()
 	in.RowsOK, in.Rows = err == nil, string(rows)
-	if ee, ok := err.(*exec.ExitError); ok {
+	if ee, ok := errors.AsType[*exec.ExitError](err); ok {
 		in.RowsErr = strings.ReplaceAll(strings.TrimSpace(string(ee.Stderr)), "\n", " ")
 	} else if err != nil {
 		in.RowsErr = err.Error()

@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// TestAutoBackend_picksTheFirstGPUThatAnswers (R17, docs/tasks/task-first-hour.md): "auto" is the first GPU backend this
+// TestAutoBackend_picksTheFirstGPUThatAnswers: "auto" is the first GPU backend this
 // binary links whose device answers, cuda then metal, else cpu, with a reason the CLIs print as-is. autoBackend is the
 // selection over its inputs, so the cases that need a GPU backend linked run here without registering one: a fake
 // registered under "cuda" would outlive this test in the process-wide registry and change what NewBackend("cuda")
@@ -33,11 +33,11 @@ func TestAutoBackend_picksTheFirstGPUThatAnswers(t *testing.T) {
 		{"no GPU backend linked", []string{"cpu"}, answers(), "amd64", "cpu", false, "this binary has no GPU backend"},
 		{"cuda with a device", []string{"cpu", "cuda"}, answers("cuda"), "amd64", "cuda", false, "a CUDA device answered"},
 		{"cuda without a device", []string{"cpu", "cuda"}, answers(), "amd64", "cpu", true, "cuda is built in, but no CUDA device answered"},
-		{"metal on Apple silicon", []string{"cpu", "metal"}, answers("metal"), "arm64", "metal", false, "Apple silicon; metal runs int4 models"},
+		{"metal on Apple silicon", []string{"cpu", "metal"}, answers("metal"), "arm64", "metal", false, "Apple silicon; metal runs int4 and q4k models"},
 		// The darwin/amd64 release asset links metal, and its probe answers from the RAM size alone.
 		{"metal on an Intel Mac", []string{"cpu", "metal"}, answers("metal"), "amd64", "cpu", true, "only been run on Apple silicon; -backend metal asks for it"},
 		{"cuda before metal", []string{"cpu", "cuda", "metal"}, answers("cuda", "metal"), "arm64", "cuda", false, "a CUDA device answered"},
-		{"metal after a cuda with no device", []string{"cpu", "cuda", "metal"}, answers("metal"), "arm64", "metal", false, "Apple silicon; metal runs int4 models"},
+		{"metal after a cuda with no device", []string{"cpu", "cuda", "metal"}, answers("metal"), "arm64", "metal", false, "Apple silicon; metal runs int4 and q4k models"},
 		{"webgpu alone is never picked", []string{"cpu", "webgpu"}, answers("webgpu"), "amd64", "cpu", true, "-backend webgpu asks for it"},
 		{"webgpu does not outrank cuda", []string{"cpu", "cuda", "webgpu"}, answers("cuda", "webgpu"), "amd64", "cuda", false, "a CUDA device answered"},
 	} {
@@ -86,25 +86,32 @@ type fakeNamedResidency struct {
 	report string // non-empty: the built resident reports it as ResidentQuant
 }
 
-// quantReporting is a fake resident that reports the precision it runs at (ResidentQuantReporter).
+// quantReporting is a fake resident that reports the precision it runs at (ResidentCaps.Quant).
 type quantReporting struct {
+	fakeSubsystems
 	ResidentForward
 	q string
 }
 
-func (r quantReporting) ResidentQuant() string { return r.q }
+func (f quantReporting) ResidentSubsystems() ResidentSubsystems { return selfSubsystems(f) }
+
+func (r quantReporting) ResidentCaps() ResidentCaps {
+	c := residentCapsOf(r.ResidentForward)
+	c.Quant = r.q
+	return c
+}
 
 func (b *fakeNamedResidency) BuildResident(m *Model) (ResidentForward, bool, error) {
 	rf, ok, err := b.fakeResidencyBackend.BuildResident(m)
 	if b.report != "" {
-		return quantReporting{rf, b.report}, ok, err
+		return quantReporting{ResidentForward: rf, q: b.report}, ok, err
 	}
 	return rf, ok, err
 }
 
 func (b *fakeNamedResidency) Name() string { return b.name }
 
-// TestAutoMetalPrecision_keepsTheLoadedPrecision (R17, then slice 5 of docs/tasks/task-metal-int8-2026-10.md): when
+// TestAutoMetalPrecision_keepsTheLoadedPrecision (R17, then slice 5 of ): when
 // auto chose metal, a model Metal would run only re-quantized (int8, int4mix) or not at all (f32) stays on the CPU at
 // the precision it loaded at, and says so. int8int8 goes to BuildResident, since Metal runs dense int8int8 natively,
 // and is kept only when the resident reports that it ran at int8int8; one Metal re-quantized (MoE, DeltaNet) is

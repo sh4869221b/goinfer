@@ -23,6 +23,9 @@ import (
 	"github.com/townsendmerino/goinfer/chat"
 	"github.com/townsendmerino/goinfer/constrain"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // The constrained-JSON suite. Each prompt asks for an object the schema then PINS, so the
@@ -68,7 +71,7 @@ func argmaxMasked(mk *constrain.Masker, g constrain.Grammar, logits []float32) i
 	buf := make([]float32, len(logits))
 	copy(buf, logits)
 	mk.MaskAt(g, buf)
-	return argmax(buf)
+	return sampling.Argmax(buf)
 }
 
 type premiseArm struct {
@@ -140,7 +143,7 @@ func runPremiseArm(t *testing.T, m *Model, d *DFlashDrafter, tk *tokenizer.Token
 		if arm.maskTarget && mk != nil {
 			return argmaxMasked(mk, mk.GrammarClone(), lg)
 		}
-		return argmax(lg)
+		return sampling.Argmax(lg)
 	}
 
 	var res premiseResult
@@ -177,7 +180,7 @@ func runPremiseArm(t *testing.T, m *Model, d *DFlashDrafter, tk *tokenizer.Token
 				id = argmaxMasked(mk, dg, lg)
 				dg.Commit(mk.TokenBytes(id))
 			} else {
-				id = argmax(lg)
+				id = sampling.Argmax(lg)
 			}
 			drafted = append(drafted, id)
 		}
@@ -226,7 +229,7 @@ func runPremiseArm(t *testing.T, m *Model, d *DFlashDrafter, tk *tokenizer.Token
 }
 
 func TestGrammarPremise_constrainedJSON(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	target := assetPath(t, "GOINFER_QWEN3_4B")
 	ddir := assetPath(t, "GOINFER_DFLASH_F32")
 	m, err := Load(target, Options{Quant: "int8"})

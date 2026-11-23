@@ -1,7 +1,7 @@
 // Package servecheck drives a running goinfer server through the conversation a HARNESS
 // would, over the real routes, and prints a per-feature verdict with a number.
 //
-// It exists because of a gap docs/tasks/task-embed-and-harness-ux.md §3.4 names: ten of the
+// It exists because of a gap: ten of the
 // serveapp test files skip without a model, so the routes Claude Code, dsh, Open-WebUI and
 // Continue actually drive are exercised by nothing. A route a harness uses that no test
 // touches is the "gate that cannot fail" one level up — the same defect class this project
@@ -140,7 +140,9 @@ func sse(resp *http.Response, fn func(data string) bool) error {
 
 // Chat streams a short completion and reports TTFT and the inter-token rate — the two numbers
 // a harness user needs before picking a model — plus whether a usage block arrived, which
-// several harnesses require for accounting and which a stream can silently omit.
+// several harnesses require for accounting and which a stream can silently omit. A reasoning delta
+// (reasoning_content or reasoning) counts as a token, and the row says how many were: a thinking
+// model can spend a small max_tokens before any content.
 func (c *Client) Chat(ctx context.Context, model, prompt string, maxTokens int, label string) Result {
 	res := Result{Name: label}
 	body := map[string]any{
@@ -160,7 +162,7 @@ func (c *Client) Chat(ctx context.Context, model, prompt string, maxTokens int, 
 		return res
 	}
 	var ttft time.Duration
-	var n int
+	var n, thinking int
 	var last time.Time
 	usage := false
 	_ = sse(resp, func(data string) bool {
@@ -169,7 +171,11 @@ func (c *Client) Chat(ctx context.Context, model, prompt string, maxTokens int, 
 		}
 		var ev struct {
 			Choices []struct {
-				Delta struct{ Content string } `json:"delta"`
+				Delta struct {
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+					Reasoning        string `json:"reasoning"`
+				} `json:"delta"`
 			} `json:"choices"`
 			Usage *struct {
 				CompletionTokens int `json:"completion_tokens"`
@@ -181,7 +187,14 @@ func (c *Client) Chat(ctx context.Context, model, prompt string, maxTokens int, 
 		if ev.Usage != nil {
 			usage = true
 		}
-		if len(ev.Choices) > 0 && ev.Choices[0].Delta.Content != "" {
+		if len(ev.Choices) > 0 {
+			d := ev.Choices[0].Delta
+			if d.Content == "" && d.ReasoningContent == "" && d.Reasoning == "" {
+				return true
+			}
+			if d.Content == "" {
+				thinking++
+			}
 			if n == 0 {
 				ttft = time.Since(start)
 			}
@@ -197,6 +210,9 @@ func (c *Client) Chat(ctx context.Context, model, prompt string, maxTokens int, 
 	d := fmt.Sprintf("TTFT %.2fs", ttft.Seconds())
 	if n > 1 {
 		d += fmt.Sprintf(" · %.1f tok/s", float64(n-1)/last.Sub(start.Add(ttft)).Seconds())
+	}
+	if thinking > 0 {
+		d += fmt.Sprintf(" · %d of %d tokens reasoning", thinking, n)
 	}
 	if usage {
 		d += " · usage present"
@@ -223,7 +239,7 @@ func sharedTail(topic string) string {
 		"In one word, what is the note about?"
 }
 
-// SharedPreamble is KV4's §5.16 row (docs/tasks/task-kv-architecture-2026-10.md): a second conversation that opens with the first's
+// SharedPreamble checks that a second conversation opening with the first's
 // preamble takes it from the first's KV. Each conversation sends the shared system message and a long message of its own, so the second
 // must run on another slot, and it must report shared_tokens above zero, covering at least a third of its prompt. A server that cannot
 // share at all (kv_share "none": off the resident path, one KV slot, recurrent state) is a skip; one turned off by its operator is
@@ -318,8 +334,8 @@ func (c *Client) modelInfo(ctx context.Context, model string) (modelEntry, error
 }
 
 // Structured checks the promise the README makes: a schema the model cannot violate. Uses a
-// top-level integer on purpose — that is M-27's shape, where StopWhenComplete used to truncate
-// at the first complete document and return a single digit.
+// top-level integer on purpose: a grammar that stops at the first complete document would return
+// a single digit of it.
 func (c *Client) Structured(ctx context.Context, model string) Result {
 	res := Result{Name: "structured output"}
 	body := map[string]any{
@@ -355,9 +371,8 @@ func (c *Client) Structured(ctx context.Context, model string) Result {
 		res.Detail = fmt.Sprintf("%q does not parse as the schema's integer", txt)
 		return res
 	}
-	// V-17 (docs/review-2026-09-04.md): the prompt asks for "366" specifically BECAUSE that is
-	// M-27's shape — StopWhenComplete used to stop at the first complete document and return a
-	// single truncated digit. A check that only confirms the output PARSES as SOME json.Number
+	// The prompt asks for "366" specifically BECAUSE a stop at the first complete document
+	// returns a single truncated digit of it. A check that only confirms the output PARSES as SOME json.Number
 	// cannot detect that: a truncated "3" parses exactly as cleanly as the real "366" and this
 	// row would report OK against the very regression it exists to catch. Compare the VALUE.
 	if n.String() != "366" {
@@ -373,7 +388,7 @@ func (c *Client) Structured(ctx context.Context, model string) Result {
 // stop string split across token boundaries leaking into the output, which a harness sees as
 // corrupted text rather than as a bug here. It also checks that the count actually REACHED the
 // stop ("4" before "5"). A reply that never gets there, such as "Sure, I can count.", contains no
-// "5" either, and used to pass (audit-2026-09-10 G-12).
+// "5" either, and must not pass.
 //
 // The prompt says what to write, not just "Count: 1, 2, ...": with the bare list, Qwen2.5-Coder-7B
 // answered "The count is now 10." and the Gemma-4 26B "The total count is…" (2026-10-06). Neither
@@ -564,7 +579,7 @@ func (c *Client) Vision(ctx context.Context, model string) Result {
 // installed on the machine, so the sub-test did not run
 // (docs/measurements/cold-user-2026-09-06.md). This row is the part of that coverage which does
 // not depend on a third-party CLI being present, and it is the "checkable" half
-// docs/tasks/task-embed-and-harness-ux.md §3.4 lists under `serve check`.
+// of what `serve check` covers.
 //
 // The tool is deliberately one a small model can get right: one required string argument, an
 // obvious call site. A model too small to emit a tool call at all is reported as a SKIP, not a
@@ -628,8 +643,8 @@ func (c *Client) Tools(ctx context.Context, model string) Result {
 		res.Detail = "unparseable response to the tool result"
 		return res
 	}
-	// A 200 is not a use of the result (audit-2026-09-10 G-12): asking for the tool again is M-18's
-	// agent-livelock shape, and an empty answer is a conversation that dies on turn two.
+	// A 200 is not a use of the result: asking for the tool again is the agent-livelock shape,
+	// and an empty answer is a conversation that dies on turn two.
 	if msg := out.Choices[0].Message; len(msg.ToolCalls) > 0 {
 		res.Detail = "turn two asked for the tool again instead of answering — the agent-livelock shape (M-18)"
 		return res
@@ -642,14 +657,12 @@ func (c *Client) Tools(ctx context.Context, model string) Result {
 	return res
 }
 
-// ToolsHarness is Tools' harness-scale twin. R11 (docs/measurements/cold-user-2026-09-06-nobara-pc.md):
-// `Tools` above passes with a ONE-function schema — "tools, OpenAI ... ok" — and a real agent
-// harness (opencode) driving the SAME server with the same model still printed a tool call as
-// plain-text JSON instead of a real OpenAI tool_calls response, twice, burning ~350 s finding
-// out. Confirmed by direct isolation that goinfer's own tool-calling was not the fault (a raw
-// curl with a one-tool schema got a proper tool_calls response) — the gap is specifically
-// "does the model still call the right tool once the schema looks like a real agent's", which
-// `Tools`'s minimal schema cannot expose. This row reproduces that shape: a dozen tools with
+// ToolsHarness is Tools' harness-scale twin. `Tools` above passes with a ONE-function schema,
+// while a real agent harness (opencode) driving the same server and model can still get a tool
+// call printed as plain-text JSON instead of a real tool_calls response
+// (docs/measurements/cold-user-2026-09-06-nobara-pc.md). The question is "does the model still
+// call the right tool once the schema looks like a real agent's", which `Tools`'s minimal schema
+// cannot expose. This row reproduces that shape: a dozen tools with
 // nested object parameters, the same target (get_weather) and prompt as `Tools`, so the schema
 // SIZE is the only variable that differs between the two rows.
 //
@@ -761,7 +774,7 @@ func messagesTools(openai []map[string]any) []map[string]any {
 
 // harnessScaleTools is a dozen tools shaped like a real coding-agent's — file read/write/edit,
 // shell, search, plus get_weather among them — several with nested object parameters, matching
-// what opencode's own "build" agent actually sends (the shape that broke under R11).
+// what opencode's own "build" agent actually sends.
 func harnessScaleTools() []map[string]any {
 	str := map[string]any{"type": "string"}
 	fn := func(name, desc string, params map[string]any, required []string) map[string]any {

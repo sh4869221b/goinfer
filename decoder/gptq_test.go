@@ -7,6 +7,8 @@ import (
 	"math"
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
 func TestParseQuantConfig(t *testing.T) {
@@ -18,11 +20,11 @@ func TestParseQuantConfig(t *testing.T) {
 	if err != nil || p == nil {
 		t.Fatalf("good config: %v", err)
 	}
-	if p.method != "gptq" || p.bits != 4 || p.groupSize != 128 || !p.descAct || !p.sym {
+	if p.Method != "gptq" || p.Bits != 4 || p.GroupSize != 128 || !p.DescAct || !p.Sym {
 		t.Errorf("parsed %+v", p)
 	}
 	aw, err := parseQuantConfig(json.RawMessage(`{"quant_method":"awq","bits":4,"group_size":128,"version":"gemm"}`))
-	if err != nil || aw == nil || aw.method != "awq" || aw.groupSize != 128 {
+	if err != nil || aw == nil || aw.Method != "awq" || aw.GroupSize != 128 {
 		t.Errorf("awq config: %v %+v", err, aw)
 	}
 	for _, bad := range []string{
@@ -78,12 +80,12 @@ func TestGPTQ_parity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("forward: %v", err)
 	}
-	if got := argmax(logits); got != g.Argmax {
+	if got := sampling.Argmax(logits); got != g.Argmax {
 		t.Errorf("GPTQ argmax = %d, want %d (f32)", got, g.Argmax)
 	}
 	cos := cosineToFull(t, logits, llamaForwardFullPath)
 	if !math.IsNaN(cos) && cos < 0.98 {
 		t.Errorf("GPTQ cosine vs f32 oracle = %v, want ≥ 0.98", cos)
 	}
-	t.Logf("GPTQ TinyLlama (4-bit g128 act-order): argmax=%d (want %d) | cosine vs f32 = %v", argmax(logits), g.Argmax, cos)
+	t.Logf("GPTQ TinyLlama (4-bit g128 act-order): argmax=%d (want %d) | cosine vs f32 = %v", sampling.Argmax(logits), g.Argmax, cos)
 }

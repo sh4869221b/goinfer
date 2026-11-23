@@ -16,10 +16,13 @@ import (
 
 	"github.com/townsendmerino/goinfer/chat"
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/decoder/fit"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// g3Prompts is G3c's prompt set: the eight prompts Metal's G3 fixed in docs/tasks/task-multimodal-support-2026-10.md before any run, unchanged.
+// g3Prompts is G3c's prompt set: the eight prompts Metal's G3 fixed before any run, unchanged.
 var g3Prompts = []string{
 	"Explain why the sky is blue in two sentences.",
 	"Write a haiku about autumn leaves.",
@@ -33,7 +36,7 @@ var g3Prompts = []string{
 
 const g3NewTokens = 32
 
-// g3Run is G3c's procedure (docs/tasks/task-multimodal-support-2026-10.md, "S1 on CUDA"; Metal's G3 procedure unchanged) over g3Prompts: free-running
+// g3Run is G3c's procedure (Metal's G3 procedure unchanged) over g3Prompts: free-running
 // greedy on each side for 32 tokens (a first divergence at a near-tie, under 3% of the CPU's |top-1|, still passes the prompt), then the CPU's sequence
 // teacher-forced through the CUDA resident and compared position by position.
 func g3Run(t *testing.T, tk *tokenizer.Tokenizer, tmpl *chat.Template, r *cudaResident, mg, mc *decoder.Model, logf func(string, ...any)) (passPrompts, agree, positions int) {
@@ -162,7 +165,7 @@ func g3Model(t *testing.T, gguf, label string, logf func(string, ...any)) (pass,
 		t.Fatalf("%s: no CUDA resident: %s", label, mg.ResidentDecline())
 	}
 	// The CPU loads the SAME file with the SAME options, so both sides hold the same quantization of every table. A CPU arm on a sidecar with an int4 head against the CUDA
-	// side's int8 pin is the confound that invalidated an earlier run (docs/tasks/task-multimodal-support-2026-10.md).
+	// side's int8 pin is the confound that invalidated an earlier run.
 	mc, err := decoder.Load(gguf, opts)
 	if err != nil {
 		t.Fatalf("%s: load (cpu): %v", label, err)
@@ -176,19 +179,19 @@ func g3Model(t *testing.T, gguf, label string, logf func(string, ...any)) (pass,
 
 // g3PassMargin and g3FailMargin bound the E-model non-inferiority gates (G3c, G-E4B-C1b) in points of teacher-forced agreement against the live reference.
 // They are -4.7 and -6.7, the registered -2.0 and -4.0 shifted by the reference's own move from 93.97% to 96.64% under ChatML's default system message, so the
-// absolute floor the gates were registered at (about 92%) is unchanged. Record: docs/tasks/task-multimodal-support-2026-10.md, "G3c reference moved".
+// absolute floor the gates were registered at (about 92%) is unchanged.
 const (
 	g3PassMargin = -4.7
 	g3FailMargin = -6.7
 )
 
-// TestGemma4EModel_realE2BNonInferiority is G3c (docs/tasks/task-multimodal-support-2026-10.md, "S1 on CUDA"; Metal's re-registered G3 rule unchanged): in one process, g3Run on Qwen2.5-Coder-1.5B on CUDA (the validated reference), then on E2B.
+// TestGemma4EModel_realE2BNonInferiority is G3c (Metal's re-registered G3 rule unchanged): in one process, g3Run on Qwen2.5-Coder-1.5B on CUDA (the validated reference), then on E2B.
 // PASS: E2B's teacher-forced agreement >= the reference's + g3PassMargin points and its free-run passes >= the reference's - 1; up to 2.0 points below
 // that is ambiguous (parked for the owner); worse, or free-run passes 2+ short, fails.
 //
 //	GOINFER_HEAVY_TESTS=1 go test -count=1 -timeout 20m -tags 'cuda goinfer_testhooks' -run '^TestGemma4EModel_realE2BNonInferiority$' -v ./cuda/
 func TestGemma4EModel_realE2BNonInferiority(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	home, _ := os.UserHomeDir()
 	t0 := time.Now()
 	logf := func(format string, a ...any) { // streams under -v (t.Logf is held until the test returns)
@@ -209,13 +212,13 @@ func TestGemma4EModel_realE2BNonInferiority(t *testing.T) {
 	}
 }
 
-// TestGemma4EModel_realE2BPLEHostCost is S1's speed record on CUDA (docs/tasks/task-multimodal-support-2026-10.md, "S1 on CUDA"): the milliseconds
+// TestGemma4EModel_realE2BPLEHostCost is S1's speed record on CUDA: the milliseconds
 // embedResidentInto spends per token on E2B, i.e. the embedding row plus the PLE inputs the CPU computes before every resident step. A record, not a
 // gate; timed, so it runs on the night queue under the timing lock.
 //
 //	GOINFER_HEAVY_TESTS=1 go test -c -tags 'cuda goinfer_testhooks' -o cuda.test ./cuda/ && GOINFER_HEAVY_TESTS=1 ./cuda.test -test.run '^TestGemma4EModel_realE2BPLEHostCost$' -test.v
 func TestGemma4EModel_realE2BPLEHostCost(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	home, _ := os.UserHomeDir()
 	gguf := filepath.Join(home, "models", "gemma-4-e2b-gguf", "gemma-4-E2B_q4_0-it.gguf")
 	if _, err := os.Stat(gguf); err != nil {
@@ -250,14 +253,14 @@ func TestGemma4EModel_realE2BPLEHostCost(t *testing.T) {
 		sum/float64(n), sorted[n/2], sorted[n*9/10], n, len(m.EmbedResidentForTest(ids[0])))
 }
 
-// TestGemma4EModel_realE4BNonInferiority is G-E4B-C1b (docs/tasks/task-multimodal-support-2026-10.md, "S6 on nobara"): G3c's procedure, rule and reference,
+// TestGemma4EModel_realE4BNonInferiority is G-E4B-C1b: G3c's procedure, rule and reference,
 // unchanged, on Gemma 4 E4B loaded by both sides from GOINFER_GEMMA4_E4B_CKPT, a .gguf or a Hugging Face directory, default Google's quantization-aware
 // GGUF (~/models/gemma-4-e4b-gguf/gemma-4-E4B_q4_0-it.gguf, the equivalent of the E2B file G3c reads). A run on the plain bf16 checkpoint
 // (~/models/gemma-4-E4B-it) is a record, not this gate: that checkpoint fails the bar for its own sake, not the implementation's (same section).
 //
 //	GOINFER_HEAVY_TESTS=1 go test -count=1 -timeout 40m -tags 'cuda goinfer_testhooks' -run '^TestGemma4EModel_realE4BNonInferiority$' -v ./cuda/
 func TestGemma4EModel_realE4BNonInferiority(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	home, _ := os.UserHomeDir()
 	t0 := time.Now()
 	logf := func(format string, a ...any) {
@@ -287,7 +290,7 @@ func TestGemma4EModel_realE4BNonInferiority(t *testing.T) {
 // This writes, for the CPU's own greedy sequence on each of G3's prompts, both arms' top-8 (id, logit) at every position, so that an HF float32 forward over the SAME ids
 // (scripts/anchor_e4b_hf.py) can say, at every position where the arms disagree, which one HF sides with. Output: $E4B_ANCHOR_DIR (default ~/goinfer-logs/e4b-anchor/dump.json).
 func TestGemma4EModel_realE4BAnchorDump(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, "models", "gemma-4-E4B-it")
 	if _, err := os.Stat(dir); err != nil {
@@ -396,7 +399,7 @@ func TestGemma4EModel_realE4BAnchorDump(t *testing.T) {
 // The float32 load needs about 30 GB of host memory. When the fit guard refuses it (decoder.ErrWontFitResident), as it does inside a long-lived
 // gate process whose earlier tests have taken memory, the test skips with the guard's arithmetic; run it alone to get the dump.
 func TestGemma4EModel_realE4BF32Dump(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, "models", "gemma-4-E4B-it")
 	if _, err := os.Stat(dir); err != nil {
@@ -426,7 +429,7 @@ func TestGemma4EModel_realE4BF32Dump(t *testing.T) {
 		t.Fatal(err)
 	}
 	mc, err := decoder.Load(dir, decoder.Options{Quant: "f32", ResidentContext: 512})
-	if errors.Is(err, decoder.ErrWontFitResident) {
+	if errors.Is(err, fit.ErrWontFitResident) {
 		t.Skipf("the float32 load does not fit this process's fit budget; run this test alone (go test -run '^TestGemma4EModel_realE4BF32Dump$'), where the budget is the box's: %v", err)
 	}
 	if err != nil {

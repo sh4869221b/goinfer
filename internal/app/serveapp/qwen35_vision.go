@@ -11,7 +11,7 @@ import (
 	"github.com/townsendmerino/goinfer/multimodal"
 )
 
-// Qwen3.5+ image serving (docs/multimodal.md, P8 record). The route is the Qwen2.5-VL one (preprocess, tower,
+// Qwen3.5+ image serving (docs/multimodal.md, "Qwen3.x-VL image path + GGUF mmproj"). The route is the Qwen2.5-VL one (preprocess, tower,
 // GenerateQwenVL with m-RoPE) with two differences that live here: the tower is loaded on first use, and an image is
 // capped at qwen3MaxImageTokens.
 
@@ -168,12 +168,12 @@ func deepstackSets(dir string) int {
 // loadQwen35VisionTower attaches a Qwen3.5+ tower to the single loaded model. Everything that can be
 // checked without reading the tower's weights is checked here, at startup, so a bad -vision dir fails
 // loudly now rather than at the first image; the weights themselves load on first use.
-func (s *server) loadQwen35VisionTower(dir string, int8Tower bool, backend string, asked, require bool) error {
+func (s *server) loadQwen35VisionTower(dir string, int8Tower bool, backend string, require bool) error {
 	tower, pp, err := setupQwen35Vision(dir, int8Tower)
 	if err != nil {
 		return err
 	}
-	if tower.plan, err = planGridTower("Qwen3.5", multimodal.Qwen3Towers(), int8Tower, backend, asked, require); err != nil {
+	if tower.plan, err = planGridTower("Qwen3.5", multimodal.Qwen3Towers(), int8Tower, backend, require); err != nil {
 		return err
 	}
 	return s.attachQwen35Tower(tower, pp, dir)
@@ -201,14 +201,14 @@ func setupQwen35MMProj(path, modelType string, textHidden int, int8Tower bool) (
 }
 
 // loadQwen35MMProj attaches a Qwen3.5+ tower from a GGUF mmproj to the single loaded model.
-func (s *server) loadQwen35MMProj(path string, int8Tower bool, backend string, asked, require bool) error {
+func (s *server) loadQwen35MMProj(path string, int8Tower bool, backend string, require bool) error {
 	for _, lm := range s.models {
 		c := lm.mdl().Config()
 		tower, pp, err := setupQwen35MMProj(path, c.ModelType, c.HiddenDim, int8Tower)
 		if err != nil {
 			return err
 		}
-		if tower.plan, err = planGridTower("Qwen3.5", multimodal.Qwen3Towers(), int8Tower, backend, asked, require); err != nil {
+		if tower.plan, err = planGridTower("Qwen3.5", multimodal.Qwen3Towers(), int8Tower, backend, require); err != nil {
 			return err
 		}
 		return s.attachQwen35Tower(tower, pp, path)
@@ -219,21 +219,19 @@ func (s *server) loadQwen35MMProj(path string, int8Tower bool, backend string, a
 // attachQwen35Tower wires a (not yet loaded) Qwen3.5+ tower and its preprocessing into every loaded model.
 func (s *server) attachQwen35Tower(tower *qwen3Tower, pp multimodal.QwenPreprocessConfig, dir string) error {
 	for _, lm := range s.models {
-		lm.qwen3 = tower
-		lm.qwenPP = pp
-		lm.qwenMerge = pp.MergeSize
-		lm.qwenImgTok = -1
+		q := &qwen3Vision{qwenGrid: qwenGrid{pp: pp, merge: pp.MergeSize, imgTok: -1}, qwen3Tower: tower}
+		lm.vision = q
 		if id, ok := lm.tk.TokenID(multimodal.QwenImagePad); ok {
-			lm.qwenImgTok = id
+			q.imgTok = id
 		}
-		if lm.qwenImgTok < 0 {
+		if q.imgTok < 0 {
 			return fmt.Errorf("vision: tokenizer has no %q token (needed to place image embeddings)", multimodal.QwenImagePad)
 		}
 		family := "Qwen3.5"
 		if tower.deep > 0 {
 			family = "Qwen3-VL"
 		}
-		fmt.Fprintf(os.Stderr, "%s vision for %q: tower (%s) loads on first image (merge %d, image-pad id %d, <= %d tokens/image) from %s\n", family, lm.name, tower.plan.where, lm.qwenMerge, lm.qwenImgTok, qwen3MaxImageTokens, dir)
+		fmt.Fprintf(os.Stderr, "%s vision for %q: tower (%s) loads on first image (merge %d, image-pad id %d, <= %d tokens/image) from %s\n", family, lm.name, tower.plan.where, q.merge, q.imgTok, qwen3MaxImageTokens, dir)
 	}
 	return nil
 }

@@ -14,7 +14,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// OP2b on CUDA, gate K (docs/tasks/task-forward-architecture-2026-10.md §4.7, "OP2b on CUDA"): the Mamba-2 kernels against the CPU's own computation
+// OP2b on CUDA, gate K: the Mamba-2 kernels against the CPU's own computation
 // (decoder/mamba2.go:mamba2Step) on the tiny fixtures' real per-token inputs. The gated norm at other group counts and the squared-ReLU quantize are
 // tested in cuda/kernels/mamba_kernels_test.go. Every reading asserts both outputs are non-zero before it takes a cosine (mambaCosNonZero), because
 // CUDA's cosF32 scores 1 for an all-zero side.
@@ -48,12 +48,13 @@ func loadMambaFixture(t *testing.T, dir string) mambaFixture {
 	defer m.Close()
 	f := mambaFixture{name: dir, eps: m.NormEps()}
 	_, nLayers, _, _, _, _, vocab := m.Dims()
-	isMamba := func(i int) bool { return m.GraniteMambaLayer(i) }
-	if nh, hd, ds, ng, k, normG, _, ok := m.NemotronResidentParams(); ok {
+	isMamba := func(i int) bool { return m.BackendView().Layer(i).GraniteMamba() }
+	if np, ok := m.BackendView().Nemotron(); ok {
+		nh, hd, ds, ng, k, normG := np.NHeads, np.HeadDim, np.DState, np.NGroups, np.DConv, np.NormGroups
 		f.nHeads, f.headDim, f.dState, f.nGroups, f.K, f.normGroups = nh, hd, ds, ng, k, normG
-		isMamba = func(i int) bool { return m.NemotronBlockKind(i) == 0 }
-	} else if nh, hd, ds, ng, k, _, _, _, _, ok := m.GraniteResidentParams(); ok {
-		f.nHeads, f.headDim, f.dState, f.nGroups, f.K, f.normGroups = nh, hd, ds, ng, k, 1
+		isMamba = func(i int) bool { return m.BackendView().Layer(i).NemotronBlockKind() == 0 }
+	} else if g, ok := m.BackendView().Granite(); ok {
+		f.nHeads, f.headDim, f.dState, f.nGroups, f.K, f.normGroups = g.NHeads, g.HeadDim, g.DState, g.NGroups, g.DConv, 1
 	} else {
 		t.Fatalf("%s is neither Nemotron-H nor Granite-4.0-H", dir)
 	}
@@ -69,7 +70,7 @@ func loadMambaFixture(t *testing.T, dir string) mambaFixture {
 	if first < 0 {
 		t.Fatalf("%s has no Mamba layer", dir)
 	}
-	_, convW, convB, aLog, dW, dtBias, normW, _ := m.GraniteMambaWeights(first)
+	_, convW, convB, aLog, dW, dtBias, normW, _ := m.BackendView().Layer(first).GraniteMambaWeights()
 	// Copied: the slices alias the model's weights, which Close releases (the deferred Close above runs before the replay).
 	f.convW, f.convB, f.normW = slices.Clone(convW), slices.Clone(convB), slices.Clone(normW)
 	f.headP = make([]float32, f.nHeads*3)

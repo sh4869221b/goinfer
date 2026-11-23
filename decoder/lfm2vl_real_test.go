@@ -1,6 +1,6 @@
 //go:build realckpt
 
-// G-S10l-c of docs/tasks/task-multimodal-support-2026-10.md (S10, LFM2.5-VL, registered 2026-10-09 before any code):
+// G-S10l-c:
 // LFM2.5-VL-1.6B on a multi-tile image prompt, goinfer's float32 CPU prefill against transformers'
 // Lfm2VlForConditionalGeneration in float32. Three steps, so the same ids reach both sides (nobara):
 //
@@ -37,6 +37,9 @@ import (
 	"github.com/townsendmerino/goinfer/internal/vision"
 	"github.com/townsendmerino/goinfer/multimodal"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 type s10lIDs struct {
@@ -48,7 +51,7 @@ type s10lIDs struct {
 }
 
 func TestLfm2VLFull(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	step, out := os.Getenv("GOINFER_S10L_STEP"), os.Getenv("GOINFER_S10L_OUT")
 	if step == "" || out == "" {
 		t.Skip("set GOINFER_S10L_STEP (ids | compare) and GOINFER_S10L_OUT")
@@ -213,15 +216,15 @@ func TestLfm2VLFull(t *testing.T) {
 		vocab := len(logits) / n
 		agree := 0
 		for i := range n {
-			if argmax(logits[i*vocab:(i+1)*vocab]) == g.C.Argmax[after+i] {
+			if sampling.Argmax(logits[i*vocab:(i+1)*vocab]) == g.C.Argmax[after+i] {
 				agree++
 			}
 		}
 		lastL := logits[(n-1)*vocab:]
 		cos = logitCosine(lastL, hfLast)
-		lastOK = argmax(lastL) == argmax(hfLast)
+		lastOK = sampling.Argmax(lastL) == sampling.Argmax(hfLast)
 		pct = 100 * float64(agree) / float64(n)
-		logf("%-50s last cosine %.6f, argmax %d (HF %d), agreement %d/%d = %.1f%% over the text after the image", label, cos, argmax(lastL), argmax(hfLast), agree, n, pct)
+		logf("%-50s last cosine %.6f, argmax %d (HF %d), agreement %d/%d = %.1f%% over the text after the image", label, cos, sampling.Argmax(lastL), sampling.Argmax(hfLast), agree, n, pct)
 		return cos, lastOK, pct
 	}
 	pass := func(cos float64, lastOK bool, pct float64) bool { return cos >= 0.999 && lastOK && pct >= 95 }

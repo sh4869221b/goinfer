@@ -4,8 +4,10 @@ package cuda
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -267,5 +269,304 @@ func TestKV8a_noRoomKeepsNone(t *testing.T) {
 	}
 	if err := r.SaveRecurrentCheckpoint(); err == nil {
 		t.Error("a save with no checkpoint kept reported success")
+	}
+}
+
+// The Generate-level test runs on qwen3next-tiny (DeltaNet, 32,768 positions): qwen35-tiny and olmo_hybrid-tiny declare 64, which a prompt that
+// reaches a snapshot's minimum (2,048 ids) passes, so the decoder runs it on the CPU, and a snapshot is whole 64-row blocks, so none fits below
+// their cap. Their split equals one prefill in TestB35SplitPrefill (qwen35-tiny); olmo_hybrid-tiny has no CUDA read of this.
+//
+// KV8's message-boundary checkpoint, gate M2 (docs/measurements/kv8-msgboundary-2026-11/README.md): on a DeltaNet hybrid, a request that
+// rewrites the last message from near its start restores the snapshot taken at the message's start, between two passes of the first turn's
+// prefill, and leaves exactly what a cold prefill of the same prompt leaves: every recurrent buffer (conv windows and states), the
+// attention K and V rows, and the reply, bit for bit. The decoder splits the first turn's prefill at the boundary, so this also holds the split
+// to the cold pass grid.
+
+func msgLoad(t *testing.T, fixture string, pass int) (*decoder.Model, *cudaResident) {
+	t.Helper()
+	if fixture == "nemotron-tiny" {
+		t.Cleanup(nemotronFeaturesForTest())
+	}
+	m, err := decoder.Load(filepath.Join("../../testdata", fixture), decoder.Options{Backend: "cuda", Quant: "int4", ResidentContext: 4096, KVHostBytes: 1 << 30})
+	if err != nil {
+		t.Fatalf("load %s: %v", fixture, err)
+	}
+	t.Cleanup(func() { m.Close() })
+	r, ok := m.ResidentForwardForTest().(*cudaResident)
+	if !ok {
+		t.Fatalf("%s not CUDA-resident: %s", fixture, m.ResidentDecline())
+	}
+	r.prefillChunkCap.Store(int64(pass)) // a short prompt has many passes, as in TestB35Snapshot_restoreEqualsCold
+	if r.PrefillMarkAlign() != pass {
+		t.Fatalf("%s: pass width %d, want the pinned %d", fixture, r.PrefillMarkAlign(), pass)
+	}
+	return m, r
+}
+
+// msgGen generates one token for prompt under sc and returns it with the generation's counters.
+func msgGen(t *testing.T, m *decoder.Model, prompt []int, sc decoder.KVScope) ([]int, *decoder.Generation) {
+	t.Helper()
+	ch, gen := m.Generate(decoder.WithKVScope(context.Background(), sc), prompt, 1, decoder.SamplingParams{})
+	var ids []int
+	for id := range ch {
+		ids = append(ids, id)
+	}
+	if err := gen.Err(); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	return ids, gen
+}
+
+func TestKV8Msg_cudaRestoreAtTheBoundaryEqualsCold(t *testing.T) {
+	requireCUDADevice(t)
+	// Passes of 64 rows put the points on the pass grid; passes of 128 leave them off it (the second slice's C2: the prefill is cut at the
+	// point, rounded to a 64-row block, so the restore at 1,472 follows passes that no cold prefill has there).
+	for _, c := range []struct {
+		fixture string
+		pass    int
+	}{{"qwen3next-tiny", 64}, {"qwen3next-tiny", 128}, {"nemotron-tiny", 64}, {"nemotron-tiny", 128}} {
+		fixture, pass := c.fixture, c.pass
+		t.Run(fmt.Sprintf("%s/pass%d", fixture, pass), func(t *testing.T) {
+			m, r := msgLoad(t, fixture, pass)
+			if !m.KeepsRecurrentSnapshots() {
+				t.Fatalf("%s: snapshots do not carry the recurrent state", fixture)
+			}
+			_, _, _, _, _, _, vocab := m.Dims()
+			const nA, msg, nB, shared = 2400, 1500, 2500, 1503 // turn 1; its last message's start; turn 2; ids turn 2 shares with turn 1
+			q := msg / 64 * 64                                 // the point, rounded down to a snapshot block
+			keepQ := (nA - 4) / 64 * 64                        // Keep, likewise: 32 rows remain, over the final pass's minimum
+			a := kv8aIDs(1, nA, vocab)
+			b := append(slices.Clone(a[:shared]), kv8aIDs(2, nB-shared, vocab)...)
+
+			if _, g := msgGen(t, m, a, decoder.KVScope{Keep: nA - 4, MsgBoundary: msg}); g.PrefillReused != 0 {
+				t.Fatalf("turn 1 reused %d rows, want a cold prefill", g.PrefillReused)
+			}
+			st, ok := m.KVSnapshotStats()
+			if !ok {
+				t.Fatal("no snapshot store")
+			}
+			var held []int
+			for _, s := range st.Snapshots {
+				held = append(held, s.Rows)
+			}
+			slices.Sort(held)
+			if want := []int{q, keepQ}; !slices.Equal(held, want) {
+				t.Fatalf("turn 1 left snapshots of %v rows, want %v (the message's start and Keep, each on its own 64-row block)", held, want)
+			}
+			got, g := msgGen(t, m, b, decoder.KVScope{Keep: nB - 4, MsgBoundary: 1700})
+			if g.PrefillReused != q || g.KVSnapRestored != q {
+				t.Fatalf("turn 2 reused %d rows, snapshot restored %d: want the boundary's %d", g.PrefillReused, g.KVSnapRestored, q)
+			}
+			warmRec, warmKV := kv8aRec(t, r), kv8aKV(t, r, nB)
+
+			cm, cr := msgLoad(t, fixture, pass)
+			want, cg := msgGen(t, cm, b, decoder.KVScope{})
+			if cg.PrefillReused != 0 {
+				t.Fatalf("the cold arm reused %d rows", cg.PrefillReused)
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("reply after the restore %v, cold %v", got, want)
+			}
+			if !kv8aSame(warmRec, kv8aRec(t, cr)) {
+				t.Errorf("the recurrent state after the restore at %d differs from a cold prefill's", q)
+			}
+			if !kv8aSame(warmKV, kv8aKV(t, cr, nB)) {
+				t.Errorf("the attention K/V rows after the restore at %d differ from a cold prefill's", q)
+			}
+		})
+	}
+}
+
+// The preamble snapshot (the fourth addendum, P2): a second conversation that shares the first 700 ids restores the snapshot taken at their
+// block, 640 rows, and leaves the reply, every recurrent buffer and the K/V rows bit-identical to a cold prefill's.
+func TestKV8Preamble_cudaRestoreAtTheSharedPreambleEqualsCold(t *testing.T) {
+	requireCUDADevice(t)
+	for _, fixture := range kv8aFixtures {
+		t.Run(fixture, func(t *testing.T) { kv8PreambleRestore(t, fixture, 128) })
+	}
+}
+
+func kv8PreambleRestore(t *testing.T, fixture string, pass int) {
+	m, r := msgLoad(t, fixture, pass)
+	_, _, _, _, _, _, vocab := m.Dims()
+	const nA, nB, preamble = 2400, 2500, 700
+	a := kv8aIDs(1, nA, vocab)
+	b := append(slices.Clone(a[:preamble+3]), kv8aIDs(2, nB-preamble-3, vocab)...)
+	msgGen(t, m, a, decoder.KVScope{Keep: nA - 4, MsgBoundary: 1500, Boundary: preamble})
+	st, _ := m.KVSnapshotStats()
+	var held []int
+	for _, s := range st.Snapshots {
+		held = append(held, s.Rows)
+	}
+	slices.Sort(held)
+	if want := []int{640, 1472, 2368}; !slices.Equal(held, want) {
+		t.Fatalf("turn 1 left snapshots of %v rows, want %v (the preamble's, the message's and Keep's)", held, want)
+	}
+	got, g := msgGen(t, m, b, decoder.KVScope{Keep: nB - 4, MsgBoundary: 1700, Boundary: preamble})
+	if g.PrefillReused != 640 || g.KVSnapRestored != 640 {
+		t.Fatalf("the second conversation reused %d rows, snapshot restored %d: want the preamble's 640", g.PrefillReused, g.KVSnapRestored)
+	}
+	warmRec, warmKV := kv8aRec(t, r), kv8aKV(t, r, nB)
+
+	cm, cr := msgLoad(t, fixture, pass)
+	want, _ := msgGen(t, cm, b, decoder.KVScope{})
+	if !slices.Equal(got, want) {
+		t.Fatalf("reply after the restore %v, cold %v", got, want)
+	}
+	if !kv8aSame(warmRec, kv8aRec(t, cr)) {
+		t.Errorf("the recurrent state after the restore at 640 differs from a cold prefill's")
+	}
+	if !kv8aSame(warmKV, kv8aKV(t, cr, nB)) {
+		t.Errorf("the attention K/V rows after the restore at 640 differ from a cold prefill's")
+	}
+}
+
+// kv8MambaLive downloads every recurrent layer's live conv window and state, and counts the Mamba-2 layers among them.
+func kv8MambaLive(t *testing.T, r *cudaResident) (bufs [][]float32, mamba int) {
+	t.Helper()
+	if err := r.do(func() error {
+		if e := r.stream.Sync(); e != nil {
+			return e
+		}
+		for l := range r.layers {
+			Ly := &r.layers[l]
+			if !Ly.isRecurrent() {
+				continue
+			}
+			if Ly.mixer == decoder.MixerMamba {
+				mamba++
+			}
+			live := Ly.recurrentLive()
+			for _, b := range []Buffer{live.win, live.state} {
+				v := make([]float32, b.Len())
+				if e := gpu.Download(b, v); e != nil {
+					return e
+				}
+				bufs = append(bufs, v)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return bufs, mamba
+}
+
+// TestKV8Mamba_snapshotRestoreEqualsColdAndPlantsAreRed reads a Mamba-2 snapshot's own contract on the device, with no decoder in between: a snapshot taken
+// between two calls of a per-token prefill, restored after another prompt has taken the slot, leaves the logits, every Mamba-2 conv window and state and the
+// attention K/V rows bit-identical to a cold prefill's. It asserts that the state compared holds Mamba-2 layers, that the snapshot's byte count is the
+// store's price (KVSnapshotBytes), and that a snapshot whose conv window was zeroed, and one that holds no recurrent state, each differ.
+func TestKV8Mamba_snapshotRestoreEqualsColdAndPlantsAreRed(t *testing.T) {
+	requireCUDADevice(t)
+	const fixture, pass = "nemotron-tiny", 64
+	const nA, mark, n2, shared = 640, 576, 720, 600
+	load := func() (*decoder.Model, *cudaResident) {
+		m, r := msgLoad(t, fixture, pass)
+		if !r.KVSnapshotRecurrent() {
+			t.Fatalf("%s: snapshots do not carry the recurrent state", fixture)
+		}
+		return m, r
+	}
+	m0, _ := load()
+	_, _, _, _, _, _, vocab := m0.Dims()
+	a := kv8aIDs(1, nA, vocab)
+	b := append(slices.Clone(a[:shared]), kv8aIDs(2, n2-shared, vocab)...)
+	other := kv8aIDs(3, 300, vocab)
+
+	type out struct {
+		logits []float32
+		rec    [][]float32
+		kv     [][]float32
+	}
+	read := func(m *decoder.Model, r *cudaResident, lg []float32) out {
+		rec, mamba := kv8MambaLive(t, r)
+		if mamba == 0 || len(rec) == 0 {
+			t.Fatalf("compared %d Mamba-2 layers and %d buffers: the fixture must have Mamba-2 state", mamba, len(rec))
+		}
+		kv := kv8aKV(t, r, n2)
+		if len(kv) == 0 {
+			t.Fatal("compared no attention K/V rows: the fixture must have attention layers")
+		}
+		return out{append([]float32(nil), lg...), rec, kv}
+	}
+	same := func(x, y out) bool {
+		return logitsDiffer(x.logits, y.logits) == 0 && kv8aSame(x.rec, y.rec) && kv8aSame(x.kv, y.kv)
+	}
+
+	cm, cr := load()
+	cold := read(cm, cr, kv8aPrefill(t, cm, cr, b, 0))
+
+	for _, plant := range []string{"", "the conv window zeroed", "no recurrent state"} {
+		m, r := load()
+		kv8aPrefill(t, m, r, a[:mark], 0)
+		snap, err := r.SnapshotKV(0, mark)
+		if err != nil {
+			t.Fatalf("SnapshotKV(0, %d): %v", mark, err)
+		}
+		s := snap.(*cudaKVSnapshot)
+		if want := r.KVSnapshotBytes(mark); s.Bytes() != want {
+			t.Fatalf("the snapshot holds %d bytes, KVSnapshotBytes(%d) prices %d", s.Bytes(), mark, want)
+		}
+		if n := r.recurrentLayers(); len(s.rec) != n || n == 0 {
+			t.Fatalf("the snapshot holds %d recurrent layers of %d", len(s.rec), n)
+		}
+		kv8aPrefill(t, m, r, a[mark:], mark)
+		kv8aPrefill(t, m, r, other, 0) // another conversation takes the slot
+		switch plant {
+		case "the conv window zeroed":
+			buf := s.hostRows()
+			for _, d := range s.rec {
+				clear(buf[d.winOff : d.winOff+d.winWords])
+			}
+		case "no recurrent state":
+			s.rec = nil
+		}
+		if err := r.RestoreKV(snap, 0, mark); err != nil {
+			t.Fatalf("RestoreKV(%d): %v", mark, err)
+		}
+		got := read(m, r, kv8aPrefill(t, m, r, b[mark:], mark))
+		snap.Release()
+		switch ok := same(cold, got); {
+		case plant == "" && !ok:
+			t.Errorf("the restore at %d then the suffix differs from a cold prefill (logits, Mamba-2 state or K/V rows)", mark)
+		case plant != "" && ok:
+			t.Errorf("plant %q: a restore with %s equals a cold prefill, so the comparison cannot see it", plant, plant)
+		}
+	}
+}
+
+// TestKVSnapHost_aSnapshotPinsNothing is KV8-overlap's O1 and O2 (docs/measurements/kv8-overlap-2026-11/README.md): taking a snapshot allocates no page-locked
+// host buffer (locking costs about 0.5 ms a MiB, six times the copy), it holds exactly Bytes() of host memory, and a released snapshot holds none and serves nothing.
+func TestKVSnapHost_aSnapshotPinsNothing(t *testing.T) {
+	requireCUDADevice(t)
+	for _, fixture := range kv8aFixtures {
+		t.Run(fixture, func(t *testing.T) {
+			m, r := msgLoad(t, fixture, 64)
+			_, _, _, _, _, _, vocab := m.Dims()
+			ids := kv8aIDs(1, 192, vocab)
+			kv8aPrefill(t, m, r, ids, 0)
+			before := r.dev.PinnedHostBuffers()
+			snap, err := r.SnapshotKV(0, 128)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n := r.dev.PinnedHostBuffers(); n != before {
+				t.Errorf("taking a snapshot left %d page-locked host buffers, %d before", n, before)
+			}
+			s := snap.(*cudaKVSnapshot)
+			if got := int64(len(s.hostRows())) * 4; got != s.Bytes() || got != r.KVSnapshotBytes(128) {
+				t.Errorf("the snapshot holds %d host bytes, Bytes() %d, KVSnapshotBytes %d", got, s.Bytes(), r.KVSnapshotBytes(128))
+			}
+			if !snap.Serves(128) {
+				t.Fatal("a fresh snapshot does not serve its own end")
+			}
+			snap.Release()
+			if s.hostRows() != nil || snap.Serves(128) {
+				t.Errorf("a released snapshot still holds its rows or serves a restore")
+			}
+			if err := r.RestoreKV(snap, 0, 128); err == nil {
+				t.Errorf("RestoreKV of a released snapshot succeeded")
+			}
+		})
 	}
 }

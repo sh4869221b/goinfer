@@ -1,11 +1,12 @@
 package serveapp
 
 import (
+	"fmt"
 	"net/http"
 	"sync"
 )
 
-// Model liveness and the drain-based unload path (docs/completed/task-admin-unload-drain.md has the design; reciprocal
+// Model liveness and the drain-based unload path ( has the design; reciprocal
 // comments at handleAdminUnload and resident.Close).
 //
 // Freeing a model's native memory on unload (purego has no ARC or finalizers) is a use-after-free unless every in-flight
@@ -120,74 +121,12 @@ func (s *server) withModelAnthropic(w http.ResponseWriter, name string, fn func(
 func (lm *loadedModel) closeEntryNatives() {
 	last := lm.visionShare.release()
 	lm.visionShare = nil
-	if last {
-		lm.closeVisionTowers()
+	if last && lm.vision != nil {
+		lm.vision.close()
 	}
-	lm.venc, lm.vproj, lm.qwenEnc, lm.glm, lm.qwen3 = nil, nil, nil, nil, nil
-	lm.gemma4Enc, lm.gemma4Tower, lm.gemma4Swap, lm.pixtral, lm.lfm2vl = nil, nil, nil, nil, nil
-	if lm.gemma4AudioAcc != nil {
-		_ = lm.gemma4AudioAcc.Close()
-		lm.gemma4AudioAcc = nil
-	}
-	lm.gemma4Audio = nil
-	// The Voxtral and Qwen3-ASR encoders keep their checkpoint mapped until Close, the mapping's only release (aikit
-	// embed.SafetensorsFile.Close), and a device attached to Voxtral's tower is the caller's to close.
-	if lm.voxtralDevice != nil {
-		_ = lm.voxtralDevice.Close()
-		lm.voxtralDevice = nil
-	}
-	if lm.voxtral != nil {
-		_ = closeAudioEncoder("voxtral", lm.voxtral)
-		lm.voxtral = nil
-	}
-	if lm.qwenASR != nil {
-		_ = closeAudioEncoder("qwenASR", lm.qwenASR)
-		lm.qwenASR = nil
-	}
-}
-
-// closeAudioEncoder closes one of an entry's lazily loaded audio encoders at unload. A variable so a test can count the
-// calls.
-var closeAudioEncoder = func(field string, enc interface{ Close() error }) error { return enc.Close() }
-
-// closeVisionTowers closes the entry's vision tower; the caller nils the fields. A device tower holds its weights and
-// scratch on its own device ledger, which only its Close frees. The CPU encoders' weights alias their checkpoint's
-// mappings (aikit vision aliasQMat), which only the encoder's Close releases, so each is closed after the device tower
-// built from it.
-func (lm *loadedModel) closeVisionTowers() {
-	if lm.venc != nil {
-		lm.venc.Close()
-	}
-	if lm.qwenEnc != nil {
-		lm.qwenEnc.Close()
-	}
-	if lm.glm != nil {
-		if lm.glm.acc != nil {
-			_ = lm.glm.acc.Close()
-		}
-		if lm.glm.enc != nil {
-			lm.glm.enc.Close()
-		}
-	}
-	if lm.qwen3 != nil {
-		if lm.qwen3.acc != nil {
-			_ = lm.qwen3.acc.Close()
-		}
-		if lm.qwen3.enc != nil {
-			lm.qwen3.enc.Close()
-		}
-	}
-	if lm.gemma4Tower != nil {
-		_ = lm.gemma4Tower.Close()
-	}
-	if lm.gemma4Enc != nil {
-		lm.gemma4Enc.Close()
-	}
-	if lm.pixtral != nil && lm.pixtral.enc != nil {
-		lm.pixtral.enc.Close()
-	}
-	if lm.lfm2vl != nil && lm.lfm2vl.enc != nil {
-		lm.lfm2vl.enc.Close()
+	lm.vision = nil
+	if lm.audio != nil {
+		lm.audio.close()
 	}
 }
 
@@ -229,6 +168,7 @@ func (s *server) startDrain(lm *loadedModel, ml *modelLiveness, last bool) <-cha
 
 	go func() {
 		defer close(done)
+		defer recoverDrain(lm.name)
 		if ml != nil {
 			ml.rw.Lock() // DRAIN: waits out every in-flight request holding this model (all siblings)
 		}
@@ -241,7 +181,9 @@ func (s *server) startDrain(lm *loadedModel, ml *modelLiveness, last bool) <-cha
 			// unload landing on a tick), but it is a map mutated concurrently, a process crash rather than a wrong answer.
 			// admin.go takes lm.sessMu around the load-side restore for the same reason.
 			lm.sessMu.Lock()
-			_ = lm.sessions.save(sessionSubdir(s.cfg.sessionDir, lm.fp))
+			if err := lm.sessions.save(sessionSubdir(s.cfg.sessionDir, lm.fp)); err != nil {
+				fmt.Fprintf(sessionNoticeOut, "unload: model %q: session checkpoint not written (%v); its sessions will not restore\n", lm.name, err)
+			}
 			lm.sessMu.Unlock()
 		}
 		lm.closeEntryNatives()

@@ -10,10 +10,12 @@ import (
 	gc "github.com/eitamring/gocudrv/cuda"
 	"github.com/townsendmerino/goinfer/decoder"
 	"github.com/townsendmerino/goinfer/internal/vision"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TestQwen25VLMRoPEPrefillResidentReal_gate is the real-checkpoint gate for the resident m-RoPE prefill fast path
-// (decoder.ResidentMRoPEPrefill): the Qwen2.5-VL sibling of gemma3_img_prefill_resident_real_test.go's
+// (decoder.ResidentPrefillSubsystem): the Qwen2.5-VL sibling of gemma3_img_prefill_resident_real_test.go's
 // TestGemma3ImgPrefillResidentReal_gate, same two-half structure, exercising a COLD (first-time) image turn's PREFILL
 // through the m-RoPE batched-rotation kernel.
 //
@@ -26,7 +28,7 @@ import (
 //
 //	GOINFER_HEAVY_TESTS=1 go test -tags 'cuda goinfer_testhooks' ./cuda/ -run TestQwen25VLMRoPEPrefillResidentReal_gate -v -timeout 30m
 func TestQwen25VLMRoPEPrefillResidentReal_gate(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ckpt := decoder.AssetPathForTest(t, "GOINFER_QWEN25VL_3B")
 	const golden = "../../testdata/qwen25vl_real_golden.json.gz"
 	raw, err := readGolden(golden)
@@ -77,9 +79,10 @@ func TestQwen25VLMRoPEPrefillResidentReal_gate(t *testing.T) {
 	if rf == nil {
 		t.Skip("qwen2_5_vl not resident-eligible on this build")
 	}
-	rmp, ok := rf.(decoder.ResidentMRoPEPrefill)
+	rmp := decoder.SubsystemsOf(rf).Prefill
+	ok := rmp.MRoPEPrefillAvailable()
 	if !ok {
-		t.Skip("rope_kv_mrope_batched did not load on this build — ResidentMRoPEPrefill unavailable")
+		t.Skip("rope_kv_mrope_batched did not load on this build — ResidentPrefillSubsystem unavailable")
 	}
 
 	// --- Half 1: primitive-level logits comparison ---
@@ -93,7 +96,7 @@ func TestQwen25VLMRoPEPrefillResidentReal_gate(t *testing.T) {
 		t.Fatalf("CPU prefill logits vs golden: cosine %.6f < %.2f — the reference itself doesn't hold, stop here", cos, cpuInt4VsF32GoldenFloor)
 	}
 
-	residentLogits, gpuPos, err := mc.ResidentMRoPEPrefillForTest(context.Background(), rmp, g.InputIDs, feats, g.ImageStart, g.NImageTokens, mropePos)
+	residentLogits, gpuPos, err := mc.ResidentMRoPEPrefillForTest(context.Background(), rf, g.InputIDs, feats, g.ImageStart, g.NImageTokens, mropePos)
 	if err != nil {
 		t.Fatalf("ResidentMRoPEPrefillForTest: %v", err)
 	}

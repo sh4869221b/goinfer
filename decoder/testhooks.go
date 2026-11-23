@@ -19,13 +19,14 @@ import (
 	"github.com/townsendmerino/goinfer/internal/runtime/hybridattn"
 	"github.com/townsendmerino/goinfer/internal/runtime/kvmgr"
 	"github.com/townsendmerino/goinfer/internal/runtime/mamba2"
+	"github.com/townsendmerino/goinfer/internal/runtime/program"
 	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 	"github.com/townsendmerino/goinfer/tokenizer"
 )
 
 // ForwardSubCaptureLogitsForTest is ForwardSubCapture plus the token's logits from the same forward: the gpu package's
 // per-layer resident-vs-CPU parity gate needs both, and running the token twice would append it to the KV cache twice. Same
-// arch guard and byte-identical-output contract as ForwardSubCapture. See docs/completed/task-webgpu-nogqa-decode-bug.md.
+// arch guard and byte-identical-output contract as ForwardSubCapture.
 func (m *Model) ForwardSubCaptureLogitsForTest(id int, cache *KVCache) (logits []float32, attn, mlp, ctx, mlpPre [][]float32, err error) {
 	a := m.w.arch
 	if m.program().SubCaptureUncovered() {
@@ -87,6 +88,14 @@ func SetKQuantNativeOffForTest(off bool) { kquantNativeOff.Store(off) }
 // KQuantSavingsForTest is kquantSavings(backend): what backend's fit pricing takes off for its q4k lane's native uploads.
 func (m *Model) KQuantSavingsForTest(backend string) int64 { return m.kquantSavings(backend) }
 
+// DecodeRowsForTest is each layer's per-row decode activations as m's program declares them (program.Buffers' per-row entries), by
+// name at the widest operation of the layer that declares it: the input the WebGPU decode-scratch figure is priced from.
+func (m *Model) DecodeRowsForTest() []map[string]int {
+	shape := m.Shape()
+	H, V := shape.Hidden, shape.Vocab
+	return m.metalDecodeRows(H, V).layers
+}
+
 // ResidentPrefillSeedForTest is residentPrefillSeed from position 0 with no adapter: the prompt into the resident KV
 // by the route a generation takes (blocks included), returning the last token's logits.
 func (m *Model) ResidentPrefillSeedForTest(ctx context.Context, prompt []int) ([]float32, error) {
@@ -97,40 +106,40 @@ func (m *Model) ResidentPrefillSeedForTest(ctx context.Context, prompt []int) ([
 // (decoder/forward_qwen35.go), so the resident kernels that mirror them can be checked against the code the CPU runs.
 func SplitQGateForTest(qg []float32, nH, hd int) (q, gate []float32) {
 	q, gate = make([]float32, nH*hd), make([]float32, nH*hd)
-	splitQGate(qg, q, gate, nH, hd)
+	hybridattn.SplitQGate(qg, q, gate, nH, hd)
 	return q, gate
 }
 
 // QGateContextForTest applies the output gate to ctx in place (see SplitQGateForTest).
-func QGateContextForTest(ctx, gate []float32) { qGateContext(ctx, gate) }
+func QGateContextForTest(ctx, gate []float32) { hybridattn.QGateContext(ctx, gate) }
 
 // AutoPinResidentContextForTest makes the model's resident context request ctx without the caller having chosen it: the
 // state the load-time fit guard's auto-pin leaves, which only a load under memory pressure produces.
 func (m *Model) AutoPinResidentContextForTest(ctx int) { m.resCtxReq, m.resCtxPinned = ctx, false }
 
-// ResidentImagePrefillForTest wraps residentImagePrefill, the primitive GenerateVL's resident image-prefill fast path calls,
+// ResidentImagePrefillForTest wraps residentImagePrefill (res is the resident, never one of its subsystems), the primitive GenerateVL's resident image-prefill fast path calls,
 // so a real-checkpoint gate (cuda/) can compare its logits with PrefillLogitsVLForTest's CPU reference at matched precision
 // on the same model instance and the same real image.
-func (m *Model) ResidentImagePrefillForTest(ctx context.Context, rip ResidentImagePrefill, ids []int, imageEmbeds []float32, imgPos, imgLen int) ([]float32, int, error) {
-	return m.residentImagePrefill(ctx, rip, ids, imageEmbeds, []ImageSpan{{Pos: imgPos, Len: imgLen}})
+func (m *Model) ResidentImagePrefillForTest(ctx context.Context, res ResidentForward, ids []int, imageEmbeds []float32, imgPos, imgLen int) ([]float32, int, error) {
+	return m.residentImagePrefill(ctx, res, ids, imageEmbeds, []ImageSpan{{Pos: imgPos, Len: imgLen}})
 }
 
 // ResidentImagePrefillSpansForTest is ResidentImagePrefillForTest for several images.
-func (m *Model) ResidentImagePrefillSpansForTest(ctx context.Context, rip ResidentImagePrefill, ids []int, imageEmbeds []float32, spans []ImageSpan) ([]float32, int, error) {
-	return m.residentImagePrefill(ctx, rip, ids, imageEmbeds, spans)
+func (m *Model) ResidentImagePrefillSpansForTest(ctx context.Context, res ResidentForward, ids []int, imageEmbeds []float32, spans []ImageSpan) ([]float32, int, error) {
+	return m.residentImagePrefill(ctx, res, ids, imageEmbeds, spans)
 }
 
 // ResidentMRoPEPrefillForTest wraps residentMRoPEPrefillDeep (no DeepStack sets), the primitive GenerateQwenVL's resident
 // m-RoPE prefill fast path calls, mirroring ResidentImagePrefillForTest for a real-checkpoint gate comparing its logits
 // against PrefillLogitsQwenVLForTest.
-func (m *Model) ResidentMRoPEPrefillForTest(ctx context.Context, rmp ResidentMRoPEPrefill, ids []int, imageFeats []float32, imgPos, imgLen int, mropePos [][3]int) ([]float32, int, error) {
-	return m.residentMRoPEPrefillDeep(ctx, rmp, ids, imageFeats, []ImageSpan{{Pos: imgPos, Len: imgLen}}, mropePos, nil)
+func (m *Model) ResidentMRoPEPrefillForTest(ctx context.Context, res ResidentForward, ids []int, imageFeats []float32, imgPos, imgLen int, mropePos [][3]int) ([]float32, int, error) {
+	return m.residentMRoPEPrefillDeep(ctx, res, ids, imageFeats, []ImageSpan{{Pos: imgPos, Len: imgLen}}, mropePos, nil)
 }
 
 // ResidentMRoPEDeepstackPrefillForTest wraps residentMRoPEPrefillDeep with Qwen3-VL's DeepStack sets, for the Metal gate
 // that compares it with the CPU prefill.
-func (m *Model) ResidentMRoPEDeepstackPrefillForTest(ctx context.Context, rmp ResidentMRoPEPrefill, ids []int, imageFeats []float32, imgPos, imgLen int, mropePos [][3]int, deep [][]float32) ([]float32, int, error) {
-	return m.residentMRoPEPrefillDeep(ctx, rmp, ids, imageFeats, []ImageSpan{{Pos: imgPos, Len: imgLen}}, mropePos, deep)
+func (m *Model) ResidentMRoPEDeepstackPrefillForTest(ctx context.Context, res ResidentForward, ids []int, imageFeats []float32, imgPos, imgLen int, mropePos [][3]int, deep [][]float32) ([]float32, int, error) {
+	return m.residentMRoPEPrefillDeep(ctx, res, ids, imageFeats, []ImageSpan{{Pos: imgPos, Len: imgLen}}, mropePos, deep)
 }
 
 // SetDeepstackForTest gives c the DeepStack sets its next prefill adds after each decoder layer (GenerateQwenVLDeepstack's
@@ -152,6 +161,15 @@ func (m *Model) ResidentCommitIDsForTest(ids []int) { m.residentCommitIDs(ids, n
 // compared against.
 func (m *Model) ResidentUploadPrefillForTest(cache *KVCache) error {
 	return m.residentUploadPrefill(cache)
+}
+
+// SetLayerBuffersForTest makes LayerBuffers answer bufs for layer l, so a backend test can build against a declaration its kernels do
+// not address. The model needs its fit memo (a Model from Load has one).
+func (m *Model) SetLayerBuffersForTest(l int, bufs []program.Buf) {
+	m.LayerBuffers(l) // fills the memo
+	m.fitOf.mu.Lock()
+	defer m.fitOf.mu.Unlock()
+	m.fitOf.bufs[l] = bufs
 }
 
 // ApplyMRoPEForTest wraps applyMRoPE, the CPU m-RoPE reference a resident kernel's own rotation must match bit-for-bit.
@@ -266,7 +284,7 @@ func SetRouterCaptureForTest(on bool) {
 func (c *KVCache) LayerKVForTest(layer int) (k, v []float32, base int) { return c.LayerKV(layer) }
 
 // SetSSMQ8CPU makes the CPU Mamba reference round-trip its projections through int8, so it carries the same quantization error as
-// the resident W8A8 path (the confirmation seam GOINFER_SSM_Q8CPU also turns on).
+// the resident W8A8 path.
 func SetSSMQ8CPU(v bool) { ssmQ8CPU = v }
 
 // SetSSMForceF32 toggles the CPU reference's f32 SSM accumulation (the gated-norm precision-localization seam). It and
@@ -402,7 +420,7 @@ func SetDeltaCapHook(f func(mixed, conv, gateIn, betaGate, corePre, gated, z []f
 // L2NormScaledForTest exposes the DeltaNet q/k normalizer (FLA's l2norm, eps 1e-6) so a backend's
 // norm kernel is gated against the reference rather than against a five-line reimplementation of
 // it. The epsilon is load-bearing for a zero-magnitude head, which is the case worth gating.
-func L2NormScaledForTest(x []float32, s float32) []float32 { return l2normScaled(x, s) }
+func L2NormScaledForTest(x []float32, s float32) []float32 { return hybridattn.L2NormScaled(x, s) }
 
 // GumbelDrawForTest is internal/sampling.GumbelDraw: the host's temperature-only draw for an explicit (seed, draw), which
 // every backend's Gumbel kernel is held to.
@@ -480,8 +498,8 @@ func SetProbeGPUConfigMutatorForTest(mutate func(name string, cfg []byte) []byte
 // ResetSelfTestCachesForTest clears the per-(backend, quant) probe cache and the recorded results, so a test sees a first-use probe.
 func ResetSelfTestCachesForTest() { resetSelfTestCaches() }
 
-// SetGemma4PLEDropTokenForTest plants a defect: the resident embedding row's PLE inputs lose their token-identity term
-// (docs/tasks/task-multimodal-support-2026-10.md), so a gate can be shown to go red. The CPU forward is unaffected.
+// SetGemma4PLEDropTokenForTest plants a defect: the resident embedding row's PLE inputs lose their token-identity term,
+// so a gate can be shown to go red. The CPU forward is unaffected.
 func SetGemma4PLEDropTokenForTest(on bool) { gemma4PLEDropTokenForTest = on }
 
 // SetGemma4VLRowsDefectForTest selects a planted defect in the E-model image-row builder (0 clears it; see gemma4VLRowsDefectForTest).
@@ -535,7 +553,7 @@ func (c *KVCache) SetCaptureLayersForTest(layers []int) {
 func (c *KVCache) CapturedForTest() [][]float32 { return c.captured }
 
 // SetStreamDirSwapForTest turns on StreamTranscodeDir's planted defect (layers 0 and 1 written in each other's place) and
-// returns the restore (docs/tasks/task-prequant-dir-streaming-2026-10.md).
+// returns the restore.
 func SetStreamDirSwapForTest(on bool) func() {
 	prev := streamDirSwapForTest
 	streamDirSwapForTest = on
@@ -549,8 +567,7 @@ func SetStreamDirSwapForTest(on bool) func() {
 // cannot run on the resident (no m-RoPE decode, the claim lost, the upload refused) is an error, never a CPU fallback, so a
 // reading is always the resident's. The model must have been loaded on a resident backend.
 func (m *Model) QwenVLTeacherForcedLogitsForTest(ctx context.Context, ids, path []int, spans []ImageSpan, feats []float32, deep [][]float32, gridTHW [][3]int, merge, imageToken int) ([]float32, error) {
-	r, ok := m.resident.(ResidentMRoPE)
-	if !ok {
+	if !canStep(m.resident, stepBatch{Pass: passToken, In: inMRoPE, Emb: stepProbe}) {
 		return nil, fmt.Errorf("decoder: no resident m-RoPE decode on this model (%s)", m.ResidentDecline())
 	}
 	if len(path) == 0 {
@@ -586,7 +603,8 @@ func (m *Model) QwenVLTeacherForcedLogitsForTest(ctx context.Context, ids, path 
 	out := append(make([]float32, 0, len(path)*len(logits)), logits...)
 	gpuPos := len(ids)
 	for _, tok := range path[:len(path)-1] {
-		l, err := r.ForwardMRoPE(m.embedResident(tok), gpuPos, gpuPos+delta)
+		sr, err := m.step(stepBatch{Pass: passToken, In: inMRoPE, Emb: [][]float32{m.embedResident(tok)}, Pos: gpuPos, RopePos: gpuPos + delta})
+		l := sr.Logits
 		if err != nil {
 			return nil, fmt.Errorf("decoder: resident step at position %d: %w", gpuPos, err)
 		}
@@ -656,7 +674,7 @@ func TakeMoESelTraceForTest() ([][]int, [][]float32) {
 func StopMoESelTraceForTest() { moeSelTrace, moeWtsTrace = nil, nil }
 
 // SetResidentFeaturesForTest adds the given features to backend's declared set and returns a function that restores it. A backend's build
-// seam that is gated but not yet declared (docs/tasks/task-forward-architecture-2026-10.md §4.7, OP2b on CUDA) is reachable from its own
+// seam that is gated but not yet declared is reachable from its own
 // tests only through this: production admission reads the unexported map and never sees a feature a test added after restore. It is not
 // safe for parallel tests, and it panics on a backend that declares no set, so a typo cannot pass as a no-op.
 func SetResidentFeaturesForTest(backend string, add ...ResidentFeature) (restore func()) {
@@ -723,11 +741,11 @@ func readbackCPUKV(c *KVCache) (r kvReadback) {
 	return r
 }
 
-// KVReadbackForTest decodes n positions on the CPU cache this model's generations use and reads it back (G3's readback, for a
+// KVReadbackForTest decodes n positions on the CPU cache this model's generations use and reads it back (the delivered-bytes readback, for a
 // backend whose resident declines and leaves the model on the CPU cache).
 func (m *Model) KVReadbackForTest(n int) (n32, n16, n8, nScale int64, err error) {
 	cache := m.NewCache(n)
-	_, _, _, _, _, _, vocab := m.Dims()
+	vocab := m.Shape().Vocab
 	for i := range n {
 		if _, err := m.forward((i*37+11)%vocab, cache); err != nil {
 			return 0, 0, 0, 0, err
@@ -737,21 +755,21 @@ func (m *Model) KVReadbackForTest(n int) (n32, n16, n8, nScale int64, err error)
 	return r.n32, r.n16, r.n8, r.nScale, nil
 }
 
-// SetEmbedRowsObserverForTest sets the observer told how many rows each embedding of a resident prefill's suffix holds at once
-// (MEM6); nil clears it.
+// SetEmbedRowsObserverForTest sets the observer told how many rows each embedding of a resident prefill's suffix holds at once;
+// nil clears it.
 func SetEmbedRowsObserverForTest(f func(rows int)) { embedRowsObserver = f }
 
 // ResidentPrefillScratchForTest is residentPrefillScratch: what admission prices a resident request of promptTokens at, and
-// whether the resident splits or chunks its prefill (KS-H1).
+// whether the resident splits or chunks its prefill.
 func (m *Model) ResidentPrefillScratchForTest(promptTokens int) (int64, bool) {
 	return m.residentPrefillScratch(promptTokens)
 }
 
-// NewBlockSpecForTest is NewBlockSpec around rd, a test's own drafter, in place of the weights' attach: SP2's scripted-drafter
+// NewBlockSpecForTest is NewBlockSpec around rd, a test's own drafter, in place of the weights' attach: the scripted-drafter
 // gates drive the real loop with a drafter whose proposals they choose. dw stands for the drafter's weights; the loop reads
 // only its BlockSize and MaskTokenID. The fold path's preparation and refusal are NewBlockSpec's.
 func (m *Model) NewBlockSpecForTest(rd ResidentBlockDrafter, dw BlockDrafterWeights, taps []int) (*BlockSpec, error) {
-	host, ok := m.resident.(ResidentDrafterHost)
+	host, _, ok := m.blockSpecHost()
 	if !ok {
 		return nil, errBlockSpecUnsupported
 	}
@@ -798,7 +816,7 @@ func RegisteredBuildDemandForTest(backend string) BuildDemandFunc {
 	return buildDemands[backend]
 }
 
-// PlanWithoutSlackForTest is Plan with no allocation rounding priced: the before side of the rounding diff (MM2b gate 1).
+// PlanWithoutSlackForTest is Plan with no allocation rounding priced: the before side of the rounding diff.
 func (m *Model) PlanWithoutSlackForTest(backend string, freeBytes int64, req PlanRequest) Plan {
 	return m.plan(backend, freeBytes, req, false)
 }
@@ -822,3 +840,39 @@ func WebGPUVkBlocksForTest(sizes []int64) int64 { return webgpuVkBlocks(sizes) }
 
 // WebGPUVkFixed is webgpuVkFixed.
 const WebGPUVkFixed = webgpuVkFixed
+
+// AttendInt8ForTest is the CPU's production int8 decode attention (attendToken's widened-cache branch: the layer dequantized, then
+// attendBatchedHeadsP with float64 accumulation) for query q at position pos of layer, over an int8 cache holding exactly the given rows:
+// kQ and vQ are [pos+1][kvDim] int8, kSc and vSc [pos+1][nKV] f32 scales. m must hold an int8 CPU cache (Options.KVQuant "i8"). It is the
+// CPU half of the exact-input identity gate: both backends' readers fed one cache.
+func (m *Model) AttendInt8ForTest(layer, pos int, q []float32, kQ, vQ []int8, kSc, vSc []float32) ([]float32, error) {
+	a := m.w.arch
+	cache := m.NewCache(pos + 1)
+	if cache.quant != kvI8 {
+		return nil, fmt.Errorf("decoder: AttendInt8ForTest needs an int8 CPU cache (Options.KVQuant \"i8\"), this one is quant %v", cache.quant)
+	}
+	nH, hd := a.headsAt(layer), a.HeadDim
+	kvDim, nKV := a.NumKVHeads*hd, a.NumKVHeads
+	if len(kQ) != (pos+1)*kvDim || len(vQ) != len(kQ) || len(kSc) != (pos+1)*nKV || len(vSc) != len(kSc) || len(q) != nH*hd {
+		return nil, fmt.Errorf("decoder: AttendInt8ForTest: %d K, %d V, %d K scales, %d V scales, %d query for %d rows of %d (%d heads)",
+			len(kQ), len(vQ), len(kSc), len(vSc), len(q), pos+1, kvDim, nKV)
+	}
+	var p attentionParams
+	found := false
+	for _, o := range a.attentionOps(layer) {
+		if o.Kind == opAttention {
+			p, found = o.Attn, true
+		}
+	}
+	if !found || p.Order != attnBatchedAcc64 {
+		return nil, fmt.Errorf("decoder: AttendInt8ForTest: layer %d's attention is not the per-token batched order", layer)
+	}
+	cache.keysQ[layer], cache.valsQ[layer] = append([]int8(nil), kQ...), append([]int8(nil), vQ...)
+	cache.keyScale[layer], cache.valScale[layer] = append([]float32(nil), kSc...), append([]float32(nil), vSc...)
+	lk, lv := cache.scr.localBufs((pos + 1) * kvDim)
+	nKeys := cache.dequantGlobalLayer(layer, kvDim, lk, lv)
+	ctx := make([]float32, nH*hd)
+	pool := cache.scr.headWorkerPool(nH, 1, nKeys, hd, false, true)
+	attendBatchedHeadsP(append([]float32(nil), q...), ctx, lk[:nKeys*kvDim], lv[:nKeys*kvDim], 0, cache, layer, pos, 1, p, a, true, pool)
+	return ctx, nil
+}

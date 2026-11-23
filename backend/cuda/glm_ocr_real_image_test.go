@@ -18,9 +18,11 @@ import (
 	"github.com/townsendmerino/goinfer/internal/vision"
 	"github.com/townsendmerino/goinfer/multimodal"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// GLM-OCR on the CUDA resident, on a REAL page through the REAL tower (gate O3 item 3, docs/tasks/task-glm-ocr-2026-10.md).
+// GLM-OCR on the CUDA resident, on a REAL page through the REAL tower.
 // TestGlmOcrResidentParityCUDA proves the pairwise kernels on a tiny fixture; these prove the composition on the real
 // 1.1 B checkpoint: the image prefill through rope_kv_mrope_batched_pw, then decode past the image through ForwardMRoPE at
 // ropePos != pos. int4 on both arms (the resident and the CPU), the images are the procedurally rendered documents of
@@ -55,7 +57,7 @@ func b64F32(t *testing.T, s string) []float32 {
 // requested context, whether the resident was built, the cap it reports, and the decline reason if not. It asserts nothing
 // about the numbers (they are a property of this card); it exists so the figure in the O3 record is reproducible.
 func TestGlmOcrCUDAContextFit(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ckpt := decoder.AssetPathForTest(t, "GOINFER_GLM_OCR")
 	for _, ctx := range []int{2048, 4096, 8192, 12288, 16384, 24576, 32768, 65536} {
 		m, err := decoder.Load(ckpt, decoder.Options{Backend: "cuda", Quant: "int4", ResidentContext: ctx})
@@ -73,7 +75,7 @@ func TestGlmOcrCUDAContextFit(t *testing.T) {
 const glmOcrResidentCtx = 4096
 
 func TestGlmOcrCUDAResidentRealImage(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ckpt := decoder.AssetPathForTest(t, "GOINFER_GLM_OCR")
 	pp, err := multimodal.LoadGlmOcrPreprocessConfig(ckpt)
 	if err != nil {
@@ -92,9 +94,10 @@ func TestGlmOcrCUDAResidentRealImage(t *testing.T) {
 		t.Fatalf("glm_ocr is not resident at ResidentContext %d: %s", glmOcrResidentCtx, mc.ResidentDecline())
 	}
 	t.Logf("CUDA resident: %s (cap %d)", mc.DecodePath(), mc.ResidentContextCap())
-	rmp, ok := mc.ResidentForwardForTest().(decoder.ResidentMRoPEPrefill)
+	rmp := decoder.SubsystemsOf(mc.ResidentForwardForTest()).Prefill
+	ok := rmp.MRoPEPrefillAvailable()
 	if !ok {
-		t.Fatal("the resident does not satisfy ResidentMRoPEPrefill")
+		t.Fatal("the resident does not satisfy ResidentPrefillSubsystem")
 	}
 	mcpu, err := decoder.Load(ckpt, decoder.Options{Backend: "cpu", Quant: "int4"})
 	if err != nil {
@@ -145,7 +148,7 @@ func TestGlmOcrCUDAResidentRealImage(t *testing.T) {
 				t.Fatal(err)
 			}
 			fmt.Fprintf(os.Stderr, "[glm-ocr cuda] %s: CPU prefill %.0fs\n", name, time.Since(t0).Seconds())
-			resLogits, gpuPos, err := mc.ResidentMRoPEPrefillForTest(context.Background(), rmp, g.InputIDs, feats, g.ImageStart, g.NImgTokens, mropePos)
+			resLogits, gpuPos, err := mc.ResidentMRoPEPrefillForTest(context.Background(), mc.ResidentForwardForTest(), g.InputIDs, feats, g.ImageStart, g.NImgTokens, mropePos)
 			if err != nil {
 				t.Fatalf("resident m-RoPE prefill: %v", err)
 			}
@@ -228,7 +231,7 @@ func firstDiff(a, b []int) int {
 // resident m-RoPE prefill's chunking, the KV at 6.2k positions, decode past a 128x192 grid whose position delta is large),
 // not what the model reads. The prompt shape is the real template's.
 func TestGlmOcrCUDAResidentFullBudget(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ckpt := decoder.AssetPathForTest(t, "GOINFER_GLM_OCR")
 	pp, err := multimodal.LoadGlmOcrPreprocessConfig(ckpt)
 	if err != nil {
@@ -273,9 +276,10 @@ func TestGlmOcrCUDAResidentFullBudget(t *testing.T) {
 	if !mc.ResidentActive() {
 		t.Fatalf("not resident at %d: %s", ctx, mc.ResidentDecline())
 	}
-	rmp, ok := mc.ResidentForwardForTest().(decoder.ResidentMRoPEPrefill)
+	rmp := decoder.SubsystemsOf(mc.ResidentForwardForTest()).Prefill
+	ok := rmp.MRoPEPrefillAvailable()
 	if !ok {
-		t.Fatal("no ResidentMRoPEPrefill")
+		t.Fatal("no ResidentPrefillSubsystem")
 	}
 	mcpu, err := decoder.Load(ckpt, decoder.Options{Backend: "cpu", Quant: "int4"})
 	if err != nil {
@@ -292,7 +296,7 @@ func TestGlmOcrCUDAResidentFullBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	fmt.Fprintf(os.Stderr, "[glm-ocr cuda] full budget: CPU prefill of %d tokens %.0fs\n", len(ids), time.Since(t0).Seconds())
-	resLogits, gpuPos, err := mc.ResidentMRoPEPrefillForTest(context.Background(), rmp, ids, feats, 5, nImg, mropePos)
+	resLogits, gpuPos, err := mc.ResidentMRoPEPrefillForTest(context.Background(), mc.ResidentForwardForTest(), ids, feats, 5, nImg, mropePos)
 	if err != nil {
 		t.Fatalf("resident m-RoPE prefill at %d tokens: %v", len(ids), err)
 	}

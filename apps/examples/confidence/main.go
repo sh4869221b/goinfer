@@ -1,6 +1,6 @@
 // Command confidence is per-field confidence on constrained output: the answer is forced into a JSON Schema, and
 // each enum, boolean and integer field comes back with the model's probability over what the schema allowed at the
-// position that decided it (docs/tasks/task-constrained-confidence.md, C1).
+// position that decided it.
 //
 // The number ranks answers — a low one is wrong more often (docs/measurements/confidence-c0-2026-09-27.md) — but it
 // is NOT the probability that the value is right, and it is not calibrated. Use it to route ("ask a person below
@@ -45,17 +45,7 @@ func main() {
 	check(err, "encode")
 
 	// The stop ids end generation; the masker allows them only once the document is complete.
-	var stop []int
-	for _, id := range []int{tok.Special().EOS, tok.Special().EndOfTurn} {
-		if id >= 0 {
-			stop = append(stop, id)
-		}
-	}
-	for _, s := range tmpl.Stops().Strings {
-		if id, ok := tok.TokenID(s); ok {
-			stop = append(stop, id)
-		}
-	}
+	stop := tmpl.StopIDs(tok)
 	g, err := constrain.JSONSchema([]byte(schema))
 	check(err, "schema")
 	mask := constrain.NewMasker(g, constrain.TokenBytes(m.Config().VocabSize, tok.TokenText), stop).

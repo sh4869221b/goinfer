@@ -60,8 +60,11 @@ func CopyDevice(dst, src Buffer, nBytes int) error {
 	if nBytes == 0 {
 		return nil
 	}
-	// Pre-sync for the same write-after-read hazard Buffer.upload documents
-	// (audit C-01): a queued launch may still be reading dst.
+	if TraceForTest != nil {
+		TraceForTest(TraceEvent{Op: TraceCopyDevice, Dst: dst.BindAddr(), SrcPtr: src.BindAddr(), Bytes: nBytes})
+	}
+	// Pre-sync for the same write-after-read hazard Buffer.upload documents:
+	// a queued launch may still be reading dst.
 	if err := syncCopyContext(dst, src); err != nil {
 		return err
 	}
@@ -95,6 +98,11 @@ func CopyDeviceBatch(copies []DeviceCopy) error {
 	for i, c := range copies {
 		if err := checkDeviceCopy(c.Dst, c.Src, c.Bytes); err != nil {
 			return fmt.Errorf("cuda: device copy %d of %d: %w", i, len(copies), err)
+		}
+	}
+	if TraceForTest != nil {
+		for _, c := range copies {
+			TraceForTest(TraceEvent{Op: TraceCopyDevice, Dst: c.Dst.BindAddr(), SrcPtr: c.Src.BindAddr(), Bytes: c.Bytes})
 		}
 	}
 	var issued bool
@@ -144,10 +152,10 @@ func checkDeviceCopy(dst, src Buffer, nBytes int) error {
 	if src.cx != nil && dst.cx != nil && src.cx != dst.cx {
 		return fmt.Errorf("cuda: device copy between buffers on different contexts")
 	}
-	if got, want := src.b.Bytes(), uint64(src.off)+uint64(nBytes); got < want {
+	if got, want := src.bytes(), uint64(src.off)+uint64(nBytes); got < want {
 		return fmt.Errorf("cuda: device copy reads %d bytes at offset %d from a %d-byte buffer", nBytes, src.off, got)
 	}
-	if got, want := dst.b.Bytes(), uint64(dst.off)+uint64(nBytes); got < want {
+	if got, want := dst.bytes(), uint64(dst.off)+uint64(nBytes); got < want {
 		return fmt.Errorf("cuda: device copy writes %d bytes at offset %d to a %d-byte buffer", nBytes, dst.off, got)
 	}
 	return nil

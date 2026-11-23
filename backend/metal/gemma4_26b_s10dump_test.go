@@ -18,9 +18,11 @@ import (
 	"github.com/townsendmerino/goinfer/chat"
 	"github.com/townsendmerino/goinfer/decoder"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// TestGemma4_26B_s10Dump is the Mac half of S1.0's 26B re-check (docs/tasks/task-multimodal-support-2026-10.md).
+// TestGemma4_26B_s10Dump is the Mac half of S1.0's 26B re-check.
 // Every 26B parity test here compares against a CPU 26B forward, which this 16 GB Mac must not run (the M26 rule:
 // Metal only, paged, guards on). So the Mac dumps Metal's per-position logits and nobara supplies the CPU reference
 // later, over the same token sequences.
@@ -33,7 +35,7 @@ import (
 //	GOINFER_HEAVY_TESTS=1 GOINFER_S10_DUMP_DIR=<dir> [GOINFER_S10_DROP=both] go test -count=1 -tags goinfer_testhooks \
 //	    -run '^TestGemma4_26B_s10Dump$' -v ./metal/
 func TestGemma4_26B_s10Dump(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	out := os.Getenv("GOINFER_S10_DUMP_DIR")
 	if out == "" {
 		t.Skip("set GOINFER_S10_DUMP_DIR")

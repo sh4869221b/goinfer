@@ -99,7 +99,7 @@ fn main() {
 }
 `
 
-// route_gptoss (FeatAttnSink's MoE half, G6 docs/tasks/task-gpu-paths-2026-09.md): gpt-oss's router
+// route_gptoss (FeatAttnSink's MoE half): gpt-oss's router
 // disagrees with moeRouteWGSL about what the bias means, so it is its own kernel rather than a
 // parameter on that one — mirroring cuda/gptoss_act.cu's route_gptoss and metal/moe.go's twin
 // exactly (same contract, same math):
@@ -152,7 +152,7 @@ fn main() {
 }
 `
 
-// gptossGluQuantWGSL (FeatAttnSink's clamped interleaved-SwiGLU expert): gpt-oss's expert
+// GptossGluQuantWGSL (FeatAttnSink's clamped interleaved-SwiGLU expert): gpt-oss's expert
 // activation is a DIFFERENT function from swigluQuantWGSL's plain silu(gate)·up, not a
 // parameterization of it — mirrors cuda/gptoss_act.cu's glu_quant_gptoss / metal/moe.go's
 // swiglu_quant_gptoss exactly:
@@ -227,7 +227,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 `
 
 // moeExpertGptOssDownGEMVWGSL (FeatAttnSink's down-projection combine): moeExpertGEMVWGSL's
-// mode-1 epilogue plus a per-(expert,row) bias — decoder/forward_gptoss.go's gptOssExpertWith
+// mode-1 epilogue plus a per-(expert,row) bias — decoder/forward_gptoss.go's gptOssExpertDown
 // computes `dst = Down·h + downBias` BEFORE the router weight scales the result
 // (gptOssMoE: `out += wgt·dst`), so the combine is `wgt[slot]*(r + bias[idx[slot]*N+row])`, NOT
 // a plain `+= bias[row]` — mirrors metal/moe.go's gemv_w4a8_moe_wacc_bias exactly, including its
@@ -284,7 +284,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 }
 `
 
-// Indexed sparse-expert GEMV (Lever C3b). Identical int8 GEMV math to gemvW8A8, but the
+// Indexed sparse-expert GEMV. Identical int8 GEMV math to gemvW8A8, but the
 // weight ROW base is computed from a DYNAMIC expert index read out of the routing buffer
 // (idx[slot], produced on-GPU by moeRoute) into a STACKED [nE,N,kp] weight buffer — so the
 // resident plan records a FIXED k dispatches (one per selected expert slot) while the
@@ -339,7 +339,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 }
 `
 
-// Gated shared-expert combine (Lever C3d). Qwen2-MoE adds an always-on shared expert
+// Gated shared-expert combine. Qwen2-MoE adds an always-on shared expert
 // scaled by a per-token sigmoid gate g = sigmoid(SharedGate·h): xd[n] += g·sharedDown[n].
 // gl is the 1-element gate logit (the SharedGate GEMV result); each thread reads it and
 // sigmoids inline. GLM/DeepSeek add the shared expert UNGATED (a plain residual add via
@@ -376,7 +376,7 @@ func (c *Context) ensureSharedGate() error {
 		sh.Release()
 		return fmt.Errorf("gpu: pipeline sharedGate: %w", err)
 	}
-	c.track(sh.Release, pl.Release) // audit C-26: register at creation
+	c.track(sh.Release, pl.Release) // registered at creation, so Close releases them
 	c.sharedGateShader, c.sharedGatePipeline, c.sharedGateLayout = sh, pl, c.bgl(pl)
 	return nil
 }
@@ -393,7 +393,7 @@ type ResidentStackedW8A8 struct {
 	w4 bool
 }
 
-// Release frees the stacked buffers.
+// Close frees the stacked buffers.
 func (s *ResidentStackedW8A8) Close() error {
 	s.ctx.releaseOwned(func() {
 		traceFree(s)
@@ -459,7 +459,7 @@ func (c *Context) ensureMoEExpert() error {
 		sh.Release()
 		return fmt.Errorf("gpu: pipeline moeExpertGEMV: %w", err)
 	}
-	c.track(sh.Release, pl.Release) // audit C-26: register at creation
+	c.track(sh.Release, pl.Release) // registered at creation, so Close releases them
 	c.moeExpertShader, c.moeExpertPipeline, c.moeExpertLayout = sh, pl, c.bgl(pl)
 	return nil
 }
@@ -481,12 +481,12 @@ func (c *Context) ensureMoERoute() error {
 		sh.Release()
 		return fmt.Errorf("gpu: pipeline moeRoute: %w", err)
 	}
-	c.track(sh.Release, pl.Release) // audit C-26: register at creation
+	c.track(sh.Release, pl.Release) // registered at creation, so Close releases them
 	c.moeRouteShader, c.moeRoutePipeline, c.moeRouteLayout = sh, pl, c.bgl(pl)
 	return nil
 }
 
-// G6 (docs/tasks/task-gpu-paths-2026-09.md): gpt-oss's three MoE kernels — own router, own
+// gpt-oss's three MoE kernels — own router, own
 // clamped-gated activation, own biased down-combine — each ensure-once, mirroring
 // ensureMoERoute/ensureMoEExpert exactly.
 func (c *Context) ensureRouteGptOss() error {

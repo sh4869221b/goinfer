@@ -1,6 +1,6 @@
 package chatapp
 
-// `goinfer-chat --batch in.jsonl -o out.jsonl` — J5 (docs/tasks/task-work-queue-2026-09.md): the same batch file serve's
+// `goinfer-chat --batch in.jsonl -o out.jsonl`: the same batch file serve's
 // POST /v1/batches reads, run locally and in-process, no server. The file format is internal/batchio's, shared with serve's
 // code rather than copied, so one file works in both places.
 //
@@ -757,7 +757,7 @@ func (s *session) batchTemplate(mode chat.ThinkMode, explicitMode bool, lineEffo
 }
 
 // batchContextMessage is the 400's text for a prompt that fills the window. When the window is the GPU context (-ctx, smaller than the
-// model's own) it says so and names the way out (R19): a coding agent's first request is ~11k tokens, against a default of 8192.
+// model's own) it says so and names the way out: a coding agent's first request is ~11k tokens, against a default of 8192.
 func batchContextMessage(promptLen, window, modelWindow int) string {
 	msg := fmt.Sprintf("prompt is %d tokens; context window is %d (context_length_exceeded)", promptLen, window)
 	if modelWindow > window {

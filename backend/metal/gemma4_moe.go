@@ -4,12 +4,14 @@ package metal
 
 import (
 	"fmt"
-	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 	"os"
 	"slices"
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/logs"
+	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 
 	"github.com/townsendmerino/goinfer/decoder"
 	"golang.org/x/sys/unix"
@@ -38,8 +40,9 @@ func (r *resident) PagedProfile() pagedProfile { return r.prof }
 // enable_moe_block layers. It is separate from moeResident (moe.go), the generic one-branch SiLU shape with wacc straight into the
 // residual, which Gemma 4 is not.
 type gemma4MoeResident struct {
+	scratch                             scratchList // its decode scratch, allocated with the decode list
 	pRouterF32, pRoute, pGU, pDownWacc  Pipeline
-	guR, downR                          int // D-B04: rows per simdgroup of pGU / pDownWacc (moeExpertRows)
+	guR, downR                          int // rows per simdgroup of pGU / pDownWacc (moeExpertRows)
 	pRmsNW, pScaleWgt, pScaleVec, pZero Pipeline
 
 	nE, topK, denseInter, moeInter int
@@ -71,7 +74,7 @@ type gemma4MoeResident struct {
 	// read-only fd across every layer's pool, closed by resident.Close.
 	giwFile *os.File
 
-	// alias is the S6 weight aliaser (nil when GOINFER_METAL_ALIAS=0 or the model is not .giw-mapped); buildResident sets it before the layer loop.
+	// alias is the weight aliaser (nil when GOINFER_METAL_ALIAS=0 or the model is not .giw-mapped); buildResident sets it before the layer loop.
 	alias *weightAlias
 }
 
@@ -92,19 +95,19 @@ type gemma4MoeLayer struct {
 // from a model that declares enable_moe_block. Returns nil when the model has no gemma4 MoE layer,
 // and an error for a shape this path cannot express (so BuildResident declines → CPU fallback rather
 // than mis-running). Mirrors cuda/backend.go's isG4MoE build and its int4-width shape checks.
-func buildGemma4MoE(d *Device, m *decoder.Model, pipe func(string) Pipeline, H, nL int) (*gemma4MoeResident, error) {
-	if !m.HasGemma4MoEResident() {
+func buildGemma4MoE(d *Device, m *decoder.Model, plan metalCtxPlan, pipe func(string) Pipeline, H, nL int) (*gemma4MoeResident, error) {
+	if !m.BackendView().HasGemma4MoE() {
 		return nil, nil
 	}
 	var b decoder.Gemma4MoEResidentBundle
 	var ok bool
 	for l := range nL {
-		if b, ok = m.Gemma4MoEResidentLayer(l); ok {
+		if b, ok = m.BackendView().Layer(l).Gemma4MoEBundle(); ok {
 			break
 		}
 	}
 	if !ok {
-		return nil, fmt.Errorf("metal gemma4 MoE: HasGemma4MoEResident but no layer bundle")
+		return nil, fmt.Errorf("metal gemma4 MoE: HasGemma4MoE but no layer bundle")
 	}
 	// int4/W4A8 width checks: the GEMVs stride by the group size (hidden) and the 8-nibble word
 	// (moeInter/denseInter), so all three must be multiples of 32. Same checks as cuda/backend.go.
@@ -121,40 +124,49 @@ func buildGemma4MoE(d *Device, m *decoder.Model, pipe func(string) Pipeline, H, 
 		nE: b.NE, topK: b.TopK, denseInter: b.DenseInter, moeInter: b.MoeInter,
 	}
 	g.pGU, g.pDownWacc, g.guR, g.downR = moeExpertRows(pipe, 2*b.MoeInter, H, true)
-	g.uNE, g.uK = NewBufferU32On(mem.LineScratch, d, uint32(b.NE)), NewBufferU32On(mem.LineScratch, d, uint32(b.TopK))
-	g.uHidden = NewBufferU32On(mem.LineScratch, d, uint32(H))
-	g.uDenseInter, g.uMoeInter = NewBufferU32On(mem.LineScratch, d, uint32(b.DenseInter)), NewBufferU32On(mem.LineScratch, d, uint32(b.MoeInter))
-	g.uMoeGU = NewBufferU32On(mem.LineScratch, d, uint32(2*b.MoeInter))
-	g.uSig0, g.uNorm1 = NewBufferU32On(mem.LineScratch, d, 0), NewBufferU32On(mem.LineScratch, d, 1)
-	g.uScale1 = NewBufferFloatsOn(mem.LineScratch, d, []float32{1})
-	g.uOne = NewBufferU32On(mem.LineScratch, d, 1)
+	sc := &g.scratch
+	sc.u32(&g.uNE, uint32(b.NE))
+	sc.u32(&g.uK, uint32(b.TopK))
+	sc.u32(&g.uHidden, uint32(H))
+	sc.u32(&g.uDenseInter, uint32(b.DenseInter))
+	sc.u32(&g.uMoeInter, uint32(b.MoeInter))
+	sc.u32(&g.uMoeGU, uint32(2*b.MoeInter))
+	sc.u32(&g.uSig0, 0)
+	sc.u32(&g.uNorm1, 1)
+	sc.f32Of(&g.uScale1, 1)
+	sc.u32(&g.uOne, 1)
 	g.uSlot = make([]Buffer, b.TopK)
 	for j := range g.uSlot {
-		g.uSlot[j] = NewBufferU32On(mem.LineScratch, d, uint32(j))
+		sc.u32(&g.uSlot[j], uint32(j))
 	}
-	g.rLogits = d.NewBufferLenOn(mem.LineScratch, b.NE)
-	g.rIdx = NewBufferUint32sOn(mem.LineScratch, d, make([]uint32, b.TopK))
-	g.rWgt = d.NewBufferLenOn(mem.LineScratch, b.TopK)
-	g.g4x1, g.g4x2, g.g4rn = d.NewBufferLenOn(mem.LineScratch, H), d.NewBufferLenOn(mem.LineScratch, H), d.NewBufferLenOn(mem.LineScratch, H)
-	g.rLogitsP, g.rIdxP, g.rWgtP, g.g4rnP = d.NewBufferLenOn(mem.LineScratch, b.NE), NewBufferUint32sOn(mem.LineScratch, d, make([]uint32, b.TopK)), d.NewBufferLenOn(mem.LineScratch, b.TopK), d.NewBufferLenOn(mem.LineScratch, H)
+	sc.f32(&g.rLogits, b.NE)
+	sc.u32s(&g.rIdx, make([]uint32, b.TopK))
+	sc.f32(&g.rWgt, b.TopK)
+	sc.f32(&g.g4x1, H)
+	sc.f32(&g.g4x2, H)
+	sc.f32(&g.g4rn, H)
+	sc.f32(&g.rLogitsP, b.NE)
+	sc.u32s(&g.rIdxP, make([]uint32, b.TopK))
+	sc.f32(&g.rWgtP, b.TopK)
+	sc.f32(&g.g4rnP, H)
 
 	// Synchronous paging: --moe-cache-slots (GOINFER_METAL_MOE_SLOTS is the deprecated fallback; metalMoESlotsRequest) keeps only N
 	// experts per layer resident and stages the routed top-k in per token. N must be >= topK (a token's own top-k must fit); N==0 or
 	// unset keeps every expert resident (the fitting path and the paged-equals-non-paged parity reference).
-	if s := metalMoESlotsRequest(m); s != "" {
+	if s := metalMoESlotsRequest(m, plan); s != "" {
 		n, err := strconv.Atoi(s)
 		if err != nil || n < b.TopK {
 			return nil, fmt.Errorf("expert-slot request %q invalid (need integer >= topK=%d)", s, b.TopK)
 		}
 		if n < b.NE { // n>=nE would hold every expert — no paging, just build the stacked path
 			g.paged, g.slots = true, n
-			g.slotIdx = NewBufferUint32sOn(mem.LineScratch, d, make([]uint32, b.TopK))
-			g.fence = newPagedFence(d, nL, b.TopK)
+			sc.u32s(&g.slotIdx, make([]uint32, b.TopK))
+			g.fence = newPagedFence(d, nL, b.TopK, sc)
 			for l := range nL {
 				if skipPagedInt4CheckForTest {
 					break
 				}
-				if bl, ok := m.Gemma4MoEResidentLayer(l); ok && len(bl.ExpertsGateUp) > 0 {
+				if bl, ok := m.BackendView().Layer(l).Gemma4MoEBundle(); ok && len(bl.ExpertsGateUp) > 0 {
 					_, _, ok1 := int4DirectWords(bl.ExpertsGateUp[0])
 					_, _, ok2 := int4DirectWords(bl.ExpertsDown[0])
 					if !ok1 || !ok2 {
@@ -176,11 +188,11 @@ func buildGemma4MoE(d *Device, m *decoder.Model, pipe func(string) Pipeline, H, 
 				// so it is not re-proposed: a cold A/B measured no effect (docs/code-notes/metal.md#buildGemma4MoE.nocache).
 				if modelKnob(m, "GOINFER_MOE_NOCACHE") == "1" {
 					if _, err := unix.FcntlInt(f.Fd(), unix.F_NOCACHE, 1); err != nil {
-						fmt.Fprintf(os.Stderr, "metal gemma4 MoE: F_NOCACHE failed (%v) — pread stays buffered\n", err)
+						logs.Warnf("metal gemma4 MoE: F_NOCACHE failed (%v) — pread stays buffered", err)
 					}
 				}
 			} else {
-				fmt.Fprintf(os.Stderr, "metal gemma4 MoE: open(%s) failed (%v) — using mmap byte-copy\n", p, err)
+				logs.Warnf("metal gemma4 MoE: open(%s) failed (%v) — using mmap byte-copy", p, err)
 			}
 		}
 	}
@@ -190,7 +202,7 @@ func buildGemma4MoE(d *Device, m *decoder.Model, pipe func(string) Pipeline, H, 
 // buildGemma4MoELayer packs one enable_moe_block layer's weights. The dense MLP and the experts are
 // row-stacked into fused gate|up buffers via int4Concat (gate rows then up rows, per the swiglu
 // gate@0/up@inter split); the router (RouterProjScaled, f32) has routerScale·hidden^-0.5 folded into
-// its columns at build (decoder Gemma4MoEResidentLayer), so the resident router is rmsnorm_nw(h) →
+// its columns at build (decoder Layer(l).Gemma4MoEBundle), so the resident router is rmsnorm_nw(h) →
 // gemv_f32_f32(RouterProjScaled) — the algebraic dual of the CPU's scaled-rn · raw-proj.
 func buildGemma4MoELayer(d *Device, m *decoder.Model, b *decoder.Gemma4MoEResidentBundle, g *gemma4MoeResident) *gemma4MoeLayer {
 	ml := &gemma4MoeLayer{}
@@ -204,8 +216,8 @@ func buildGemma4MoELayer(d *Device, m *decoder.Model, b *decoder.Gemma4MoEReside
 	}
 	if g.paged {
 		// Paged: do not stack the experts (the all-E buffers are what cannot be afforded). Build a bounded LRU slot pool and a stage fn
-		// that reads expert e's W4A8 bytes straight from the bundle's mmap-backed WeightMats on demand (int4DirectWords aliases the
-		// .giw). Per-expert buffer sizes come from expert 0. The .giw expert weights MUST be int4-direct (group-32) for this
+		// that reads expert e's W4A8 bytes straight from the bundle's mmap-backed WeightMats on demand (int4DirectWords aliases the.
+		// giw). Per-expert buffer sizes come from expert 0. The .giw expert weights MUST be int4-direct (group-32) for this
 		// zero-intermediate path.
 		gw0, gs0, ok1 := int4DirectWords(b.ExpertsGateUp[0])
 		dw0, ds0, ok2 := int4DirectWords(b.ExpertsDown[0])
@@ -341,7 +353,7 @@ func buildGemma4MoELayer(d *Device, m *decoder.Model, b *decoder.Gemma4MoEReside
 func (r *resident) encodeGemma4MoEFFN(e *Encoder, L *residLayer) {
 	if L.g4moe.pool != nil {
 		e.FinishEncoding()
-		panic("metal: encodeGemma4MoEFFN reached a paged Gemma-4 MoE layer — route through forwardLogitsPaged instead (C-02)")
+		panic("metal: encodeGemma4MoEFFN reached a paged Gemma-4 MoE layer — route through forwardLogitsPaged instead")
 	}
 	r.encodeG4Phase1(e, L)         // dense branch + router + preFFN2 quant
 	r.encodeG4Phase2NonPaged(e, L) // experts from the stacked all-E buffer
@@ -410,6 +422,7 @@ func (r *resident) forwardLogitsPaged(pos int, ropePos ...int) (logits []float32
 	// server.
 	defer func() {
 		if p := recover(); p != nil {
+			mem.RepanicBug(p)
 			r.recordExecErr(fmt.Errorf("metal: paged forward aborted: %v", p))
 			logits = nil
 			// Accepted bounded side-effects on this rare abort path: the in-flight encoder is left un-ended (a small native cb/pool leak) and
@@ -606,8 +619,8 @@ func (r *resident) encodeG4Join(e *Encoder, L *residLayer) {
 	e.Dispatch(g.pScaleVec, r.H, 256, r.x, ml.uLayerScalar)                                        // r.x *= layerScalar
 }
 
-// pagedAsyncPhase2On commits a paged MoE layer's phase 2 (experts and join) without waiting for it (M-11,
-// docs/audit-metal-2026-09-30.md): the host reads nothing back from phase 2, and the next layer's phase 1 runs on the
+// pagedAsyncPhase2On commits a paged MoE layer's phase 2 (experts and join) without waiting for it
+// (docs/audit-metal-2026-09-30.md): the host reads nothing back from phase 2, and the next layer's phase 1 runs on the
 // same queue, ordered after it by Metal's hazard tracking on the residual it reads. The slot table the host rewrites for
 // the next layer is written only after that phase 1 is seen complete, so after this phase 2. Half the token's
 // submit-and-wait round trips go; the arithmetic is unchanged. Both pagers (forwardLogitsPaged, forwardLogitsMoEPaged).
@@ -616,8 +629,8 @@ var pagedAsyncPhase2On = true
 // g4PrefetchOn guesses a paged Gemma 4 MoE layer's experts from the layer before it and reads the misses in the background:
 // phase 1 of layer l also runs layer l+1's router on l's residual, the host starts reading those experts into l+1's pool, and the
 // reads overlap the GPU's phase 2 of l and phase 1 of l+1. The true router still picks; a wrong guess costs an evicted slot,
-// never a wrong bit. OFF: the extra reads compete with demand reads on the SSD and it measured slower than not guessing
-// (docs/tasks/task-m26-mac-2026-10.md, "Lever 3"). Kept, gated bit-exact, for a better guess.
+// never a wrong bit. OFF: the extra reads compete with demand reads on the SSD and it measured slower than not guessing.
+// Kept, gated bit-exact, for a better guess.
 var g4PrefetchOn = false
 
 // g4PrefetchTop is how many of the guess's experts are prefetched, highest score first.

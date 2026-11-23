@@ -8,6 +8,7 @@ in neither SCANS nor EXCLUDED, so a new scanner cannot be missed silently.
 """
 import fnmatch
 import os
+import subprocess
 
 SKIP_DIRS = ("testdata/", "node_modules/", ".git/", "apps/site/")
 
@@ -63,25 +64,48 @@ def _matches(kind, arg, path):
 SCANS = [
     # decoder
     Scan("decoder", "TestDispatchCensus", NT("decoder")),
-    # MM1's decision census pins every fit decision: a change to the fit code or the machine zoo runs it.
+    Scan("decoder", "TestResidentSubsystems_NoScatteredMicroAssertions", NT("decoder")),
+    # reads every .go file under each backend module, subdirectories included (fnmatch's * crosses /)
+    Scan("decoder", "TestResidentSubsystems_NoScatteredMicroAssertionsInBackends", F("backend/cuda/*.go", "backend/metal/*.go", "backend/webgpu/*.go")),
+    # MM1's decision census pins every fit decision: a change to the fit code, the machine zoo or a fixture it reads runs it. Every
+    # censusFixtures entry has "tiny" in its name (TestCensusFixtures_areTheCommittedOnes).
+    Scan("decoder", "TestStepShapes_assertedOnlyInStep", NT("decoder")),
     Scan("decoder", "TestDecisionCensus", F("decoder/fitguard.go", "decoder/fitplan.go", "decoder/fitquery.go", "decoder/prefill_budget.go",
                                             "decoder/weightbytes.go", "decoder/residentneed.go", "decoder/kvresolve.go", "decoder/kvpolicy.go",
-                                            "decoder/metal_fitctx.go", "decoder/memprobe.go", "testdata/machines/*.json", "testdata/mm1_census.json.gz") +
+                                            "decoder/metal_fitctx.go", "decoder/memprobe.go", "testdata/machines/*.json", "testdata/census/*.txt.gz",
+                                            "decoder/mm1_census_fixtures_test.go", "testdata/*tiny*", "decoder/testdata/*tiny*",
+                                            "decoder/selftestdata/*tiny*", "internal/vision/testdata/*tiny*",
+                                            # MM5: KV and state are priced from each layer's operations' declarations
+                                            "decoder/statebytes.go", "decoder/membufs.go", "decoder/program.go",
+                                            "internal/runtime/program/buffers.go") +
          NT("internal/runtime/mem")),
+    # docs/option-state-grid.md is generated from the cache-state table's text (decoder/cachestate.go), and the test also checks the function and test names it cites: any non-test decoder file can move it.
+    Scan("decoder", "TestOptionStateGrid_fresh", NT("decoder") + F("decoder/optiongrid_test.go", "docs/option-state-grid.md")),
+    # MM5's G-MP4: KV and state pricing names no family or mixer.
+    Scan("decoder", "TestMM5_noFamilySwitchInPricing", F("decoder/residentneed.go", "decoder/statebytes.go", "decoder/arch.go", "decoder/fitplan.go", "decoder/webgpu_vulkan.go")),
+    # MM5b's G-MS4: Metal's decode scratch pricing names no family, mixer or FFN form.
+    Scan("decoder", "TestMM5b_decodeScratchNamesNoFamily", F("decoder/metal_scratch.go")),
+    # The census reads a declared fixture list, which must match the committed fixtures: a fixture added or removed runs it.
+    Scan("decoder", "TestCensusFixtures_areTheCommittedOnes", F("decoder/mm1_census_fixtures_test.go", "testdata/*", "decoder/testdata/*",
+                                                                "decoder/selftestdata/*", "internal/vision/testdata/*")),
     # VK2's census: each family's own list covers its registry adapter's file and the arch_*.go files it reaches.
     Scan("decoder", "TestParityManifest_adapterFilesOwned", NT("decoder") + F("testdata/parity/*.json")),
     # VK2's forward census: every file the forward reaches is in a hash set or an own list.
     Scan("decoder", "TestParityManifest_coreClosed", NT("decoder") + F("testdata/parity/*.json")),
+    Scan("decoder", "TestParityManifest_loadersClosed", NT("decoder", "decoder/quant", "decoder/config") + F("testdata/parity/*.json")),
+    # A record that hashes a test file running through textParity hashes the helper too.
+    Scan("decoder", "TestTextParity_hashedWithItsUsers", T("decoder") + F("testdata/parity/*.json")),
     Scan("decoder", "TestTranscode_writesViaTempThenRenames", F("decoder/sidecar.go")),
     Scan("decoder", "TestTranscodeDir_writesViaTempThenRenames", F("decoder/sidecar.go")),
     Scan("decoder", "TestGGUFConfig_everyArchitectureReadsMaxPositions", F("decoder/gguf.go")),
-    Scan("decoder", "TestStreamableFamilyClosures_onlyReadPerLayerTensors", F("decoder/gguf.go")),
+    Scan("decoder", "TestStreamableFamilyClosures_onlyReadPerLayerTensors", F("decoder/gguf.go", "decoder/gguf_build*.go")),
     Scan("decoder", "TestEmbedInt4_noLoaderPinsTheHeadItself", NT("decoder")),
     Scan("decoder", "TestProgram_noFamilyLoopAndEveryFamilyWalks", NT("decoder")),
     Scan("decoder", "TestFP8_shapeCheckDistinguishesTranspose", F("decoder/fp8.go")),
     Scan("decoder", "TestGoDoc_listsEveryFieldOfOptionsAndSamplingParams", NT("decoder")),
     Scan("decoder", "TestBackendBanner_usesTheReport", TREE_NT),
     Scan("decoder", "TestEnvVars_docAndCodeAgree", TREE_GO + F("docs/env-vars.md", "testdata/env_reads.txt")),
+    Scan("decoder", "TestEnvVars_noNewPackageInitRead", TREE_NT),
     Scan("internal/config", "TestInventory", F("decoder/knobs.go", "decoder/model.go", "testdata/env_reads.txt", "docs/flags.meta.json") + NT("internal/app/loadflags")),
     Scan("internal/config", "TestInventory_plants", F("decoder/knobs.go", "decoder/model.go", "testdata/env_reads.txt", "docs/flags.meta.json") + NT("internal/app/loadflags")),
     Scan("internal/config", "TestEnvVarsDoc", F("docs/env-vars.md", "docs/env-vars.meta.json")),
@@ -90,13 +114,28 @@ SCANS = [
     Scan("internal/app/serveapp", "TestFlagsDoc", F("docs/flags.md", "docs/flags.meta.json") + NT("internal/app/serveapp")),
     Scan("decoder", "TestGoldenNames_matchTheFileOnDisk", TREE_T),
     Scan("decoder", "TestOptionGrid_cellsCarryEvidence", TREE_GO),
-    Scan("decoder", "TestAssetRegistry_usedByExists", TREE_T + F("testdata/assets.json")),
-    Scan("decoder", "TestAssetRegistry_noDirectReads", TREE_T + F("testdata/assets.json")),
+    Scan("decoder", "TestAssetRegistry_usedByExists", TREE_T + F("testdata/assets.json", "decoder/assets.go")),
+    Scan("decoder", "TestAssetRegistry_noDirectReads", TREE_T + F("testdata/assets.json", "decoder/assets.go")),
+    Scan("decoder", "TestAssetRegistry_resolvesFromEveryCallerDir", TREE_T + F("testdata/assets.json", "decoder/assets.go")),
     # Two computations of one key over the same files: only the two implementations or the manifest can split them.
-    Scan("decoder", "TestParityKey_matchesFreshDepsHash", F("decoder/parity_manifest_test.go", "testdata/parity/*.json", "testdata/kernel_fingerprints.json") + NT("internal/guard/paritykey")),
-    Scan("decoder", "TestParityKey_shadowMatchesDecoder", F("testdata/loader_identity.json", "decoder/parity_manifest_test.go", "testdata/parity/*.json", "testdata/kernel_fingerprints.json", "testdata/program_fingerprints.json") + NT("internal/guard/paritykey", "decoder")),
+    Scan("decoder", "TestParityKey_matchesFreshDepsHash", F("decoder/parity_manifest_test.go", "testdata/parity/*.json", "testdata/kernel_fingerprints.json", "testdata/parity_key.json", "testdata/program_fingerprints.json") + NT("internal/guard/paritykey")),
+    Scan("decoder", "TestParityKey_shadowMatchesDecoder", F("testdata/loader_identity.json", "decoder/parity_manifest_test.go", "testdata/parity/*.json", "testdata/kernel_fingerprints.json", "testdata/program_fingerprints.json", "testdata/parity_key.json") + NT("internal/guard/paritykey", "decoder")),
+    # Both keys of every family over the working tree, from the tables they read.
+    Scan("internal/guard/paritykey", "TestKey_onTheTree", F("testdata/parity/*.json", "testdata/parity_key.json", "testdata/program_fingerprints.json", "testdata/loader_identity.json", "testdata/kernel_fingerprints.json")),
     Scan("decoder", "TestParityPrograms_mapping", F("testdata/parity/*.json", "testdata/program_fingerprints.json", "testdata/*/config.json") + NT("decoder")),
+    # decoder's config tests exercise decoder/config through decoder's wrappers (loadConfig, resolveEOSIDs) and real fixtures, so an
+    # edit in decoder/config runs them; touched.py alone would run only decoder/config's own tests (where Config's validator tests live).
+    *[Scan("decoder", n, NT("decoder/config")) for n in (
+        "TestValidateConfigBounds_hostileCountsAreRefusedBeforeAllocation", "TestGGUFLayerCount_boundsTheLagunaPath", "FuzzLoadConfig",
+        "TestConfigSnapshot_M23", "TestLagunaArchitecture_realConfigs", "TestMellum21_configResolves", "TestNemotronH_attentionHeadDim",
+        "TestRecommendedSampling_sources", "TestQwen3ASR_loadedModelDoesNotStopOnIDZero")],
+    # The parity key's and the program fingerprints' guards: Config and the program's types, methods and constants are builders or
+    # core files of every family, in packages whose own tests touched.py would run alone.
+    *[Scan("decoder", n, NT("decoder/config", "internal/runtime/program")) for n in (
+        "TestParityKey_matchesFreshDepsHash", "TestParityKey_shadowMatchesDecoder", "TestProgramFingerprint_table", "TestParityPrograms_mapping")],
     Scan("decoder", "TestParityLoaders_mapping", F("testdata/parity/*.json", "testdata/loader_identity.json") + NT("internal/guard/paritykey")),
+    # It polices one file of the program package, and a declaration can move into it from any other.
+    Scan("internal/guard/paritykey", "TestBuilderFile_programTypesDeclareOnly", NT("internal/runtime/program")),
     # The fixture censuses walk testdata/: a new or changed model fixture must be listed or excluded in each (8ec704c3).
     Scan("decoder", "TestSerializeCensus_everyFixtureIsListedOrExcluded", F("testdata/*/config.json")),
     Scan("decoder", "TestSeams_subCaptureRefusedWhereGateSCannotRun", F("testdata/*/config.json")),
@@ -110,11 +149,10 @@ SCANS = [
     # SB7: a loadedModel's model handle is set only through handleOf.
     Scan("engine", "TestSurface_exportsOnlyItsContract", NT("engine", "engine/enginetest")),
     Scan("internal/app/serveapp", "TestModelHandle_assignedThroughHandleOf", NT("internal/app/serveapp")),
-    Scan("internal/app/serveapp", "TestDecoderEmbedder_boundComesFromTheModelNotZero", F("internal/app/serveapp/decoder_embedder.go")),
-    Scan("internal/app/serveapp", "TestAnthropic_decodeUsesTheSharedShaping", F("internal/app/serveapp/anthropic.go")),
     Scan("internal/app/serveapp", "TestSessions_persistedStateIsOwnerOnly", F("internal/app/serveapp/sessions.go")),
     Scan("internal/app/serveapp", "TestAdminLoad_racedDuplicateIsClosed", F("internal/app/serveapp/admin.go", "internal/app/serveapp/webui.go")),
     Scan("internal/app/serveapp", "TestStartDrain_savesSessionsUnderTheLRULock", F("internal/app/serveapp/liveness.go")),
+    Scan("internal/app/serveapp", "TestPanicGuard_everyGoFuncLiteralDefersARecover", NT("internal/app/serveapp")),
     Scan("internal/app/serveapp", "TestAdminLoad_requestQuantIsTheExplicitOne", F("internal/app/serveapp/admin.go")),
     Scan("internal/app/serveapp", "TestLookupLockedOnlyViaResolve", NT("internal/app/serveapp")),
     Scan("internal/app/serveapp", "TestStreamSurfaces_allSendUsageBeforeDone",
@@ -122,7 +160,6 @@ SCANS = [
     Scan("internal/app/serveapp", "TestStreamTokens_decodesAsAContinuation", F("internal/app/serveapp/openai.go")),
     Scan("internal/app/serveapp", "TestServe_prepareEnforcesThePublishedWindow", F("internal/app/serveapp/openai.go")),
     Scan("internal/app/serveapp", "TestDriveUsesRequestContext", NT("internal/app/serveapp")),
-    Scan("internal/app/serveapp", "TestRequestLog_wiredIntoTheGenerationRoutes", F("internal/app/serveapp/main.go")),
     Scan("internal/app/serveapp", "TestRespondTools_callsMaybeStoreWithTheToolCalls", F("internal/app/serveapp/responses.go")),
     Scan("internal/app/serveapp", "TestSSE_everyStreamingDriveSiteHeartbeats",
          F("internal/app/serveapp/openai.go", "internal/app/serveapp/anthropic_stream.go", "internal/app/serveapp/vision_serve.go",
@@ -141,16 +178,24 @@ SCANS = [
     Scan("internal/app/fitcmd", "TestRun_closesFirstLoadBeforeMeasuring", F("internal/app/fitcmd/fit.go")),
     Scan("internal/diag/hwcensus", "TestHardwareCensus", TREE_NT + F("docs/hardware-coverage.json")),
     Scan("internal/runtime/mem/probe", "TestOnlyProbeReadsOSMemory", TREE_NT),
+    Scan("internal/guard/testcmdtags", "TestDocs_goTestCommandsCompileTheTestsTheyName", TREE_T + F("docs/*.md")),
+    Scan("internal/testpath", "TestNoStrayRelativePathInInternalTests", TREE_T),
     Scan("internal/runtime/mem", "TestImports", NT("internal/runtime/mem")),
     Scan("backend/cuda", "TestPlanSlack_oneCopy", NT("backend/cuda")),
     Scan("backend/cuda", "TestLedger_everyAllocationNamesALine", NT("backend/cuda")),
+    Scan("internal/layout", "TestCUDASoloShapes_takeTodaysCalls", F("backend/cuda/resident.go", "backend/cuda/gumbel.go")),
     Scan("internal/runtime/mem", "TestSolve_pure", NT("internal/runtime/mem")),
     Scan("internal/runtime/mem", "TestNoGuardThresholdOutsideMem", TREE_NT),
+    Scan("internal/runtime/mem", "TestRecover_everyBroadRecoverLetsABugThrough", TREE_NT),
     Scan("internal/runtime/mem/probe", "TestProbeImports", NT("internal/runtime/mem/probe")),
+    # internal/testgate is imported by _test.go files only, in every module (its env reads are test-only).
+    Scan("internal/testgate", "TestNoProductionImporter", TREE_GO),
     Scan("internal/layout", "TestBackendTests_decoderImportsOnlyFall", TREE_GO),
     # SB7: internal/app/serveapp test files importing decoder may only fall.
     Scan("internal/layout", "TestServeappTests_decoderImportsOnlyFall", TREE_GO),
     # SB13: every goinfer-to-goinfer import against internal/layout/imports.json, and the root go.mod against its rules.
+    # Every fuzz target is in the weekly matrix, under the directory it lives in now.
+    Scan("internal/layout", "TestFuzzWeekly_listsEveryTarget", TREE_T + F(".github/workflows/fuzz-weekly.yml")),
     Scan("internal/layout", "TestLayout_arrows", TREE_GO + F("internal/layout/imports.json", "go.mod")),
     # SB13: towers-standalone's one exception (internal/audio may import internal/vision), read from imports.json.
     Scan("internal/layout", "TestLayout_towersStandalone", F("internal/layout/imports.json")),
@@ -158,6 +203,8 @@ SCANS = [
     Scan("internal/layout", "TestPackageDocs_namedTestsExist", TREE_GO),
     Scan("internal/layout", "TestArchitecture_importAppendix", F("internal/layout/imports.json", "docs/ARCHITECTURE.md")),
     Scan("internal/guard/prezerolint", "TestPreZero_noDeadZeroingBeforeOverwriteKernels", TREE_NT),
+    # Library code writes through internal/runtime/logs, and no block both reports an error and returns it.
+    Scan("internal/runtime/logs", "TestLibraryOutput_goesThroughLogs", TREE_NT),
     Scan("internal/guard/movedpaths", "TestNoMovedAikitPath", TREE_GO + F("go.mod", "*/go.mod", "go.sum", "*/go.sum")),
     Scan("pull", "TestResolve_callsResolveOfflineBeforeCheckAccess", F("pull/resolve.go")),
     Scan("apps/examples/structured", "TestUseFromGoDoc_codeIsFromExamples", F("apps/examples/*/main.go", "docs/use-from-go.md")),
@@ -184,14 +231,19 @@ SCANS = [
     # site module
     Scan("apps/site/internal/site", "TestHome_heroCodeIsFromTheExample", F("apps/examples/structured/main.go")),
     # gpu module
-    Scan("backend/webgpu", "TestNemotronBlockKind_hasADefault", F("backend/webgpu/residency.go")),
+    # MM5b's G-MS4w: WebGPU's decode scratch pricing names no family or mixer.
+    Scan("backend/webgpu", "TestMM5b_webgpuDecodeScratchNamesNoFamily", F("backend/webgpu/sb2_census_test.go")),
+    Scan("backend/webgpu", "TestNemotronBlockKind_hasADefault", F("backend/webgpu/residency.go", "backend/webgpu/residency_layer.go")),
+    Scan("backend/webgpu/internal/kernels", "TestKernels_noDroppedTryError", NT("backend/webgpu/internal/kernels")),
     Scan("backend/webgpu/internal/kernels", "TestLedger_everyBufferIsLeased", NT("backend/webgpu", "backend/webgpu/internal/kernels")),
+    Scan("backend/webgpu/internal/kernels", "TestRopeKernels_noBuiltinSinCos", NT("backend/webgpu/internal/kernels")),
     Scan("backend/webgpu", "TestEnsureAttnWide_guardsOnTheLastPipeline", F("backend/webgpu/attention.go")),
     Scan("backend/webgpu", "TestGPU_deviceBoundaryErrorsAreNotDropped", F("backend/webgpu/decoderunner.go", "backend/webgpu/residency.go")),
-    Scan("backend/webgpu", "TestResidency_kvPrecisionDeclineCoversTheNonGenericBranches", F("backend/webgpu/residency.go")),
+    Scan("backend/webgpu", "TestResidency_kvPrecisionDeclineCoversTheNonGenericBranches", F("backend/webgpu/residency.go", "backend/webgpu/residency_build.go")),
     # metal module
     Scan("backend/metal", "TestGptOssBiasDispatches_alwaysIndexedByRealExpert", F("backend/metal/moe.go")),
-    Scan("backend/metal", "TestLedger_everyMetalAllocationNamesALine", NT("backend/metal", "backend/metal/internal/gpudev", "backend/metal/internal/qwenmetal", "backend/metal/internal/visionmetal")),
+    Scan("backend/metal", "TestLedger_everyMetalAllocationNamesALine", NT("backend/metal", "backend/metal/internal/gpudev")),
+    Scan("backend/metal", "TestSwitchGuard_coversEveryAssignedSwitch", NT("backend/metal") + T("backend/metal")),
     Scan("backend/metal/internal/gpudev", "TestOutputContract_newBufferDocsAgreeWithBackends",
          F("backend/cuda/internal/gpudev/cuda.go", "backend/metal/internal/gpudev/metal.go")),
     Scan("backend/metal/internal/gpudev", "TestOutputContract_hostWritersStateTheirs",
@@ -206,6 +258,7 @@ SCANS = [
     Scan("backend/cuda", "TestPipelineLint_boundKernelsAreLaunched", NT("backend/cuda")),
     Scan("backend/cuda", "TestPrefillCoreAndDraftBlockCallTheShmemGuards", F("backend/cuda/prefill.go", "backend/cuda/drafter.go")),
     Scan("backend/cuda", "TestPrefillCoreCallsMropePosWindow", F("backend/cuda/prefill.go")),
+    Scan("backend/cuda", "TestKV8_everyFusedPrefillLaunchPassesScales", F("backend/cuda/prefill.go", "backend/cuda/prefill_pass.go")),
     Scan("backend/cuda", "TestPrefillCoreCallsCheckPrefillShmemImg", F("backend/cuda/prefill.go")),
     Scan("backend/cuda", "TestDeclineAdvice_wiredIntoBuildResident", F("backend/cuda/backend.go")),
     Scan("backend/cuda/kernels", "TestAttnKernelDigests_tableCoversTheSource", CU("backend/cuda")),
@@ -254,6 +307,7 @@ EXCLUDED = {
     "TestSpecResidentPrefillRegression": "prompt corpus, env-gated",
     "TestSuffixProbe_step1": "prompt corpus, env-gated",
     "TestKV3_admissionPricesTheChunk": "prompt corpus (kv0TextTokens)",
+    "TestKV10_longContextFidelity": "prompt corpus (the repository's text as 131,000 tokens), heavy-gated: an hour of card time",
     "TestSP2_foldCost": "prompt corpus, heavy- and env-gated measurement",
     "TestKV3_batchedPrefillPastTheSpanBound_real1p5B": "prompt corpus, heavy-gated",
     "TestKV3Tiled_forcedRouteOnGemma3": "prompt corpus (kv0TextTokens), real-checkpoint gated",
@@ -271,7 +325,47 @@ EXCLUDED = {
     "TestIdentity_determinismCatchesANondeterministicDumper": "git clone of the tree",
     "TestIdentityGiw_bytesCommentOnlyChangeIsIdentical": "git clone of the tree",
     "TestIdentityGiw_headerChangeIsDifferentBytesAndIdenticalLogits": "git clone of the tree",
+    # The quality_scan-tagged scans (internal/guard/qualityscan) run nightly by design, never in the day loop.
+    "TestQualityScan_readsEveryModule": "nightly quality scan",
+    "TestQualityScan_testSwitchAssignmentsRatchet": "nightly quality scan",
+    "TestQualityScan_heavyGateReadsRatchet": "nightly quality scan",
+    "TestQualityScan_receiverUnpackingRatchet": "nightly quality scan",
+    "TestQualityScan_functionLengthRatchet": "nightly quality scan",
+    "TestQualityScan_noSameNameForwardingShims": "nightly quality scan",
+    "TestQualityScan_noRunsOfBoolLiteralArguments": "nightly quality scan",
+    "TestQualityScan_committedFixtureLoadsFailNotSkip": "nightly quality scan",
+    "TestQualityScan_userStringsCarryNoTrackerIDs": "nightly quality scan",
+    "TestQualityScan_memorySizesUseTheGiBFormatter": "nightly quality scan",
 }
+
+
+# The private notes checkout (a sibling goinfer-notes) holds the task, queue, plan and scoping docs once they leave this repository.
+# A scan that reads docs/ reads them from there too, so a change in the checkout counts as a change to the path it would have had.
+NOTES_AS_DOCS = (("tasks/", "docs/tasks/"), ("completed/", "docs/completed/"), ("queues/", "docs/"), ("plans/", "docs/"),
+                 ("measurements/", "docs/measurements/"))
+
+
+def notes_changes(root):
+    """The paths changed in the notes checkout beside root (against its origin/main, or its HEAD without one; untracked files
+    too), as the docs/ paths they stand for. Empty when there is no checkout, which is CI."""
+    notes = os.path.join(os.path.dirname(os.path.abspath(root)), "goinfer-notes")
+    if not os.path.isdir(os.path.join(notes, ".git")):
+        return set()
+
+    def git(*a):
+        return subprocess.run(["git", "-C", notes, *a], capture_output=True, text=True)
+
+    diff = git("diff", "--name-only", "origin/main")
+    if diff.returncode != 0:
+        diff = git("diff", "--name-only", "HEAD")
+    names = set(diff.stdout.split()) | set(git("ls-files", "--others", "--exclude-standard").stdout.split())
+    out = set()
+    for n in names:
+        for src, dst in NOTES_AS_DOCS:
+            if n.startswith(src):
+                out.add(dst + n[len(src):])
+                break
+    return out
 
 
 def select(changed):

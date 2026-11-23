@@ -1,6 +1,7 @@
 package decoder
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,8 +14,8 @@ import (
 // where that mode cannot cap RAM: darwin's MADV_DONTNEED is a documented no-op (madvise_darwin.go), so an mmap-aliased
 // cache can WILLNEED bytes in but never release them. Owned buffers the pool allocates and reuses give a firm cap on
 // every platform: eviction here means "this slot's bytes may now be overwritten", which genuinely frees that RAM for
-// the next miss. It is the default on darwin; elsewhere --moe-pager=pool (Options.MoEPager) selects it. Design:
-// docs/completed/task-moe-streaming.md (Lever 1b); darwin rates: docs/measurements/moe-pager-mode-darwin-2026-09-23.md.
+// the next miss. It is the default on darwin; elsewhere --moe-pager=pool (Options.MoEPager) selects it.
+// Darwin rates: docs/measurements/moe-pager-mode-darwin-2026-09-23.md.
 //
 // It mirrors metal/expertpool.go's shape, translated from GPU Buffer writes to plain []byte plus WeightMat repointing
 // via aikit/linalg's exported Wrap*/accessor API. No aikit API change is needed: scales, rows, cols and group are heap
@@ -127,7 +128,7 @@ func preadFull(f *os.File, dst []byte, off int64) error {
 		n, err := f.ReadAt(dst[done:], off+int64(done))
 		done += n
 		if err != nil {
-			if err == io.EOF && done >= len(dst) {
+			if errors.Is(err, io.EOF) && done >= len(dst) {
 				break
 			}
 			return err

@@ -6,6 +6,7 @@ package cliutil
 
 import (
 	"errors"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -13,8 +14,8 @@ import (
 
 // OnOff is a lenient bool flag.Value: plain flag.Bool only accepts strconv.ParseBool's spellings
 // (1/t/T/TRUE/true/True/0/f/F/FALSE/false/False), so --fit=off — the spelling --fit's own help and
-// tasks/task-fit-to-hardware.md print — was rejected with exit 2 (M-14, audit-2026-09-10). Accepts
-// on/off in addition to the usual set, case-insensitively.
+// tasks/task-fit-to-hardware.md print — would be rejected with exit 2. Accepts on/off in addition
+// to the usual set, case-insensitively.
 type OnOff bool
 
 func (f *OnOff) String() string {
@@ -46,10 +47,9 @@ func (f *OnOff) IsBoolFlag() bool { return true }
 // the commit, the honest answer rather than a version constant someone forgot to bump.
 //
 // injected, when non-empty, wins over the stamped version. It is the caller's own package-level
-// var that a release build sets with `-ldflags -X` (R6, docs/measurements/
-// cold-user-2026-09-06-nobara-pc.md: the release workflow builds from an ephemeral checkout with
-// a `go mod edit -replace` applied, and that uncommitted edit makes the stamp read "+dirty" even
-// on the exact tagged tree). The var deliberately stays in each binary's package: -X names a
+// var that a release build sets with `-ldflags -X` (the release workflow builds from an
+// ephemeral checkout with a `go mod edit -replace` applied, and that uncommitted edit makes the
+// stamp read "+dirty" even on the exact tagged tree). The var deliberately stays in each binary's package: -X names a
 // symbol by its full package path, and an -X naming a symbol that no longer exists is silently
 // ignored, so moving it would quietly bring the "+dirty" release version back.
 // TestLdflagsTargetsExist holds those paths to the source.
@@ -82,4 +82,13 @@ func BuildIdent(injected string) (version, revision string) {
 		revision += "-dirty"
 	}
 	return version, revision
+}
+
+// BinaryName is prog, a binary's file name, without a Windows .exe extension in any case: the name --version's first line
+// gives, which a client that pins goinfer's version parses.
+func BinaryName(prog string) string {
+	if ext := filepath.Ext(prog); strings.EqualFold(ext, ".exe") {
+		return strings.TrimSuffix(prog, ext)
+	}
+	return prog
 }

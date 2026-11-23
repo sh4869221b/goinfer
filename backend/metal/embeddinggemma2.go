@@ -13,7 +13,7 @@ import (
 	"github.com/townsendmerino/goinfer/embeddinggemma2"
 )
 
-// EmbeddingGemma 2's text encoder on Metal (Phase M, docs/tasks/task-embeddinggemma2.md): the CPU forward of
+// EmbeddingGemma 2's text encoder on Metal: the CPU forward of
 // embeddinggemma2/model.go in float32 on the GPU, one command buffer per input. The GEMMs and the row RMSNorm are
 // aikit's ViT kernels (an f32 simdgroup GEMM of A·Bᵀ with B as nn.Linear stores it, [N, K]); attention runs as those
 // GEMMs over blocks of query rows (attention, below), and this file adds the windowed row softmax and the data
@@ -52,9 +52,9 @@ type eg2Ops struct {
 	arena Buffer // one scalar per 256-byte slot, so no two dispatches in a command buffer share one
 	slot  int
 	eps   float32
-	w32   Pipeline // tower_gemm_w32: gemm's kernel (KS-D4)
+	w32   Pipeline // tower_gemm_w32: gemm's kernel
 	// vitGemmForTest runs gemm on aikit's GEMMF32Plan kernel, which tower_gemm_w32 matches byte for byte: the old arm of
-	// KS-D4's A/B.
+	// its A/B.
 	vitGemmForTest bool
 }
 

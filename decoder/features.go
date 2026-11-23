@@ -82,7 +82,7 @@ const (
 	// FeatPairwiseRoPE is GPT-J pairwise rotation (dims 2d, 2d+1) in the scalar decode/prefill rope (Cohere, Cohere2, Aya, GLM-OCR's text
 	// rows). Every generic resident rope kernel is the NeoX half-split rotation of pairs (d, d+half); a runner on those is exact at position 0
 	// (the rotation is the identity there) and wrong at every later one, with no error and fluent-looking logits. A backend declares it only
-	// with pairwise rope kernels, bound in place of the NeoX ones when Model.PairwiseRoPEResident(); its gate must use peaked attention and
+	// with pairwise rope kernels, bound in place of the NeoX ones when Model.BackendView().PairwiseRoPE(); its gate must use peaked attention and
 	// non-flat weights, because flat 0.02-std fixtures hide a wrong rotation. MLA carries its own interleave flag and is gated by FeatMLA.
 	// History: docs/code-notes/decoder.md#FeatPairwiseRoPE; the kernel port notes are in docs/measurements/cuda-pairwise-rope-2026-10-01.md.
 	FeatPairwiseRoPE ResidentFeature = "pairwise-rope"
@@ -91,7 +91,7 @@ const (
 	// image-prefill kernels are NeoX. Needed in addition to FeatPairwiseRoPE, since the family's text rows and decode use the scalar kernel.
 	FeatPairwiseMRoPE ResidentFeature = "pairwise-mrope"
 	// FeatGatedGELUErf is a gated MLP whose activation is the exact erf GELU (ActGelu), not FeatGatedGELU's tanh approximation. The
-	// gated kernels select by GatedActResident's ordinal and know GELU-tanh and SiLU only, so any other ordinal runs one of those two
+	// gated kernels select by GatedAct's ordinal and know GELU-tanh and SiLU only, so any other ordinal runs one of those two
 	// with no error. A backend declares this only with an erf branch in every gated kernel it runs and an end-to-end gate.
 	FeatGatedGELUErf ResidentFeature = "gated-gelu-erf"
 	// FeatNonGatedGELUErf is the same activation in a non-gated MLP (a GPT-2 checkpoint declaring "gelu" rather than "gelu_new"),
@@ -155,7 +155,7 @@ func (a *Architecture) residentFeatures() []ResidentFeature {
 	add(a.Norm != NormRMS, FeatLayerNorm)
 	// The MLP activation, not just the gate's presence: a glue kernel that hardcodes SwiGLU would run Gemma's gated GELU-tanh block silently
 	// wrong. One feature per gated activation, and the default arm is deliberate: a gated activation without a feature of its own must
-	// not derive one a backend declares, or GatedActResident hands its ordinal to a kernel that knows only GELU-tanh and SiLU. An arch
+	// not derive one a backend declares, or GatedAct hands its ordinal to a kernel that knows only GELU-tanh and SiLU. An arch
 	// that forgets to set Act reads as ActGeluTanh (ActKind's zero value) on the CPU and on a backend alike. A non-gated arch
 	// derives one feature per activation in the same way.
 	switch {
@@ -198,7 +198,7 @@ func (a *Architecture) residentFeatures() []ResidentFeature {
 	add(a.pairwiseRoPE(), FeatPairwiseRoPE)
 	add(a.pairwiseRoPE() && len(a.MRopeSection) > 0, FeatPairwiseMRoPE)
 	add(a.lfm2 != nil, FeatShortConv)
-	add(a.gptoss != nil, FeatAttnSink)
+	add(a.hasAttnSinks(), FeatAttnSink)
 	// The attention output gate, by the activation the forward applies (hasAttnOutputGate's two cases: Laguna's softplus, keyed on
 	// arch.laguna, and arch.AttnGate == GateSigmoid), so the features and the math cannot drift; and Laguna's per-layer query-head
 	// count where its config gives one.
@@ -295,7 +295,7 @@ func residentGateReason(a *Architecture, backend string) string {
 // that clears ActivationQuantHazard on a backend that implements it (cuda, actgroup.cu), since the hazard is the per-vector activation
 // scale.
 func residentGateReasonAct(a *Architecture, backend string, actSafe bool) string {
-	if g := residentGateReasons(a, backend, actSafe); len(g) > 0 {
+	if g := residentGateReasons(a, nil, backend, actSafe); len(g) > 0 {
 		return g[0].Reason
 	}
 	return ""
@@ -321,8 +321,9 @@ const (
 
 // residentGateReasons is every gate after the runner-shape one that refuses a on backend, in the order admission applies them; empty
 // when all admit. Admission reports the first (residentGateReasonAct). The hardware matrix prints all of them, because the first
-// refusal says nothing about the rest: a family that lacks one feature may also exceed the router's capacity.
-func residentGateReasons(a *Architecture, backend string, actSafe bool) []residentGate {
+// refusal says nothing about the rest: a family that lacks one feature may also exceed the router's capacity. prog is a's program
+// when the caller has it built; nil builds it here.
+func residentGateReasons(a *Architecture, prog *layerProgram, backend string, actSafe bool) []residentGate {
 	impl, ok := residentBackendFeatures[backend]
 	table := residentBackendTables[backend]
 	if !ok && table == nil {
@@ -336,7 +337,10 @@ func residentGateReasons(a *Architecture, backend string, actSafe bool) []reside
 			Reason: "every resident " + backend + " projection quantizes activations to int8, and " + why})
 	}
 	if table != nil {
-		if gaps := table.Gaps(buildProgram(a, configExperts(a))); len(gaps) > 0 {
+		if prog == nil {
+			prog = buildProgram(a, configExperts(a))
+		}
+		if gaps := table.Gaps(prog); len(gaps) > 0 {
 			out = append(out, residentGate{Kind: residentGateOperations, Reason: strings.Join(gaps, "; ")})
 		}
 		if missing := a.featuresOutsideProgram(); len(missing) > 0 {
@@ -365,8 +369,8 @@ func residentGateReasons(a *Architecture, backend string, actSafe bool) []reside
 	return out
 }
 
-// residentBackendTables names the backends whose admission reads an operation-and-parameter table instead of a feature set
-// (docs/tasks/task-forward-architecture-2026-10.md §4.9 and §4.9a, OP4m-c and OP4cu-c). The backend's walker checks the same
+// residentBackendTables names the backends whose admission reads an operation-and-parameter table instead of a feature set.
+// The backend's walker checks the same
 // table at build.
 var residentBackendTables = map[string]*program.Support{"metal": program.Metal, "cuda": program.CUDA}
 
@@ -377,10 +381,13 @@ func residentDeclared(backend string) bool {
 }
 
 // residentCovers reports whether backend implements everything a needs: its feature set, or its table and the features outside
-// the program.
-func residentCovers(a *Architecture, backend string) bool {
+// the program. prog is a's program, nil to build it.
+func residentCovers(a *Architecture, prog *layerProgram, backend string) bool {
 	if t := residentBackendTables[backend]; t != nil {
-		return t.Check(buildProgram(a, configExperts(a))) == nil && len(a.featuresOutsideProgram()) == 0
+		if prog == nil {
+			prog = buildProgram(a, configExperts(a))
+		}
+		return t.Check(prog) == nil && len(a.featuresOutsideProgram()) == 0
 	}
 	return len(missingFeatures(a.residentFeatures(), residentBackendFeatures[backend])) == 0
 }
@@ -415,7 +422,7 @@ func (a *Architecture) featuresOutsideProgram() []ResidentFeature {
 // validation. History: docs/code-notes/decoder.md#residentBackendMoECap.
 var residentBackendMoECap = map[string]struct{ experts, groups int }{
 	"webgpu": {experts: 512, groups: 32}, // gpu/moe.go: MAXE 512, array<f32,512> score/sel / array<f32,32> gscore
-	"cuda":   {experts: 512, groups: 64}, // cuda/moe.cu: MOE_MAX_E 512 / MOE_MAX_G 64. 256→512 raised deliberately (see below); groups was 32→64 by audit M-17
+	"cuda":   {experts: 512, groups: 64}, // cuda/moe.cu: MOE_MAX_E 512 / MOE_MAX_G 64. 256→512 raised deliberately (see below)
 	"metal":  {experts: 256, groups: 64}, // metal/moe.go: float score[256]/sel[256], gscore[64]/keep[64]; guarded at build (moe.go:375-376)
 }
 

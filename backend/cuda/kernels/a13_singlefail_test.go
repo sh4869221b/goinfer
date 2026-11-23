@@ -22,7 +22,7 @@ import (
 //	               path in the same process with no error
 //
 // Three repeats either way: A13's failures vary run to run, so a single negative clears nothing.
-// Record: docs/queue-engineering.md, section A13. Detail: docs/code-notes/cuda.md#TestA13_SingleFailedAllocPoisons.
+// Detail: docs/code-notes/cuda.md#TestA13_SingleFailedAllocPoisons.
 func TestA13_SingleFailedAllocPoisons(t *testing.T) {
 	if os.Getenv("GOINFER_A13_SINGLEFAIL") == "" {
 		t.Skip("set GOINFER_A13_SINGLEFAIL=1 — A13 probe, deliberately not part of the tier")
@@ -156,8 +156,7 @@ func TestA13_SingleFailedAllocPoisons(t *testing.T) {
 	validateGlue(t, ctx, stream, bg, fRms2, fSw2, fAttn2, nH*hd, I, nH, nKV, hd, nKeys, scale)
 	if t.Failed() {
 		t.Logf("(c) POISONED after failed allocations — production is exposed: one model's OOM " +
-			"silently breaks another model's CUDA path in the same process, with no error anywhere. " +
-			"See docs/QUEUE.md A13.")
+			"silently breaks another model's CUDA path in the same process, with no error anywhere.")
 		return
 	}
 	t.Logf("(c) correct after %d failed allocation(s) — this many refusals do not poison the context", nfail)

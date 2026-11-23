@@ -12,13 +12,12 @@ import (
 	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 )
 
-// The Mamba-2 mixer (Nemotron-H) and the non-gated squared-ReLU MLP on the resident runner (docs/tasks/task-forward-architecture-2026-10.md §4.7, OP2b on
-// CUDA, step 2b). A Nemotron-H block carries ONE operation (cudaMixerOf, from the program): the Mamba-2 mixer, attention, or the MLP, each behind
+// The Mamba-2 mixer (Nemotron-H) and the non-gated squared-ReLU MLP on the resident runner. A Nemotron-H block carries ONE operation (cudaMixerOf, from the program): the Mamba-2 mixer, attention, or the MLP, each behind
 // its own pre-norm and added to the residual. The mixer is mamba.cu's conv → SSM → gated-norm chain around two W8A8 projections; the MLP is the up
 // GEMV, nongated_act.cu's relu2_quant, and the down GEMV. Nothing here is reachable end to end until the recurrent guard sites read Mamba too
 // (step 2c) and the backend declares the features.
 
-// mambaConvShiftForTest shifts mamba_conv's input read by that many elements: OP2b gate M's planted defect, a conv that sees the wrong channels while the CPU
+// mambaConvShiftForTest shifts mamba_conv's input read by that many elements: the Mamba-2 resident gate's planted defect, a conv that sees the wrong channels while the CPU
 // keeps the right math. Set by tests only.
 var mambaConvShiftForTest int
 
@@ -41,14 +40,16 @@ func (p *mambaParams) ssmFloats() int { return p.nHeads * p.headDim * p.dState }
 // buildMambaParams returns the model's Mamba-2 geometry, or nil for a model with no Mamba layer. Granite-4.0-H and an int8 load decline by name:
 // Granite's embedding and residual multipliers are not folded here, and int8 projections would be re-quantized to int4 without notice.
 func buildMambaParams(m *decoder.Model) (*mambaParams, error) {
-	if _, _, _, _, _, _, _, _, _, ok := m.GraniteResidentParams(); ok {
+	bv := m.BackendView()
+	if _, ok := bv.Granite(); ok {
 		return nil, fmt.Errorf("Granite-4.0-H's embedding and residual multipliers are not folded on CUDA; it runs on the CPU")
 	}
-	nh, hd, ds, ng, k, normG, _, ok := m.NemotronResidentParams()
+	np, ok := bv.Nemotron()
 	if !ok {
 		return nil, nil
 	}
-	if (!m.ResidentProjsInt4() || recurrentInt8Load(m)) && !mambaInt8DeclineOffForTest {
+	nh, hd, ds, ng, k, normG := np.NHeads, np.HeadDim, np.DState, np.NGroups, np.DConv, np.NormGroups
+	if (!bv.ProjsInt4() || recurrentInt8Load(m)) && !mambaInt8DeclineOffForTest {
 		return nil, fmt.Errorf("Nemotron-H runs resident at int4 only; its int8 projections would be re-quantized to int4 here, so it runs on the CPU")
 	}
 	if normG < 1 || ng < 1 || nh%ng != 0 || (nh*hd)%normG != 0 || k < 2 || k > 8 || (nh*hd)%8 != 0 {
@@ -72,18 +73,20 @@ func recurrentInt8Load(m *decoder.Model) bool {
 	return false
 }
 
-// hostMamba is one Mamba-2 layer's packed weights and small tables, before upload.
+// hostMamba is one Mamba-2 layer's planned projections and small tables, before upload. The projections are planned, not packed (planWeight): upW streams them
+// to the device in row blocks, so the host holds no packed copy of them.
 type hostMamba struct {
 	in, out                    hostW
 	convW, convB, headP, normW []float32
 }
 
-// packMambaLayer packs layer l's Mamba-2 weights: in_proj [projDim, hidden] and out_proj [hidden, dInner] as per-row int8 (the codes the load holds, or
-// quantized here from the f32, the same codes either way), and headP = {-exp(aLog) in f64, dtBias, D} per head.
+// packMambaLayer plans layer l's Mamba-2 weights: in_proj [projDim, hidden] and out_proj [hidden, dInner] as per-row int8 (the codes the load holds, or
+// quantized at upload from the f32, the same codes either way), and packs headP = {-exp(aLog) in f64, dtBias, D} per head.
 func packMambaLayer(m *decoder.Model, l, hidden int, p *mambaParams) (hostMamba, error) {
-	inProj, convW, convB, aLog, dW, dtBias, normW, outProj := m.GraniteMambaWeights(l)
+	bv := m.BackendView()
+	inProj, convW, convB, aLog, dW, dtBias, normW, outProj := bv.Layer(l).GraniteMambaWeights()
 	var inWM, outWM linalg.WeightMat
-	if in, out := m.MambaProjInt8(l); in != nil {
+	if in, out := bv.Layer(l).MambaProjInt8(); in != nil {
 		inWM, outWM = *in, *out
 	} else {
 		if len(inProj) != p.projDim*hidden || len(outProj) != hidden*p.dInner {
@@ -106,10 +109,10 @@ func packMambaLayer(m *decoder.Model, l, hidden int, p *mambaParams) (hostMamba,
 	}
 	var hm hostMamba
 	var err error
-	if hm.in, err = packWeight(&inWM); err != nil {
+	if hm.in, err = planWeight(&inWM); err != nil {
 		return hostMamba{}, fmt.Errorf("layer %d in_proj: %w", l, err)
 	}
-	if hm.out, err = packWeight(&outWM); err != nil {
+	if hm.out, err = planWeight(&outWM); err != nil {
 		return hostMamba{}, fmt.Errorf("layer %d out_proj: %w", l, err)
 	}
 	if hm.in.kind != "int8" || hm.out.kind != "int8" {
@@ -225,18 +228,16 @@ func (r *cudaResident) resetMambaState() error {
 	if r.mamba == nil || mambaResetSkipForTest {
 		return nil
 	}
-	p := r.mamba
-	winZ := make([]float32, (p.dConv-1)*p.convDim)
-	ssmZ := make([]float32, p.nHeads*p.headDim*p.dState)
+	zero := zeroFloats()
 	for i := range r.layers {
 		L := &r.layers[i]
 		if L.mixer != decoder.MixerMamba {
 			continue
 		}
-		if e := gpu.Upload(L.mbWin, winZ); e != nil {
+		if e := gpu.Upload(L.mbWin, zero(r.recFloats[i].win)); e != nil {
 			return e
 		}
-		if e := gpu.Upload(L.mbSSM, ssmZ); e != nil {
+		if e := gpu.Upload(L.mbSSM, zero(r.recFloats[i].state)); e != nil {
 			return e
 		}
 	}

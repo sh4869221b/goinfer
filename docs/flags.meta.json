@@ -44,13 +44,13 @@
   {
    "name": "vision-device",
    "group": "Choosing models",
-   "summary": "Where the vision towers and the Whisper-style audio encoder (Whisper, Voxtral) run: `auto` (on the `--backend` GPU when this binary has a tower there; under `--backend webgpu` the vision towers stay on the CPU), `cpu` (the model keeps its own backend) or `gpu` (as `auto`, and under `--backend webgpu` the towers with a WebGPU form run on the GPU in float32).",
+   "summary": "Where the vision towers and the Whisper-style audio encoder (Whisper, Voxtral) run: `auto` (on the `--backend` GPU when this binary has a tower there; under `--backend webgpu` a discrete GPU and a Qwen3.5+ `.gguf` mmproj tower keep the CPU), `cpu` (the model keeps its own backend) or `gpu` (as `auto`, and it also puts those on the device).",
    "type": "auto | cpu | gpu"
   },
   {
    "name": "vision-quant",
    "group": "Choosing models",
-   "summary": "Vision encoder precision: `f32` (bit-exact) or `int8`, which only speeds up the vision encoder on AVX512-VNNI CPUs. Unset is `f32` everywhere. On CUDA Gemma 3 is `int8` instead, with a note, if the card cannot hold decoder, a KV slot and the float32 tower; explicit `f32` never falls back. Under `--backend webgpu` Gemma 3's unset default runs on the CPU, and an explicit `f32` or `int8` puts that tower on the GPU.",
+   "summary": "Vision encoder precision: `f32` (bit-exact) or `int8`, which only speeds up the vision encoder on AVX512-VNNI CPUs. Unset is `f32` everywhere. On CUDA Gemma 3 is `int8` instead, with a note, if the card cannot hold decoder, a KV slot and the float32 tower. Under `--backend webgpu` Gemma 3's `f32` tower is on the GPU on a Mac (a discrete GPU keeps the CPU tower unless `f32` or `int8` is given).",
    "type": "f32 | int8"
   },
   {
@@ -105,12 +105,17 @@
   {
    "name": "accept-slow",
    "group": "Memory and swap safety",
-   "summary": "Load a `--stream-weights` paged-MoE model even when its predicted decode rate is below the 2 tok/s floor. Without this, such a load is refused and the predicted rate is named."
+   "summary": "Load a MoE `.giw` (its default mapped sidecar, or `--stream-weights`) even when its predicted decode rate on the CPU is below the 2 tok/s floor. Without this, such a load is refused and the predicted rate is named."
   },
   {
    "name": "moe-cache-experts",
    "group": "Memory and swap safety",
    "summary": "Run a MoE model whose experts exceed VRAM or RAM by streaming routed experts to the GPU per token. Bit-identical to fully resident, at the cost of a transfer per token. Off by default."
+  },
+  {
+   "name": "moe-experts-unpinned",
+   "group": "Memory and swap safety",
+   "summary": "With `--moe-cache-experts` on CUDA, upload expert slots from a packed-experts file's pageable pages instead of a pinned host copy: about 12 GiB less host memory on Gemma 4 26B, slower by design (0.82x decode at short context, 0.75x at long). Off by default; named by the memory refusal when the copy does not fit."
   },
   {
    "name": "moe-cache-slots",
@@ -132,27 +137,27 @@
   {
    "name": "backend",
    "group": "Backend, precision and context",
-   "summary": "The compute backend. `auto` (the default) picks `cuda` when a device answers, else `metal` on Apple silicon for int4 models (Metal re-quantizes other precisions, so those stay on the CPU), else `cpu`, and prints one line saying which. It never picks `webgpu`. `--version` lists the backends in this binary; naming one that is not there falls back to `cpu`.",
+   "summary": "The compute backend. `auto` (the default) picks `cuda` when a device answers, else `metal` on Apple silicon for int4 and q4k models (Metal re-quantizes other precisions, so those stay on the CPU), else `cpu`, and prints one line saying which. It never picks `webgpu`. `--version` lists the backends in this binary; naming one that is not there falls back to `cpu`.",
    "type": "auto | cpu | webgpu | cuda | metal"
   },
   {
    "name": "quant",
    "group": "Backend, precision and context",
-   "summary": "Weight precision, the accuracy, speed and RAM trade-off. `int4` is the default; `f32` is unquantized. A prequantized `.giw` carries its own.",
+   "summary": "Weight precision, the accuracy, speed and RAM trade-off. `int4` is the default (`q4k` for a Phi-3/4 `.gguf`, except on WebGPU); `f32` is unquantized. A prequantized `.giw` carries its own.",
    "type": "int4 | int4mix | q4k | int8int8 | int8 | f32",
    "see": "docs/quantization.md"
   },
   {
    "name": "embed-int4",
    "group": "Backend, precision and context",
-   "summary": "With `--quant int4`, keep the token-embedding and LM-head table at int4 as well, halving the largest resident tensor on a small model with a big vocabulary. On by default, except when the backend is `metal` (named, or chosen by `auto`), where the resident runner does not take an int4 table yet and the default is off. `--embed-int4=false` keeps it at int8.",
+   "summary": "Keep the token-embedding and LM-head table at int4 with `--quant int4`, halving the largest resident tensor. The default is on under 1B parameters and off from 1B up and on `metal`; an explicit value wins.",
    "type": "bool",
    "see": "docs/quantization.md"
   },
   {
    "name": "kv",
    "group": "Backend, precision and context",
-   "summary": "KV cache precision. `auto` (the default) is f16 on Metal, and on CUDA for each family group whose quality gate cleared it (the rest stay f32 with the reason in the banner; the KV precision matrix names which), f32 elsewhere; `f32` is bit-exact; `f16` and `i8` are lossy and smaller (`f16` applies to GPU-resident models only).",
+   "summary": "KV cache precision. `auto` (the default) is f16 on Metal, and on CUDA for each family group whose quality gate cleared it (the rest stay f32 with the reason in the banner; the KV precision matrix names which), f32 elsewhere; `f32` is bit-exact; `f16` and `i8` are lossy and smaller (`f16` applies to GPU-resident models only). CUDA `i8`'s measured cost: the KV precision matrix.",
    "type": "auto | f32 | f16 | i8"
   },
   {
@@ -165,7 +170,7 @@
   {
    "name": "ctx",
    "group": "Backend, precision and context",
-   "summary": "GPU-resident KV capacity in positions. 0 keeps the backend default, which `--fit` may raise."
+   "summary": "GPU-resident KV capacity in positions. 0 keeps the backend default, which `--fit` may raise. On CUDA a context given here whose KV does not fit the card stops startup with an error naming the bytes, rather than running on the CPU."
   },
   {
    "name": "direct-load",
@@ -187,27 +192,34 @@
    "name": "windowed-kv",
    "group": "Backend, precision and context",
    "summary": "CUDA only: each sliding-window layer keeps `window + 512` KV positions instead of the whole context, so a mixed sliding/full model fits a longer context in the same VRAM. Output is meant to be identical. On by default (`--windowed-kv=false` opts out); ignored by other backends and by models with no sliding-window layers.",
-   "see": "docs/tasks/task-cuda-windowed-kv-2026-10.md"
+   "see": "docs/completed/task-cuda-windowed-kv-2026-10.md"
   },
   {
    "name": "moe-step",
    "group": "Backend, precision and context",
    "summary": "Metal only: a MoE model runs concurrent requests in one batched decode step, and prefills prompts under 16 tokens on it. Output is bit-identical either way. It costs the step's scratch, a few MB. On by default (`--moe-step=false` opts out); ignored by other backends, dense models and a paged MoE.",
-   "see": "docs/tasks/task-forward-architecture-2026-10.md"
+   "see": "docs/completed/task-forward-architecture-2026-10.md"
   },
   {
    "name": "recurrent-step",
    "group": "Backend, precision and context",
    "summary": "Metal only: a Qwen3.5-family or Nemotron-H model batches concurrent requests in one decode step. Bit-identical output. In serve, on when `--kv-sessions` is given at 2 or more, for about 10 MB; off in `goinfer-chat`. Not with a vision tower attached.",
    "type": "bool",
-   "see": "docs/tasks/task-forward-architecture-2026-10.md"
+   "see": "docs/completed/task-forward-architecture-2026-10.md"
+  },
+  {
+   "name": "flash-decode-softcap",
+   "group": "Backend, precision and context",
+   "summary": "CUDA only: a model with an attention softcap (Gemma 2) decodes on the flash-decode lane, in its capped variant, instead of the exact split-KV lane. Off by default; its outputs differ from the exact lane's. No effect on a model without a softcap.",
+   "type": "bool",
+   "see": "docs/measurements/op1o2-fa-softcap-2026-11/README.md"
   },
   {
    "name": "gemma4-step",
    "group": "Backend, precision and context",
    "summary": "Metal only: a Gemma 4 dense model batches concurrent requests in one decode step. Bit-identical output. In serve, on with 2 or more KV sessions, the default included, for about 10 MB; off in `goinfer-chat`. Not with a vision tower attached.",
    "type": "bool",
-   "see": "docs/tasks/task-forward-architecture-2026-10.md"
+   "see": "docs/completed/task-forward-architecture-2026-10.md"
   },
   {
    "name": "max-concurrent",
@@ -241,9 +253,14 @@
    "summary": "Cap on request-body size in bytes; a larger body is rejected with 413 before it is read. 0 derives the cap from the model's context window."
   },
   {
+   "name": "max-file-store-bytes",
+   "group": "Concurrency and queues",
+   "summary": "Cap on the bytes of uploaded files and batch results held in memory (1 GiB). The oldest go first and the newest upload or batch's result files are always kept, so a dropped file's id answers 404. 0 means no limit on bytes."
+  },
+  {
    "name": "kv-host-bytes",
    "group": "Sessions and KV cache",
-   "summary": "Host memory for prefix snapshots on a GPU-resident model: after a cold first prefill of a long prompt its KV is copied to pinned host memory, and a later request starting with the same ids restores it. `auto` (default) is a tenth of RAM, at most 8 GiB; `0` turns it off; or a byte count with an optional K, M or G. Pinned only while a snapshot is held. Named: also keeps released rows (CUDA; experimental)."
+   "summary": "Host memory for prefix snapshots on a GPU-resident model: after a cold first prefill of a long prompt its KV is copied to host memory, and a later request starting with the same ids restores it. `auto` (default) is a tenth of RAM, at most 8 GiB; `0` turns it off; or a byte count with an optional K, M or G. Held only while a snapshot is. Named: also keeps released rows (CUDA; experimental)."
   },
   {
    "name": "kv-share",
@@ -285,7 +302,7 @@
   {
    "name": "spec-adaptive",
    "group": "Speculative decoding",
-   "summary": "Experimental. With `--spec ngram`, keeps concurrent generations: one speculates only while it is alone and joins batched decode when others arrive. Needs a resident whose decode can batch. Graded on CUDA: faster than batching alone, but under load slower than batching on chat (0.86x) and slower than plain `--spec ngram` on copy (0.80x), so not recommended there (`docs/measurements/mc4-candidate-cuda-2026-10-01.md`)."
+   "summary": "Experimental, opt-in. With `--spec ngram`, a generation speculates only while it is alone and joins batched decode when others arrive. Measured on CUDA under load: 0.858x batching on chat and 0.80x plain `--spec ngram` on copy (`docs/measurements/mc4-candidate-cuda-2026-10-01.md`)."
   },
   {
    "name": "drafter",

@@ -16,9 +16,11 @@ import (
 	"time"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/internal/app/serveapp/jobs"
+	"github.com/townsendmerino/goinfer/internal/runtime/scheduler"
 )
 
-// The scheduling census (docs/tasks/task-subsystems-2026-10.md § "SB6 — the scheduling census"): today's scheduling
+// The scheduling census: today's scheduling
 // decisions replayed over fixed traces and compared with goldens under testdata/sched/, so a move of the policy out of
 // this package can show it changed nothing. -sched.update rewrites the goldens.
 var updateSched = flag.Bool("sched.update", false, "rewrite the scheduling census goldens under testdata/sched/")
@@ -260,7 +262,7 @@ func (s *schedSim) step(e schedEvent) schedStep {
 			}
 			if len(r.ev.Prompt) > 0 {
 				if s.prev != nil {
-					n := commonPrefix(s.prev, r.ev.Prompt)
+					n := scheduler.CommonPrefix(s.prev, r.ev.Prompt)
 					r.out.SharedPrev = &n
 				}
 				s.prev = r.ev.Prompt
@@ -269,7 +271,7 @@ func (s *schedSim) step(e schedEvent) schedStep {
 			continue
 		}
 		switch {
-		case r.why.state == jobFailed:
+		case r.why.state == jobs.Failed:
 			r.out.Outcome = "queue_full"
 		case r.ctx.Err() != nil && r.why.reason == "cancelled before a turn was granted":
 			r.out.Outcome = "cancelled"
@@ -517,7 +519,7 @@ func (s *placementSim) holds(toks []int) string {
 	for _, n := range names {
 		c := s.convs[n]
 		for _, p := range append(slices.Clone(c.prompts), c.history) {
-			if m := commonPrefix(p, toks); m > best {
+			if m := scheduler.CommonPrefix(p, toks); m > best {
 				best, name = m, n
 			}
 		}
@@ -599,7 +601,7 @@ func (s *placementSim) acquire(e placementEvent) placementStep {
 		st.Action = "in_place"
 	}
 	if inLRU {
-		n, m := len(had), commonPrefix(had, prompt)
+		n, m := len(had), scheduler.CommonPrefix(had, prompt)
 		st.HadTokens, st.Common = &n, &m
 	}
 	h := len(x.Tokens())

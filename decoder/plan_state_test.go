@@ -71,7 +71,7 @@ func TestPlan_pricesRecurrentState(t *testing.T) {
 			if p.StateBytes != held {
 				t.Errorf("%s: the plan's state line is %d bytes, the forward holds %d", fx.kind, p.StateBytes, held)
 			}
-			if want := p.DenseBytes + p.AllocSlackBytes + p.ExpertBytesUsed + p.KVBytes + p.HostCopyBytes + p.ExtraBytes + p.StateBytes; p.NeedBytes() != want {
+			if want := p.DenseBytes + p.AllocSlackBytes + p.ExpertBytesUsed + p.KVBytes + p.HostCopyBytes + p.ExtraBytes + p.StateBytes + p.ScratchBytes; p.NeedBytes() != want {
 				t.Errorf("NeedBytes %d, its lines sum to %d", p.NeedBytes(), want)
 			}
 			if tight := m.Plan("cpu", p.NeedBytes()-1, PlanRequest{Ctx: 64, CtxPinned: true}); tight.Placement == PlacementResident {
@@ -191,7 +191,7 @@ func TestPlan_expertBiasesOnTheLineThatHoldsThem(t *testing.T) {
 	}
 	full := m.ResidentWeightBytesPaged(0) - m.ResidentDenseWeightBytes() - bias
 	for _, b := range []string{"cuda", "webgpu", "metal", "cpu"} {
-		l := m.deviceLoad(b, false, false, true)
+		l := m.deviceLoad(b, PlanRequest{CtxPinned: true})
 		if l.ExpertBytesFull != full {
 			t.Errorf("%s: the scaled expert figure is %d, the experts alone %d", b, l.ExpertBytesFull, full)
 		}
@@ -200,7 +200,7 @@ func TestPlan_expertBiasesOnTheLineThatHoldsThem(t *testing.T) {
 			t.Errorf("%s: %d fixed on experts with %d of biases", b, l.ExpertBytesFixed, bias)
 		}
 	}
-	if got, want := m.ResidentDenseWeightBytesFor("webgpu")-m.ResidentDenseWeightBytes(), bias-m.kquantSavings("webgpu")-m.mambaProjSavings("webgpu"); got != want {
+	if got, want := m.ResidentDenseWeightBytesFor("webgpu")-m.ResidentDenseWeightBytes(), bias-m.kquantSavings("webgpu")-m.mambaProjSavings("webgpu")-m.residentHostSideBytes("webgpu"); got != want {
 		t.Errorf("webgpu's dense figure holds %d past the tensors, want %d", got, want)
 	}
 	// Metal's autoMoESlots reads these: one more slot costs an expert alone, and what is left at no slots holds the biases.
@@ -250,7 +250,7 @@ func TestDeviceLoad_stateOnEachBackend(t *testing.T) {
 			}
 		}
 		for _, be := range []string{"cpu", "webgpu", "metal", "cuda"} {
-			if got, held := m.deviceLoad(be, false, false, false).StateBytes, cacheStateBytes(c); got != held {
+			if got, held := m.deviceLoad(be, PlanRequest{}).StateBytes, cacheStateBytes(c); got != held {
 				t.Errorf("%s on %s: state line %d, the forward holds %d", dir, be, got, held)
 			}
 		}
@@ -262,7 +262,7 @@ func TestDeviceLoad_stateOnEachBackend(t *testing.T) {
 	}
 	defer dense.Close()
 	for _, be := range []string{"cpu", "webgpu", "metal", "cuda"} {
-		if got := dense.deviceLoad(be, false, false, false).StateBytes; got != 0 {
+		if got := dense.deviceLoad(be, PlanRequest{}).StateBytes; got != 0 {
 			t.Errorf("llama-tiny on %s has a state line of %d bytes", be, got)
 		}
 	}
@@ -288,11 +288,26 @@ func TestStateBuffers_granite(t *testing.T) {
 	}
 }
 
-// TestStateBuffers_kdaPerStream: a KDA layer's three conv windows are three buffers, so a backend's allocator rounds each on its own.
+// TestStateBuffers_kdaPerStream: a KDA layer's three conv windows are three buffers, so a backend's allocator rounds each on its own. On
+// Bailing Hybrid, the one family with KDA layers (MLA on the rest, which hold no state): the architecture is resolved from its config,
+// since a layer's state is what its operations declare and the program builds KDA only beside MLA.
 func TestStateBuffers_kdaPerStream(t *testing.T) {
-	a := &Architecture{NumLayers: 2, kda: &kdaParams{HeadDim: 8, NumHeads: 2, ConvKernel: 3}, layerIsLinear: func(l int) bool { return l == 1 }}
-	win, s := int64((3-1)*2*8)*4, int64(2*8*8)*4
-	if got, want := stateBuffers(a), []int64{win, win, win, s}; !slices.Equal(got, want) {
+	a, _, err := resolveArchitecture(representativeConfig("bailing_hybrid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := a.kda
+	win, s := int64((p.ConvKernel-1)*p.NumHeads*p.HeadDim)*4, int64(p.NumHeads*p.HeadDim*p.HeadDim)*4
+	var want []int64
+	for l := range a.NumLayers {
+		if a.isLinearLayer(l) {
+			want = append(want, win, win, win, s)
+		}
+	}
+	if len(want) == 0 {
+		t.Fatal("the config has no KDA layer; the test reads nothing")
+	}
+	if got := stateBuffers(a); !slices.Equal(got, want) {
 		t.Errorf("KDA's state buffers: %v, want %v", got, want)
 	}
 }
@@ -319,5 +334,24 @@ func TestCheckpointHeadroom_followsTheBuildsOrder(t *testing.T) {
 		if got := checkpointHeadroom(c.p, free, c.req); got != c.want {
 			t.Errorf("%s: headroom %d, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+// TestCUDABuildDemand_unpinnedExpertsDropTheCopy: a CUDA expert-cache build from a .gguf peaks at the weights once, the experts' pinned copy,
+// one packed layer (when the layer count is known) and the packing stages; with MoEExpertsUnpinned the copy is file pages and is not
+// priced. No second copy of the weights: the build streams its packing (docs/measurements/memfix-e6-2026-11/README.md).
+func TestCUDABuildDemand_unpinnedExpertsDropTheCopy(t *testing.T) {
+	q := BuildQuery{Options: Options{Backend: "cuda"}, GGUF: true, WeightBytes: 10 << 30, ExpertBytes: 7 << 30, ExpertCache: true}
+	if got, want := defaultCUDABuildDemand(q).HostBuildPeak, int64(17<<30+cudaPackStageBytes); got != want {
+		t.Errorf("pinned: build peak %d, want %d", got, want)
+	}
+	q.Layers = 10
+	if got, want := defaultCUDABuildDemand(q).HostBuildPeak, int64(18<<30+cudaPackStageBytes); got != want {
+		t.Errorf("pinned, 10 layers: build peak %d, want %d (one packed layer of 1 GiB)", got, want)
+	}
+	q.Layers = 0
+	q.Options.MoEExpertsUnpinned = true
+	if got, want := defaultCUDABuildDemand(q).HostBuildPeak, int64(10<<30+cudaPackStageBytes); got != want {
+		t.Errorf("unpinned: build peak %d, want %d", got, want)
 	}
 }

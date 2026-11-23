@@ -14,7 +14,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// OP6's Metal half, tier 0 (docs/tasks/task-forward-architecture-2026-10.md §4.7): the q4k lane on MC3's batched step.
+// OP6's Metal half, tier 0: the q4k lane on MC3's batched step.
 // Every check is bit for bit against the lane's own decode. The model is Qwen2.5-Coder-0.5B q4_k_m, whose attn_v is Q6_K
 // (int8 on the lane) in half the layers, so both rows GEMVs and the multi-segment projections run.
 
@@ -43,7 +43,7 @@ func q4kStepLoad(t *testing.T, env, file string, slots, ctx int) *metalResident 
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		m.Close()
 		t.Fatalf("build resident: %v", err)
@@ -144,14 +144,15 @@ func q4kStepPrompt(t *testing.T, a *metalResident, ids []int, startPos int) (lg,
 }
 
 // TestQ4KStep_promptMatchesSequential is gate (a): a q4k prompt on the step route gives the last row's logits and every K/V
-// byte that decode's single-token loop gives, at lengths that leave a one-row tail (9, 17), end on a full step (8, 64), or
-// fit in one step (2, 7), and for a continuation. It also pins PrefillPath's report of the route.
+// byte that decode's single-token loop gives, at lengths that leave a one-row tail (9, 17), end on a full step (8, 24), or
+// fit in one step (2, 7), and for a continuation; all end below the step's bound (stepPrefillBound), past which a prompt takes
+// the f16 pass. It also pins PrefillPath's report of the route.
 func TestQ4KStep_promptMatchesSequential(t *testing.T) {
 	a := q4kStepResident(t, 2, 1024)
 	if ok, why := a.PrefillPath(); !ok || !strings.Contains(why, "batched step") {
 		t.Errorf("PrefillPath() = %v, %q: want the batched step route", ok, why)
 	}
-	cases := []struct{ n, start int }{{2, 0}, {7, 0}, {8, 0}, {9, 0}, {17, 0}, {64, 0}, {26, 17}}
+	cases := []struct{ n, start int }{{2, 0}, {7, 0}, {8, 0}, {9, 0}, {17, 0}, {24, 0}, {26, 17}}
 	for i, c := range cases {
 		lg, kv := q4kStepPrompt(t, a, q4kStepIDs(uint32(9001+i), c.n), c.start)
 		t.Logf("%d tokens from %d: %d of %d last-row logits and %d K/V elements differ", c.n-c.start, c.start, lg, a.r.V, kv)
@@ -164,12 +165,12 @@ func TestQ4KStep_promptMatchesSequential(t *testing.T) {
 // TestQ4KStep_plantIsRed is gate (a)'s planted defect: the min term dropped from the q4k rows kernel alone (decode keeps
 // it) must make the step differ from sequential decode.
 func TestQ4KStep_plantIsRed(t *testing.T) {
-	const good = "acc[r] += d*sc0*dlo + d*sc1*dhi - dm*(m0*slo + m1*shi);"
+	const good = "acc[n] += d*sc0*dlo + d*sc1*dhi - dm*(m0*slo + m1*shi);"
 	if strings.Count(mc3RowsKernels, good) != 1 {
 		t.Fatal("the plant's target is not in the q4k rows kernel")
 	}
 	prev := mc3RowsKernels
-	mc3RowsKernels = strings.Replace(prev, good, "acc[r] += d*sc0*dlo + d*sc1*dhi;", 1)
+	mc3RowsKernels = strings.Replace(prev, good, "acc[n] += d*sc0*dlo + d*sc1*dhi;", 1)
 	t.Cleanup(func() { mc3RowsKernels = prev })
 	a := q4kStepResident(t, 2, 1024)
 	lg, kv := q4kStepPrompt(t, a, q4kStepIDs(9004, 17), 0)
@@ -180,8 +181,9 @@ func TestQ4KStep_plantIsRed(t *testing.T) {
 }
 
 // TestQ4KStep_verifyRowsMatchDecode is gate (b): M consecutive rows of one sequence on one slot, as a speculative verify
-// runs them, against decode at depths 128 and 2048. Both slots take the same history once per depth, through PrefillLast
-// (gate (a) shows it writes decode's bytes); each case's rows overwrite their positions before attention reads them.
+// runs them, against decode at depths 128 and 2048. Both slots take the same history once per depth, through PrefillLast (the
+// f16 pass at these depths, which writes the same bytes into each slot); each case's rows overwrite their positions before
+// attention reads them.
 func TestQ4KStep_verifyRowsMatchDecode(t *testing.T) {
 	a := q4kStepResident(t, 2, 4096)
 	r := a.r

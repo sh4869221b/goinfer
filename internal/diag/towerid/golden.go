@@ -15,8 +15,7 @@ import (
 	"github.com/townsendmerino/goinfer/internal/vision"
 )
 
-// Golden is one backend's committed record on one platform, with the anchor its bits depend on (SB9's goldens,
-// docs/tasks/task-subsystems-2026-10.md, "SB9's gates").
+// Golden is one backend's committed record on one platform, with the anchor its bits depend on.
 type Golden struct {
 	Schema int    `json:"schema"`
 	Anchor string `json:"anchor"`
@@ -32,7 +31,7 @@ const (
 	// FailOtherAnchor: a different anchor is re-anchored deliberately, never carried forward (a device's driver or adapter).
 	FailOtherAnchor
 	// FailOtherAnchorSkipOnCI is FailOtherAnchor, except on CI (GITHUB_ACTIONS=true), where a different anchor skips: a CI
-	// runner's virtual adapter has no golden of its own (docs/tasks/task-subsystems-2026-10.md, "SB9 step S on the Mac").
+	// runner's virtual adapter has no golden of its own.
 	FailOtherAnchorSkipOnCI
 )
 
@@ -44,7 +43,7 @@ func GoldenPath(root, backend string) string {
 	return filepath.Join(root, "internal", "diag", "towerid", "testdata", fmt.Sprintf("towers.%s-%s-%s.json", backend, runtime.GOOS, runtime.GOARCH))
 }
 
-// CheckGolden grades rec, recorded under anchor, against its backend's golden case for case, exactly (G-SB9-1). With update
+// CheckGolden grades rec, recorded under anchor, against its backend's golden case for case, exactly. With update
 // it first writes rec as the golden. A platform without a golden skips, printing the record to commit; a different anchor
 // skips or fails as onOther says. It returns the golden's record.
 func CheckGolden(t testing.TB, root string, rec Record, anchor string, onOther OnOtherAnchor, update bool) Record {
@@ -116,7 +115,7 @@ func diffCases(want, got []Case) []string {
 	return out
 }
 
-// CheckPlants is G-SB9-2: for each family in golden, a one-ulp plant in that family's output (PlantForTest) turns exactly
+// CheckPlants is the plant gate: for each family in golden, a one-ulp plant in that family's output (PlantForTest) turns exactly
 // that family's cases red against golden and leaves every other case equal.
 func CheckPlants(t testing.TB, root, backend string, golden Record) {
 	t.Helper()
@@ -170,7 +169,7 @@ func isActivation(op vision.TowerOp) bool {
 		op.Kind == vision.TowerGELUErf || op.Kind == vision.TowerSiLU
 }
 
-// programPlants are G-SB9M-2's plants in a tower program (docs/tasks/task-subsystems-2026-10.md §8, "SB9 step M"). The
+// programPlants are G-SB9M-2's plants in a tower program. The
 // epsilon is scaled by 2^20, exact in float32 and float64, because a one-ulp move is lost in variance+eps. The
 // activation swap reads a register its linear has not yet written (on SigLIP and Qwen3 it equals the activation
 // dropped), so proj's swap with the second norm is the order plant that reads only written registers.
@@ -288,13 +287,13 @@ func programPlantVerdict(backend string, fams []string, golden, rec Record) (err
 	return errs, covered
 }
 
-// The bound G-SB9-3 registered for a device output against the CPU's: an expectation, not a measured floor.
+// The bound registered for a device output against the CPU's: an expectation, not a measured floor.
 const (
 	BackendMinCosine = 0.999
 	BackendMaxRelErr = 0.05
 )
 
-// CompareBackends is G-SB9-3: each of backend's device cases against the CPU's output on the same input, by cosine and by
+// CompareBackends is the cross-backend gate: each of backend's device cases against the CPU's output on the same input, by cosine and by
 // max abs difference over the CPU output's RMS. A case outside the registered bound is a finding (DECISION NEEDED).
 func CompareBackends(t testing.TB, root, backend string) {
 	t.Helper()

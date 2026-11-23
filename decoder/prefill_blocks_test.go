@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// blockFake is mc3Fake as a resident that splits its prefill (ResidentPrefillBlocks): it reports a block and a
+// blockFake is mc3Fake as a resident that splits its prefill (PrefillBlocksAvailable): it reports a block and a
 // per-row scratch figure, records every PrefillLast call, and can decline or cancel at a chosen call. mc3Fake's pass
 // writes each position as a Forward would, so a continuation equals the whole pass by construction and any difference
 // a test sees comes from how the decoder cut the prompt.
@@ -27,6 +27,9 @@ type blockFake struct {
 	partialAt, partialRows int
 	dropped                int // Forward at a position below this fails; 0: none
 }
+
+func (f *blockFake) ResidentSubsystems() ResidentSubsystems { return selfSubsystems(f) }
+func (f *blockFake) PrefillBlocksAvailable() bool           { return true }
 
 func (f *blockFake) PrefillLast(ctx context.Context, embs [][]float32, startPos int) ([]float32, error) {
 	f.calls = append(f.calls, [2]int{startPos, len(embs)})
@@ -58,7 +61,11 @@ func (f *blockFake) Forward(emb []float32, pos int) ([]float32, error) {
 func (f *blockFake) PrefillBlockRows() int              { return f.block }
 func (f *blockFake) PrefillScratchBytes(rows int) int64 { return int64(rows) * f.perRow }
 func (f *blockFake) PrefillTailExact() bool             { return f.tailExact }
-func (f *blockFake) PrefillKernelFloor() int            { return f.floor }
+func (f *blockFake) ResidentCaps() ResidentCaps {
+	c := f.mc3Fake.ResidentCaps()
+	c.HasKernelFloor, c.KernelFloor = true, f.floor
+	return c
+}
 
 type blockFakeBackend struct {
 	Backend
@@ -304,7 +311,7 @@ func TestAdmitPrefillMemory_pricesABlockedResidentByTheBlock(t *testing.T) {
 		t.Errorf("a blocked resident's request was refused though one block fits: %v", err)
 	}
 	wantRows := int64(rf.block + prefillTailMin - 1)
-	if got, ok := m.residentPrefillScratch(promptTokens); !ok || got != wantRows*rf.perRow+wantRows*4*int64(m.ResidentEmbedLen()) {
+	if got, ok := m.residentPrefillScratch(promptTokens); !ok || got != wantRows*rf.perRow+wantRows*4*int64(m.BackendView().EmbedLen()) {
 		t.Errorf("residentPrefillScratch = %d, %v; want the longest pass's %d rows of scratch and embeddings", got, ok, wantRows)
 	}
 	if err := m.AdmitPrefillMemoryShare(promptTokens, maxTokens, false, 1); err == nil {

@@ -11,10 +11,12 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 	"github.com/townsendmerino/goinfer/internal/vision"
 	"github.com/townsendmerino/goinfer/multimodal"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TestGemma3ImgPrefillResidentReal_gate is the real-checkpoint gate for the resident image-prefill
-// fast path (finishing gap 0, decoder.ResidentImagePrefill) — the direct sibling of
+// fast path (finishing gap 0, decoder.ResidentPrefillSubsystem) — the direct sibling of
 // gemma3_resident_real_test.go's TestGemma3ResidentReal_gate, same methodology, but exercising a
 // COLD (first-time) image turn's PREFILL on the resident GPU instead of the CPU-prefill-then-
 // UploadKV bridge that gate covers.
@@ -38,7 +40,7 @@ import (
 //
 //     GOINFER_HEAVY_TESTS=1 go test -tags 'cuda goinfer_testhooks' ./cuda/ -run TestGemma3ImgPrefillResidentReal_gate -v -timeout 30m
 func TestGemma3ImgPrefillResidentReal_gate(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	home, _ := os.UserHomeDir()
 	ckpt := os.Getenv("GEMMA3_4B")
 	if ckpt == "" {
@@ -95,9 +97,10 @@ func TestGemma3ImgPrefillResidentReal_gate(t *testing.T) {
 	if rf == nil {
 		t.Fatalf("gemma3 did not take the resident path with a 1024-position context (decode path: %s): the gate has nothing to test, which is a failure, not a skip", mc.DecodePath())
 	}
-	rip, ok := rf.(decoder.ResidentImagePrefill)
+	rip := decoder.SubsystemsOf(rf).Prefill
+	ok := rip.ImagePrefillAvailable()
 	if !ok {
-		t.Fatal("attn_img_batched did not load on this build — ResidentImagePrefill unavailable: the gate has nothing to test, which is a failure, not a skip")
+		t.Fatal("attn_img_batched did not load on this build — ResidentPrefillSubsystem unavailable: the gate has nothing to test, which is a failure, not a skip")
 	}
 
 	// --- Half 1: primitive-level logits comparison ---
@@ -111,7 +114,7 @@ func TestGemma3ImgPrefillResidentReal_gate(t *testing.T) {
 		t.Fatalf("CPU prefill logits vs golden: cosine %.6f < %.2f — the reference itself doesn't hold, stop here", cos, cpuInt4VsF32GoldenFloor)
 	}
 
-	residentLogits, gpuPos, err := mc.ResidentImagePrefillForTest(context.Background(), rip, g.InputIDs, feats, g.ImageTokenStart, g.MMTokens)
+	residentLogits, gpuPos, err := mc.ResidentImagePrefillForTest(context.Background(), rf, g.InputIDs, feats, g.ImageTokenStart, g.MMTokens)
 	if err != nil {
 		t.Fatalf("ResidentImagePrefillForTest: %v", err)
 	}

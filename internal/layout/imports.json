@@ -1,5 +1,5 @@
 {
-  "_about": "SB13's package layout (docs/tasks/task-subsystems-2026-10.md §8 and §9). arrows and test_arrows: every import from one goinfer package to another, by repository-relative directory, from non-test and from test files; TestLayout_arrows fails on one the tree makes that is not here, and on one here the tree no longer makes. rules: the protected separations, which no import, made or recorded, may break; they are edited by hand only.",
+  "_about": "The package layout. arrows and test_arrows: every import from one goinfer package to another, by repository-relative directory, from non-test and from test files; TestLayout_arrows fails on one the tree makes that is not here, and on one here the tree no longer makes. rules: the protected separations, which no import, made or recorded, may break; they are edited by hand only.",
   "rules": [
     {
       "name": "fit-leaf",
@@ -16,6 +16,45 @@
         ]
       },
       "why": "decoder/fit (Tier 3, docs/layout.md) holds the fit guard's and the planner's exchange types so a caller can name them without importing the loader. It sits below decoder, which re-exports them: it imports internal/runtime/mem and no other goinfer package, decoder included."
+    },
+    {
+      "name": "resident-leaf",
+      "from": [
+        "decoder/resident"
+      ],
+      "tests": true,
+      "forbid_goinfer": [
+        "*"
+      ],
+      "allow_goinfer": {
+        "decoder/resident": [
+          "internal/cost",
+          "internal/runtime/adapter"
+        ]
+      },
+      "why": "decoder/resident holds the contract a resident backend implements (the four subsystem interfaces, the provider, ResidentForward, the drafter host and the small data their signatures carry) so a reader can hold it without the loader (MZ5 option B, docs/sub1-resident-interfaces.md). It sits below decoder, which aliases every name in decoder/residentalias.go: it imports internal/cost and internal/runtime/adapter and no other goinfer package, decoder included."
+    },
+    {
+      "name": "config-leaf",
+      "from": [
+        "decoder/config"
+      ],
+      "tests": true,
+      "forbid_goinfer": [
+        "*"
+      ],
+      "why": "decoder/config holds a checkpoint's Config, its validators and its loader, so they test in seconds without compiling decoder. It sits below decoder, which aliases Config: it imports no goinfer package, decoder included."
+    },
+    {
+      "name": "quant-leaf",
+      "from": [
+        "decoder/quant"
+      ],
+      "tests": true,
+      "forbid_goinfer": [
+        "*"
+      ],
+      "why": "decoder/quant (Tier 3, docs/layout.md) parses safetensors checkpoint quantization configs and reconstructs FP8, GPTQ, AWQ, NVFP4 and MLX quantized weights behind Reconstructor/RowStreamReconstructor. It sits below decoder and imports no goinfer package, decoder included."
     },
     {
       "name": "towers-standalone",
@@ -125,6 +164,17 @@
         "cmd"
       ],
       "why": "The engine package (SB7) is what the serving shell asks of a model; the shell imports it and its fakes, never the reverse, so a fake engine needs no server."
+    },
+    {
+      "name": "serveapp-fakes-test-only",
+      "from": [
+        "internal/app/serveapp"
+      ],
+      "tests": false,
+      "forbid_goinfer": [
+        "engine/enginetest"
+      ],
+      "why": "The engine fakes are test code: the serving shell's production files do not link them. A test supplies its engine through loadedModel.fakeEngine."
     }
   ],
   "arrows": {
@@ -156,12 +206,15 @@
       "site/internal/site"
     ],
     "backend/cuda": [
+      "backend/cuda/internal/fitdecide",
       "backend/cuda/internal/gpudev",
       "backend/cuda/internal/launchgeom",
       "backend/cuda/internal/wpack",
       "decoder",
+      "decoder/fit",
       "internal/audio",
       "internal/cost",
+      "internal/runtime/logs",
       "internal/runtime/mem",
       "internal/runtime/program",
       "internal/runtime/sampling",
@@ -176,15 +229,8 @@
       "backend/cuda",
       "internal/app/serveapp"
     ],
-    "backend/cuda/internal/qwencuda": [
-      "backend/cuda/internal/gpudev",
-      "internal/runtime/mem",
-      "internal/vision"
-    ],
-    "backend/cuda/internal/visioncuda": [
-      "backend/cuda/internal/gpudev",
-      "internal/runtime/mem",
-      "internal/vision"
+    "backend/cuda/internal/fitdecide": [
+      "internal/runtime/mem"
     ],
     "backend/metal": [
       "backend/metal/internal/gpudev",
@@ -194,6 +240,7 @@
       "internal/audio",
       "internal/cost",
       "internal/runtime/f16",
+      "internal/runtime/logs",
       "internal/runtime/mem",
       "internal/runtime/mem/probe",
       "internal/runtime/program",
@@ -208,23 +255,15 @@
       "backend/metal",
       "internal/app/serveapp"
     ],
-    "backend/metal/internal/qwenmetal": [
-      "backend/metal/internal/gpudev",
-      "internal/runtime/mem",
-      "internal/vision"
-    ],
-    "backend/metal/internal/visionmetal": [
-      "backend/metal/internal/gpudev",
-      "internal/runtime/mem",
-      "internal/vision"
-    ],
     "backend/metal/kernels": [
       "internal/runtime/f16"
     ],
     "backend/webgpu": [
       "backend/webgpu/internal/kernels",
+      "backend/webgpu/internal/kvdecl",
       "decoder",
       "internal/cost",
+      "internal/runtime/logs",
       "internal/runtime/mem",
       "internal/runtime/program"
     ],
@@ -243,7 +282,11 @@
       "internal/vision",
       "multimodal"
     ],
+    "backend/webgpu/internal/kvdecl": [
+      "internal/runtime/program"
+    ],
     "chat": [
+      "constrain",
       "tokenizer"
     ],
     "cmd/gate": [
@@ -261,10 +304,16 @@
     "cmd/serve": [
       "internal/app/serveapp"
     ],
+    "cmd/testcmdtags": [
+      "internal/guard/testcmdtags"
+    ],
     "decoder": [
       "chat",
       "constrain",
+      "decoder/config",
       "decoder/fit",
+      "decoder/quant",
+      "decoder/resident",
       "internal/cost",
       "internal/runtime/adapter",
       "internal/runtime/checkpoint",
@@ -273,6 +322,7 @@
       "internal/runtime/giw",
       "internal/runtime/hybridattn",
       "internal/runtime/kvmgr",
+      "internal/runtime/logs",
       "internal/runtime/mamba2",
       "internal/runtime/mem",
       "internal/runtime/mem/probe",
@@ -282,6 +332,10 @@
     ],
     "decoder/fit": [
       "internal/runtime/mem"
+    ],
+    "decoder/resident": [
+      "internal/cost",
+      "internal/runtime/adapter"
     ],
     "demo/agent/agent": [
       "chat",
@@ -349,6 +403,9 @@
     ],
     "internal/app/fitcmd": [
       "decoder",
+      "decoder/fit",
+      "internal/config",
+      "internal/runtime/mem",
       "internal/runtime/modelload",
       "internal/runtime/prequant"
     ],
@@ -364,13 +421,14 @@
       "chat",
       "constrain",
       "decoder",
+      "decoder/fit",
       "embeddinggemma2",
       "engine",
-      "engine/enginetest",
       "internal/app/cliutil",
       "internal/app/connect",
       "internal/app/loadflags",
       "internal/app/pullcmd",
+      "internal/app/serveapp/jobs",
       "internal/audio",
       "internal/batchio",
       "internal/clef",
@@ -379,6 +437,7 @@
       "internal/decide",
       "internal/guard/servecheck",
       "internal/guard/swapguard",
+      "internal/runtime/mem",
       "internal/runtime/modelload",
       "internal/runtime/prequant",
       "internal/runtime/sampling",
@@ -388,6 +447,9 @@
       "multimodal",
       "pull",
       "tokenizer"
+    ],
+    "internal/app/serveapp/jobs": [
+      "internal/cost"
     ],
     "internal/audio": [
       "internal/vision"
@@ -421,6 +483,7 @@
     ],
     "internal/guard/memgate": [
       "decoder",
+      "decoder/fit",
       "internal/runtime/mem"
     ],
     "internal/guard/servecheck": [
@@ -429,6 +492,7 @@
     ],
     "internal/guard/swapguard": [
       "decoder",
+      "internal/runtime/logs",
       "internal/runtime/mem/probe"
     ],
     "internal/runtime/mamba2": [
@@ -436,8 +500,10 @@
     ],
     "internal/runtime/modelload": [
       "decoder",
+      "decoder/fit",
       "internal/guard/swapguard",
       "internal/runtime/giw",
+      "internal/runtime/logs",
       "internal/runtime/mem",
       "internal/runtime/prequant",
       "pull",
@@ -482,15 +548,19 @@
     "backend/cuda": [
       "backend/cuda/internal/gpudev",
       "backend/cuda/internal/launchgeom",
+      "backend/cuda/internal/wpack",
       "chat",
       "decoder",
+      "decoder/fit",
       "embeddinggemma2",
+      "internal/app/fitcmd",
       "internal/app/loadflags",
       "internal/audio",
       "internal/clef",
       "internal/cost",
       "internal/diag/sb2census",
       "internal/diag/towerid",
+      "internal/fidelity",
       "internal/guard/memgate",
       "internal/runtime/giw",
       "internal/runtime/mem",
@@ -499,17 +569,11 @@
       "internal/runtime/program",
       "internal/runtime/sampling",
       "internal/runtime/whisper",
+      "internal/testgate",
       "internal/vision",
       "internal/wrappedupload",
       "multimodal",
       "tokenizer"
-    ],
-    "backend/cuda/internal/qwencuda": [
-      "internal/vision"
-    ],
-    "backend/cuda/internal/visioncuda": [
-      "backend/cuda/internal/gpudev",
-      "internal/vision"
     ],
     "backend/cuda/kernels": [
       "backend/cuda/internal/gpudev",
@@ -517,11 +581,8 @@
       "backend/cuda/internal/wpack",
       "internal/runtime/hybridattn",
       "internal/runtime/mamba2",
+      "internal/runtime/mem",
       "internal/runtime/sampling"
-    ],
-    "backend/cuda/s4siglip": [
-      "backend/cuda/internal/visioncuda",
-      "internal/vision"
     ],
     "backend/metal": [
       "backend/metal/internal/gpudev",
@@ -529,6 +590,7 @@
       "chat",
       "constrain",
       "decoder",
+      "decoder/fit",
       "embeddinggemma2",
       "internal/app/loadflags",
       "internal/audio",
@@ -545,18 +607,11 @@
       "internal/runtime/modelload",
       "internal/runtime/prequant",
       "internal/runtime/program",
+      "internal/testgate",
       "internal/vision",
       "internal/wrappedupload",
       "multimodal",
       "tokenizer"
-    ],
-    "backend/metal/internal/qwenmetal": [
-      "backend/metal/internal/gpudev",
-      "internal/vision"
-    ],
-    "backend/metal/internal/visionmetal": [
-      "backend/metal/internal/gpudev",
-      "internal/vision"
     ],
     "backend/metal/kernels": [
       "backend/metal/internal/gpudev",
@@ -569,15 +624,18 @@
       "backend/webgpu/internal/kernels",
       "chat",
       "decoder",
+      "decoder/fit",
       "internal/cost",
       "internal/diag/sb2census",
       "internal/diag/towerid",
       "internal/fidelity",
       "internal/guard/memgate",
       "internal/runtime/giw",
+      "internal/runtime/logs",
       "internal/runtime/mem",
       "internal/runtime/mem/probe",
       "internal/runtime/program",
+      "internal/testgate",
       "internal/vision",
       "internal/wrappedupload",
       "multimodal",
@@ -587,8 +645,12 @@
       "internal/runtime/hybridattn",
       "internal/runtime/mem",
       "internal/runtime/sampling",
+      "internal/testgate",
       "internal/vision",
       "multimodal"
+    ],
+    "backend/webgpu/internal/kvdecl": [
+      "internal/runtime/program"
     ],
     "chat": [
       "internal/codec",
@@ -596,7 +658,8 @@
       "tokenizer"
     ],
     "cmd/gate": [
-      "internal/guard/paritykey"
+      "internal/guard/paritykey",
+      "internal/testgate"
     ],
     "cmd/hostmem": [
       "internal/runtime/mem/probe"
@@ -607,15 +670,23 @@
     "decoder": [
       "chat",
       "constrain",
+      "decoder/config",
+      "decoder/fit",
+      "decoder/quant",
+      "decoder/resident",
       "internal/audio",
       "internal/cost",
+      "internal/diag/sb2census",
       "internal/fidelity",
       "internal/guard/paritykey",
       "internal/runtime/giw",
+      "internal/runtime/hybridattn",
       "internal/runtime/kvmgr",
       "internal/runtime/mem",
       "internal/runtime/mem/probe",
       "internal/runtime/program",
+      "internal/runtime/sampling",
+      "internal/testgate",
       "internal/vision",
       "multimodal",
       "tokenizer"
@@ -633,6 +704,7 @@
       "multimodal"
     ],
     "engine": [
+      "constrain",
       "decoder",
       "internal/cost"
     ],
@@ -650,7 +722,9 @@
     ],
     "internal/app/fitcmd": [
       "decoder",
-      "internal/runtime/giw"
+      "decoder/fit",
+      "internal/runtime/giw",
+      "internal/runtime/modelload"
     ],
     "internal/app/loadflags": [
       "decoder",
@@ -663,23 +737,31 @@
       "chat",
       "constrain",
       "decoder",
+      "decoder/fit",
       "embeddinggemma2",
       "engine",
+      "engine/enginetest",
       "internal/app/chatapp",
       "internal/app/connect",
       "internal/app/inproc",
       "internal/app/loadflags",
+      "internal/app/serveapp/jobs",
       "internal/audio",
       "internal/clef",
+      "internal/codec",
       "internal/config",
       "internal/cost",
       "internal/decide",
       "internal/guard/swapguard",
       "internal/runtime/giw",
       "internal/runtime/kvmgr",
+      "internal/runtime/mem",
       "internal/runtime/modelload",
       "internal/runtime/prequant",
+      "internal/runtime/scheduler",
       "internal/runtime/whisper",
+      "internal/testgate",
+      "internal/testpath",
       "internal/vision",
       "multimodal",
       "pull",
@@ -709,15 +791,19 @@
     ],
     "internal/guard/memgate": [
       "decoder",
+      "decoder/fit",
       "internal/diag/sb2census",
       "internal/runtime/mem"
     ],
     "internal/guard/swapguard": [
-      "decoder"
+      "decoder",
+      "internal/runtime/mem/probe"
     ],
     "internal/runtime/modelload": [
       "decoder",
+      "decoder/fit",
       "internal/runtime/prequant",
+      "internal/testpath",
       "tokenizer"
     ],
     "internal/runtime/whisper": [

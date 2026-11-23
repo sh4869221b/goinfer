@@ -7,12 +7,15 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // layerDumpPositions are the token positions of the 1441-token window golden whose per-layer residuals are dumped. The sliding
 // window is 1024, so a token at position p attends [p-1023, p]: positions <= 1023 see their whole history (the window cannot
 // have changed anything for them) and positions >= 1024 lose their oldest tokens on the 21 sliding layers. The split is what lets
-// ONE run separate "the window path" from "long-context drift" (docs/tasks/task-mellum21-2026-10.md, follow-up A).
+// ONE run separate "the window path" from "long-context drift".
 var layerDumpPositions = []int{10, 300, 600, 900, 1000, 1030, 1100, 1300, 1440}
 
 // TestMellum2_layerDump writes the goinfer side of the per-layer comparison against Hugging Face for the window golden: the residual
@@ -27,7 +30,7 @@ func TestMellum2_layerDump(t *testing.T) {
 	if prefix == "" {
 		t.Skip("set GOINFER_MELLUM_GOLDEN_PREFIX (it names where the dump is written and which golden's ids are run)")
 	}
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	raw, err := os.ReadFile(mellum2GoldenPath("window"))
 	if err != nil {
 		t.Skipf("no window golden: %v", err)
@@ -105,7 +108,7 @@ func TestMellum2_layerDump(t *testing.T) {
 	if len(logits) != g.Vocab {
 		t.Fatalf("got %d logits, want vocab %d", len(logits), g.Vocab)
 	}
-	got := argmax(logits)
+	got := sampling.Argmax(logits)
 	var dot, na, nb float64
 	for _, kv := range g.Sample {
 		a, b := float64(logits[int(kv[0])]), kv[1]

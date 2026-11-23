@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-// TestKSD2_steelHeadDims is D2-G2 (docs/tasks/task-kernel-survey-2026-10.md, "KS-D2 gates"): attention_prefill_steel's
+// TestKSD2_steelHeadDims is D2-G2: attention_prefill_steel's
 // head-dim 64, 80 and 96 instances and attention_prefill_fused, each against an f64 attention over the same half-precision
 // inputs, at random q, k and v; M = 100 and 300; start 0 and 37; window 0 and 64; 14 query heads over 2 KV heads. PASS iff
 // every output is finite and, in every cell, steel's max-abs error is at most 2x the fused kernel's and its mean-abs error
@@ -58,7 +58,7 @@ func TestKSD2_steelHeadDims(t *testing.T) {
 						out := NewBufferU16s(d, make([]uint16, Mpad*qDim))
 						args := []Buffer{bQ, bK, bV, out, NewBufferU32(d, nH), NewBufferU32(d, nKV), NewBufferU32(d, uint32(hd)),
 							NewBufferU32(d, uint32(start)), NewBufferFloats(d, []float32{scale}), NewBufferU32(d, uint32(stride)),
-							NewBufferU32(d, uint32(window)), NewBufferU32(d, uint32(M))}
+							NewBufferU32(d, uint32(window)), NewBufferU32(d, uint32(M)), kvIdentityTable(d)}
 						e := q.Begin()
 						if steel {
 							e.Dispatch(pSteel, nH*((M+31)/32)*128, 128, args...)

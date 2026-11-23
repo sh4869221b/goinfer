@@ -19,9 +19,12 @@ import (
 
 	"github.com/townsendmerino/goinfer/internal/vision"
 	"github.com/townsendmerino/goinfer/multimodal"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// GLM-OCR end to end on the REAL checkpoint (gate O3, docs/tasks/task-glm-ocr-2026-10.md). Goinfer at f32 (Options{}, no
+// GLM-OCR end to end on the REAL checkpoint. Goinfer at f32 (Options{}, no
 // Quant) reads three PROCEDURALLY RENDERED documents (scripts/gen_glm_ocr_doc_images.py: an invoice, a ruled table, a page
 // with an equation; not real scans) through its OWN preprocessing, tower and decoder (GenerateQwenVL, the entry point serve
 // uses), and must produce the SAME 64 greedy tokens as transformers 5.12.0 f32 CPU eager (scripts/pin_glm_ocr_e2e.py,
@@ -247,7 +250,7 @@ func glmOcrRun(t *testing.T, g *glmOcrGolden, pv []float32, grid [3]int, tag str
 	want := g.lastLogits(t)
 	cs := logitCosine(logits, want)
 	worst, at := maxAbsDiff32(logits, want)
-	gotArg, wantArg := argmax(logits), argmax(want)
+	gotArg, wantArg := sampling.Argmax(logits), sampling.Argmax(want)
 	t.Logf("[%s] last-prompt-token logits vs HF: cosine %.9f, max|diff| %.3g at id %d (HF logit %.4f, range %.2f), argmax goinfer %d HF %d",
 		tag, cs, worst, at, want[at], logitRange(want), gotArg, wantArg)
 	if cs < glmOcrE2EBarCS {
@@ -315,7 +318,7 @@ func got2(s []int, i int) any {
 }
 
 func TestGlmOcrE2E_f32(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	for _, name := range []string{"invoice", "table", "formula"} {
 		t.Run(name, func(t *testing.T) {
 			g, png := glmOcrReadGolden(t, name)
@@ -347,7 +350,7 @@ func TestGlmOcrE2E_f32(t *testing.T) {
 // tower: a divergence in TestGlmOcrE2E_f32 that vanishes here came from preprocessing (PIL-style bicubic vs torchvision's);
 // one that stays here is the model path.
 func TestGlmOcrE2E_f32_hfPixels(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	dir := assetPath(t, "GOINFER_GLM_OCR_E2E")
 	for _, name := range []string{"invoice", "table", "formula"} {
 		t.Run(name, func(t *testing.T) {

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
 func TestPlamo3RealOracle(t *testing.T) {
@@ -57,8 +59,8 @@ func TestPlamo3RealOracle(t *testing.T) {
 			}
 		}
 		cos, ok := plamo3OracleCosine(logits, c.Logits)
-		t.Logf("case %d: %d prompt tokens; %d layers; final logit cosine %.9f; argmax %d/%d", ci, len(c.PromptIDs), len(layers), cos, argmax(logits), argmax(c.Logits))
-		if !ok || argmax(logits) != argmax(c.Logits) {
+		t.Logf("case %d: %d prompt tokens; %d layers; final logit cosine %.9f; argmax %d/%d", ci, len(c.PromptIDs), len(layers), cos, sampling.Argmax(logits), sampling.Argmax(c.Logits))
+		if !ok || sampling.Argmax(logits) != sampling.Argmax(c.Logits) {
 			t.Fatal("real-checkpoint logit parity failed")
 		}
 	}

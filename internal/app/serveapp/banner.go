@@ -2,6 +2,7 @@ package serveapp
 
 import (
 	"fmt"
+	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 	"strconv"
 	"strings"
 
@@ -12,7 +13,7 @@ import (
 //
 // A harness user reads exactly one thing before their first request: the lines `serve` prints before it says it is
 // listening. Everything below is a fact the runtime already knows, so nobody has to discover one request at a time
-// that their agent loop re-prefills every turn (docs/tasks/task-embed-and-harness-ux.md section 3.3, and the dsh
+// that their agent loop re-prefills every turn (the dsh
 // recipe in docs/server.md: "set expectations, don't let the harness discover them").
 //
 // The banner is built as a function returning lines, not a run of Fprintf calls, so a test can assert it against the
@@ -85,8 +86,6 @@ type bannerFacts struct {
 	// cpuBatched: a CPU model's concurrent generations join their decode tokens into batched steps
 	// (decoder.Model.EnableCPUBatch).
 	cpuBatched bool
-	// cpuBatchBypass is why a batched model's decode tokens still run per sequence (decoder.Model.CPUBatchKVBypass), "" when they batch.
-	cpuBatchBypass string
 
 	// sampling: the checkpoint's recommended sampling (decoder.Config.Sampling), nil when it carries none.
 	sampling *decoder.RecommendedSampling
@@ -111,7 +110,6 @@ func factsOf(lm *loadedModel) bannerFacts {
 	f.ctxWindow = lm.contextWindow(lm.adapter == "")
 	f.maxPositions = lm.mdl().Config().MaxPositions
 	f.kv = lm.mdl().KVPrecisionReports()
-	f.cpuBatchBypass = lm.mdl().CPUBatchKVBypass()
 	f.ctxNote = lm.mdl().ResidentContextNote()
 	f.harnessKVBytes = lm.mdl().ResidentContextKVBytes(harnessCtx)
 	f.kvSlots = lm.mdl().ResidentKVSlots()
@@ -197,7 +195,7 @@ func modelBannerFrom(f bannerFacts, cfg config) []string {
 			cpuNote += "; a GPU-resident load caps it with --ctx, but this model declined one (see decode path)"
 		}
 	}
-	ctxLine += kvBannerPart(f.kv)
+	ctxLine += kvBannerPart(f.kv, strings.HasPrefix(f.decodePath, "cuda-resident"))
 	ctxLine += cpuNote
 	out = append(out, ctxLine)
 	if l := harnessLine(f); l != "" {
@@ -210,12 +208,17 @@ func modelBannerFrom(f bannerFacts, cfg config) []string {
 	// excluded from it by the OS's own accounting. Subtracting them again would double-count a footprint that is not
 	// there (the bug AdmitPrefillMemory once had at request time). Weights are still shown, for the reader's own
 	// arithmetic.
+	// A resident of two or more slots holds every slot's KV from the load, so the line prices its pool (the resident's own account),
+	// not one conversation's cap.
 	if f.fitKnown {
-		remaining := f.fitBudgetBytes - f.fitKVBytes
+		kv, what := f.fitKVBytes, fmt.Sprintf("%d-token cap needs", f.fitCtx)
+		if f.resident && f.kvSlots > 1 && f.kvPoolDetail.Bytes > 0 {
+			kv, what = f.kvPoolDetail.Bytes, fmt.Sprintf("%d KV slots at a %d-token cap hold", f.kvSlots, f.fitCtx)
+		}
 		fitLine := fmt.Sprintf(
-			"fit: %d-token cap needs %.1f GB KV (weights %.1f GB, budget %.1f GB, %.1f GB left for a request's own prefill)",
-			f.fitCtx, float64(f.fitKVBytes)/(1<<30), float64(f.fitWeightBytes)/(1<<30),
-			float64(f.fitBudgetBytes)/(1<<30), float64(remaining)/(1<<30))
+			"fit: %s %s KV (weights %s, budget %s, %s left for a request's own prefill)",
+			what, mem.GiB(kv), mem.GiB(f.fitWeightBytes),
+			mem.GiB(f.fitBudgetBytes), mem.GiB(f.fitBudgetBytes-kv))
 		if !f.resident && f.ctxWindow > 0 && f.fitCtx == f.maxPositions { // the CPU path's ceiling, as the context line says
 			fitLine += " — a ceiling, reached only by a request that fills the window"
 		}
@@ -275,8 +278,8 @@ func modelBannerFrom(f bannerFacts, cfg config) []string {
 		case !f.snapshots:
 			out = append(out, "prefix snapshots: not on this backend or model family")
 		default:
-			out = append(out, fmt.Sprintf("prefix snapshots: budget %s (%s), 0 B held; host memory is pinned only while a snapshot is held "+
-				"(taken after a cold first prefill of 2048 ids or more; /admin/status reports the use)", gib(cfg.kvHostBytes), cfg.kvHostBytesHow))
+			out = append(out, fmt.Sprintf("prefix snapshots: budget %s (%s), 0 B held; host memory is held only while a snapshot is "+
+				"(taken after a cold first prefill of 2048 ids or more; /admin/status reports the use)", mem.GiB(cfg.kvHostBytes), cfg.kvHostBytesHow))
 			if cfg.kvDemote {
 				out = append(out, "released conversations: kept in that budget where the backend can, and brought back when they return")
 			}
@@ -327,8 +330,7 @@ func serverBanner(s *server, cfg config) []string {
 	out := []string{"routes: " + strings.Join(routes, " ")}
 	// Load cost, split by phase. The split is what makes it actionable: "load 9.2s" is a number to be annoyed by,
 	// "9.2s, 82% build" says the disk is not the problem and a different quant might be. Printed only for a model
-	// whose loader instrumented it (docs/tasks/task-embed-and-harness-ux.md section 3.3 names the banner as the
-	// harness user's UI).
+	// whose loader instrumented it.
 	for _, lm := range s.models {
 		if sum := lm.mdl().LoadProfile().Summary(); sum != "" {
 			out = append(out, sum)
@@ -358,9 +360,7 @@ func concurrencyLine(f bannerFacts, cfg config) string {
 		return line
 	case f.concurrent > 1:
 		line := fmt.Sprintf("concurrency: %d generations at once, each on its own session KV (-max-concurrent)", f.concurrent)
-		if f.cpuBatched && f.cpuBatchBypass != "" {
-			line += "; decode runs per sequence: " + f.cpuBatchBypass
-		} else if f.cpuBatched {
+		if f.cpuBatched {
 			line = fmt.Sprintf("concurrency: %d generations at once, each on its own session KV, decode tokens batched on the CPU (-max-concurrent, -cpu-batch)", f.concurrent)
 		} else if cfg.cpuBatch == decoder.CPUBatchAuto {
 			line += "; decode runs as independent workers (-cpu-batch auto batches models with 2 GiB or more of weights)"
@@ -410,8 +410,8 @@ func harnessLine(f bannerFacts) string {
 		if slots == 1 {
 			noun = "slot"
 		}
-		return line + fmt.Sprintf("; --ctx %d holds it for %.1f GB of KV (%d %s)", harnessCtx,
-			float64(int64(slots)*f.harnessKVBytes)/(1<<30), slots, noun)
+		return line + fmt.Sprintf("; --ctx %d holds it for %s of KV (%d %s)", harnessCtx,
+			mem.GiB(int64(slots)*f.harnessKVBytes), slots, noun)
 	}
 	return line + fmt.Sprintf("; --ctx %d holds it", harnessCtx)
 }
@@ -439,7 +439,7 @@ func kvPlanLine(f bannerFacts, cfg config) string {
 		why = append(why, fmt.Sprintf("--ctx %d", cfg.load.Ctx))
 	}
 	if f.towerReserve > 0 {
-		why = append(why, fmt.Sprintf("%.1f GB held back for the vision tower", float64(f.towerReserve)/1e9))
+		why = append(why, fmt.Sprintf("%s held back for the vision tower", mem.GiB(f.towerReserve)))
 	}
 	if len(why) > 0 {
 		line += " (" + strings.Join(why, "; ") + ")"
@@ -447,7 +447,7 @@ func kvPlanLine(f bannerFacts, cfg config) string {
 	return line
 }
 
-// kvPoolBannerLine names a resident's shared KV pool (docs/tasks/task-kv-architecture-2026-10.md §5.16): its tokens and block
+// kvPoolBannerLine names a resident's shared KV pool: its tokens and block
 // size, precision and device bytes, the layer groups that hold pools and what a window group keeps, the sharing scope, and how much of
 // it one conversation can use. A sliding-window layer keeps only a conversation's newest rows, so a windowed pool never reads as all
 // one conversation's. "" without a pool.
@@ -476,12 +476,12 @@ func kvPoolBannerLine(f bannerFacts) string {
 		kvPoolBytes(d.Bytes), groups, scope, use)
 }
 
-// kvPoolBytes is n as the banner prints a pool: GB from 1 GiB up, MB below it.
+// kvPoolBytes is n as the banner prints a pool: GiB from 1 GiB up, MiB below it.
 func kvPoolBytes(n int64) string {
 	if n >= 1<<30 {
-		return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
+		return mem.GiB(n)
 	}
-	return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
 }
 
 // commaInt is n with thousands separators.
@@ -515,8 +515,12 @@ func samplingLine(rs *decoder.RecommendedSampling) string {
 
 // kvBannerPart is the context line's KV part: for each cache the load built, the precision it holds and the one requested, with the
 // reason when they differ (an explicit request that cannot be delivered refuses the load, so a difference here is auto's pick).
-// "lossy" marks f16 or i8 that the operator asked for by name.
-func kvBannerPart(reps []decoder.KVPrecisionReport) string {
+// "lossy" marks f16 or i8 that the operator asked for by name. A CUDA resident's i8 cache (cudaResident: the load's decode path is
+// cuda-resident) also names its measured cost, which was measured there and nowhere else (docs/kv-precision-matrix.md, "Measured cost").
+// kvI8Cost is CUDA int8 KV's measured cost, as the banner states it: the fidelity and speed results of docs/measurements/cuda-kv-i8-2026-11/s6-registration.md (and s4-registration.md's).
+const kvI8Cost = "about f16's quality on a 7B at 8K keys, a measurable loss on a 1.5B; decode up to 28% slower than f16 at short context, prefill near f16's"
+
+func kvBannerPart(reps []decoder.KVPrecisionReport, cudaResident bool) string {
 	if len(reps) == 0 {
 		return " · KV f32"
 	}
@@ -532,6 +536,9 @@ func kvBannerPart(reps []decoder.KVPrecisionReport) string {
 		}
 		if (r.Delivered == "f16" || r.Delivered == "i8") && r.Delivered == r.Requested {
 			note += ", lossy"
+			if r.Delivered == "i8" && r.Cache == "resident" && cudaResident {
+				note += ": " + kvI8Cost
+			}
 		}
 		s += " · " + label + " " + r.Delivered + " (" + note + ")"
 	}

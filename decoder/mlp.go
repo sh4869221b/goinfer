@@ -50,7 +50,7 @@ func moeMLP(h []float32, lw *LayerWeights, moe *MoEConfig, act ActKind, hidden i
 	matmul(be, &lw.Router, h, logits, 1)
 	var idx []int
 	var wts []float32
-	if moeSelOverride != nil { // E2: replay the higher-precision reference's routing
+	if moeSelOverride != nil { // replay the higher-precision reference's routing
 		idx, wts = moeSelOverride[moeOverridePos], moeWtsOverride[moeOverridePos]
 		moeOverridePos++
 	} else {
@@ -515,7 +515,7 @@ func gatedMLPAct(h, out []float32, lw *LayerWeights, act ActKind, be Backend, sc
 		if decodeTiming {
 			dt0 = time.Now()
 		}
-		scr.hq.prepare(be, &lw.GateProj, h, 1) // one quantization of h for gate and up (R-13)
+		scr.hq.prepare(be, &lw.GateProj, h, 1) // one quantization of h for gate and up
 		matmulIntoPre(scr.ws, be, &lw.GateProj, &scr.hq, h, gate, 1)
 		matmulIntoPre(scr.ws, be, &lw.UpProj, &scr.hq, h, up, 1)
 		if decodeTiming {
@@ -606,8 +606,7 @@ type moeBatchScratch struct {
 // moeSlot is one (row, rank) pair that selected an expert.
 type moeSlot struct{ row, rank int }
 
-// moeScratchGrows counts each moeBatchScratch buffer's fresh allocations, so a gate can bar every term on its own (SCR-G1,
-// docs/tasks/task-memory-campaign-2026-10.md).
+// moeScratchGrows counts each moeBatchScratch buffer's fresh allocations, so a gate can bar every term on its own.
 var moeScratchGrows struct{ out, done, logits, perRank, gathered, gate, up, outBuf atomic.Int64 }
 
 // moeGrow returns (*buf)[:n], growing *buf when it holds less and counting the growth in grows; the contents are not cleared.

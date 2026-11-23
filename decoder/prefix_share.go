@@ -3,9 +3,11 @@ package decoder
 import (
 	"context"
 	"fmt"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/kvmgr"
 )
 
-// Shared state, many questions (docs/tasks/task-constrained-confidence.md, D8). A decision request asks several
+// Shared state, many questions. A decision request asks several
 // questions about one state, and on the hybrid Qwen3.5 family each question would prefill the whole prompt again. The
 // state is the same in every question's prompt, so its prefill is done once and its CACHE (the KV rows of the attention
 // layers and the Gated DeltaNet's recurrent state, which has no per-position history and so cannot be rewound, only
@@ -149,7 +151,7 @@ func shareGroups(prompts [][]int, minShared int) (members [][]int, prefix []int)
 			if assigned[j] {
 				continue
 			}
-			l := min(commonPrefixLen(prompts[i], prompts[j]), len(prompts[j])-1)
+			l := min(kvmgr.CommonPrefixLen(prompts[i], prompts[j]), len(prompts[j])-1)
 			if l >= minShared && min(p, l) >= minShared {
 				p = min(p, l)
 				g = append(g, j)

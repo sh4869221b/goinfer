@@ -9,7 +9,7 @@ import (
 )
 
 // emodelLayerMajorOn routes a Gemma 4 E-model's prompt (E2B, E4B: per-layer embeddings, KV-shared layers) through
-// prefillEModel instead of declining PrefillLast (S9 of docs/tasks/task-multimodal-support-2026-10.md). The f16-MMA pass
+// prefillEModel instead of declining PrefillLast. The f16-MMA pass
 // declines every dense Gemma 4 (head size varies by layer), so without this a text prompt prefilled one token at a time on
 // the GPU and an image turn prefilled on the CPU. The pass is bit-identical to the sequential loop by construction. On by
 // default; docs/code-notes/metal.md#emodelLayerMajorOn.
@@ -28,13 +28,12 @@ type emRow struct {
 	u      posUniforms
 }
 
-// emodelBatchedOn routes a Gemma 4 E-model's prompt through the f16 batched pass (S9 of
-// docs/tasks/task-multimodal-support-2026-10.md) instead of the layer-major one, at or above the fast-prefill floor. On by
+// emodelBatchedOn routes a Gemma 4 E-model's prompt through the f16 batched pass instead of the layer-major one, at or above the fast-prefill floor. On by
 // default (speed: docs/code-notes/metal.md#emodelBatchedOn). Below the floor, on any decline, or with --exact-prefill, the
 // layer-major pass (bit-identical to sequential) keeps the route.
 var emodelBatchedOn = true
 
-// emodelBatchDefect is G-S9c's planted defects in the batched pass (0 in production): 1 a shared layer attends over an
+// emodelBatchDefect is the planted defects in the batched pass (0 in production): 1 a shared layer attends over an
 // empty cache, 2 the PLE block skipped, 3 each row's PLE inputs from the next row, 4 the layer scalar dropped, 5 v_norm
 // dropped, 6 every layer's FFN at the first layer's width.
 var emodelBatchDefect int
@@ -76,11 +75,17 @@ func (r *resident) prefillEModelSrc(src rowSource, startPos int, head bool) (log
 	defer runtime.UnlockOSThread()
 	defer func() {
 		if p := recover(); p != nil {
+			mem.RepanicBug(p)
 			r.recordExecErr(fmt.Errorf("metal: E-model layer-major prefill aborted: %v", p))
 			logits = nil
 		}
 	}()
 	r.emodelLayerMajorRuns++
+	r.stopExec() // the pass runs beside the executor: a pipelined forward may be in flight reading the table or K/V
+	if err := r.kvWrite(r.kvSlot, startPos, startPos+src.n); err != nil {
+		r.recordExecErr(err)
+		return nil
+	}
 	for c := 0; c < src.n; c += emodelChunk {
 		end := min(c+emodelChunk, src.n)
 		logits = r.emodelRows(src.rows(c, end), startPos+c, head && end == src.n)
@@ -108,7 +113,7 @@ func (r *resident) emodelRows(embs [][]float32, start int, head bool) []float32 
 		rw.u = posUniforms{nb(NewBufferU32On(mem.LineScratch, d, 0)), nb(NewBufferU32On(mem.LineScratch, d, 0)), nb(NewBufferU32On(mem.LineScratch, d, 0)),
 			nb(NewBufferFloatsOn(mem.LineScratch, d, []float32{1})), nb(NewBufferU32On(mem.LineScratch, d, 0))}
 		if emodelPlant.posShift {
-			rw.pos++ // G-S9b (3)
+			rw.pos++ // planted defect: every row one position late
 		}
 		r.writePosUniforms(rw.u, rw.pos, rw.pos)
 	}
@@ -121,8 +126,8 @@ func (r *resident) emodelRows(embs [][]float32, start int, head bool) []float32 
 		r.x, r.pleIn = rw.x, rw.ple
 		r.encNKeys, r.encFANSplit = rw.pos+1, rw.u.uFANSplit
 	}
-	emodelPlantDefect(rows)              // G-S9b's planted defects; a no-op in production
-	order := r.emodelRowOrder(len(rows)) // G-S9b's row-order seam; identity in production
+	emodelPlantDefect(rows)              // planted defects; a no-op in production
+	order := r.emodelRowOrder(len(rows)) // row-order seam; identity in production
 	for l := 0; l < r.nL; l++ {
 		e := r.q.Begin()
 		for _, i := range order {
@@ -153,7 +158,7 @@ func (r *resident) emodelRows(embs [][]float32, start int, head bool) []float32 
 
 // emodelRowOrder is the order rows are encoded within a layer: 0..n-1, and it must be. Within a layer each row writes
 // its own K/V and later rows attend to it, so a row encoded before an earlier one reads keys not yet written. A test
-// seam: G-S9b reverses it as a planted defect.
+// seam: a gate reverses it as a planted defect.
 var emodelRowOrderHook func(n int) []int
 
 func (r *resident) emodelRowOrder(n int) []int {
@@ -167,7 +172,7 @@ func (r *resident) emodelRowOrder(n int) []int {
 	return o
 }
 
-// emodelPlant is G-S9b's planted defects (zero in production): pleShift binds each row's PLE inputs to the next row's,
+// emodelPlant is the layer-major pass's planted defects (zero in production): pleShift binds each row's PLE inputs to the next row's,
 // pleZero drops the PLE term (a zero input makes the block add nothing), posShift runs every row one position late.
 var emodelPlant struct{ pleShift, pleZero, posShift bool }
 

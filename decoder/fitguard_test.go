@@ -113,8 +113,8 @@ func TestFitGuard_pricesTheOnDiskGGUFDuringLoadNotJustFinalWeights(t *testing.T)
 	}
 }
 
-// TestFitGuard_pricesTheCUDAExpertCacheBuildPeak: --backend cuda --moe-cache-experts holds the canonical weights, a packed
-// copy of them and a pinned copy of the experts on the host at once. In the regime that matters that exceeds the CPU path's
+// TestFitGuard_pricesTheCUDAExpertCacheBuildPeak: --backend cuda --moe-cache-experts holds the canonical weights, a pinned copy
+// of the experts and the packing (one packed layer and the staging) on the host at once. In the regime that matters that exceeds the CPU path's
 // weights+KV+file total, and it does not stack with the file term (the source is unmapped before the build), so need()
 // takes the larger.
 //
@@ -128,8 +128,11 @@ func TestFitGuard_pricesTheCUDAExpertCacheBuildPeak(t *testing.T) {
 	if probe.expertBytes <= 0 {
 		t.Fatal("no routed-expert bytes found in a MoE GGUF — the '_exps' tensor match is broken")
 	}
-	if want := 2*probe.weightBytes + probe.expertBytes; probe.cudaBuildBytes != want {
-		t.Fatalf("cudaBuildBytes = %d, want 2*weights+experts = %d", probe.cudaBuildBytes, want)
+	if probe.cfg == nil || probe.cfg.NumLayers < 1 {
+		t.Fatal("the tiny GGUF's config did not resolve: the packed layer cannot be priced")
+	}
+	if want := probe.weightBytes + probe.expertBytes + probe.weightBytes/int64(probe.cfg.NumLayers) + cudaPackStageBytes; probe.cudaBuildBytes != want {
+		t.Fatalf("cudaBuildBytes = %d, want weights + experts + one packed layer + staging = %d", probe.cudaBuildBytes, want)
 	}
 	if plain := fitCheckFor(gguf, "int4", quantInt4, Options{Quant: "int4", Backend: "cuda"}); plain.cudaBuildBytes != 0 {
 		t.Errorf("cudaBuildBytes = %d without --moe-cache-experts; the term is only for the expert-cache build", plain.cudaBuildBytes)
@@ -200,8 +203,8 @@ func TestFitGuard_envOverrideLoads(t *testing.T) {
 	m.Close()
 }
 
-// The same bypass through Options.Knobs, for one model, with the environment clean — the per-model route
-// (docs/tasks/task-env-config-2026-09.md, phase 2b). The guard runs inside Load before the model's knob
+// The same bypass through Options.Knobs, for one model, with the environment clean — the per-model route.
+// The guard runs inside Load before the model's knob
 // snapshot exists, so it reads the knob through loadKnob; this pins that the override reaches it. The
 // refusing half is TestFitGuard_envOverrideLoads' own premise (same fixture, same injected RAM).
 func TestFitGuard_optionsKnobLoads(t *testing.T) {
@@ -294,7 +297,7 @@ func TestFitCheck_arithmeticMatchesTheMeasuredFailure(t *testing.T) {
 		t.Errorf("budget = %d, want %d (70%% of physical)", got, want)
 	}
 	msg := f.declineErr().Error()
-	for _, want := range []string{"21.0 GB", "16.0 GB", "11.2 GB"} {
+	for _, want := range []string{"21.00 GiB", "16.00 GiB", "11.20 GiB"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("refusal omits %q — a refusal without the numbers is the message the cold run already had:\n%s", want, msg)
 		}
@@ -441,36 +444,7 @@ func TestFitGuard_unpinnedLoadAutoPinsASmallerContextRatherThanRefusing(t *testi
 // ResidentWeightBytes sums the matrices AFTER it. They answer the same question from opposite sides, so a large
 // disagreement means one of them is wrong.
 func TestFitEstimate_agreesWithResidentWeightBytes(t *testing.T) {
-	const gguf = "testdata/gptoss_tiny.gguf"
-	for _, q := range []struct {
-		name string
-		mode quantMode
-	}{{"int4", quantInt4}, {"int8int8", quantInt8I8}} {
-		t.Run(q.name, func(t *testing.T) {
-			est := estimateGGUFWeightBytes(gguf, q.mode)
-			if est <= 0 {
-				t.Fatal("estimator returned 0 for a real GGUF")
-			}
-			m, err := Load(gguf, Options{Quant: q.name})
-			if err != nil {
-				t.Skipf("cannot load fixture at %s: %v", q.name, err)
-			}
-			defer m.Close()
-			actual := m.ResidentWeightBytes()
-			if actual <= 0 {
-				t.Skip("accountant reported 0 for this fixture")
-			}
-			ratio := float64(est) / float64(actual)
-			// TIGHT on purpose: quantBytesPerElem MEASURES through quantizeWM, so a wide band would hide a platform divergence
-			// (the arm64 W4A8 row4 repack keeps a second buffer, so int4 costs about twice its encoding there). Some slack
-			// remains because the estimator prices every tensor uniformly while the accountant reads the real backing slices.
-			if ratio < 0.85 || ratio > 1.25 {
-				t.Errorf("estimate %d vs accounted %d (ratio %.2f) — the pre-load estimate has "+
-					"drifted from ResidentWeightBytes", est, actual, ratio)
-			}
-			t.Logf("%s: estimate %d, accounted %d, ratio %.2f", q.name, est, actual, ratio)
-		})
-	}
+	checkFitEstimateAgrees(t, "testdata/gptoss_tiny.gguf", estimateGGUFWeightBytes)
 }
 
 // TestFitEstimate_safetensorsAgreesWithResidentWeightBytes is TestFitEstimate_agreesWithResidentWeightBytes's safetensors
@@ -478,36 +452,7 @@ func TestFitEstimate_agreesWithResidentWeightBytes(t *testing.T) {
 // load's resident weight bytes, on a real (tracked, non-gitignored) safetensors checkpoint. A safetensors path used to
 // return a zero weight estimate, so fits() was always true.
 func TestFitEstimate_safetensorsAgreesWithResidentWeightBytes(t *testing.T) {
-	const dir = "testdata/internlm2-tiny"
-	for _, q := range []struct {
-		name string
-		mode quantMode
-	}{{"int4", quantInt4}, {"int8int8", quantInt8I8}} {
-		t.Run(q.name, func(t *testing.T) {
-			est := estimateSafetensorsWeightBytes(dir, q.mode)
-			if est <= 0 {
-				t.Fatal("estimator returned 0 for a real safetensors checkpoint")
-			}
-			m, err := Load(dir, Options{Quant: q.name})
-			if err != nil {
-				t.Skipf("cannot load fixture at %s: %v", q.name, err)
-			}
-			defer m.Close()
-			actual := m.ResidentWeightBytes()
-			if actual <= 0 {
-				t.Skip("accountant reported 0 for this fixture")
-			}
-			ratio := float64(est) / float64(actual)
-			// Same band as the GGUF twin, same reasoning: quantBytesPerElem measures through the
-			// real quantizeWM path, so remaining slack is the estimator pricing every tensor
-			// uniformly while the accountant reads the real backing slices.
-			if ratio < 0.85 || ratio > 1.25 {
-				t.Errorf("estimate %d vs accounted %d (ratio %.2f) — the pre-load safetensors "+
-					"estimate has drifted from ResidentWeightBytes", est, actual, ratio)
-			}
-			t.Logf("%s: estimate %d, accounted %d, ratio %.2f", q.name, est, actual, ratio)
-		})
-	}
+	checkFitEstimateAgrees(t, "testdata/internlm2-tiny", estimateSafetensorsWeightBytes)
 }
 
 // TestFitCheckFor_pricesSafetensorsNotJustGGUF pins that fitCheckFor no longer returns a zero-weight (always-fits)
@@ -545,8 +490,8 @@ func TestFitCheckFor_unresolvableSafetensorsProceedsUnknown(t *testing.T) {
 }
 
 // TestFitGuard_remedyNamesPrequantNotStreamWeightsForDirectory (M-30): the remedy for a refused safetensors DIRECTORY
-// must not recommend -stream-weights, which is a no-op for a directory (decoder.Load ignores it for anything but a
-// .giw). It must name the escape hatch that works for this source (GOINFER_NO_FIT_GUARD=1) and the permanent fix
+// must not recommend -stream-weights, which is a no-op for a directory (decoder.Load ignores it for anything but a.
+// giw). It must name the escape hatch that works for this source (GOINFER_NO_FIT_GUARD=1) and the permanent fix
 // (cmd/prequant).
 func TestFitGuard_remedyNamesPrequantNotStreamWeightsForDirectory(t *testing.T) {
 	restore := injectHostRAM(t, 128<<10) // far below anything internlm2-tiny needs — forces refusal
@@ -666,7 +611,7 @@ func TestQuantBytesPerElem_everyModeIsPlausible(t *testing.T) {
 	//
 	// Pinning the pair rather than a range is the point: a wrong measurement usually lands BETWEEN them, and a range wide enough
 	// to hold both would accept it. Do not assert int4 < int8: on Apple Silicon int4 occupies MORE resident RAM than int8int8,
-	// because int8 gets no repack (docs/tasks/task-first-hour.md).
+	// because int8 gets no repack.
 	for _, name := range []struct {
 		label string
 		mode  quantMode
@@ -711,4 +656,38 @@ func TestResolveWeightCacheBudget(t *testing.T) {
 			t.Errorf("resolveWeightCacheBudget(0) with no live probe = %d, want 0 (aikit's own fallback applies)", got)
 		}
 	})
+}
+
+// checkFitEstimateAgrees loads path at int4 and int8int8 and holds estimate to what the accountant then reports.
+func checkFitEstimateAgrees(t *testing.T, path string, estimate func(string, quantMode) int64) {
+	t.Helper()
+	for _, q := range []struct {
+		name string
+		mode quantMode
+	}{{"int4", quantInt4}, {"int8int8", quantInt8I8}} {
+		t.Run(q.name, func(t *testing.T) {
+			est := estimate(path, q.mode)
+			if est <= 0 {
+				t.Fatalf("estimator returned 0 for the real fixture %s", path)
+			}
+			m, err := Load(path, Options{Quant: q.name})
+			if err != nil {
+				t.Skipf("cannot load fixture at %s: %v", q.name, err)
+			}
+			defer m.Close()
+			actual := m.ResidentWeightBytes()
+			if actual <= 0 {
+				t.Skip("accountant reported 0 for this fixture")
+			}
+			ratio := float64(est) / float64(actual)
+			// TIGHT on purpose: quantBytesPerElem MEASURES through quantizeWM, so a wide band would hide a platform divergence
+			// (the arm64 W4A8 row4 repack keeps a second buffer, so int4 costs about twice its encoding there). Some slack
+			// remains because the estimator prices every tensor uniformly while the accountant reads the real backing slices.
+			if ratio < 0.85 || ratio > 1.25 {
+				t.Errorf("estimate %d vs accounted %d (ratio %.2f) — the pre-load estimate has "+
+					"drifted from ResidentWeightBytes", est, actual, ratio)
+			}
+			t.Logf("%s: estimate %d, accounted %d, ratio %.2f", q.name, est, actual, ratio)
+		})
+	}
 }

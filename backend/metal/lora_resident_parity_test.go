@@ -14,14 +14,14 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// TestLoRAResidentParityMetal is the G3 numeric gate (docs/tasks/task-gpu-paths-2026-09.md): compute-time LoRA on Metal's
+// TestLoRAResidentParityMetal is the G3 numeric gate: compute-time LoRA on Metal's
 // resident decode path must match the CPU reference (the same adapter through decoder's generic gatedMLP/causalAttention
 // forward) within the resident-vs-CPU floor. 0.95 is the floor gpt2_resident_parity_test.go set for whole-model resident-vs-CPU
 // logits (hiddenlast_resident_parity_test.go explains why 0.9999 does not apply once the LM head amplifies quantization
 // noise), here with a LoRA delta on both sides.
 //
-// It drives decoder.ResidentAdapter directly (ResidentForwardForTest/ResidentAdapterLayersForTest) to isolate kernel
-// correctness; the wiring (does an adapter session reach ResidentAdapter, does a backend without it decline) is gated by
+// It drives decoder.ResidentRuntimeSubsystem directly (ResidentForwardForTest/ResidentAdapterLayersForTest) to isolate kernel
+// correctness; the wiring (does an adapter session reach ResidentRuntimeSubsystem, does a backend without it decline) is gated by
 // decoder/resident_adapter_seam_test.go's fake-backend tests.
 //
 // Fixture: testdata/llama-tiny, a committed resident-eligible safetensors checkpoint with GQA (4 heads/2 kv heads), so the
@@ -41,9 +41,10 @@ func TestLoRAResidentParityMetal(t *testing.T) {
 		t.Fatalf("llama-tiny did not go resident (BuildResident refused) — decode path %q; decline: %s",
 			mRes.DecodePath(), mRes.ResidentDecline())
 	}
-	ra, ok := rf.(decoder.ResidentAdapter)
+	ra := decoder.SubsystemsOf(rf).Runtime
+	ok := ra.AdapterAvailable()
 	if !ok {
-		t.Fatalf("metal resident runner does not implement decoder.ResidentAdapter")
+		t.Fatalf("metal resident runner does not implement decoder.ResidentRuntimeSubsystem")
 	}
 	if err := mRes.LoadAdapter("a", adapterDir); err != nil {
 		t.Fatalf("LoadAdapter (metal side): %v", err)
@@ -134,9 +135,10 @@ func TestLoRAResidentParityMetal_armedExecutorThenBind(t *testing.T) {
 		t.Fatalf("llama-tiny did not go resident (BuildResident refused) — decode path %q; decline: %s",
 			mRes.DecodePath(), mRes.ResidentDecline())
 	}
-	ra, ok := rf.(decoder.ResidentAdapter)
+	ra := decoder.SubsystemsOf(rf).Runtime
+	ok := ra.AdapterAvailable()
 	if !ok {
-		t.Fatalf("metal resident runner does not implement decoder.ResidentAdapter")
+		t.Fatalf("metal resident runner does not implement decoder.ResidentRuntimeSubsystem")
 	}
 	if err := mRes.LoadAdapter("a", adapterDir); err != nil {
 		t.Fatalf("LoadAdapter (metal side): %v", err)

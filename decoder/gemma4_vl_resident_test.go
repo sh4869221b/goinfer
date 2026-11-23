@@ -84,6 +84,8 @@ func loadGemma4VLBidirTiny(t *testing.T) (*Model, gemma4VLBidirImageGolden) {
 // GenerateGemma4VL's fallback-to-CPU-decode path can be exercised directly.
 type uploadFailResident struct{ *fakeResident }
 
+func (f *uploadFailResident) ResidentSubsystems() ResidentSubsystems { return selfSubsystems(f) }
+
 func (u *uploadFailResident) UploadKV(layer, base int, keys, vals []float32) error {
 	_ = u.fakeResident.UploadKV(layer, base, keys, vals) // still record the attempt
 	return errors.New("uploadFailResident: forced decline")
@@ -158,29 +160,10 @@ func TestGenerateGemma4VL_residentDecodeEngagesOnBidirectional(t *testing.T) {
 // reports the same finish_reason as an ordinary EOS-terminated one.
 func TestGenerateGemma4VL_residentContextCapPublishesBudgetClamped(t *testing.T) {
 	m, g := loadGemma4VLBidirTiny(t)
-	rf := &fakeResident{vocab: m.w.arch.VocabSize}
-	rf.capPos = len(g.InputIDs) + 2
-	m.resident = rf
-
-	const maxNew = 5
 	features := func() ([]float32, error) { return g.ImageFeatures, nil }
-	stream, gen := m.GenerateGemma4VL(context.Background(), g.InputIDs, g.ImageTokenStart, g.NImageTokens, 0, features, maxNew, SamplingParams{Temperature: 0})
-	var got []int
-	for id := range stream {
-		got = append(got, id)
-	}
-	if err := gen.Err(); err != nil {
-		t.Fatalf("GenerateGemma4VL: %v", err)
-	}
-	if !gen.BudgetClamped {
-		t.Error("BudgetClamped = false, want true — the resident cap bound this turn, not the request")
-	}
-	if gen.Budget != 2 {
-		t.Errorf("Budget = %d, want 2 (capPos %d − prompt %d)", gen.Budget, rf.capPos, len(g.InputIDs))
-	}
-	if len(got) > gen.Budget {
-		t.Errorf("streamed %d tokens, more than the published Budget %d", len(got), gen.Budget)
-	}
+	checkResidentCapPublishesBudgetClamped(t, m, len(g.InputIDs), func(maxNew int) (<-chan int, *Generation) {
+		return m.GenerateGemma4VL(context.Background(), g.InputIDs, g.ImageTokenStart, g.NImageTokens, 0, features, maxNew, SamplingParams{Temperature: 0})
+	})
 }
 
 // TestGenerateGemma4VL_residentUploadFailureFallsBackToCPU is the decline half: an UploadKV
@@ -219,7 +202,7 @@ func TestGenerateGemma4VL_residentUploadFailureFallsBackToCPU(t *testing.T) {
 }
 
 // TestGenerateGemma4VL_sequentialEModelUploadsOwningLayers is the gitignored gemma4-vl-tiny fixture's check of the S1.8
-// contract (docs/tasks/task-multimodal-support-2026-10.md): a sequential (causal) checkpoint of the E-model class (this one
+// contract: a sequential (causal) checkpoint of the E-model class (this one
 // has KV-shared layers) with a resident attached uploads its CPU prefill's K/V for the layers that own it, never a KV-shared
 // one, then decodes resident. CI skips it (the fixture is gitignored); the same contract runs on a committed-path fixture in
 // TestGenerateGemma4VL_eModelDecodesResident.

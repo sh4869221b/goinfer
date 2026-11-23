@@ -3,6 +3,7 @@ package constrain
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
@@ -15,7 +16,7 @@ import (
 // (`请按下列JSON格式输出图中信息:` followed by `{"id_number": "", "address": {"street": "", ...}}`, the model card's
 // example): the model is told the SHAPE by example, not by a JSON Schema, and the grammar (JSONSchema /
 // GrammarFromStruct) is what guarantees it. A schema-only request gives the model no template to read, and a
-// template-only one gives no guarantee, so both are built from the one source (docs/tasks/task-glm-ocr-2026-10.md O5).
+// template-only one gives no guarantee, so both are built from the one source.
 //
 // THE CONVENTION, one table for both entry points (a test pins every row):
 //
@@ -53,7 +54,7 @@ func TemplateFromSchema(schema []byte) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("constrain: parse schema: %w", err)
 	}
-	if _, err := dec.Token(); err != io.EOF {
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return "", fmt.Errorf("constrain: parse schema: unexpected data after the top-level value")
 	}
 	n, err := templateNode(doc, 0)

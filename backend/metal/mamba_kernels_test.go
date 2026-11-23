@@ -38,12 +38,13 @@ func loadMambaFixture(t *testing.T, dir string) mambaFixture {
 	defer m.Close()
 	f := mambaFixture{name: dir, eps: m.NormEps()}
 	_, nLayers, _, _, _, _, vocab := m.Dims()
-	isMamba := func(i int) bool { return m.GraniteMambaLayer(i) }
-	if nh, hd, ds, ng, k, normG, _, ok := m.NemotronResidentParams(); ok {
+	isMamba := func(i int) bool { return m.BackendView().Layer(i).GraniteMamba() }
+	if np, ok := m.BackendView().Nemotron(); ok {
+		nh, hd, ds, ng, k, normG := np.NHeads, np.HeadDim, np.DState, np.NGroups, np.DConv, np.NormGroups
 		f.nHeads, f.headDim, f.dState, f.nGroups, f.K, f.normGroups = nh, hd, ds, ng, k, normG
-		isMamba = func(i int) bool { return m.NemotronBlockKind(i) == 0 }
-	} else if nh, hd, ds, ng, k, _, _, _, _, ok := m.GraniteResidentParams(); ok {
-		f.nHeads, f.headDim, f.dState, f.nGroups, f.K, f.normGroups = nh, hd, ds, ng, k, 1
+		isMamba = func(i int) bool { return m.BackendView().Layer(i).NemotronBlockKind() == 0 }
+	} else if g, ok := m.BackendView().Granite(); ok {
+		f.nHeads, f.headDim, f.dState, f.nGroups, f.K, f.normGroups = g.NHeads, g.HeadDim, g.DState, g.NGroups, g.DConv, 1
 	} else {
 		t.Fatalf("%s is neither Nemotron-H nor Granite-4.0-H", dir)
 	}
@@ -59,7 +60,7 @@ func loadMambaFixture(t *testing.T, dir string) mambaFixture {
 	if first < 0 {
 		t.Fatalf("%s has no Mamba layer", dir)
 	}
-	_, convW, convB, aLog, dW, dtBias, normW, _ := m.GraniteMambaWeights(first)
+	_, convW, convB, aLog, dW, dtBias, normW, _ := m.BackendView().Layer(first).GraniteMambaWeights()
 	// Copied: the slices alias the model's weights, which Close releases (the deferred Close above runs before the replay).
 	f.convW, f.convB, f.normW = slices.Clone(convW), slices.Clone(convB), slices.Clone(normW)
 	f.headP = make([]float32, f.nHeads*3)
@@ -157,7 +158,7 @@ func mambaCos(a, b []float32) (cos, maxAbs float64) {
 	return cos, maxAbs
 }
 
-// TestMambaKernels_cpuParity is OP2b's K gate on Metal (docs/tasks/task-forward-architecture-2026-10.md §4.7, "OP2b on Metal"):
+// TestMambaKernels_cpuParity is OP2b's K gate on Metal:
 // the conv, SSM and gated-norm kernels, chained as the resident runs them, against decoder.mamba2Step on the tiny Nemotron-H
 // (normalized per group) and Granite-4.0-H (over the full width) fixtures' real per-token inputs, over 72 steps. Bar:
 // cosine ≥ 0.99999 and max |diff| ≤ 1e-3 at every step.

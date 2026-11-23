@@ -1,7 +1,6 @@
 //go:build realckpt
 
-// Real-model gates for Spark-X2.5-1.7B (model_type "spark2_5", Spark2_5ForCausalLM): Gate 2 of
-// docs/tasks/task-spark-x2-5.md, the T3 promotion of the family from the tiny synthetic fixture to a released checkpoint
+// Real-model gates for Spark-X2.5-1.7B (model_type "spark2_5", Spark2_5ForCausalLM): Gate 2, the T3 promotion of the family from the tiny synthetic fixture to a released checkpoint
 // (1.7B is the smaller of the two released sizes). Fixture: scripts/pin_spark2_5_real.py.
 //
 // TestSpark25Real_gate and TestSpark25Real_fitGuardLongContext need OPPOSITE fit-guard states and must be run as
@@ -20,10 +19,13 @@ import (
 	"errors"
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 func TestSpark25Real_gate(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ckpt := assetPath(t, "GOINFER_SPARK25_1_7B")
 	const golden = "../testdata/spark2_5_real_golden.json.gz"
 	raw, err := readGolden(golden)
@@ -82,7 +84,7 @@ func TestSpark25Real_gate(t *testing.T) {
 			t.Fatalf("forward: %v", err)
 		}
 	}
-	gotArg := argmax(logits)
+	gotArg := sampling.Argmax(logits)
 	cos := logitCosine(logits, g.LastLogits)
 	t.Logf("spark25-1.7b parity: argmax got=%d want=%d | logit cosine=%.6f", gotArg, g.Argmax, cos)
 	if gotArg != g.Argmax {
@@ -94,7 +96,7 @@ func TestSpark25Real_gate(t *testing.T) {
 
 	got := make([]int, 0, g.NNew)
 	for range g.NNew {
-		id := argmax(logits)
+		id := sampling.Argmax(logits)
 		got = append(got, id)
 		if logits, err = m.forward(id, cache); err != nil {
 			t.Fatalf("continuation forward: %v", err)
@@ -113,13 +115,13 @@ func TestSpark25Real_gate(t *testing.T) {
 	emitParityRow(t, "spark2_5", "full-forward-oracle", "HF f32 (Spark-X2.5-1.7B, Spark2_5ForCausalLM)", 100.0, float64(cos), float64(cos))
 }
 
-// TestSpark25Real_fitGuardLongContext is Gate 3 (docs/tasks/task-spark-x2-5.md): the fit guard must price KV correctly
+// TestSpark25Real_fitGuardLongContext is Gate 3: the fit guard must price KV correctly
 // for a sliding-window model at long context (131072), where a naive calculation is most wrong (llama.cpp's --swa-full
 // prices every layer at full context). decoder/arch.go's kvPositionsAt/kvBytesForCtx is the generic mechanism that
 // prevents that mistake; this checks it against the REAL checkpoint's geometry (fitkv_test.go's
 // TestFitGuard_slidingWindowFlattensPastTheWindow covers the generic mechanism on olmo3-tiny).
 func TestSpark25Real_fitGuardLongContext(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ckpt := assetPath(t, "GOINFER_SPARK25_1_7B")
 
 	cfg, err := loadConfig(os.DirFS(ckpt), "config.json")
@@ -139,11 +141,11 @@ func TestSpark25Real_fitGuardLongContext(t *testing.T) {
 	// Hand-computed expectation from the real config (28 layers, 21 sliding/7 full, kvDim =
 	// NumKVHeads*HeadDim = 2*256 = 512, f32 = 4 bytes/elem, ×2 for K and V):
 	//   7 full layers  × ctx(131072)              × 512 × 4 × 2 = 3,758,096,384 bytes
-	//   21 sliding layers × window(512, capped)   × 512 × 4 × 2 =    44,040,192 bytes
-	//   total ≈ 3.80 GB — vs the flat (pre-M-28) formula's 28 × ctx × 512 × 4 × 2 ≈ 15.03 GB, ~4x more.
-	const wantFixed = int64(7*ctx+21*512) * 512 * 4 * 2
+	//   21 sliding layers × 2 × window(512)       × 512 × 4 × 2 =    88,080,384 bytes (an f32 ring past its window and its mirror)
+	//   total ≈ 3.85 GB — vs the flat (pre-M-28) formula's 28 × ctx × 512 × 4 × 2 ≈ 15.03 GB, ~4x more.
+	const wantFixed = int64(7*ctx+21*2*512) * 512 * 4 * 2
 	if fixed != wantFixed {
-		t.Errorf("estimateKVBytes(ctx=%d) = %d, want %d (hand-computed: 7 full layers uncapped, 21 sliding capped at window %d)",
+		t.Errorf("estimateKVBytes(ctx=%d) = %d, want %d (hand-computed: 7 full layers uncapped, 21 sliding rings of twice window %d)",
 			ctx, fixed, wantFixed, arch.SlidingWindow)
 	}
 	if fixed <= 0 || fixed >= flat {

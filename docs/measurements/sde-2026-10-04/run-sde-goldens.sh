@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# H1.2 (docs/tasks/task-hardware-coverage-2026-10.md): the CPU parity suite and the tiny-fixture goldens under Intel SDE,
+# H1.2 (docs/completed/task-hardware-coverage-2026-10.md): the CPU parity suite and the tiny-fixture goldens under Intel SDE,
 # so the AVX-512 VNNI paths nobody here owns (Ice Lake -icx, Sapphire Rapids -spr) execute, with Haswell -hsw as the
 # control (AVX2 only, so it must match the native run on the 3700X).
 #
@@ -16,9 +16,11 @@ DBIN=${DBIN:-$HOME/goinfer-logs/night/bin/decoder-sde-vnnigolden.test}
 LBIN=${LBIN:-$HOME/goinfer-logs/night/bin/linalg-sde-v1.55.0.test}
 OUT=${OUT:-$REPO/docs/measurements/sde-2026-10-04}
 # Everything cheap under emulation. The LongPrompt tests take 4+ minutes EACH under SDE and are the same arithmetic the
-# 15-fixture goldens already cover, so they are skipped and named as skipped.
+# 15-fixture goldens already cover, so they are skipped and named as skipped. The two ParityManifest closure tests type-check
+# the source by running `go list` as a child process, which SDE's Pin can crash (exit 127, a DisableSigStack assertion; seen
+# under -hsw on 2026-11-20 and passing natively); they read no CPU feature, so they are skipped here and run natively in CI.
 RUN=${RUN:-'Golden|Parity|Int4|Int8|W4A8|Quant'}
-SKIP=${SKIP:-'LongPrompt'}
+SKIP=${SKIP:-'LongPrompt|^TestParityManifest_(coreClosed|loadersClosed)$'}
 CPUS=${CPUS:-"hsw icx spr"}
 # linalg's FMA-peak test infers the clock from measured throughput (it read 0.35 GHz under SDE): a timing test, meaningless under emulation.
 LSKIP=${LSKIP:-'FMAPeak'}

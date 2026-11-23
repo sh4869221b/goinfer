@@ -5,6 +5,7 @@ package cuda
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -15,7 +16,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// TestKSH6C_postPoolBreakdown is a reading for KS-H6's build (docs/tasks/task-kernel-survey-2026-10.md, "KS-H6 build"): one CUDA
+// TestKSH6C_postPoolBreakdown is a reading for KS-H6's build: one CUDA
 // build of KSH6C_MODEL at KSH6C_CTX, served as serve loads it, with free VRAM read at every requested allocation. It lists every
 // allocation after the last K/V pool buffer (bytes, and the card's drop across it) and the drop no allocation accounts for.
 // KSH6C_NO_SELFTEST skips the decoder's startup self-test, whose fixtures build before this one. KSH6C_S4=1 makes it H6C-S4's
@@ -166,4 +167,102 @@ func TestKSH6C_postPoolBreakdown(t *testing.T) {
 			fmt.Fprintf(os.Stderr, "[H6C]     at %s\n[H6C]     next allocation at %s\n", x.site, x.next)
 		}
 	}
+}
+
+// TestKV3R_allocSequence loads KV3R_MODEL (a path under ~/models) as serve does and writes the build's device allocation sequence,
+// with its frees and the card's free VRAM after each, to KV3R_OUT (tab-separated: A|F, id, requested bytes, on-device, plan line,
+// free bytes; "S" rows carry a site marker: kv pools done, post-pool done, the fit-check reading). A reading, not a gate.
+func TestKV3R_allocSequence(t *testing.T) {
+	rel, out := os.Getenv("KV3R_MODEL"), os.Getenv("KV3R_OUT")
+	if rel == "" || out == "" {
+		t.Skip("set KV3R_MODEL and KV3R_OUT")
+	}
+	requireCUDADevice(t)
+	home, _ := os.UserHomeDir()
+	path := filepath.Join(home, "models", rel)
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("no model at %s", path)
+	}
+	free := func() int64 {
+		f, ok := decoder.FreeBytesFor("cuda")
+		if !ok {
+			t.Errorf("no free-VRAM reading")
+		}
+		return f
+	}
+	kvF16Auto.Store(true)
+	defer kvF16Auto.Store(false)
+	if w, err := decoder.Load(filepath.Join("../../testdata/llama-tiny"), decoder.Options{Backend: "cuda", Quant: "int4"}); err == nil {
+		_ = w.Close() // the startup self-test runs here, before the sequence below
+	}
+	var (
+		mu  sync.Mutex
+		log []string
+		n   int
+	)
+	mark := func(s string) {
+		mu.Lock()
+		log = append(log, fmt.Sprintf("S\t%s\t%d", s, free()))
+		mu.Unlock()
+	}
+	leaseSeenForTest = func(onDevice bool, line string, requested int64, release func()) func() {
+		mu.Lock()
+		id := n
+		n++
+		log = append(log, fmt.Sprintf("A\t%d\t%d\t%d\t%s\t%d", id, requested, b2i(onDevice), line, free()))
+		mu.Unlock()
+		return func() {
+			release()
+			mu.Lock()
+			log = append(log, fmt.Sprintf("F\t%d\t%d\t%d\t%s\t%d", id, requested, b2i(onDevice), line, free()))
+			mu.Unlock()
+		}
+	}
+	saved := cudaFreeVRAM
+	gotFit := false
+	cudaFreeVRAM = func(r *cudaResident) (uint64, error) {
+		f, e := saved(r)
+		if !gotFit {
+			gotFit = true
+			mu.Lock()
+			log = append(log, fmt.Sprintf("S\tfit\t%d", f))
+			mu.Unlock()
+		}
+		return f, e
+	}
+	kvPoolsDoneForTest = func() { mark("kvpools") }
+	postPoolDoneForTest = func() { mark("postpool") }
+	restore := func() {
+		leaseSeenForTest, cudaFreeVRAM, kvPoolsDoneForTest, postPoolDoneForTest = nil, saved, nil, nil
+	}
+	defer restore()
+	mark("start")
+	m, err := decoder.Load(path, decoder.Options{Backend: "cuda", Quant: "int4"})
+	restore()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	defer m.Close()
+	r, ok := m.ResidentForwardForTest().(*cudaResident)
+	if !ok {
+		t.Fatalf("not CUDA-resident: %s", m.ResidentDecline())
+	}
+	mu.Lock()
+	log = append(log, fmt.Sprintf("S\tdone\t%d", free()))
+	body := ""
+	for _, l := range log {
+		body += l + "\n"
+	}
+	mu.Unlock()
+	if err := os.WriteFile(out, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(os.Stderr, "[KV3R] %s: %d events, ctx planned %d cap %d, written to %s\n", rel, len(log), r.ctxPlanned, r.ctxCap, out)
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

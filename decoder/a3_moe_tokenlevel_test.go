@@ -8,6 +8,9 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // Does the A3 MoE divergence change the tokens a user sees? A cosine on hidden states does not say: dense
@@ -29,7 +32,7 @@ func TestA3MoETokenLevel(t *testing.T) {
 		t.Skip("DIAGNOSTIC (set GOINFER_DIAG=1): reports evidence for a judgement.")
 	}
 	path := assetPath(t, "GOINFER_MELLUM_CKPT")
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	K, N := 2048, 48
 	if v := os.Getenv("GOINFER_MELLUM_K"); v != "" {
 		fmt.Sscanf(v, "%d", &K)
@@ -88,7 +91,7 @@ func TestA3MoETokenLevel(t *testing.T) {
 		fmt.Fprintf(os.Stderr, "A3-token: probe=%v prefill %.1fs; decoding %d\n", probe, time.Since(start).Seconds(), N)
 		toks, margins := make([]int, 0, N), make([]float64, 0, N)
 		for step := 0; step < N; step++ {
-			tok := argmax(lg)
+			tok := sampling.Argmax(lg)
 			toks = append(toks, tok)
 			margins = append(margins, margin(lg))
 			if lg, err = m.forward(tok, cache); err != nil {

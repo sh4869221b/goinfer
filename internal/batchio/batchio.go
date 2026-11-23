@@ -1,5 +1,5 @@
 // Package batchio is the file format of goinfer's batch runs: the OpenAI-style JSONL that serve's
-// POST /v1/batches reads and writes (J4) and that `goinfer-chat --batch` reads and writes (J5), kept in ONE place so a file
+// POST /v1/batches reads and writes and that `goinfer-chat --batch` reads and writes, kept in ONE place so a file
 // really is interchangeable between the two — the input parser, the byte layout of an output and an error line, and the
 // resume scan are the same code on both sides, not two copies that agree today.
 //
@@ -51,7 +51,7 @@ func ParseInput(data []byte) ([]Line, error) {
 		}
 		var l Line
 		if err := json.Unmarshal([]byte(raw), &l); err != nil {
-			return nil, fmt.Errorf("input file line %d: invalid JSON: %s", lineNo, err.Error())
+			return nil, fmt.Errorf("input file line %d: invalid JSON: %w", lineNo, err)
 		}
 		if l.CustomID == "" {
 			return nil, fmt.Errorf("input file line %d: custom_id is required", lineNo)

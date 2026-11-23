@@ -9,6 +9,9 @@ import (
 
 	"github.com/townsendmerino/goinfer/chat"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TestDFlashGemma4_diag localizes why the Gemma-4 pairing's mean acceptance was exactly 0.00 (477 rounds): a merely
@@ -27,7 +30,7 @@ import (
 //
 //	GOINFER_HEAVY_TESTS=1 go test -tags realckpt ./decoder/ -run DFlashGemma4_diag -v
 func TestDFlashGemma4_diag(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ddir := os.Getenv("GOINFER_DFLASH_DRAFTER")
 	tdir := os.Getenv("GOINFER_DFLASH_TARGET")
 	tokDir := os.Getenv("GOINFER_DFLASH_TOKENIZER")
@@ -91,7 +94,7 @@ func TestDFlashGemma4_diag(t *testing.T) {
 		t.Logf("  tap layer %2d  rms %.4f", l, rms(last[i*d.hidden:(i+1)*d.hidden]))
 	}
 
-	anchor := argmax(logits)
+	anchor := sampling.Argmax(logits)
 	txt, _ := tk.DecodePiece(anchor)
 	t.Logf("target anchor = %d (%q)", anchor, txt)
 
@@ -116,7 +119,7 @@ func TestDFlashGemma4_diag(t *testing.T) {
 	// saturated inputs; varied-but-wrong points at a convention mismatch instead.
 	var drafted []int
 	for _, h := range trunk[1:] {
-		drafted = append(drafted, argmax(m.DrafterHeadLogits(h)))
+		drafted = append(drafted, sampling.Argmax(m.DrafterHeadLogits(h)))
 	}
 	t.Logf("drafted ids = %v", drafted)
 	uniq := map[int]bool{}

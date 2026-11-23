@@ -10,9 +10,11 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/decoder"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// spec_twoturn_test.go is item 30 (docs/prompts/nobara-cuda-spec-trailing-token-2026-09.md §2): the CUDA check of two
+// spec_twoturn_test.go is item 30: the CUDA check of two
 // trailing-token fixes whose real drafter and kernels exist only on CUDA —
 //
 //   - the block drafter (--drafter, CUDA only): at a completed exit (EOS or max_tokens) the resident commit must record the
@@ -33,7 +35,7 @@ import (
 // (cheap; no weights) rather than threading one through every call site.
 func twoTurnAssets(t *testing.T) (tgt string) {
 	t.Helper()
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	tgt = os.Getenv("GOINFER_CUDA_MODEL")
 	if tgt == "" {
 		tgt = os.ExpandEnv("$HOME/models/qwen3-4b")

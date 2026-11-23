@@ -30,31 +30,33 @@ const (
 
 // Flags holds the shared loading flags' values once the flag set has been parsed.
 type Flags struct {
-	Backend          string              // --backend; "auto" (the default) is replaced by the backend it resolves to in Validate
-	Auto             *decoder.AutoChoice // what -backend auto chose and why; nil when the user named a backend
-	Quant            string              // --quant
-	QuantSet         bool                // --quant was given on the command line, not left at its default
-	LoRA             string              // --lora
-	KV               string              // --kv
-	Ctx              int                 // --ctx
-	StreamWeights    bool                // --stream-weights
-	WeightCacheGB    float64             // --weight-cache
-	MoECacheExperts  bool                // --moe-cache-experts
-	MoECacheSlots    int                 // --moe-cache-slots
-	MoEPager         string              // --moe-pager
-	AcceptSlow       bool                // --accept-slow
-	EmbedInt4        bool                // --embed-int4
-	EmbedInt4Set     bool                // --embed-int4 was given on the command line, not left at its default
-	DirectLoad       bool                // --direct-load
-	Fit              bool                // --fit
-	ExactPrefill     bool                // --exact-prefill
-	CPUExactPrefill  bool                // --cpu-exact-prefill
-	WindowedKV       bool                // --windowed-kv
-	MoEStep          bool                // --moe-step
-	RecurrentStep    bool                // --recurrent-step
-	Gemma4Step       bool                // --gemma4-step
-	RecurrentStepSet bool                // --recurrent-step was given on the command line, not left at its default
-	Gemma4StepSet    bool                // --gemma4-step was given on the command line, not left at its default
+	Backend            string              // --backend; "auto" (the default) is replaced by the backend it resolves to in Validate
+	Auto               *decoder.AutoChoice // what -backend auto chose and why; nil when the user named a backend
+	Quant              string              // --quant
+	QuantSet           bool                // --quant was given on the command line, not left at its default
+	LoRA               string              // --lora
+	KV                 string              // --kv
+	Ctx                int                 // --ctx
+	StreamWeights      bool                // --stream-weights
+	WeightCacheGB      float64             // --weight-cache
+	MoECacheExperts    bool                // --moe-cache-experts
+	MoEExpertsUnpinned bool                // --moe-experts-unpinned
+	MoECacheSlots      int                 // --moe-cache-slots
+	MoEPager           string              // --moe-pager
+	AcceptSlow         bool                // --accept-slow
+	EmbedInt4          bool                // --embed-int4
+	EmbedInt4Set       bool                // --embed-int4 was given on the command line, not left at its default
+	DirectLoad         bool                // --direct-load
+	Fit                bool                // --fit
+	ExactPrefill       bool                // --exact-prefill
+	CPUExactPrefill    bool                // --cpu-exact-prefill
+	WindowedKV         bool                // --windowed-kv
+	MoEStep            bool                // --moe-step
+	RecurrentStep      bool                // --recurrent-step
+	Gemma4Step         bool                // --gemma4-step
+	FlashDecodeSoftcap bool                // --flash-decode-softcap
+	RecurrentStepSet   bool                // --recurrent-step was given on the command line, not left at its default
+	Gemma4StepSet      bool                // --gemma4-step was given on the command line, not left at its default
 }
 
 // Register adds the shared loading flags to fs and returns the Flags their values are parsed into. Each flag's
@@ -83,16 +85,18 @@ func register(fs *flag.FlagSet, app App, goos string, ggufDirect bool) *Flags {
 	fs.BoolVar(&f.StreamWeights, "stream-weights", boolDef("stream-weights"), use("stream-weights"))
 	fs.Float64Var(&f.WeightCacheGB, "weight-cache", floatDef("weight-cache"), use("weight-cache"))
 	fs.BoolVar(&f.MoECacheExperts, "moe-cache-experts", boolDef("moe-cache-experts"), use("moe-cache-experts"))
+	fs.BoolVar(&f.MoEExpertsUnpinned, "moe-experts-unpinned", boolDef("moe-experts-unpinned"), use("moe-experts-unpinned"))
 	fs.IntVar(&f.MoECacheSlots, "moe-cache-slots", intDef("moe-cache-slots"), use("moe-cache-slots"))
 	fs.StringVar(&f.MoEPager, "moe-pager", def("moe-pager"), use("moe-pager"))
 	fs.BoolVar(&f.AcceptSlow, "accept-slow", boolDef("accept-slow"), use("accept-slow"))
 	fs.Var(embedInt4Flag{f}, "embed-int4", use("embed-int4"))
 	fs.BoolVar(&f.DirectLoad, "direct-load", boolDef("direct-load") || ggufDirect, use("direct-load"))
-	fs.Var((*cliutil.OnOff)(&f.Fit), "fit", use("fit")) // lenient: --fit=off works (M-14)
+	fs.Var((*cliutil.OnOff)(&f.Fit), "fit", use("fit")) // lenient: --fit=off works
 	fs.BoolVar(&f.ExactPrefill, "exact-prefill", boolDef("exact-prefill"), use("exact-prefill"))
 	fs.BoolVar(&f.CPUExactPrefill, "cpu-exact-prefill", boolDef("cpu-exact-prefill"), use("cpu-exact-prefill"))
 	fs.BoolVar(&f.WindowedKV, "windowed-kv", boolDef("windowed-kv"), use("windowed-kv"))
 	fs.BoolVar(&f.MoEStep, "moe-step", boolDef("moe-step"), use("moe-step"))
+	fs.BoolVar(&f.FlashDecodeSoftcap, "flash-decode-softcap", boolDef("flash-decode-softcap"), use("flash-decode-softcap"))
 	f.RecurrentStep, f.Gemma4Step = boolDef("recurrent-step"), boolDef("gemma4-step")
 	fs.Var(givenBool{&f.RecurrentStep, &f.RecurrentStepSet}, "recurrent-step", use("recurrent-step"))
 	fs.Var(givenBool{&f.Gemma4Step, &f.Gemma4StepSet}, "gemma4-step", use("gemma4-step"))
@@ -167,16 +171,19 @@ func Resolve(f Flags, m Machine, ov Overrides) decoder.Options {
 		StreamWeights:         or(ov.Stream, f.StreamWeights),
 		WeightCacheBytes:      int64(or(ov.WeightCacheGB, f.WeightCacheGB) * 1e9),
 		MoECacheExperts:       f.MoECacheExperts,
+		MoEExpertsUnpinned:    f.MoEExpertsUnpinned,
 		MoECacheSlots:         f.MoECacheSlots,
 		MoEPager:              f.MoEPager,
 		AcceptSlowMoE:         f.AcceptSlow,
 		EmbedInt4:             or(ov.EmbedInt4, f.embedInt4()),
+		EmbedInt4Default:      ov.EmbedInt4 == nil && !f.EmbedInt4Set,
 		DisableFit:            !f.Fit,
 		ExactPrefill:          f.ExactPrefill,
 		ResidentWindowedKV:    f.WindowedKV,
 		ResidentMoEStep:       f.MoEStep,
 		ResidentRecurrentStep: f.RecurrentStep,
 		ResidentGemma4Step:    f.Gemma4Step,
+		FlashDecodeSoftcap:    f.FlashDecodeSoftcap,
 		Knobs:                 f.Knobs(),
 	}
 	if sv := ov.Serve; sv != nil {
@@ -278,8 +285,7 @@ func (f *Flags) ExplicitQuant() string {
 	return ""
 }
 
-// Knobs carries the prompt-ingestion flags to the model's decoder.Options (phase 5,
-// docs/tasks/task-env-config-2026-09.md). --exact-prefill itself travels as Options.ExactPrefill,
+// Knobs carries the prompt-ingestion flags to the model's decoder.Options. --exact-prefill itself travels as Options.ExactPrefill,
 // which every backend consults per model, so only the CPU-specific flag needs a knob.
 //
 // The CPU knob is set EXPLICITLY either way rather than left unset. The decoder treats unset as on,
@@ -295,8 +301,8 @@ func (f *Flags) Knobs() *decoder.Knobs {
 }
 
 // CPUKV is the CPU KV cache precision: serve's deprecated --kv-quant when given, else --kv mapped onto the CPU cache: f16 and
-// i8 select those caches, and auto (the default) and f32 the f32 reference. auto moves to f16 only after the gates read
-// (docs/tasks/task-cpu-kv-f16-2026-10.md, decision 1). (Both Options fields remain; only the command line unified.)
+// i8 select those caches, and auto (the default) and f32 the f32 reference. auto moves to f16 only after the gates read.
+// (Both Options fields remain; only the command line unified.)
 func CPUKV(kvQuant, kv string) string {
 	if kvQuant != "" {
 		return kvQuant

@@ -2,36 +2,35 @@ package metal
 
 import (
 	"fmt"
-	"os"
+	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 
 	gpu "github.com/townsendmerino/goinfer/backend/metal/internal/gpudev"
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/internal/runtime/logs"
 )
 
-// KV8a's recurrent checkpoint on Metal (decoder.ResidentRecurrentCheckpoint; docs/measurements/kv8a-metal-2026-10/README.md): one copy
+// The recurrent checkpoint on Metal (decoder.ResidentKVSubsystem; docs/measurements/kv8a-metal-2026-10/README.md): one copy
 // of every recurrent layer's conv window and state, Gated-DeltaNet (win, state) and Mamba-2 (win, ssm), in buffers beside the live
 // ones, copied on the device after the executor has drained. A load the memory guard cannot also fit it into keeps none, and the
-// slot behaves as before KV8a.
-
-var _ decoder.ResidentRecurrentCheckpoint = (*metalResident)(nil)
+// slot has no checkpoint to restore.
 
 // ckptFits reports whether the guard's budget holds the load's need plus the checkpoint's bytes (residentMemoryDecline's quantities,
 // not the OS's account of free memory), and why not. A variable so a test can stand in a machine with no room.
-var ckptFits = func(m *decoder.Model, bytes int64) (bool, string) {
-	need := residentNeedBytes(m)
+var ckptFits = func(m *decoder.Model, plan metalCtxPlan, bytes int64) (bool, string) {
+	need := residentNeedBytes(m, plan)
 	budget, ok := residentBudget()
 	if need <= 0 || !ok {
 		return true, "" // nothing to compare against, as residentMemoryDecline
 	}
 	if need+bytes > budget {
-		return false, fmt.Sprintf("%.1f MiB needed beside the load's %.2f GB, over the %.2f GB budget", mib(bytes), float64(need)/(1<<30), float64(budget)/(1<<30))
+		return false, fmt.Sprintf("%.1f MiB needed beside the load's %s, over the %s budget", mib(bytes), mem.GiB(need), mem.GiB(budget))
 	}
 	return true, ""
 }
 
 // allocRecurrentCheckpoint allocates the checkpoint once the resident is built. It keeps none, and says why on stderr, when the
 // memory guard's budget cannot also hold it.
-func (r *resident) allocRecurrentCheckpoint(m *decoder.Model) {
+func (r *resident) allocRecurrentCheckpoint(m *decoder.Model, plan metalCtxPlan) {
 	if !r.recurrentModel() {
 		return
 	}
@@ -39,9 +38,9 @@ func (r *resident) allocRecurrentCheckpoint(m *decoder.Model) {
 	if bytes == 0 {
 		return
 	}
-	if ok, why := ckptFits(m, bytes); !ok {
+	if ok, why := ckptFits(m, plan, bytes); !ok {
 		r.ckptDeclined = why
-		fmt.Fprintf(os.Stderr, "metal: recurrent checkpoint: none kept (%s); a reply rendered back differently re-prefills the whole prompt\n", why)
+		logs.Warnf("metal: recurrent checkpoint: none kept (%s); a reply rendered back differently re-prefills the whole prompt", why)
 		return
 	}
 	for l := range r.layers { // in recurrentLive's order, which bindCheckpoint pairs them by
@@ -54,19 +53,19 @@ func (r *resident) allocRecurrentCheckpoint(m *decoder.Model) {
 				r.d.ReleaseBuf(b)
 			}
 			r.ckptBufs, r.ckptDeclined = nil, err.Error()
-			fmt.Fprintf(os.Stderr, "metal: recurrent checkpoint: none kept (%v); a reply rendered back differently re-prefills the whole prompt\n", err)
+			logs.Warnf("metal: recurrent checkpoint: none kept (%v); a reply rendered back differently re-prefills the whole prompt", err)
 			return
 		}
 		r.ckptBufs = append(r.ckptBufs, win, state)
 	}
 	r.bindCheckpoint()
 	r.ckptBytes = bytes
-	fmt.Fprintf(os.Stderr, "metal: recurrent checkpoint: %.1f MiB (%d buffers, KV8a)\n", mib(bytes), len(r.ckptBufs))
+	logs.Infof("metal: recurrent checkpoint: %.1f MiB (%d buffers)", mib(bytes), len(r.ckptBufs))
 }
 
 func mib(b int64) float64 { return float64(b) / (1 << 20) }
 
-// RecurrentCheckpointBytes (decoder.ResidentRecurrentCheckpoint) is the checkpoint's bytes, 0 when the load kept none.
+// RecurrentCheckpointBytes (decoder.ResidentKVSubsystem) is the checkpoint's bytes, 0 when the load kept none.
 func (a *metalResident) RecurrentCheckpointBytes() int64 { return a.r.ckptBytes }
 
 // recurrentLive is every recurrent layer's live conv window and state, in layer order: the bound KV slot's (useKVSlot).
@@ -94,7 +93,7 @@ func (r *resident) bindCheckpoint() {
 	}
 }
 
-// RecurrentCheckpointHeld implements decoder.ResidentRecurrentCheckpointOwner: the one copy is the slot's that last saved it.
+// RecurrentCheckpointHeld is decoder.ResidentKVSubsystem's: the one copy is the slot's that last saved it.
 func (a *metalResident) RecurrentCheckpointHeld(slot int) bool {
 	return slot >= 0 && len(a.r.ckptBufs) > 0 && a.r.ckptSlot == slot
 }

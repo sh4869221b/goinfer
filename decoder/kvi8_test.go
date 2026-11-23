@@ -10,9 +10,12 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// kv-quant Increment 1 gate (docs/completed/task-cpu-kv-quant.md): int8 KV decode quality.
+// kv-quant Increment 1 gate: int8 KV decode quality.
 // int8 is lossy, so the bar is cosine vs the f32 cache (not bit-exact). Covers
 // BOTH int8 layer kinds — a global (append-forever) layer and a ring
 // (sliding-window) layer that wraps — since attendQueryI8 reads them differently.
@@ -148,7 +151,7 @@ func TestKVI8_truncateReappend(t *testing.T) {
 // never snapshotted. gemma-3-4b-it int8 covers both layer kinds (int8 rings on the
 // sliding-window layers + int8 global layers). Skips without the checkpoint.
 func TestKVI8_snapshotRoundtrip(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	dir := os.Getenv("GOINFER_TEST_MODEL")
 	if dir == "" {
 		dir = os.Getenv("HOME") + "/models/gemma-3-4b-it"
@@ -213,7 +216,7 @@ func TestKVI8_snapshotRoundtrip(t *testing.T) {
 // garbage input where argmax is a coin-flip (the bug that faked an earlier
 // "int8 fails" result).
 func TestKVI8_genParity(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	dir := os.Getenv("GOINFER_TEST_MODEL")
 	if dir == "" {
 		dir = os.Getenv("HOME") + "/models/gemma-3-4b-it"
@@ -247,7 +250,7 @@ func TestKVI8_genParity(t *testing.T) {
 		lg := make([][]float32, len(ids))
 		for i, id := range ids {
 			logits, _ := mm.forward(id, cache)
-			am[i] = argmax(logits)
+			am[i] = sampling.Argmax(logits)
 			lg[i] = append([]float32(nil), logits...)
 		}
 		return am, lg
@@ -280,7 +283,7 @@ const kvi8GateText = "The history of computing began in the early nineteenth cen
 // argmax + cosine. Catches bugs in the int8 dequant/round-trip and confirms int8
 // no longer forces sequential prefill. Skips without a checkpoint + tokenizer.
 func TestKVI8_batchedPrefill(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	dir := os.Getenv("GOINFER_TEST_MODEL")
 	if dir == "" {
 		dir = os.Getenv("HOME") + "/models/gemma-3-4b-it"
@@ -316,7 +319,7 @@ func TestKVI8_batchedPrefill(t *testing.T) {
 	match := 0
 	var cosSum float64
 	for i := range ids {
-		if argmax(gotL[i]) == argmax(refL[i]) {
+		if sampling.Argmax(gotL[i]) == sampling.Argmax(refL[i]) {
 			match++
 		}
 		cosSum += logitCosine(refL[i], gotL[i])
@@ -329,5 +332,33 @@ func TestKVI8_batchedPrefill(t *testing.T) {
 	}
 	if cos < 0.99 {
 		t.Errorf("batched int8 prefill avg cosine %.5f < 0.99", cos)
+	}
+}
+
+// TestKVI8_moeFamiliesConsistent: an int8 CPU cache on the MoE families of the generic loop (mixtral-tiny, qwen3moe-tiny, glm-tiny,
+// laguna-m1-tiny, flint-tiny; llama-tiny is the dense control) is int8, and a batched forward over N tokens gives, bit for bit, the logits of the same N tokens
+// decoded one at a time.
+func TestKVI8_moeFamiliesConsistent(t *testing.T) {
+	for _, dir := range []string{"../testdata/llama-tiny", "../testdata/mixtral-tiny", "../testdata/qwen3moe-tiny", "../testdata/glm-tiny", "testdata/laguna-m1-tiny", "../testdata/flint-tiny"} {
+		t.Run(filepath.Base(dir), func(t *testing.T) {
+			m, err := Load(dir, Options{KVQuant: "i8"})
+			if err != nil {
+				t.Fatalf("load -kv i8: %v", err)
+			}
+			defer m.Close()
+			if m.CPUKVPrecision() != "i8" {
+				t.Fatalf("CPU KV %q, want i8 delivered", m.CPUKVPrecision())
+			}
+			_, _, _, _, _, _, vocab := m.Dims()
+			ids := f1IDs(32, vocab)
+			dec := f1Decode(t, m, ids)
+			pre, c := f1Prefill(t, m, ids, nil)
+			if c.quant != kvI8 {
+				t.Fatalf("the cache is %d, want int8", c.quant)
+			}
+			if d := f1Diff(pre, dec); d != 0 {
+				t.Errorf("the batched forward differs from token-by-token decode in %d values", d)
+			}
+		})
 	}
 }
