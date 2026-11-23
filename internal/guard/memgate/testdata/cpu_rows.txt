@@ -310,6 +310,14 @@ testdata/phi3-tiny int4/kv-i8
 testdata/phi3-tiny int4/kvquant-f16
 testdata/phi3-tiny int8int8
 testdata/phi3-tiny int8int8/g32
+testdata/plamo3-tiny f32
+testdata/plamo3-tiny f32/g32
+testdata/plamo3-tiny int4
+testdata/plamo3-tiny int4/g32
+testdata/plamo3-tiny int4/kv-i8
+testdata/plamo3-tiny int4/kvquant-f16
+testdata/plamo3-tiny int8int8
+testdata/plamo3-tiny int8int8/g32
 testdata/qwen25vl-tiny f32
 testdata/qwen25vl-tiny f32/g32
 testdata/qwen25vl-tiny int4

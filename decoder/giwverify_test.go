@@ -33,28 +33,37 @@ func writeTinyGIW(t *testing.T) string {
 	return out
 }
 
-// corruptWeightByte flips one byte deep inside the payload without changing the file's size, and
-// restores its mtime so the file looks untouched to any (size, mtime) check.
+// corruptWeightByte flips a byte in an embedding value and restores the file's mtime.
+// The reader can still parse all tensor metadata when CRC verification is skipped.
 func corruptWeightByte(t *testing.T, path string) {
 	t.Helper()
 	fi, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	off := fi.Size() * 3 / 4
-	var b [1]byte
-	if _, err := f.ReadAt(b[:], off); err != nil {
+	weights, _, err := giw.Read(data)
+	if err != nil {
 		t.Fatal(err)
 	}
-	b[0] ^= 0xFF
-	if _, err := f.WriteAt(b[:], off); err != nil {
+	r, _, _, err := readGIWHeadReader(weights)
+	if err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
+	embedding := r.weightMat()
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if _, ok := embedding.F32(); !ok {
+		t.Fatal("corruption fixture needs f32 embeddings")
+	}
+	weights[r.off-4] ^= 0xFF // low byte of the last embedding value
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chtimes(path, fi.ModTime(), fi.ModTime()); err != nil {
 		t.Fatal(err)
 	}

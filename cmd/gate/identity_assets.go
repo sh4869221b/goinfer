@@ -80,6 +80,7 @@ var identityTiny = []identityAsset{
 	{Family: "gemma2", Name: "tiny", Path: "testdata/gemma2-tiny", Golden: "testdata/gemma2_forward_golden.json"},
 	{Family: "olmo_hybrid", Name: "tiny", Path: "testdata/olmo_hybrid-tiny", Golden: "testdata/olmo_hybrid_forward_golden.json"},
 	{Family: "phi3", Name: "tiny", Path: "testdata/phi3-tiny", Golden: "testdata/phi3_tiny_text_golden.json"},
+	{Family: "plamo3", Name: "tiny", Path: "testdata/plamo3-tiny", Golden: "testdata/plamo3_tiny_golden.json"},
 	{Family: "qwen2", Name: "0.5b", Path: "testdata/qwen2.5-0.5b", Golden: "testdata/qwen2_forward_golden.json"},
 	{Family: "qwen2_5_vl", Name: "tiny-text", Path: "testdata/qwen25vl-tiny", Golden: "testdata/qwen25vl_tiny_text_golden.json"},
 	{Family: "qwen2_moe", Name: "tiny", Path: "testdata/tiny-qwen2-moe", Golden: "testdata/qwen2moe_forward_golden.json"},
