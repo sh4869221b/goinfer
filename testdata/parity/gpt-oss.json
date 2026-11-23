@@ -13,7 +13,7 @@
     "decoder/arch_gpt_oss.go",
     "decoder/gguf_build_gptoss.go"
   ],
-  "deps_hash": "sha256:54a1a1adb84d06548dc7aa9a59c12ec7b1a3be71824dbaecfaa362b9b569188c",
+  "deps_hash": "sha256:671b40c2eea7fd76bf60fc1514b21eedac97a9ad64a52e29b23bec717b796f92",
   "status": "validated",
   "validated_at": "960ef65a7",
   "date": "2026-10-26",

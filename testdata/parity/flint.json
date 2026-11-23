@@ -13,7 +13,7 @@
   "programs": [
     "testdata/flint-tiny"
   ],
-  "deps_hash": "sha256:fe3def36707effa2f3bd1b4865cfde38c85184c74b390f0c6823ab7bc59b9a6b",
+  "deps_hash": "sha256:cbdec5c27c70a5ed2527ce5656679bc2cde29f10148ba21b9343c07d10b503d4",
   "status": "experimental",
   "validated_at": "d29d1ba4",
   "date": "2026-11-11",
