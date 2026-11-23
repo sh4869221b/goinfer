@@ -7,13 +7,15 @@ import (
 	"math"
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
 // F3 dense Granite 4.2 parity (ibm-granite/granite-4.2-{3b,8b,30b}, model_type "granite"): a
 // plain llama skeleton plus three of Granite's four scalar multipliers (embedding_multiplier,
 // attention_multiplier, logits_scaling — all already generic on Architecture; residual_multiplier
 // stays at its identity 1.0, the only value any released 4.2 size ships and the only value
-// validateGraniteDense accepts). Loads a tiny seeded GraniteForCausalLM with NON-trivial
+// ValidateGraniteDense accepts). Loads a tiny seeded GraniteForCausalLM with NON-trivial
 // multipliers through the generic forward and matches the HF float32 oracle, so a forward that
 // drops any one of them fails parity.
 //
@@ -81,7 +83,7 @@ func TestGraniteDense_forwardParity(t *testing.T) {
 		t.Fatalf("got %d logits, want vocab %d", len(logits), g.Vocab)
 	}
 
-	if got := argmax(logits); got != g.Argmax {
+	if got := sampling.Argmax(logits); got != g.Argmax {
 		t.Errorf("argmax = %d, want %d (logit[got]=%.4f logit[want]=%.4f)",
 			got, g.Argmax, logits[got], logits[g.Argmax])
 	}
@@ -107,6 +109,6 @@ func TestGraniteDense_forwardParity(t *testing.T) {
 
 	cos := fullCosine(t, logits, graniteDenseForwardFullPath)
 	t.Logf("granite (dense): argmax=%d (want %d) | maxSampleΔ=%.5f | cosine=%v",
-		argmax(logits), g.Argmax, maxSampleΔ, cos)
+		sampling.Argmax(logits), g.Argmax, maxSampleΔ, cos)
 	emitParityRow(t, "granite", "tiny-golden", "HF f32 (granite-dense-tiny seeded fixture, non-trivial scalar multipliers)", 100.0, cos, cos)
 }

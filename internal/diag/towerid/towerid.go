@@ -1,6 +1,6 @@
 // Package towerid fingerprints every vision and audio tower's output on its committed tiny fixture, on the CPU or on a
 // device backend reached through the registries production uses, so a change that must not move a tower's numerics
-// (Track AX's import switch, docs/tasks/task-subsystems-2026-10.md §7.8) can be checked bit for bit.
+// (Track AX's import switch) can be checked bit for bit.
 //
 // Contract. Run(root, backend) loads each family from root's fixtures with float32 weights, feeds it fixed synthetic
 // inputs, and returns one Case per (family, input): the SHA-256 of the output's float32 bits and whether the device path
@@ -72,8 +72,8 @@ type runner struct {
 	outputs       map[string][]float32 // each case's output values, keyed by caseKey; nil unless RunOutputs asked
 }
 
-// PlantForTest, when it names a family, changes that family's first output value by one ulp before it is fingerprinted: the
-// plant SB9's goldens are shown to go red with (G-SB9-2). Empty in production and in every other test.
+// PlantForTest (when it names a family) changes that family's first output value by one ulp before it is fingerprinted: the
+// plant the tower goldens are shown to go red with (CheckPlants). Empty in production and in every other test.
 var PlantForTest string
 
 func caseKey(family, input string) string { return family + "\x00" + input }

@@ -15,7 +15,7 @@ import (
 	"github.com/townsendmerino/goinfer/tokenizer"
 )
 
-// TestS9EModelBatched_tiny is G-S9c of S9 step 2 (docs/tasks/task-multimodal-support-2026-10.md, registered before any
+// TestS9EModelBatched_tiny is G-S9c of S9 step 2 ( registered before any
 // code): on gemma4-emodel-tiny (6 layers; head dims 32 and 64; 2 KV-shared layers with their own sources and double FFN
 // width; PLE P=32; layer scalars; v_norm), the f16 batched pass against the S9 layer-major pass (the validated path,
 // bit-identical to sequential) on one Metal resident. Compared: the last prompt row and 8 decode steps teacher-forced
@@ -49,8 +49,8 @@ func TestS9EModelBatched_tiny(t *testing.T) {
 	if !ok {
 		t.Fatalf("not Metal-resident: %s", m.ResidentDecline())
 	}
+	defer func(v bool) { emodelBatchedOn, emodelBatchDefect = v, 0 }(emodelBatchedOn)
 	emodelBatchedOn = true
-	defer func() { emodelBatchedOn, emodelBatchDefect = false, 0 }()
 	if !a.emodelBatched() {
 		t.Fatal("the batched pass does not claim this E-model")
 	}
@@ -127,7 +127,7 @@ func TestS9EModelBatched_tiny(t *testing.T) {
 	}
 }
 
-// TestS9EModelBatched_realE2B is G-S9d of S9 step 2 (docs/tasks/task-multimodal-support-2026-10.md, registered before any
+// TestS9EModelBatched_realE2B is G-S9d of S9 step 2 ( registered before any
 // code): S1's G3 shape on the batched prefill, real Gemma 4 E2B (its int4 Metal sidecar). For each of G3's eight prompts,
 // the prompt is prefilled by the pass under test and then decoded on Metal: the free run's 32 greedy tokens against the
 // CPU's by G3's rule (identical, or the first divergence at a CPU logit gap under 3%), and the CPU's sequence
@@ -163,7 +163,7 @@ func TestS9EModelBatched_realE2B(t *testing.T) {
 	if !ok {
 		t.Fatalf("not Metal-resident: %s", m.ResidentDecline())
 	}
-	defer func() { emodelBatchedOn = false }()
+	defer func(v bool) { emodelBatchedOn = v }(emodelBatchedOn)
 	emodelBatchedOn = true
 	if !a.emodelBatched() {
 		t.Fatal("the batched pass does not claim E2B")

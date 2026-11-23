@@ -11,11 +11,12 @@ import (
 	"os"
 	"reflect"
 
+	"github.com/townsendmerino/goinfer/decoder/config"
 	"github.com/townsendmerino/goinfer/internal/runtime/checkpoint"
 )
 
-// programFingerprint is a SHA-256 over p's operations and parameters: VK4's program fingerprint
-// (docs/tasks/task-subsystems-2026-10.md §5.7). Two programs with the same fingerprint run the same operations with the
+// programFingerprint is a SHA-256 over p's operations and parameters.
+// Two programs with the same fingerprint run the same operations with the
 // same parameters. The encoding is a reflection walk that writes each struct field's name (its `fp` tag where it has one)
 // and value (floats by their bits, slices with their length) and no type names, so renaming a type, or a field that keeps its
 // tag, leaves it unchanged, and adding a field changes it.
@@ -97,7 +98,7 @@ func programForConfigDir(dir string) (*layerProgram, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := parseConfig(os.DirFS(dir), "config.json", raw)
+	cfg, err := config.Parse(os.DirFS(dir), "config.json", raw)
 	if err != nil {
 		return nil, err
 	}

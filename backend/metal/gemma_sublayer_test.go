@@ -8,10 +8,12 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/decoder"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// TestGemmaSublayer_MetalContribution is the Metal half of the cross-box per-sublayer trace
-// (docs/prompts/gemma-metal-signflip-bisect.md, Fork 1). The CUDA box built ForwardSubCapture and
+// TestGemmaSublayer_MetalContribution is the Metal half of the cross-box per-sublayer trace.
+// The CUDA box built ForwardSubCapture and
 // gave f32-truth attention/MLP contributions for the two confirmed Metal sign-flips (1723, 227) at
 // the last layers. This produces MY Metal attention contribution (o-proj → post-attn-norm, before
 // the residual add) and MLP contribution (down → post-MLP-norm, before the add) at the same
@@ -25,7 +27,7 @@ import (
 //
 // Where Metal's attn or mlp contribution goes POSITIVE against a negative truth is the culprit.
 func TestGemmaSublayer_MetalContribution(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	if testing.Short() {
 		t.Skip("loads a real model")
 	}
@@ -40,7 +42,7 @@ func TestGemmaSublayer_MetalContribution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load int8: %v", err)
 	}
-	r, err := buildResident(m8)
+	r, err := buildResident(m8, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("BuildResident: %v", err)
 	}
@@ -171,7 +173,7 @@ func TestGemmaSublayer_MetalContribution(t *testing.T) {
 	t.Logf("=== per-layer cos(Metal ctx, int4-ref ctx) — where the attention context first breaks ===")
 	for l := range nL {
 		tag := "global"
-		if m4.LayerIsLocalResident(l) {
+		if m4.BackendView().Layer(l).IsLocal() {
 			tag = "local "
 		}
 		t.Logf("  L%2d [%s]: cos(Metal,int4-ref)=%.4f", l, tag, cosCtx(ctx[l], i4Ctx[l]))

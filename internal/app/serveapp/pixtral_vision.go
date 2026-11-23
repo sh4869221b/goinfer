@@ -11,12 +11,22 @@ import (
 // pixtralTower is Ministral 3's image path: aikit's Pixtral tower, the multimodal projector, the processor's settings and the
 // [IMG] token id. The tower runs on the CPU in float32 (no backend declares a Pixtral device tower:
 // multimodal.DeclaredTowers); the image tokens are causal, so the turn goes through decoder.GenerateVLCausalSpans, one span
-// per merged row (docs/tasks/task-multimodal-support-2026-10.md).
+// per merged row.
 type pixtralTower struct {
 	enc    *vision.PixtralVisionEncoder
 	proj   *multimodal.PixtralProjector
 	pp     multimodal.PixtralPreprocessConfig
 	imgTok int
+}
+
+func (px *pixtralTower) family() string { return "Pixtral" }
+func (px *pixtralTower) kind() string   { return "pixtral" }
+func (px *pixtralTower) imageTok() int  { return px.imgTok }
+
+func (px *pixtralTower) close() {
+	if px.enc != nil {
+		px.enc.Close()
+	}
 }
 
 // loadPixtralVisionTower attaches Ministral 3's tower to the single loaded model.
@@ -49,15 +59,14 @@ func (s *server) loadPixtralVisionTower(dir string) error {
 				return fmt.Errorf("vision: tokenizer has no %q token", t)
 			}
 		}
-		lm.pixtral = &pixtralTower{enc: enc, proj: proj, pp: pp, imgTok: id}
+		lm.vision = &pixtralTower{enc: enc, proj: proj, pp: pp, imgTok: id}
 		fmt.Fprintf(os.Stderr, "loaded Pixtral vision tower for %q (%d layers, image token id %d, tower on CPU, float32) from %s\n", lm.name, enc.Cfg.NumHiddenLayers, id, dir)
 	}
 	return nil
 }
 
-// pixtralPrep prepares one image: its merged grid, one [IMG] run per merged row, and the lazy tower and projector.
-func (lm *loadedModel) pixtralPrep(img imageRef) (imagePrep, error) {
-	px := lm.pixtral
+// prep prepares one image: its merged grid, one [IMG] run per merged row, and the lazy tower and projector.
+func (px *pixtralTower) prep(lm *loadedModel, img imageRef) (imagePrep, error) {
 	chw, h, w, err := multimodal.PixtralPreprocess(img.data, px.pp)
 	if err != nil {
 		return imagePrep{}, err

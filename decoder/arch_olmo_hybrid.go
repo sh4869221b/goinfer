@@ -1,15 +1,14 @@
 package decoder
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 )
 
 // olmoHybridArchitecture expresses Olmo Hybrid (Ai2, model_type olmo_hybrid): qwen3_5's Gated DeltaNet on 3 of every 4 layers and olmo3's
 // own full-attention shape (whole-vector QK-norm) on the rest, but not simply composed side by side: the full-attention layers use olmo3's
-// NormPostOnly while the DeltaNet layers use plain NormPre2, two placements in ONE model, which is what NormPlacementLinear exists for
-// (docs/completed/task-families-2026-09.md, G2 section). Every departure from a straight qwen3_5-DeltaNet + olmo3-attention composition is a
+// NormPostOnly while the DeltaNet layers use plain NormPre2, two placements in ONE model, which is what NormPlacementLinear exists for.
+// Every departure from a straight qwen3_5-DeltaNet + olmo3-attention composition is a
 // parameterization of shared code, not new math, checked against the real modeling_olmo_hybrid.py and a real checkpoint's header:
 //   - linear_allow_neg_eigval (default true) doubles the write-gate beta to [0,2) after the sigmoid: NegEigval.
 //   - q_proj/k_proj/v_proj are three fully separate tensors (SeparateQKVProj), and the depthwise causal conv is also three separate tensors
@@ -26,7 +25,7 @@ import (
 //
 // No MoE variant exists; the FFN is a plain dense SwiGLU on every layer, with the same tensor names as olmo3/llama.
 func olmoHybridArchitecture(cfg *Config) (*Architecture, *tensorSchema, error) {
-	if err := cfg.validateOlmoHybrid(); err != nil {
+	if err := cfg.ValidateOlmoHybrid(); err != nil {
 		return nil, nil, err
 	}
 	// rope_parameters on this family is always the FLAT {"rope_theta": ...} shape (never Olmo 3's
@@ -36,7 +35,9 @@ func olmoHybridArchitecture(cfg *Config) (*Architecture, *tensorSchema, error) {
 	var ropeFlat struct {
 		RopeTheta *float64 `json:"rope_theta"`
 	}
-	_ = json.Unmarshal(cfg.RopeParameters, &ropeFlat)
+	if err := rereadRope("olmo_hybrid", cfg.RopeParameters, &ropeFlat); err != nil {
+		return nil, nil, err
+	}
 	noRope := ropeFlat.RopeTheta == nil
 	var base float64
 	var scaling *ropeScaling
@@ -51,7 +52,7 @@ func olmoHybridArchitecture(cfg *Config) (*Architecture, *tensorSchema, error) {
 		}
 		scaling = sc
 	}
-	hd := cfg.headDim()
+	hd := cfg.EffectiveHeadDim()
 	linearPlacement := NormPre2
 	return &Architecture{
 		Name:                "olmo_hybrid",

@@ -29,7 +29,15 @@ From v1.0 these follow semver: no breaking change before a v2.0.
 - `decoder.Model`: `Close`, `Config`, `Dims`, `Quant`, `NewCache`, `NewSession`, `Generate`
 - `decoder.Session`: `Generate`, `Reset`, `Tokens`, `Snapshot`, and `Model.LoadSession`
 - `decoder.SamplingParams`, `decoder.Generation` (`Err`), `decoder.ErrClosed`, `decoder.KVCache` as an opaque handle
-- `decoder.Config` as a READ surface (what a loaded model reports)
+- `decoder.Config` as a READ surface (what a loaded model reports). It is an alias of `decoder/config.Config`, listed in
+  `testdata/apidiff/hard_tier_aliases.txt`: every source use is unchanged, but a value's `%T`, its `reflect` `String` and `PkgPath`,
+  and so gob's type names, read `config.Config` and `.../decoder/config`, not `decoder.Config`.
+
+### `decoder/config`
+
+- `config.Config`, the type `decoder.Config` aliases: every field and method `decoder.Config` had at the baseline (`Config.*` in
+  the list). The promise moved with the type: `scripts/apidiff_check.sh` compares the baseline's `decoder` with `decoder/config`
+  and judges `Config`'s own lines there. Users of `decoder.Config` reach no other name in this package.
 
 ### `tokenizer`
 
@@ -42,7 +50,7 @@ From v1.0 these follow semver: no breaking change before a v2.0.
 ### `chat`
 
 - `chat.Detect`, `chat.Meta`, `chat.ErrUnknownTemplate`
-- `chat.Template`: `Name`, `Render`, `RenderSegments`, `ParseToolCalls`
+- `chat.Template`: `Name`, `Render`, `RenderSegments`, `ParseToolCalls`, `StopIDs`
 - The named constructors: `ChatML`, `Gemma3`, `Gemma4`, `Harmony`, `Llama3`, `Mellum2`, `Mistral`
 - `chat.Turn`, `chat.Tool`, `chat.ToolCall`, `chat.Stops`, `chat.Segment`
 
@@ -54,7 +62,8 @@ for a given input IS, because callers pin prompts against it.
 - `constrain.Grammar` (interface), `constrain.NewMasker`, `constrain.Masker`'s
   `Process`, `MaskAt`, `Commit`, `Reset`, `CanEnd`, `StopWhenComplete`, `ForcedRun`,
   `ForcedBytesRun`, `GrammarClone`
-- `constrain.TokenBytes`, `constrain.SchemaFromStruct`
+- `constrain.TokenBytes`, `constrain.SchemaFromStruct`, `constrain.GrammarFromStruct`, `constrain.TemplateFromStruct` (the
+  README's structured-output API)
 
 ### `cmd/serve` — the operator surface
 
@@ -84,23 +93,38 @@ than editorial.
 Real, supported, and used in production paths here — but they may change in any release, minor or
 patch. Pin a version if you depend on them. Each graduates when it settles.
 
+- **The library's logger.** `decoder.SetLogger`.
+- **Load's error kinds.** `decoder.ErrUnsupportedModel`, `ErrUnknownQuant`, `ErrUnknownBackend`, for `errors.Is`, and
+  `ErrBackendDeclined` with the `Options.RequireBackend` that asks for it (a named backend's decline becomes Load's error).
+- **Structured output from JSON Schema.** `constrain.JSONSchema`, which holds a string's `format` for `date`, `time`,
+  `date-time`, `uuid`, `ipv4` and `email` (any other format is an annotation). `GrammarFromStruct` and
+  `TemplateFromStruct`, its Go-type twins, are Hard (above).
+- **Per-field confidence.** `constrain.Masker`'s `CaptureConfidence` and `FieldConfidence`, with `ConfidenceOptions` and
+  `FieldConfidence`.
+- **Tool-call wiring.** `chat.Template`'s `ToolGrammar` (the masker for a turn that may call a tool), `ToolCallWrapper`,
+  `ToolCallOpener`, `ParseToolCallsFor` and `SplitThink`, and
+  `constrain.ToolCallsGrammar`, `ToolSpec`, `NewLazyMasker` and `LazyMasker`: the parts a caller assembles a constrained
+  tool call from (`ParseToolCalls` itself is Hard, above).
+- **Fit and placement reports.** `decoder.FitDeclineError`, `ErrWontFitResident` and `ResidentDeclineError`, and
+  `Model.EffectiveBackend`, `BackendReport` and `CPUConcurrentSafe`: what a load or a backend decided, and why.
+- **Embeddings.** The `embeddinggemma2` package (EmbeddingGemma 2's text, image and audio encoders).
 - **The backend/residency seam.** `decoder.Backend`, `RegisterBackend`, `QuantBackend`,
-  `QuantBatchBackend`, `ResidencyBackend`, `Prefiller`, `ResidentForward`, `ResidentGreedy`,
-  `ResidentPrefillKV`, `ResidentCapped`, `ResidentDrafterHost`, `ResidentBlockDrafter`,
+  `QuantBatchBackend`, `ResidencyBackend`, `Prefiller`, `ResidentForward`,
+  `ResidentCapped`, `ResidentDrafterHost`, `ResidentBlockDrafter`,
   `ResidentFeature`, `ResidentEligible`, `ResidentBackendFeatures`, and **every `*Resident*`
   method on `Model`**. This is the seam the `backend/webgpu/`, `backend/cuda/` and `backend/metal/` submodules bind to; it
   moves whenever a family is ported.
 - **The KV geometry.** `decoder.KVGeometry`, `KVGroup`, `KVState`, `KVRetention` and its values,
   `KVClass`, `KVClassMap`, `KVBlockRows`, `KVSlotRow`, and `Architecture.KVGeometry` /
-  `Model.KVGeometry`. They are the KV manager's types under decoder names, for the backends
-  (`docs/tasks/task-kv-architecture-2026-10.md`), and they move with that program.
+  `Model.KVGeometry`. They are the KV manager's types under decoder names, for the backends,
+  and they move with that program.
 - **Family descriptors and weights.** `decoder.Architecture`, `Weights`, `LayerWeights`,
   `MoEConfig`, `ActKind`, `NormKind`, `NormPlacement`, and the `qwen35Params`-class internals they
   carry. A new family routinely adds fields here.
 - **The engine package.** `engine.Engine`, `Local` (the engine a loaded model generates on in this process) and its
   `SessionPool`, `Request` with its `Media` (an image or audio turn: `MediaKind` and its five kinds), `Report`, and
   `Stream` (what `Start` returns) with its constructors `NewStream` and `GenerationStream`: what the serving shell asks
-  of a model (`docs/tasks/task-subsystems-2026-10.md`, SB7). Its request, scope and logprobs are `decoder`'s own types; the shell's
+  of a model (`docs/completed/task-subsystems-2026-10.md`, SB7). Its request, scope and logprobs are `decoder`'s own types; the shell's
   model handle stays internal. `engine/enginetest` holds its fake, `Scripted`.
 - **Speculative decoding and drafters.** `Drafter`, `NgramDrafter`, `GrammarDrafter`,
   `RouterDrafter`, `DFlashDrafter`, `DSparkDrafter`, `ConfidentDrafter`, `AdaptiveDepth`, `BlockSpec`, `BlockSpecOptions`, `BlockDrafterWeights`,
@@ -109,12 +133,13 @@ patch. Pin a version if you depend on them. Each graduates when it settles.
   EAGLE entry points were removed 2026-09-24 — killed on CPU wall-clock, see `docs/spec/05-eagle3-head.md`.)
 - **Multimodal.** `Model.GenerateVL`, `GenerateQwenVL`, and the `multimodal` package.
 - **Per-turn telemetry on the wire.** The responses' `timings` object and the opt-in `cost` report (the request's
-  `"goinfer": {"cost": true}`), and `decoder.ResidentCost` behind it (`docs/server.md`, "Per-turn timings and cost").
+  `"goinfer": {"cost": true}`), and `decoder.ResidentRuntimeSubsystem.CostSpan` behind it (`docs/server.md`, "Per-turn timings and cost").
   Their fields may be added to or renamed until they settle; no standard field changes.
 - **Adapters at compute time.** `Model.LoadAdapter`, `HasAdapter`, `Session.UseAdapter`,
   `Session.ClearAdapter`, and `Options.LoRA`'s multi-adapter behaviour.
 - **Diagnostics and capture.** `Model.ForwardCapture`, `ForwardSubCapture`, `HiddenLast`,
-  `DecodePath`, `PrefillPath`, `PrefillPathReporter`, `ResidentDecline`, `MmapByteOffset`.
+  `DecodePath`, `PrefillPath`, `PrefillPathReporter`, `ResidentDecline`, `MmapByteOffset`, and `Generation.ResidentDeclined`
+  (why one generation ran on the CPU on a resident model).
 - **Serialization plumbing.** `SerializeWeights`, `SerializeWeightsTo`, `StreamTranscodeGGUF`,
   `TranscodeGIW`, `TranscodeGIWTimed`, `TranscodeGIWLoRA`, `TranscodeGIWLoRATimed`, `TranscodePhases`, `GIWAdapterLoRA`,
   `EnsureCachedGIW`, `SidecarPath`, `SidecarPathIfFresh`, `SidecarPathIfCurrent`, `SidecarState`, `DefaultToSidecar`,

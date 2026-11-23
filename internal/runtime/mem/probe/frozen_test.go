@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// frozen is the readers as they were before they moved here (the commit is named in docs/tasks/task-subsystems-2026-10.md,
+// frozen is the readers as they were before they moved here (the commit is named in
 // MM0's gates), copied into the per-platform frozen_*_test.go files with their bodies unchanged and their names prefixed. A nil
 // reader is one the platform did not have.
 type frozen struct {
@@ -61,7 +61,9 @@ func TestHost_matchesFrozenReaders(t *testing.T) {
 			t.Fatalf("SelfSwapReader = nil (%s) where the frozen reader read", why)
 		}
 		live("SelfSwap", f.selfSwap, r, Host.SelfSwap)
-	} else if r, _ := SelfSwapReader(); r != nil {
+	} else if r, _ := SelfSwapReader(); r != nil && runtime.GOOS != "darwin" {
+		// macOS's reader (the server's compressed pages) was added after the move, so it has no frozen copy;
+		// TestSelfSwapReader_isTheProcesssCompressedPages holds it.
 		t.Error("SelfSwapReader reads on a platform whose frozen readers had none")
 	}
 }

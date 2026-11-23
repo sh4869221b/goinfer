@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -18,7 +19,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// Phase 2, Batch A of docs/tasks/task-metal-audit-2026-10.md: the timed probes of docs/audit-metal-2026-09-30.md §10
+// Phase 2, Batch A: the timed probes of docs/audit-metal-2026-09-30.md §10
 // that run at night. Each prints a "[t1.x] RESULT" line carrying the reading its pre-registration names; the decision
 // rules are in the task doc, committed before the run. GOINFER_METAL_AUDIT_A=1 enables them (they are timings, so never
 // by day except as a labelled smoke run), GOINFER_AUDIT_MODEL picks the checkpoint, and GOINFER_AUDIT_REPS overrides
@@ -57,7 +58,7 @@ func auditLoad(t *testing.T, def string, slots, ctx int, knobs *decoder.Knobs) (
 	if err != nil {
 		t.Fatalf("load %s: %v", path, err)
 	}
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		m.Close()
 		t.Fatalf("build resident: %v", err)
@@ -411,4 +412,30 @@ func auditFmt(xs []float64) string {
 		fmt.Fprintf(&b, "%.1f", x)
 	}
 	return b.String()
+}
+
+// A nil dereference inside the build is a bug, not a device that declined: it panics out of BuildResident and buildResident instead
+// of becoming a decline that sends the model to the CPU path. The build's string panics (its documented declines) are not
+// runtime.Errors and still decline (mem.TestRepanicBug_raisesOnlyRuntimeErrors).
+func TestBuildResident_aBugPanicsInsteadOfDeclining(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		build func()
+	}{
+		{"metalBackend.BuildResident", func() { _, _, _ = (&metalBackend{}).BuildResident(nil) }},
+		{"buildResident", func() { _, _ = buildResident((*decoder.Model)(nil), metalCtxPlan{}) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			defer func() {
+				p := recover()
+				if p == nil {
+					t.Fatalf("%s on a nil model returned: a programming bug was absorbed into a decline", c.name)
+				}
+				if _, ok := p.(runtime.Error); !ok {
+					t.Fatalf("%s panicked with %T %v, want the runtime.Error itself", c.name, p, p)
+				}
+			}()
+			c.build()
+		})
+	}
 }

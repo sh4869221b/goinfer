@@ -102,7 +102,7 @@ func GemvRNGridX(n int) int {
 }
 
 // KQuantGemvRows equals KQ_ROWS in actgroup.cu: the rows a warp of the standalone native Q5_K and Q6_K GEMVs (gemv_q5k_g32,
-// gemv_q6k_g32), A1-G0's pick (docs/tasks/task-kernel-survey-2026-10.md, "KS-A1 on CUDA"). TestKQuantGemv_matchesCuDefine
+// gemv_q6k_g32), A1-G0's pick. TestKQuantGemv_matchesCuDefine
 // holds the two together.
 const KQuantGemvRows = 1
 
@@ -150,6 +150,9 @@ func PTXSourceName(mod string) (src string, capped bool) {
 	}
 	if s, ok := strings.CutSuffix(mod, "_cap"); ok {
 		return s, true
+	}
+	if s, ok := strings.CutSuffix(mod, "_kv8"); ok {
+		return s, false
 	}
 	return strings.TrimSuffix(mod, "_kv16"), false
 }

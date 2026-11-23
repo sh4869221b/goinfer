@@ -107,8 +107,8 @@ func kquantServes(dims []int, ok bool, in int, src kquantSrc, rows int) bool {
 // Package-level because Weights is copied by value in places, and loads are few.
 var kquantMu sync.Mutex
 
-// kquantNativeOff empties every backend's kquantLane, so a load keeps the int8 copies on the device and in its pricing: KS-O1's
-// old arm. Set only by a test (SetKQuantNativeOffForTest).
+// kquantNativeOff empties every backend's kquantLane, so a load keeps the int8 copies on the device and in its pricing: the arm
+// without the native K-quant lane. Set only by a test (SetKQuantNativeOffForTest).
 var kquantNativeOff atomic.Bool
 
 // kquantLane is the weights backend's q4k lane uploads as the file's Q5_K and Q6_K blocks (KQuantReader) in place of their
@@ -122,7 +122,7 @@ func (m *Model) kquantLane(backend string) []*linalg.WeightMat {
 	if kquantNativeOff.Load() || m == nil || m.w == nil || len(m.w.kquant) == 0 || m.Quant() != "q4k" || (backend != "metal" && backend != "cuda") {
 		return nil
 	}
-	if backend == "cuda" && m.actGroup != 32 {
+	if backend == "cuda" && m.opts.ActQuantGroup != 32 {
 		return nil
 	}
 	var ws []*linalg.WeightMat
@@ -131,9 +131,9 @@ func (m *Model) kquantLane(backend string) []*linalg.WeightMat {
 		ps := []*linalg.WeightMat{&lw.QProj, &lw.KProj, &lw.VProj, &lw.OProj, &lw.GateProj, &lw.UpProj, &lw.DownProj}
 		if backend == "cuda" {
 			switch {
-			case m.KVSrcAtResident(l) != l:
+			case m.BackendView().Layer(l).KVSrc() != l:
 				ps = []*linalg.WeightMat{&lw.QProj, &lw.OProj, &lw.GateProj, &lw.UpProj, &lw.DownProj}
-			case m.VFromKResident(l):
+			case m.BackendView().Layer(l).VFromK():
 				ps = []*linalg.WeightMat{&lw.QProj, &lw.KProj, &lw.OProj, &lw.GateProj, &lw.UpProj, &lw.DownProj}
 			}
 		}

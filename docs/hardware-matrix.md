@@ -15,6 +15,7 @@ Regenerate with `go test ./decoder -run HardwareMatrix -update`.
 | Command-R7B | ✅ | CPU | ✅ resident | ✅ resident |
 | DeepSeek-V2 | ✅ | ✅ resident | ✅ resident | ✅ resident |
 | DeepSeek-V3 | ✅ | ✅ resident | ✅ resident | ✅ resident |
+| Flint | ✅ | ✅ resident | ✅ resident | ✅ resident |
 | GLM-4.5/4.6 | ✅ | ✅ resident | ✅ resident | ✅ resident |
 | GLM-OCR | ✅ | CPU | ✅ resident | ✅ resident |
 | GPT-2 | ✅ | CPU | CPU | ✅ resident |
@@ -73,8 +74,8 @@ features). Two load-time notes the taxonomy does not encode:
   (Metal's builder still declines Granite-4.0-H, backend/metal/mamba.go:buildMamba, until its own resident gate).
 - **Nemotron-H's row is generated from a DENSE representative config.** Real, downloadable
   Nemotron 3 Nano and 3.5 Lightning checkpoints add a fourth per-layer block kind (MoE
-  FFN) this representative config never exercises — WebGPU implements it (G7 part 2,
-  docs/tasks/task-gpu-paths-2026-09.md); CUDA and Metal still decline it, CPU-only. `DecodePath()`
+  FFN) this representative config never exercises — WebGPU implements it (G7 part 2);
+  CUDA and Metal still decline it, CPU-only. `DecodePath()`
   names this specific per-checkpoint gap for a loaded model; this table cannot, since its
   rows are one per architecture, not per checkpoint.
 - **Gemma 4's row is generated from a representative that is not an E-model.** The small E-models
@@ -89,7 +90,7 @@ features). Two load-time notes the taxonomy does not encode:
   kernels is exact at position 0 and wrong from position 1 with no error (measured 2026-10-01 on the
   CUDA resident before its pairwise kernels existed: real Command-R7B and Aya-expanse-8B at int4, worst
   per-position cosine -0.075 / -0.041 against the CPU). CUDA has `backend/cuda/rope_pairwise.cu` and Metal its
-  twins since 2026-10-09 (docs/tasks/task-metal-pairwise-rope-2026-10.md); a WebGPU row returns once it
+  twins since 2026-10-09; a WebGPU row returns once it
   has pairwise rope kernels and a resident-vs-CPU gate on peaked attention.
 
 ## Why a cell reads CPU
@@ -143,8 +144,9 @@ the configuration that has it. The loader picks one that does not
 
 - **CUDA:** a GGUF loads at `--quant q4k` by default and runs resident. Any other source loads at int8int8 with
   per-32 activation scales, which CUDA's residency also implements.
-- **Metal:** resident only with an explicit `--quant q4k`. The default load is int8int8 with per-32 activation
-  scales, which Metal's resident projections do not implement, so it runs on the CPU.
+- **Metal:** a GGUF loads at `--quant q4k` by default and runs resident on the q4k lane, which quantizes no
+  activation. Any other source loads at int8int8 with per-32 activation scales, which Metal's resident projections do
+  not implement, so it runs on the CPU.
 - **WebGPU:** neither; the CPU.
 
 ## Verified on: what has actually run
@@ -170,12 +172,13 @@ How it ran: **native** is real hardware; **ci-pool** is a GitHub runner whose CP
 | qemu-aarch64-static 10.2.2 user-mode emulation of -cpu cortex-a72 (no DotProd) on nobara-pc | emulated | 1 | 2026-10-04 |
 | GitHub ubuntu-24.04-arm runner: Neoverse-N2 (has DotProd, forced off by aikit_nodotprod) | forced | 1 | 2026-10-04 |
 | nobara-pc: RTX 2070 SUPER over Vulkan (wgpu-native, ADAPTER_PROBE backend=vulkan software=false), driver 595.91.07 | native | 1 | 2026-09-28 |
+| mbp2: MacBook Pro 13-inch 2020 on Kubuntu (kernel 7.3.3-2-t2-resolute), Core i5-8257U, 16 GB shared; Intel Iris Plus Graphics 645 (CFL GT3) over Vulkan, Mesa 26.0.8 (wgpu-native, ADAPTER_PROBE backend=vulkan software=false, integrated-gpu, dot4I8Packed yes) | native | 1 | 2026-11-20 |
 | Francis's MacBook Pro: M1 Pro, 16 GB unified memory, macOS (Darwin 25.6.0), wgpu-native Metal backend (adapter Apple M1 Pro, integrated-gpu, dot4I8Packed yes) | native | 1 | 2026-10-04 |
 | GitHub windows-latest runner: AMD EPYC 9V74 (Zen 4), 2 cores / 4 threads, windows/amd64 | ci-pool | 1 | 2026-10-03 |
 | GitHub windows-11-arm runner: Azure Cobalt 100 (Neoverse N2), 4 CPUs, windows/arm64, go1.27.0 | ci-pool | 1 | 2026-10-04 |
 | GitHub windows-11-arm runner: Azure Cobalt 100 (ARMv8, Microsoft), 4 logical CPUs, Windows 10.0.26200, windows/arm64, go1.27.0 | ci-pool | 1 | 2026-10-04 |
 
-**10 of 31 hardware-selected paths have no record of ever executing:**
+**10 of 32 hardware-selected paths have no record of ever executing:**
 
 - `cpu-popcnt`: POPCNT Hamming distance
 - `cuda-compute-mode`: CUDA graphs tenancy check (device compute mode)

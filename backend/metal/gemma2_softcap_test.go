@@ -12,8 +12,8 @@ import (
 
 // TestGemma2Softcap_lanesAndPrefillMetal builds a resident for each Gemma 2 tiny fixture directly (Metal does not
 // declare the attention softcap, so a load declines: TestGemma2DeclinesResidentMetal) and checks two things about a
-// model with a cap. It is not the Gemma 2 parity gate; that is registered in
-// docs/tasks/task-forward-architecture-2026-10.md §4.6 and runs with the declaration.
+// model with a cap. It is not the Gemma 2 parity gate; that is registered separately
+// and runs with the declaration.
 //
 //   - The lanes: a capped model takes the exact attention kernels only, the ones the softcap is gated on
 //     (TestAttnSoftcap_decodeKernels, TestAttnSoftcap_prefillKernel). The fixtures' head dimension is 32, which without a
@@ -27,13 +27,13 @@ func TestGemma2Softcap_lanesAndPrefillMetal(t *testing.T) {
 				t.Fatalf("load: %v", err)
 			}
 			defer m.Close()
-			r, err := buildResident(m)
+			r, err := buildResident(m, metalCtxPlan{})
 			if err != nil {
 				t.Fatalf("resident: %v", err)
 			}
 			defer r.Close()
-			if r.attnSoftcap == 0 || r.attnSoftcap != m.AttnLogitSoftcapResident() {
-				t.Fatalf("resident cap %v, model cap %v: the fixture no longer has a cap, or the resident did not take it", r.attnSoftcap, m.AttnLogitSoftcapResident())
+			if r.attnSoftcap == 0 || r.attnSoftcap != m.BackendView().AttnLogitSoftcap() {
+				t.Fatalf("resident cap %v, model cap %v: the fixture no longer has a cap, or the resident did not take it", r.attnSoftcap, m.BackendView().AttnLogitSoftcap())
 			}
 			if fused, steel := r.prefillAttnKernels(); fused || steel {
 				t.Errorf("a capped model would take the fused (%v) or steel (%v) prefill kernel, which the softcap is not gated on", fused, steel)

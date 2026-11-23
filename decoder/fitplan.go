@@ -4,48 +4,51 @@ import (
 	"fmt"
 
 	"github.com/townsendmerino/goinfer/internal/runtime/mem"
+	"github.com/townsendmerino/goinfer/internal/runtime/program"
 )
 
-// ctxPlanFloor is the smallest context Plan will shrink to before giving up (docs/tasks/task-fit-to-hardware.md §2: shrink context
+// ctxPlanFloor is the smallest context Plan will shrink to before giving up (shrink context
 // toward a floor before moving anything else). It is not fitguard.go's ctxFloor, the CPU staged-load guard's own floor: the two guards are
 // independent by design, so a change to one floor must not silently move the other's.
 const ctxPlanFloor = mem.PlanCtxFloor
 
-// kvBytesPerPositionAllLayers is Plan's KV-cost rate: per layer (a per-layer-varying family like Gemma 4 is not approximated by one
-// model-level figure, as metal/backend.go's residentKVBytes also sums per layer), K+V, at the requested precision. Bytes per element match
-// kvBytesForCtx in decoder/arch.go (f32 4.0, f16 2, int8 1.125 including scale). The per-layer width is Architecture.kvDimAt: zero for a
+// kvBytesPerPositionAllLayers is the KV-cost rate Plan prices WebGPU at (ResidentKVBytes; the CPU, CUDA and Metal have their own): per layer (a per-layer-varying family like Gemma 4 is not approximated by one
+// model-level figure, as metal/backend.go's residentKVBytes also sums per layer), K+V, at the requested precision: f32 4 bytes an element,
+// f16 2, int8 one byte an element plus one f32 scale a KV head a position (what WebGPU's int8 cache holds, as the CPU's does). The per-layer width is Architecture.kvDimAt: zero for a
 // linear/mamba/conv mixer layer (no position-indexed K/V), MLA's compressed latent width, whose one row stays f32 at any precision.
 //
-// It deliberately does NOT apply kvBytesForCtx's sliding-window cap (kvPositionsAt): this returns a flat per-position rate that the caller
+// It deliberately does NOT cap a sliding-window layer (kvPositionsAt): this returns a flat per-position rate that the caller
 // multiplies by ctx, while a sliding-window layer's cost flattens at SlidingWindow, so capping it needs tryCtx/chooseCtx to search rather
 // than multiply, and a sliding-window fixture to verify against. The rate stays exact for families without a window (MLA, DeltaNet/Mamba/
 // conv hybrids); a family with both would be overpriced, the safe direction.
 func (m *Model) kvBytesPerPositionAllLayers(f16, i8 bool) int64 {
 	perElem := 4.0
-	switch {
-	case i8:
-		perElem = 1.125
-	case f16:
+	if f16 && !i8 {
 		perElem = 2
 	}
-	arch := m.w.arch
-	_, nLayers, _, _, _, _, _ := m.Dims()
+	bv := m.BackendView()
+	nLayers := bv.NumLayers()
 	var perPos float64
-	for l := range nLayers {
-		var kvDim int
-		if arch != nil {
-			if arch.gemma4KVSrcAt(l) != l {
-				continue // a Gemma 4 E-model's KV-shared layer aliases its source's cache
+	if m.w.arch != nil {
+		for l := range nLayers {
+			for _, b := range m.LayerBuffers(l) {
+				if b.Unit != program.PerPosition {
+					continue
+				}
+				row, scale := webgpuKVRowBytes(b, f16, i8)
+				perPos += float64(row + scale)
 			}
-			kvDim = arch.kvDimAt(l)
-		} else {
-			kvDim = m.KVHeadsAtResident(l) * m.HeadDimAtResident(l)
 		}
-		if arch != nil && arch.mla != nil {
-			perPos += 4 * float64(kvDim)
+		return int64(perPos)
+	}
+	for l := range nLayers { // a model with no resolved architecture: the layer view's own width
+		lv := bv.Layer(l)
+		kvDim := lv.KVHeads() * lv.HeadDim()
+		if i8 && kvDim > 0 {
+			perPos += 2 * (float64(kvDim) + 4*float64(lv.KVHeads()))
 			continue
 		}
-		perPos += 2 * float64(kvDim) * perElem // ×2 for K and V
+		perPos += 2 * float64(kvDim) * perElem
 	}
 	return int64(perPos)
 }
@@ -55,11 +58,11 @@ func (m *Model) kvBytesPerPositionAllLayers(f16, i8 bool) int64 {
 // assumption ResidentWeightBytesPaged already makes) and the top-k floor below which even one
 // token's routed set cannot be resident.
 func (m *Model) moeGeometry() (nExperts, topK int, isMoE bool) {
-	nE, k, _, _, _, _, _, _, _, _, ok := m.MoEResidentParams()
-	if !ok || nE == 0 {
+	mo := m.BackendView().Spec().MoE
+	if mo == nil || mo.NumExperts == 0 {
 		return 0, 0, false
 	}
-	return nE, k, true
+	return mo.NumExperts, mo.TopK, true
 }
 
 // WebGPUCtxCeiling is the WebGPU backend's fixed per-precision KV-capacity ceiling, gpu/residency.go's ctxCap before any -ctx request
@@ -88,7 +91,7 @@ const (
 	MetalCtxCeiling    = 32768
 )
 
-// Plan is the planner's pure function (docs/tasks/task-fit-to-hardware.md §2): given this model, a candidate backend, how many bytes are
+// Plan is the planner's pure function: given this model, a candidate backend, how many bytes are
 // free on it and what the caller asked for, decide a placement (resident, expert-cached, weight-paged, or decline) in §2's priority order:
 // shrink context toward ctxPlanFloor first, since it costs no numerics; then cap routed experts into a cache; dense weights always stay
 // resident; CPU alone falls to weight-paging rather than ever declining.
@@ -110,15 +113,22 @@ func (m *Model) plan(backend string, freeBytes int64, req PlanRequest, slack boo
 		p.Reason = reason
 		return p
 	}
-	l := m.deviceLoad(backend, req.KVF16, req.KVI8, req.CtxPinned)
+	l := m.deviceLoad(backend, req)
 	if !slack {
 		l.FixedSlack = 0
 	}
 	p.DenseBytes, p.ExpertBytesFull, p.AllocSlackBytes, p.StateBytes = l.DenseBytes, l.ExpertBytesFull, l.FixedSlack, l.StateBytes
 	d := mem.SolvePlacement(l, mem.PlanRequest{Ctx: req.Ctx, CtxPinned: req.CtxPinned, Slots: req.Slots, ExtraBytes: req.ExtraBytes},
 		mem.Machine{Free: map[mem.Tier]int64{l.Tier: freeBytes}}, mem.DefaultPolicy())
-	p.Placement, p.Ctx, p.Slots = Placement(d.Placement), d.Ctx, d.Slots
+	p.Placement, p.Ctx, p.Slots, p.ScratchBytes = Placement(d.Placement), d.Ctx, d.Slots, d.ScratchBytes
 	p.ExpertBytesUsed, p.KVBytes, p.HostCopyBytes, p.Reason = d.ExpertBytesUsed, d.KVBytes, d.HostCopyBytes, d.Reason
+	if backend == "webgpu" && webgpuVulkan && p.Placement != PlacementDecline {
+		// The search priced Vulkan's block rounding on the KV term, where it moves with the context; the plan reports it as slack, so
+		// KVBytes is the KV the build allocates (one slot's, as a caller multiplies it) and the total is unchanged.
+		r := m.webgpuBlockRounding(p.Ctx, req.KVF16, req.KVI8)
+		p.KVBytes -= r
+		p.AllocSlackBytes += r
+	}
 	if ckpt, perSlot := m.checkpointBytes(backend); p.Placement != PlacementDecline {
 		if copies := checkpointCopies(checkpointHeadroom(p, freeBytes, req), ckpt, max(req.KVSlots, 1), perSlot); copies > 0 {
 			p.CheckpointBytes, p.CheckpointCopies = ckpt, copies
@@ -161,7 +171,7 @@ func (m *Model) planAdmitDecline(backend string) string {
 		return fmt.Sprintf("%s: no resident path is declared for this backend — use the staged/CPU path", backend)
 	}
 	f := m.admitFacts()
-	f.Backend, f.Residency = backend, true
+	f.Backend, f.Residency, f.program = backend, true, m.admitProgram(backend)
 	if why := Admit(f).Why; why != "" {
 		return fmt.Sprintf("%s: %s — use the staged/CPU path", backend, why)
 	}
@@ -176,18 +186,20 @@ func (m *Model) planIneligible(backend string, req PlanRequest) string {
 	if why := m.planAdmitDecline(backend); why != "" {
 		return why
 	}
+	bv := m.BackendView()
 	if backend == "webgpu" {
 		// webgpu's stacked-expert kernels take int8 or int4 (gpu/residency.go:staticResidentDecline).
-		if k := m.MoEExpertKind(); k != "" && k != "int8" && k != "int4" {
+		if k := bv.MoEExpertKind(); k != "" && k != "int8" && k != "int4" {
 			return fmt.Sprintf("webgpu: the routed experts are %s, and webgpu's MoE kernels take int8 or int4 — load with --quant int4 "+
 				"or int8int8 to plan the resident path", k)
 		}
 	}
 	if backend == "webgpu" && (req.KVF16 || req.KVI8) {
-		_, _, _, _, _, _, _, _, mlaOK := m.MLAResidentParams()
-		_, _, _, _, _, attnGate, dnetOK := m.Qwen35ResidentParams()
-		_, _, _, _, _, _, _, nemoOK := m.NemotronResidentParams()
-		if family := map[bool]string{true: "nemotron"}[nemoOK] + map[bool]string{true: "qwen3_5"}[dnetOK && attnGate] +
+		spec := bv.Spec()
+		mlaOK := spec.MLA != nil
+		dnetGated := spec.Qwen35 != nil && spec.Qwen35.AttnGate
+		nemoOK := spec.Nemotron != nil
+		if family := map[bool]string{true: "nemotron"}[nemoOK] + map[bool]string{true: "qwen3_5"}[dnetGated] +
 			map[bool]string{true: "mla"}[mlaOK]; family != "" {
 			flag := map[bool]string{true: "--kv-i8"}[req.KVI8] + map[bool]string{true: "--kv-f16"}[req.KVF16]
 			return fmt.Sprintf("webgpu: %s does not implement %s KV (only the generic GQA path does) — drop the flag to plan the resident path", family, flag)
@@ -199,8 +211,10 @@ func (m *Model) planIneligible(backend string, req PlanRequest) string {
 // deviceLoad is this model on backend as internal/mem's planner prices it: the dense weights less what the backend keeps on the
 // host, one slot's recurrent state (BuildDemand.StateBytes), the routed experts, Metal's host copies, the backend's KV at a context (CUDA at the load's own KV precision, not a flag
 // the planner is handed), and the backend's context grid and ceiling: Metal's is MetalCtxCeiling for a pinned request and
-// MetalFitDefaultCtx for an unpinned one (MetalFitCtx), WebGPU's its fixed per-precision cap.
-func (m *Model) deviceLoad(backend string, kvF16, kvI8, pinned bool) mem.DeviceLoad {
+// MetalFitDefaultCtx for an unpinned one (MetalFitCtx), WebGPU's its fixed per-precision cap. It reads req's KV precision
+// (KVF16, KVI8) and CtxPinned.
+func (m *Model) deviceLoad(backend string, req PlanRequest) mem.DeviceLoad {
+	kvF16, kvI8, pinned := req.KVF16, req.KVI8, req.CtxPinned
 	l := mem.DeviceLoad{Backend: backend, Tier: planTier(backend), DenseBytes: m.ResidentDenseWeightBytesFor(backend), CtxStep: 1,
 		FixedSlack: m.planSlack(backend), StateBytes: m.stateBytes(backend)}
 	if nExperts, topK, isMoE := m.moeGeometry(); isMoE {
@@ -219,13 +233,29 @@ func (m *Model) deviceLoad(backend string, kvF16, kvI8, pinned bool) mem.DeviceL
 	switch backend {
 	case "metal":
 		l.CtxStep, l.CtxCeiling, l.CtxSearch = metalKVPad, MetalCtxCeiling, true // whole blocks beside the pools' null blocks: no one rate
+		l.ScratchBytes = m.MetalDecodeScratchBytes(0)
+		if l.TopK < l.NExperts { // an expert cache holds at least the top k, under the expert count when it pages
+			l.ScratchPagedExtra = m.MetalDecodeScratchBytes(l.TopK) - l.ScratchBytes
+		}
 		if !pinned {
 			l.CtxCeiling = MetalFitDefaultCtx
 		}
 	case "webgpu":
 		l.CtxCeiling = WebGPUCtxCeiling(kvF16, kvI8)
+		l.DenseBytes = m.webgpuDenseLine()
+		if !webgpuVulkan {
+			break
+		}
+		// Vulkan's blocks, not the buffers' sum (webgpu_vulkan.go): the device and the kept host block are fixed, and the block
+		// rounding moves with the context, so it rides on the KV term and the context is searched.
+		l.FixedSlack += webgpuVkFixed
+		l.CtxSearch = true
+		l.KV = func(ctx int) int64 {
+			return m.ResidentKVBytes(backend, ctx, kvF16, kvI8) + m.webgpuBlockRounding(ctx, kvF16, kvI8)
+		}
+		return l
 	case "cuda":
-		kvF16 = m.kvF16
+		kvF16, kvI8 = m.residentKVFlags(backend)
 		l.CtxSearch = true
 	}
 	l.KV = func(ctx int) int64 { return m.ResidentKVBytes(backend, ctx, kvF16, kvI8) }

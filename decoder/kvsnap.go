@@ -1,11 +1,12 @@
 package decoder
 
 import (
-	"context"
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -13,8 +14,8 @@ import (
 	"github.com/townsendmerino/goinfer/internal/runtime/kvmgr"
 )
 
-// Prefix snapshots in host memory (docs/tasks/task-kv7-prefix-snapshot-2026-10.md). After a cold first prefill of a long prompt the
-// resident's KV for the prompt's full blocks is copied to pinned host memory, keyed by the token ids and the root KV2 keys on
+// Prefix snapshots in host memory. After a cold first prefill of a long prompt the
+// resident's KV for the prompt's full blocks is copied to pinned host memory, keyed by the token ids and the KV root, which keys on
 // (namespace, model identity, adapter, KV precision). A later request whose prompt starts with those ids restores the rows into its
 // slot by device copy and prefills only the rest. It keeps a prefix that a one-slot card would overwrite when the next session
 // starts. The rows are prefill-class rows copied before any decode step, so a restored prefix is the prefix computed
@@ -31,68 +32,20 @@ var kvSnapMinPrompt = 2048
 // a first prompt that does not qualify.
 const kvSnapMinShared = 512
 
-// ResidentKVSnapshot is one prefix's KV held in host memory by a resident. Release frees it; it is idempotent.
-type ResidentKVSnapshot interface {
-	// Rows is how many leading positions it holds, a whole number of blocks.
-	Rows() int
-	// Bytes is the host memory it occupies.
-	Bytes() int64
-	// Serves reports whether RestoreKV can restore its first end rows into a slot: false when a windowed layer's rows behind the
-	// snapshot's end, which the window of position end needs, are not among those it holds, or when the resident's geometry has
-	// changed since it was taken.
-	Serves(end int) bool
-	Release()
-}
-
-// ResidentKVSnapshotter is the optional capability of a resident to hold a slot's KV rows in host memory and put them back. Like
-// ResidentKVCopier it works on today's slot storage: a windowed layer's rows are those its window and the rollback need, and the
-// restore sets the slot's ring base as a copy does.
-type ResidentKVSnapshotter interface {
-	// SnapshotKV copies rows [0, end) of slot into pinned host memory, end a whole number of blocks; for a windowed layer, the rows
-	// [end-(window-1)-rollback, end) its slot holds. A *KVCopyDecline, before anything is allocated, refuses what it cannot hold.
-	SnapshotKV(slot, end int) (ResidentKVSnapshot, error)
-	// RestoreKV writes the first end rows of snap into slot, so that the slot continues at position end. A *KVCopyDecline, before
-	// anything is written, refuses what it cannot serve.
-	RestoreKV(snap ResidentKVSnapshot, slot, end int) error
-	// KVSnapshotBytes is the host memory SnapshotKV(_, end) would hold, 0 when it would decline for a reason that needs no slot.
-	KVSnapshotBytes(end int) int64
-	// KVSnapshotRollback is how many positions before a snapshot's end a windowed layer still serves a restore; 0 with no windowed layer.
-	KVSnapshotRollback() int
-}
-
-// ResidentRecurrentSnapshots is the optional capability of a ResidentKVSnapshotter to carry a recurrent model's state with its rows: a snapshot
-// to end holds the state as it stood after position end-1, so it serves a restore to exactly end and to no shorter prefix.
-type ResidentRecurrentSnapshots interface {
-	KVSnapshotRecurrent() bool
-}
-
 // KeepsRecurrentSnapshots reports whether this model's prefix snapshots carry its recurrent state: it has recurrent state, and its resident's
-// snapshots hold it (ResidentRecurrentSnapshots). A route computes KVScope.Keep only for such a model.
+// snapshots hold it (KVSnapshotterAvailable.KVSnapshotRecurrent). A route computes KVScope.Keep only for such a model.
 func (m *Model) KeepsRecurrentSnapshots() bool {
 	return m.hasRecurrentState() && m.recurrentSnapshots()
 }
 
 // recurrentSnapshots reports whether the snapshotter carries recurrent state.
 func (m *Model) recurrentSnapshots() bool {
-	rs, ok := m.snapshotter().(ResidentRecurrentSnapshots)
-	return ok && rs.KVSnapshotRecurrent()
+	sn := m.snapshotter()
+	return sn != nil && sn.KVSnapshotRecurrent()
 }
 
 // snapshotsBlocked reports whether this model's state is outside what a snapshot holds: recurrent state its snapshotter does not carry.
 func (m *Model) snapshotsBlocked() bool { return m.hasRecurrentState() && !m.recurrentSnapshots() }
-
-// ResidentPrefillMarked is the optional capability of a resident to tell its caller when a batched prefill has just written a given position,
-// between two of its passes: the one moment a windowed layer's ring holds exactly what a shorter prompt would leave there, so a prefix snapshot
-// can be taken in the middle of a cold prefill (docs/tasks/task-kv7-step2-boundary-snapshot-2026-10.md).
-type ResidentPrefillMarked interface {
-	Prefiller
-	// PrefillMarkAlign is the width of the passes of a batched prefill, in positions: a mark can fire only at startPos plus a multiple of it.
-	PrefillMarkAlign() int
-	// PrefillLastMarked is PrefillLast that calls at(mark) on the caller's goroutine after the pass that ends exactly at position mark, with no
-	// pass running. A mark that is not at a pass boundary of this prefill (a single pass, a start that is not aligned to it, the passes cut
-	// differently) calls nothing. at must not fail the prefill; a snapshot it cannot take is the caller's to count.
-	PrefillLastMarked(ctx context.Context, embeddings [][]float32, startPos, mark int, at func(pos int)) ([]float32, error)
-}
 
 // KVSnapshotStats is a model's host snapshots, for /admin/status and the request log.
 type KVSnapshotStats struct {
@@ -135,6 +88,9 @@ type kvSnap struct {
 	restores int
 	last     uint64
 	created  time.Time
+	// preamble marks a recurrent snapshot taken at the end of the system-and-tools preamble (KVScope.Boundary): other conversations share its
+	// prefix, so no deeper snapshot of the same prefix replaces it; only the store's budget drops it.
+	preamble bool
 }
 
 // kvSnapStore is a model's held snapshots under a host byte budget, most recently used first.
@@ -171,7 +127,7 @@ func (s *kvSnapStore) best(root kvmgr.Root, prompt []int) (*kvSnap, int) {
 		if x.root != root {
 			continue
 		}
-		if n := commonPrefixLen(x.ids, prompt); n > lcp {
+		if n := kvmgr.CommonPrefixLen(x.ids, prompt); n > lcp {
 			out, lcp = x, n
 		}
 	}
@@ -195,7 +151,7 @@ func (s *kvSnapStore) candidates(root kvmgr.Root, prompt []int) []snapMatch {
 		if x.root != root {
 			continue
 		}
-		if n := commonPrefixLen(x.ids, prompt); n >= kvmgr.BlockRows {
+		if n := kvmgr.CommonPrefixLen(x.ids, prompt); n >= kvmgr.BlockRows {
 			out = append(out, snapMatch{x, n})
 		}
 	}
@@ -215,7 +171,7 @@ func (s *kvSnapStore) covering(root kvmgr.Root, prompt []int, b, slack int) *kvS
 		if x.root != root {
 			continue
 		}
-		lcp := commonPrefixLen(x.ids, prompt)
+		lcp := kvmgr.CommonPrefixLen(x.ids, prompt)
 		if lcp < min(x.h.Rows(), b)-slack {
 			continue
 		}
@@ -226,6 +182,13 @@ func (s *kvSnapStore) covering(root kvmgr.Root, prompt []int, b, slack int) *kvS
 		}
 	}
 	return nil
+}
+
+// holds reports whether x is still in the store.
+func (s *kvSnapStore) holds(x *kvSnap) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Contains(s.list, x)
 }
 
 // use marks x as just used and counts a restore of rows rows.
@@ -411,12 +374,15 @@ func (m *Model) KVHostBytes() int64 {
 }
 
 // snapshotter is the resident's snapshot capability, nil when snapshots are off for this model or the resident has none.
-func (m *Model) snapshotter() ResidentKVSnapshotter {
+func (m *Model) snapshotter() ResidentKVSubsystem {
 	if m.kvSnaps == nil || m.resident == nil {
 		return nil
 	}
-	sn, _ := m.resident.(ResidentKVSnapshotter)
-	return sn
+	kv := m.resKV()
+	if !kv.KVSnapshotterAvailable() {
+		return nil
+	}
+	return kv
 }
 
 // residentRestoreSnapshot restores a held snapshot's rows into the bound slot when that serves more of prompt than the slot's own
@@ -427,7 +393,7 @@ func (m *Model) snapshotter() ResidentKVSnapshotter {
 // refusal before anything is written leaves acq as it was; a failure after leaves the slot unknown.
 func (m *Model) residentRestoreSnapshot(prompt []int, lora *loraRuntime, sc KVScope, acq *kvAcquired) {
 	sn := m.snapshotter()
-	if sn == nil || sc.Off || m.kvShareOff || lora != nil || m.residentReuseDisabled() || m.snapshotsBlocked() || acq.slot < 0 {
+	if sn == nil || sc.Off || m.opts.KVShareOff || lora != nil || m.residentReuseDisabled() || m.snapshotsBlocked() || acq.slot < 0 {
 		return
 	}
 	st := m.kvSnaps
@@ -553,23 +519,19 @@ func (m *Model) kvSnapSlack() int {
 // KVScope.Keep rounded down to a pass instead, whatever the rollback (residentSnapshotPrompt takes no end snapshot for one). ok is false when the resident
 // cannot mark its passes, there is no boundary, the prompt is short, or the part after the boundary fits the rollback (the end snapshot serves).
 func (m *Model) kvBoundaryPlan(prompt []int, sc KVScope, lora *loraRuntime) (q int, ok bool) {
-	sn := m.snapshotter()
-	mp, hasMark := m.resident.(ResidentPrefillMarked)
-	if sn == nil || !hasMark || lora != nil || sc.Off || m.kvShareOff || m.residentReuseDisabled() || m.snapshotsBlocked() {
+	var align int
+	align, ok = m.kvMarkGuard(sc, lora)
+	if !ok {
 		return 0, false
 	}
-	n, align := len(prompt), mp.PrefillMarkAlign()
+	n := len(prompt)
 	if m.hasRecurrentState() {
-		// A recurrent model's snapshot is taken where the next turn's prompt parts from this one (KVScope.Keep), on a pass boundary: the
-		// state exists only between passes, and the next turn re-prefills from there on the same pass grid as a cold prefill.
+		// A recurrent model's snapshot is taken where the next turn's prompt parts from this one (KVScope.Keep): the prefill is cut there
+		// (recurrentCut), so the state exists at that row and the next turn re-prefills from it.
 		if align <= 0 || n < kvSnapMinPrompt || sc.Keep <= 0 || sc.Keep >= n {
 			return 0, false
 		}
-		q = sc.Keep / align * align
-		if q < kvSnapMinShared || q%kvmgr.BlockRows != 0 {
-			return 0, false
-		}
-		return q, true
+		return m.recurrentCut(n, sc.Keep)
 	}
 	if sc.Boundary <= 0 {
 		return 0, false
@@ -584,18 +546,133 @@ func (m *Model) kvBoundaryPlan(prompt []int, sc KVScope, lora *loraRuntime) (q i
 	return q, true
 }
 
+// recurrentCut is the row a recurrent model's snapshot for point is cut at in a prompt of n ids: point rounded down to a snapshot block, and
+// lowered a block at a time while fewer rows than the resident's final-pass minimum would follow it (a shorter last pass runs other kernels
+// than a cold prefill's). ok is false below a snapshot's minimum.
+func (m *Model) recurrentCut(n, point int) (q int, ok bool) {
+	q = point / kvmgr.BlockRows * kvmgr.BlockRows
+	for q > 0 && n-q < m.prefillTailMinRows() {
+		q -= kvmgr.BlockRows
+	}
+	return q, q >= kvSnapMinShared
+}
+
+// cutSegmentOK reports whether a prefill of rows rows from a restore point or a cut keeps every pass at or above the resident's final-pass
+// minimum: passes are align rows wide, so the last is rows mod align, or align itself when that divides.
+func (m *Model) cutSegmentOK(rows, align int) bool {
+	last := rows % align
+	return rows >= m.prefillTailMinRows() && (last == 0 || last >= m.prefillTailMinRows())
+}
+
+// kvMarkGuard is the width of the resident's marked passes, and ok when a snapshot mark may be planned for this request at all.
+func (m *Model) kvMarkGuard(sc KVScope, lora *loraRuntime) (align int, ok bool) {
+	align, hasMark := stepMarkAlign(m.resident)
+	if m.snapshotter() == nil || !hasMark || lora != nil || sc.Off || m.opts.KVShareOff || m.residentReuseDisabled() || m.snapshotsBlocked() {
+		return 0, false
+	}
+	return align, true
+}
+
+// kvMsgPlan is the position of a recurrent model's message-boundary snapshot (KVScope.MsgBoundary) rounded down to a pass, on the grid kvBoundaryPlan
+// keeps Keep's on. ok is false for a model without recurrent state, or when the resident cannot mark, there is no boundary, or the prompt is short.
+func (m *Model) kvMsgPlan(prompt []int, sc KVScope, lora *loraRuntime) (q int, ok bool) {
+	align, ok := m.kvMarkGuard(sc, lora)
+	if !ok || !m.hasRecurrentState() || align <= 0 || len(prompt) < kvSnapMinPrompt || sc.MsgBoundary <= 0 || sc.MsgBoundary >= len(prompt) {
+		return 0, false
+	}
+	return m.recurrentCut(len(prompt), sc.MsgBoundary)
+}
+
+// kvMsgMark is the mark for the message-boundary snapshot, or nil. It is taken beside Keep's, which a prompt that rewrites its last message from
+// near the start does not match through: the snapshot Keep's mark takes later does not replace it (acq.msgRows), though a recurrent snapshot of
+// the same prefix that ends earlier is otherwise replaced (kvSnapHolds). keep is the request's Keep mark, nil when there is none; a point at or
+// past it is Keep's to serve.
+func (m *Model) kvMsgMark(slot int, prompt []int, from int, lora *loraRuntime, sc KVScope, acq *kvAcquired, keep *prefillMark) *prefillMark {
+	q, ok := m.kvMsgPlan(prompt, sc, lora)
+	if !ok || q <= from || (keep != nil && q >= keep.q) {
+		return nil
+	}
+	if align, _ := stepMarkAlign(m.resident); !m.cutSegmentOK(q-from, align) {
+		return nil
+	}
+	st := m.kvSnaps
+	if c := st.covering(m.kvRootIn(nil, sc.Namespace), prompt, q, 0); c != nil && m.kvSnapHolds(c, q) {
+		st.decline("held")
+		return nil
+	}
+	return &prefillMark{q: q, cut: true, at: func(pos int) {
+		acq.markFired = true
+		m.residentSnapshotRows(slot, prompt, pos, lora, sc, *acq)
+		acq.msgRows = pos
+		if x := acq.snapFrom; x != nil && !st.holds(x) {
+			acq.snapFrom = nil // the snapshot this request restored from went to this one's admission; the next mark must not drop it again
+		}
+	}}
+}
+
 // kvPrefillMark returns the mark a cold prefill of prompt from position from should carry: the boundary position and the function that takes the
 // snapshot there. nil when no boundary snapshot applies, when from does not start on a pass boundary the mark could meet, or when a held snapshot
 // already serves the prefix (this request restored it, or another one covers it). A recurrent model's restored request still marks its own
 // Keep past the restored point, so the kept state moves to each new question instead of staying at the first one
 // (docs/measurements/b35-keep-advance-2026-10/README.md); admission then replaces the snapshot it restored from (residentSnapshotRows).
 func (m *Model) kvPrefillMark(slot int, prompt []int, from int, lora *loraRuntime, sc KVScope, acq *kvAcquired) *prefillMark {
+	top := m.kvKeepMark(slot, prompt, from, lora, sc, acq)
+	msg := m.kvMsgMark(slot, prompt, from, lora, sc, acq, top)
+	lowest := top
+	if msg != nil {
+		msg.pre, top, lowest = nil, cmp.Or(top, msg), msg
+		if top != msg {
+			top.pre = msg
+		}
+	}
+	if pre := m.kvPreambleMark(slot, prompt, from, lora, sc, acq, lowest); pre != nil {
+		if lowest == nil {
+			return pre
+		}
+		lowest.pre = pre
+	}
+	return top
+}
+
+// kvPreambleMark is the mark for a recurrent model's snapshot at the end of the system-and-tools preamble (KVScope.Boundary), or nil. above is the
+// request's lowest other mark: the preamble's point must lie below it. It is taken when no snapshot is held at that row, which is the first cold
+// request to reach a preamble; the snapshot is kept apart from the replacement rule (kvSnap.preamble).
+func (m *Model) kvPreambleMark(slot int, prompt []int, from int, lora *loraRuntime, sc KVScope, acq *kvAcquired, above *prefillMark) *prefillMark {
+	align, ok := m.kvMarkGuard(sc, lora)
+	if !ok || !m.hasRecurrentState() || align <= 0 || len(prompt) < kvSnapMinPrompt || sc.Boundary <= 0 || sc.Boundary >= len(prompt) {
+		return nil
+	}
+	q, ok := m.recurrentCut(len(prompt), sc.Boundary)
+	if !ok || q <= from || (above != nil && q >= above.q) || !m.cutSegmentOK(q-from, align) {
+		return nil
+	}
+	st := m.kvSnaps
+	if c := st.covering(m.kvRootIn(nil, sc.Namespace), prompt, q, 0); c != nil && m.kvSnapHolds(c, q) {
+		st.decline("held")
+		return nil
+	}
+	return &prefillMark{q: q, cut: true, at: func(pos int) {
+		acq.markFired = true
+		acq.preambleRows = pos
+		m.residentSnapshotRows(slot, prompt, pos, lora, sc, *acq)
+		if x := acq.snapFrom; x != nil && !st.holds(x) {
+			acq.snapFrom = nil
+		}
+	}}
+}
+
+// kvKeepMark is the boundary snapshot's mark: Keep's for a recurrent model, the prefix boundary's otherwise.
+func (m *Model) kvKeepMark(slot int, prompt []int, from int, lora *loraRuntime, sc KVScope, acq *kvAcquired) *prefillMark {
 	q, ok := m.kvBoundaryPlan(prompt, sc, lora)
 	if !ok || (acq.snapRows > 0 && !m.hasRecurrentState()) || q <= from {
 		return nil
 	}
-	mp := m.resident.(ResidentPrefillMarked)
-	if (q-from)%mp.PrefillMarkAlign() != 0 {
+	align, _ := stepMarkAlign(m.resident)
+	if m.hasRecurrentState() {
+		if !m.cutSegmentOK(q-from, align) {
+			return nil
+		}
+	} else if (q-from)%align != 0 {
 		return nil // the passes of this prefill do not end at q
 	}
 	if st := m.kvSnaps; st != nil {
@@ -604,16 +681,20 @@ func (m *Model) kvPrefillMark(slot int, prompt []int, from int, lora *loraRuntim
 			return nil
 		}
 	}
-	return &prefillMark{q: q, at: func(pos int) {
+	return &prefillMark{q: q, cut: m.hasRecurrentState(), at: func(pos int) {
 		acq.markFired = true
 		m.residentSnapshotRows(slot, prompt, pos, lora, sc, *acq)
 	}}
 }
 
-// prefillMark is a position at which a batched prefill is to call back between two passes.
+// prefillMark is a position at which a prefill is to call back: between two passes of its batched prefill, or, when cut, where it was split.
 type prefillMark struct {
 	q  int
 	at func(pos int)
+	// cut: the prefill is split at q (a recurrent model's snapshot points), not called back at a pass boundary.
+	cut bool
+	// pre is an earlier mark of the same prefill (q below this one's): residentPrefillSeedMarked prefills up to it, calls it, and goes on.
+	pre *prefillMark
 }
 
 // kvSnapHolds reports whether held snapshot c already serves a snapshot of the first b rows, the rule kvPrefillMark and
@@ -639,7 +720,7 @@ func (m *Model) kvSnapCoverSlack(slack int) int {
 // prompt, residentSnapshotPrompt) or between two passes of it (b the boundary, kvPrefillMark). It is the same admission either way.
 func (m *Model) residentSnapshotRows(slot int, prompt []int, b int, lora *loraRuntime, sc KVScope, acq kvAcquired) {
 	sn := m.snapshotter()
-	if sn == nil || sc.Off || m.kvShareOff || m.residentReuseDisabled() || m.snapshotsBlocked() {
+	if sn == nil || sc.Off || m.opts.KVShareOff || m.residentReuseDisabled() || m.snapshotsBlocked() {
 		return
 	}
 	st := m.kvSnaps
@@ -677,7 +758,7 @@ func (m *Model) residentSnapshotRows(slot int, prompt []int, b int, lora *loraRu
 	case x != nil && recurrent && m.kvSnapHolds(x, b):
 		st.decline("held")
 		return
-	case x != nil && x.h.Rows() < b:
+	case x != nil && x.h.Rows() < b && !x.preamble:
 		replaced = x
 	case x != nil:
 		// A recurrent snapshot longer than b: a different point, kept beside the new one.
@@ -687,7 +768,7 @@ func (m *Model) residentSnapshotRows(slot int, prompt []int, b int, lora *loraRu
 				st.decline("held")
 				return
 			}
-			if c.h.Rows() < b {
+			if c.h.Rows() < b && !c.preamble && !(recurrent && acq.msgRows > 0 && c.h.Rows() == acq.msgRows) {
 				replaced = c // a longer prompt of the same prefix: take it, then drop the shorter
 			}
 		}
@@ -727,7 +808,7 @@ func (m *Model) residentSnapshotRows(slot int, prompt []int, b int, lora *loraRu
 		st.mu.Unlock()
 		return
 	}
-	x := &kvSnap{root: root, ids: append([]int(nil), prompt[:b]...), classes: clipRuns(cold, b), h: h}
+	x := &kvSnap{root: root, ids: append([]int(nil), prompt[:b]...), classes: clipRuns(cold, b), h: h, preamble: recurrent && acq.preambleRows == b && b > 0}
 	st.add(x, replaced, d, need)
 	used := st.stats().Used
 	fmt.Fprintf(stderrKV, "kv snapshot: took %d rows (%.0f MiB host) from slot %d in %.1f ms; %.0f of %.0f MiB held\n",
@@ -737,8 +818,8 @@ func (m *Model) residentSnapshotRows(slot int, prompt []int, b int, lora *loraRu
 // kvSnapReserve charges need bytes for a snapshot about to be taken. A demoted copy goes before a held snapshot: it serves one conversation
 // that may never return, a snapshot any prompt with its prefix.
 func (m *Model) kvSnapReserve(st *kvSnapStore, need int64) bool {
-	if d, ok := m.resident.(ResidentKVDemoter); ok && m.kvDemote {
-		return d.ReserveKVHost(need)
+	if kv := m.resKV(); kv.KVDemoterAvailable() && m.opts.KVDemote {
+		return kv.ReserveKVHost(need)
 	}
 	return st.Reserve(need, true)
 }

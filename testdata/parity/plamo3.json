@@ -11,7 +11,7 @@
   "programs": [
     "testdata/plamo3-tiny"
   ],
-  "deps_hash": "sha256:4a15f0c1ad0e1d3fbe532d7d9383fb3e52e80d3df0f716a11f307656ca8ac61c",
+  "deps_hash": "sha256:f7551ac0546fc2706056c8f8051ca942b2c3c9aaa48456820ee2dc8759f528b8",
   "status": "pending",
   "validated_at": null,
   "date": "2026-11-06",

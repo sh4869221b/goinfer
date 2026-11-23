@@ -17,7 +17,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// TestR18InSequence is R18's grading instrument (docs/tasks/red-october.md R18; graded, then wired). On a real
+// TestR18InSequence is R18's grading instrument ( R18; graded, then wired). On a real
 // checkpoint it times the production decode token against the SHIPPED kernels (resident.gemvRows zeroed, so every GEMV
 // takes its one-row-per-simdgroup kernel), plus any prototype arms, through resident.gemvRows and the four rows-kernel
 // pipelines, and measures:
@@ -97,7 +97,7 @@ func TestR18InSequence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("build resident: %v", err)
 	}

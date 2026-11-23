@@ -63,7 +63,7 @@ if [ ! -f "$MODEL" ]; then echo "model not found: $MODEL" >&2; exit 1; fi
 # //go:embed needs the asset inside the package dir and does not follow symlinks.
 if [ "$MODE" = prequant ]; then
   echo "building prequant bundle (quant=$QUANT) -> internal/app/chatapp/model.giw"
-  # -target canonical (docs/tasks/task-int4-layout-2026-09.md's L2): this ONE bundle is baked once,
+  # -target canonical: this ONE bundle is baked once,
   # here, on the host box's own arch — then embedded into every os/arch in the TARGETS loop
   # below (darwin/*, linux/*, windows/*, cross-compiled with CGO_ENABLED=0 regardless of host),
   # so no single arch-specific repacked-only layout (kind 5, cpu-arm64-only) is safe for all of
@@ -106,7 +106,7 @@ for t in "${TARGETS[@]}"; do
   os="${t%/*}"; arch="${t#*/}"
   out="$DIR/dist/$NAME-$os-$arch"
   [ "$os" = "windows" ] && out="$out.exe"
-  # G1 (docs/tasks/task-gpu-paths-2026-09.md): building every target from $DIR (the pure-Go root
+  # G1 (docs/completed/task-gpu-paths-2026-09.md): building every target from $DIR (the pure-Go root
   # demo/chat) meant the darwin/linux embedded assets carried no GPU backend even though
   # metal/cuda exist — the same gap the goinfer-chat/goinfer-serve release loops were fixed for.
   # darwin builds ./metal/cmd/chat, linux ./cuda/cmd/chat; both are separate modules, so outside

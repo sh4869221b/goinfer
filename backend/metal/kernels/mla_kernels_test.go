@@ -82,7 +82,7 @@ func kmlaWorst(t *testing.T, src string, interleave bool) (store, qrope float64)
 		e := q.Begin()
 		e.Dispatch(pStore, 64, 64, NewBufferFloats(d, kv), NewBufferFloats(d, normW), NewBufferFloats(d, invf), lat,
 			NewBufferUint32s(d, []uint32{kmlaRank, kmlaQKRope, il}), NewBufferU32(d, uint32(pos)), NewBufferU32(d, uint32(pos)),
-			NewBufferFloats(d, []float32{eps}), NewBufferFloats(d, []float32{1}))
+			NewBufferFloats(d, []float32{eps}), NewBufferFloats(d, []float32{1}), kvIdentityTable(d))
 		e.End()
 		var ss float64
 		for i := range kmlaRank {
@@ -119,7 +119,7 @@ func kmlaWorst(t *testing.T, src string, interleave bool) (store, qrope float64)
 	return store, qrope
 }
 
-// TestMLAKernels_rope is OP2a's K-MLA gate (docs/tasks/task-forward-architecture-2026-10.md §4.7, registered before it ran):
+// TestMLAKernels_rope is OP2a's K-MLA gate ( registered before it ran):
 // mla_store and mla_qrope against a float64 reference on non-flat inputs, both rope branches, at positions 0, 1, 7, 255 and
 // 4,095, max|error| <= 2e-3 x max|reference|. With q's and the latent's rope and nope slices swapped in each branch (the
 // plant), both kernels must exceed it. The tiny fixtures cannot see this defect (gate M's amendment 2).

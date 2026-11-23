@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-// Soft-token audio prefill and generation for Qwen3-ASR (docs/tasks/task-multimodal-support-2026-10.md). The audio
+// Soft-token audio prefill and generation for Qwen3-ASR. The audio
 // encoder's projected embeddings replace the input embeddings of the run of <|audio_pad|> placeholders; everything else
 // is an ordinary causal text prefill and decode. That is the whole difference from the image paths: no bidirectional
 // block (GenerateVL's Gemma 3 mask), no m-RoPE grid (GenerateQwenVL), the positions are 0..n-1 as in text. CPU only: a
@@ -24,7 +24,7 @@ func (m *Model) prefillLogitsAudio(ctx context.Context, ids []int, feats []float
 		return nil, fmt.Errorf("decoder: audio features len %d, want %d (%d tokens x %d)", len(feats), n*hidden, n, hidden)
 	}
 	// The audio run's rows are the raw projector output (no embed scale, as transformers' masked_scatter into inputs_embeds),
-	// spliced per pass; they attend causally, so any cut is allowed (MEM5-VL).
+	// spliced per pass; they attend causally, so any cut is allowed.
 	hN, err := m.prefillSpliced(ctx, ids, []ImageSpan{{Pos: pos, Len: n}}, feats, cache, false)
 	if err != nil {
 		return nil, err

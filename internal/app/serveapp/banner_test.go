@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/townsendmerino/goinfer/decoder"
 	"github.com/townsendmerino/goinfer/internal/app/loadflags"
+	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 	"os"
 	"path/filepath"
 	"strings"
@@ -277,12 +278,6 @@ func TestConcurrencyLine_cpuBatch(t *testing.T) {
 	if !strings.Contains(batched, "decode tokens batched on the CPU") || !strings.Contains(batched, "-cpu-batch") {
 		t.Errorf("batched CPU model: %q", batched)
 	}
-	// Batching engaged for the family, but an f16 or int8 cache's tokens decode per sequence: the line says so and why, not "batched".
-	why := "the i8 KV cache decodes per sequence; the CPU batcher reads f32 KV only until phase 4"
-	bypass := concurrencyLine(bannerFacts{concurrent: 4, cpuBatched: true, cpuBatchBypass: why}, config{maxConcurrent: 4, kvSessions: 4})
-	if strings.Contains(bypass, "batched on the CPU") || !strings.Contains(bypass, "decode runs per sequence: "+why) {
-		t.Errorf("CPU model whose int8 cache bypasses the batcher: %q", bypass)
-	}
 	workers := concurrencyLine(bannerFacts{concurrent: 4}, config{maxConcurrent: 4, kvSessions: 4, cpuBatch: decoder.CPUBatchAuto})
 	if !strings.Contains(workers, "independent workers") || strings.Contains(workers, "batched on the CPU") {
 		t.Errorf("CPU model on the workers under auto: %q", workers)
@@ -357,6 +352,49 @@ func TestFactsOf_carriesTheResidentDecline(t *testing.T) {
 	}
 }
 
+// Through the real banner: a context pin past the model's own window, on a load whose GPU backend declined, is priced at the window,
+// as the load-time guard prices it. The fit: line is read off modelBanner of a real model, and compared with the same model loaded
+// with no pin (priced at its maximum).
+func TestBanner_fitLineAfterADeclineIsClampedToTheModelWindow(t *testing.T) {
+	p := filepath.Join("../../../testdata/glm-tiny.gguf")
+	if _, err := os.Stat(p); err != nil {
+		t.Skipf("no committed tiny fixture at %s", p)
+	}
+	name := "fake-declines-n26"
+	decoder.RegisterBackend(name, func() (decoder.Backend, error) {
+		cpu, err := decoder.NewBackend("cpu")
+		if err != nil {
+			return nil, err
+		}
+		return &decliningBackend{Backend: cpu}, nil
+	})
+	load := func(pin int) *loadedModel {
+		m, err := decoder.Load(p, decoder.Options{Backend: name, Quant: "int8int8", ResidentContext: pin})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = m.Close() })
+		return &loadedModel{name: "declined", model: m}
+	}
+	unpinned := load(0)
+	window := unpinned.model.Config().MaxPositions
+	if window <= 0 {
+		t.Skip("the fixture declares no window")
+	}
+	want := factsOf(unpinned)
+	if !want.fitKnown || want.fitCtx != window {
+		t.Fatalf("unpinned decline: fitKnown=%v fitCtx=%d, want the window %d", want.fitKnown, want.fitCtx, window)
+	}
+	pinned := load(window * 8)
+	got := factsOf(pinned)
+	if !got.fitKnown || got.fitCtx != window || got.fitKVBytes != want.fitKVBytes {
+		t.Errorf("a pin of %d past the window %d after a decline: fit ctx %d, KV %d bytes; want ctx %d, KV %d", window*8, window, got.fitCtx, got.fitKVBytes, window, want.fitKVBytes)
+	}
+	if line := bannerLine(modelBanner(pinned, config{}), "fit:"); !strings.Contains(line, fmt.Sprintf("fit: %d-token cap", window)) {
+		t.Errorf("the banner's fit line prices a context other than the window %d: %q", window, line)
+	}
+}
+
 // A plain CPU load is not a decline: the CPU was the choice. decoder sets ResidentDecline for it too ("backend
 // does not implement residency (… the CPU backend)"), so the banner must not report that as a GPU load that
 // fell through.
@@ -384,7 +422,7 @@ func (b *decliningBackend) BuildResident(m *decoder.Model) (decoder.ResidentForw
 	return nil, false, decoder.DeclineResident("no card in this test")
 }
 
-// TestKVPlanLine pins S18's "KV plan" line (docs/tasks/task-multimodal-support-2026-10.md): the resolved slots and positions, and the reasons the banner can state when the plan is less than was asked for.
+// TestKVPlanLine pins S18's "KV plan" line: the resolved slots and positions, and the reasons the banner can state when the plan is less than was asked for.
 func TestKVPlanLine(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -395,9 +433,9 @@ func TestKVPlanLine(t *testing.T) {
 	}{
 		{"a tower held 2.4 GB back and the card allowed 2 of 4 (Gemma 3 4B on the 8 GB card, float32 tower)",
 			bannerFacts{resident: true, kvSlots: 2, ctxWindow: 4096, decodePath: "cuda-resident (int4)", towerReserve: 2_400_000_000}, config{kvSessions: 4},
-			"KV plan: 2 conversations x 4096 positions (4 asked for; 2.4 GB held back for the vision tower)", false},
+			"KV plan: 2 conversations x 4096 positions (4 asked for; 2.24 GiB held back for the vision tower)", false},
 		{"one slot", bannerFacts{resident: true, kvSlots: 1, ctxWindow: 4096, decodePath: "cuda-resident (int4)", towerReserve: 959_000_000}, config{kvSessions: 4},
-			"KV plan: 1 conversation x 4096 positions (4 asked for; 1.0 GB held back for the vision tower)", false},
+			"KV plan: 1 conversation x 4096 positions (4 asked for; 0.89 GiB held back for the vision tower)", false},
 		{"nothing reduced, no tower: no parenthesis", bannerFacts{resident: true, kvSlots: 4, ctxWindow: 5057, decodePath: "cuda-resident (int4)"}, config{kvSessions: 4},
 			"KV plan: 4 conversations x 5057 positions", false},
 		{"an explicit -ctx is named", bannerFacts{resident: true, kvSlots: 2, ctxWindow: 8192, decodePath: "cuda-resident (int4)"}, config{kvSessions: 4, load: loadflags.Flags{Ctx: 8192}},
@@ -526,15 +564,15 @@ func TestBanner_contextSaysWhyAndWarnsAHarness(t *testing.T) {
 		{"paged MoE keeps the default: the first request is refused",
 			bannerFacts{resident: true, ctxWindow: 4096, maxPositions: 131072, ctxNote: "paged MoE keeps the default", kvSlots: 2, harnessKVBytes: gib}, 0,
 			"context: 4096 tokens (paged MoE keeps the default; model maximum 131072 — raise with --ctx)",
-			[]string{"harness: 4096 tokens is short for a coding agent", "about 11k tokens (opencode: 11137)", "will be refused (context_length_exceeded)", "--ctx 16384 holds it for 2.0 GB of KV (2 slots)"}},
+			[]string{"harness: 4096 tokens is short for a coding agent", "about 11k tokens (opencode: 11137)", "will be refused (context_length_exceeded)", "--ctx 16384 holds it for 2.00 GiB of KV (2 slots)"}},
 		{"shrunk to 12000: fits, with little room",
 			bannerFacts{resident: true, ctxWindow: 12000, maxPositions: 32768, ctxNote: "fit: 2 slots, 1.4 GB KV", kvSlots: 1, harnessKVBytes: gib / 2}, 0,
 			"context: 12000 tokens (fit: 2 slots, 1.4 GB KV; model maximum 32768 — raise with --ctx)",
-			[]string{"which leaves 863 for the session", "--ctx 16384 holds it for 0.5 GB of KV (1 slot)"}},
+			[]string{"which leaves 863 for the session", "--ctx 16384 holds it for 0.50 GiB of KV (1 slot)"}},
 		{"no note from the backend: the old words",
 			bannerFacts{resident: true, ctxWindow: 8192, maxPositions: 40960, kvSlots: 4, harnessKVBytes: gib}, 0,
 			"context: 8192 tokens (backend default; model maximum 40960 — raise with --ctx)",
-			[]string{"will be refused", "4.0 GB of KV (4 slots)"}},
+			[]string{"will be refused", "4.00 GiB of KV (4 slots)"}},
 		{"an explicit --ctx 4096 is warned too",
 			bannerFacts{resident: true, ctxWindow: 4096, maxPositions: 32768, kvSlots: 2, harnessKVBytes: gib}, 4096,
 			"context: 4096 tokens (--ctx; model maximum 32768)", []string{"will be refused", "--ctx 16384 holds it"}},
@@ -572,7 +610,7 @@ func TestBanner_cpuKVBothCaches(t *testing.T) {
 	}
 }
 
-// TestBanner_kvPoolLine is KV4's §5.16 pool banner (docs/tasks/task-kv-architecture-2026-10.md): a resident's shared KV pool is
+// TestBanner_kvPoolLine is KV4's §5.16 pool banner: a resident's shared KV pool is
 // named in tokens and block size, with its precision, device bytes, groups, sharing scope and what one conversation can use.
 func TestBanner_kvPoolLine(t *testing.T) {
 	pool := decoder.KVPoolDetail{Positions: 58000, Guaranteed: 14500, BlockRows: 64, Groups: []string{"full"}, Precision: "f16", Bytes: 3_543_348_019}
@@ -587,17 +625,17 @@ func TestBanner_kvPoolLine(t *testing.T) {
 		f                bannerFacts
 	}{
 		{name: "one conversation can use all of it", f: bannerFacts{kvSlots: 4, ctxWindow: 58000, kvPoolDetail: pool, kvShareState: "on"},
-			want: "KV pool: 58,000 tokens in blocks of 64 (f16, 3.3 GB; group: full); a prompt can take another conversation's KV rows; one conversation can use all of it.",
+			want: "KV pool: 58,000 tokens in blocks of 64 (f16, 3.30 GiB; group: full); a prompt can take another conversation's KV rows; one conversation can use all of it.",
 			plan: "KV plan: a 58000-position pool for 4 conversations; each is guaranteed 14500, and one can use up to 58000"},
 		{name: "one slot: nothing to share with", f: bannerFacts{kvSlots: 1, ctxWindow: 58000, kvPoolDetail: pool, kvShareState: "none", kvShareWhy: "one KV slot"},
-			want: "KV pool: 58,000 tokens in blocks of 64 (f16, 3.3 GB; group: full); no conversation takes another's KV rows (one KV slot); one conversation can use all of it."},
+			want: "KV pool: 58,000 tokens in blocks of 64 (f16, 3.30 GiB; group: full); no conversation takes another's KV rows (one KV slot); one conversation can use all of it."},
 		{name: "resident reuse off", f: bannerFacts{kvSlots: 4, ctxWindow: 58000, kvPoolDetail: pool, kvShareState: "off", kvShareWhy: "GOINFER_NO_RESIDENT_REUSE"},
-			want: "KV pool: 58,000 tokens in blocks of 64 (f16, 3.3 GB; group: full); no conversation takes another's KV rows (GOINFER_NO_RESIDENT_REUSE); one conversation can use all of it."},
+			want: "KV pool: 58,000 tokens in blocks of 64 (f16, 3.30 GiB; group: full); no conversation takes another's KV rows (GOINFER_NO_RESIDENT_REUSE); one conversation can use all of it."},
 		{name: "a cap below the pool, sharing off, both groups", f: bannerFacts{kvSlots: 4, ctxWindow: 32768, kvShareState: "off", kvShareWhy: "--kv-share off",
 			kvPoolDetail: decoder.KVPoolDetail{Positions: 48128, Guaranteed: 12032, BlockRows: 64, WindowRows: 1216, Groups: []string{"full", "sliding window"}, Precision: "f32", Bytes: 1 << 30}},
-			want: "KV pool: 48,128 tokens in blocks of 64 (f32, 1.0 GB; groups: full, sliding window, whose sliding-window layers keep a conversation's newest 1,216 rows); no conversation takes another's KV rows (--kv-share off); one conversation can use up to 32,768 of them."},
+			want: "KV pool: 48,128 tokens in blocks of 64 (f32, 1.00 GiB; groups: full, sliding window, whose sliding-window layers keep a conversation's newest 1,216 rows); no conversation takes another's KV rows (--kv-share off); one conversation can use up to 32,768 of them."},
 		{name: "a pure sliding-window pool: named, in MB, never all one conversation's, and the pool no smaller than a share", f: bannerFacts{kvSlots: 2, ctxWindow: 8192, kvShareState: "on", kvPoolDetail: window},
-			want: "KV pool: 8,192 tokens in blocks of 64 (f32, 3.7 MB; group: sliding window, whose sliding-window layers keep a conversation's newest 1,216 rows); a prompt can take another conversation's KV rows; one conversation can use up to 8,192 of them.",
+			want: "KV pool: 8,192 tokens in blocks of 64 (f32, 3.7 MiB; group: sliding window, whose sliding-window layers keep a conversation's newest 1,216 rows); a prompt can take another conversation's KV rows; one conversation can use up to 8,192 of them.",
 			plan: "KV plan: a 8192-position pool for 2 conversations; each is guaranteed 4096, and one can use up to 8192"},
 		{name: "no pool: no line", f: bannerFacts{kvSlots: 1, ctxWindow: 4096}},
 	} {
@@ -610,5 +648,63 @@ func TestBanner_kvPoolLine(t *testing.T) {
 				t.Errorf("KV plan line\n got %q\nwant %q", got, tc.plan)
 			}
 		})
+	}
+}
+
+// TestBanner_kvI8CostIsCUDAs: the measured int8 cost is CUDA's (kvI8Cost), so the banner prints it only for a CUDA resident's int8 cache. A
+// CPU cache, a Metal resident and a CPU cache beside a CUDA resident print "lossy" alone.
+func TestBanner_kvI8CostIsCUDAs(t *testing.T) {
+	i8 := func(cache string) decoder.KVPrecisionReport {
+		return decoder.KVPrecisionReport{Cache: cache, Requested: "i8", Delivered: "i8"}
+	}
+	for _, tc := range []struct {
+		name, decodePath string
+		kv               []decoder.KVPrecisionReport
+		want, notWant    []string
+	}{
+		{"cuda resident", "cuda-resident (int4)", []decoder.KVPrecisionReport{i8("resident")},
+			[]string{"KV i8 (requested i8, lossy: " + kvI8Cost + ")"}, nil},
+		{"metal resident", "metal-resident (int4)", []decoder.KVPrecisionReport{i8("resident")},
+			[]string{"KV i8 (requested i8, lossy)"}, []string{kvI8Cost}},
+		{"webgpu resident", "webgpu-resident (int8)", []decoder.KVPrecisionReport{i8("resident")},
+			[]string{"KV i8 (requested i8, lossy)"}, []string{kvI8Cost}},
+		{"cpu", "cpu (int4)", []decoder.KVPrecisionReport{i8("cpu")},
+			[]string{"KV i8 (requested i8, lossy)"}, []string{kvI8Cost}},
+		{"cuda resident and its cpu cache", "cuda-resident (int4)", []decoder.KVPrecisionReport{i8("resident"), i8("cpu")},
+			[]string{"· KV i8 (requested i8, lossy: " + kvI8Cost + ") · CPU KV i8 (requested i8, lossy)"}, nil},
+	} {
+		got := bannerLine(modelBannerFrom(bannerFacts{hasTemplate: true, ctxWindow: 4096, maxPositions: 4096, decodePath: tc.decodePath, kv: tc.kv},
+			config{load: loadflags.Flags{KV: "i8"}}), "context:")
+		for _, w := range tc.want {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s: line %q lacks %q", tc.name, got, w)
+			}
+		}
+		for _, w := range tc.notWant {
+			if strings.Contains(got, w) {
+				t.Errorf("%s: line %q prints CUDA's measured int8 cost", tc.name, got)
+			}
+		}
+	}
+}
+
+// The "fit:" line prices the KV a resident holds: with two or more slots, the pool every slot's blocks take (the resident's own
+// account, decoder.Model.ResidentKVPool), not one conversation's cap, and the room left for a prefill is the budget less all of it.
+// A one-slot resident and the CPU path keep the one-cap figure.
+func TestBanner_fitLinePricesEveryResidentSlot(t *testing.T) {
+	f := bannerFacts{hasTemplate: true, resident: true, kvSlots: 2, ctxWindow: 2048, maxPositions: 4096, fitKnown: true, fitCtx: 2048,
+		fitKVBytes: 792 << 20, fitWeightBytes: 2680 << 20, fitBudgetBytes: 7884 << 20,
+		kvPoolDetail: decoder.KVPoolDetail{Positions: 4096, Guaranteed: 2048, BlockRows: 64, Precision: "f16", Bytes: 1560 << 20}}
+	line := func(f bannerFacts) string { return bannerLine(modelBannerFrom(f, config{}), "fit:") }
+
+	want := fmt.Sprintf("fit: 2 KV slots at a 2048-token cap hold %s KV (weights %s, budget %s, %s left for a request's own prefill)",
+		mem.GiB(1560<<20), mem.GiB(2680<<20), mem.GiB(7884<<20), mem.GiB((7884-1560)<<20))
+	if got := line(f); got != want {
+		t.Errorf("two resident slots:\n got %q\nwant %q", got, want)
+	}
+	one := f
+	one.kvSlots, one.kvPoolDetail.Positions, one.kvPoolDetail.Bytes = 1, 2048, 792<<20
+	if got := line(one); !strings.HasPrefix(got, "fit: 2048-token cap needs 0.77 GiB KV (") {
+		t.Errorf("one resident slot: %q, want the cap's own figure", got)
 	}
 }

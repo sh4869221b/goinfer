@@ -13,12 +13,13 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 	"github.com/townsendmerino/goinfer/internal/vision"
 	"github.com/townsendmerino/goinfer/multimodal"
 	"github.com/townsendmerino/goinfer/tokenizer"
 )
 
-// TestS16MRoPEPrefill_tiny is G-S16a and G-S16b (defects 1-3) of S16 (docs/tasks/task-multimodal-support-2026-10.md,
+// TestS16MRoPEPrefill_tiny is G-S16a and G-S16b (defects 1-3) of S16 (
 // registered before any S16 code): on one Metal-resident int4 model, the new resident m-RoPE prefill against today's path,
 // on the tiny Qwen2.5-VL (contiguous sections) and Qwen3.5 (interleaved, a Gated-DeltaNet hybrid) fixtures.
 //
@@ -240,7 +241,58 @@ func TestS16MRoPEPrefill_tiny(t *testing.T) {
 	}
 }
 
-// TestS16MRoPEPrefill_real is G-S16c's first half (docs/tasks/task-multimodal-support-2026-10.md, S16): Qwen2.5-VL-3B and
+// TestS16MRoPEPrefill_givesItsScratchBack: a resident m-RoPE prefill gives back every buffer it allocates, its rows' position triples
+// included, so a second prefill of the same prompt leaves the scratch line where the first did.
+func TestS16MRoPEPrefill_givesItsScratchBack(t *testing.T) {
+	defer func(m bool) { metalMRoPEPrefillOn = m }(metalMRoPEPrefillOn)
+	metalMRoPEPrefillOn = true
+	var g struct {
+		InputIDs      []int     `json:"input_ids"`
+		ImageToken    int       `json:"image_token_id"`
+		ImageStart    int       `json:"image_token_start"`
+		NImageTokens  int       `json:"n_image_tokens"`
+		GridTHW       [][3]int  `json:"grid_thw"`
+		ImageFeatures []float32 `json:"image_features"`
+	}
+	raw, err := os.ReadFile("../../testdata/qwen25vl_tiny_image_golden.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &g); err != nil {
+		t.Fatal(err)
+	}
+	m, err := decoder.Load("../../testdata/qwen25vl-tiny", decoder.Options{Backend: "metal", Quant: "int4", ResidentContext: 256,
+		Knobs: &decoder.Knobs{"GOINFER_METAL_FAST_PREFILL_FLOOR": "0"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	a, ok := m.ResidentForwardForTest().(*metalResident)
+	if !ok {
+		t.Fatalf("not Metal-resident: %s", m.ResidentDecline())
+	}
+	mrope, err := decoder.MRopePositionsForTest(g.InputIDs, g.ImageToken, g.GridTHW, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := metalLedgerOf(a.r.d)
+	if l == nil {
+		t.Fatal("the build's device has no ledger")
+	}
+	run := func() int64 {
+		t.Helper()
+		a.Reset()
+		if _, _, err := m.ResidentMRoPEPrefillForTest(context.Background(), a, g.InputIDs, g.ImageFeatures, g.ImageStart, g.NImageTokens, mrope); err != nil {
+			t.Fatal(err)
+		}
+		return l.Usage().ByLine[mem.LineScratch]
+	}
+	if first, second := run(), run(); second != first {
+		t.Errorf("the scratch line holds %d bytes after one m-RoPE prefill and %d after a second of the same prompt; want the same", first, second)
+	}
+}
+
+// TestS16MRoPEPrefill_real is G-S16c's first half: Qwen2.5-VL-3B and
 // Qwen3-VL-2B (with its DeepStack sets, S16 step 2) on the four F2a images, the resident m-RoPE prefill against today's path
 // (the CPU prefill and upload, then Metal decode, so both arms decode on the same kernels), over the last prompt row and 8
 // teacher-forced decode steps.
@@ -507,7 +559,7 @@ func TestS16MRoPEPrefill_real(t *testing.T) {
 	}
 }
 
-// TestS16DeepstackPrefill_tiny is S16 step 2's G-S16a and G-S16b defects 4-6 (docs/tasks/task-multimodal-support-2026-10.md):
+// TestS16DeepstackPrefill_tiny is S16 step 2's G-S16a and G-S16b defects 4-6:
 // the tiny Qwen3-VL decoder (2 layers, DeepStack after layers 0 and 1), a synthetic prompt with a 16x24 image (96 merged
 // rows) whose features and DeepStack sets are random at unit scale (the comparison is Go path against Go path, so no HF
 // golden is needed). Today's path: the CPU prefill with the sets, its K/V uploaded, Metal decode; the new path: Metal's

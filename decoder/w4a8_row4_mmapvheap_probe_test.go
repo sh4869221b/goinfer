@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/townsendmerino/aikit/linalg"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // heapifyRow4 replaces wm's row4 bytes/scales with fresh heap allocations holding the
@@ -34,14 +36,14 @@ func heapifyRow4(wm *linalg.WeightMat) bool {
 // 16 GB box, so this times raw MatmulBTW4A8Into calls directly on a small, fixed set of experts, keeping the extra heap
 // footprint under 100 MB.
 //
-// The resident-path row4 speedup (docs/completed/task-w4a8-neon-bandwidth.md) was measured against heap-resident
+// The resident-path row4 speedup was measured against heap-resident
 // repacked bytes (RepackInt4Row4, the GGUF/safetensors streaming loaders). The kind-4 .giw path's row4 bytes are
 // mmap-aliased even when NOT paged (no StreamWeights): Load() always mmaps a .giw file read-only. If mmap-resident calls
 // are slower than heap-resident calls on the identical bytes, the quiet-machine gemma4 gap
-// (docs/completed/task-zeno-compare.md's "Quiet-machine re-measure") is memory-source mechanics (TLB/page-fault residue
+// is memory-source mechanics (TLB/page-fault residue
 // on mapped pages), not paging-machinery overhead.
 func TestRow4_mmapVsHeapResident(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	kind4 := expandHome(t, envOr("GOINFER_GEMMA4_26B_GIW_ROW4", "~/models/gemma4-26b-int4-row4.giw"))
 	if _, err := os.Stat(kind4); err != nil {
 		t.Skipf("no kind-4 gemma4 .giw at %s: %v", kind4, err)

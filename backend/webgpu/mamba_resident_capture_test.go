@@ -9,6 +9,8 @@ import (
 
 	"github.com/townsendmerino/goinfer/decoder"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TestMambaResidentCapture diffs the resident's wiring against the isolated kernels
@@ -21,7 +23,7 @@ import (
 // or in attn/MoE; a divergence is a PLAN/STATE bug (the kernels run differently in the full
 // command buffer than in isolation: barrier, race, state corruption).
 func TestMambaResidentCapture(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	if os.Getenv("GOINFER_SSM_QUALITY") == "" {
 		t.Skip("resident mamba capture — needs granite model; set GOINFER_SSM_QUALITY=1")
 	}
@@ -56,7 +58,8 @@ func TestMambaResidentCapture(t *testing.T) {
 		t.Fatalf("resident forward is %T, not *residentDecoder", m.ResidentForwardForTest())
 	}
 
-	nHeads, headDim, dState, nGroups, dConv, _, _, _, _, gok := m.GraniteResidentParams()
+	g, gok := m.BackendView().Granite()
+	nHeads, headDim, dState, nGroups, dConv := g.NHeads, g.HeadDim, g.DState, g.NGroups, g.DConv
 	if !gok {
 		t.Fatal("not granite")
 	}
@@ -67,7 +70,7 @@ func TestMambaResidentCapture(t *testing.T) {
 	projDim := 2*dInner + 2*gSize + nHeads
 	repeat := nHeads / nGroups
 	eps := float64(m.NormEps())
-	_, convW, convB, aLog, dW, dtBias, normW, _ := m.GraniteMambaWeights(0)
+	_, convW, convB, aLog, dW, dtBias, normW, _ := m.BackendView().Layer(0).GraniteMambaWeights()
 
 	// CPU reference mixer (mamba2.go steps 2-5), fed the resident's OWN proj, fresh state.
 	var win [][]float32
@@ -137,7 +140,7 @@ func TestMambaResidentCapture(t *testing.T) {
 	}
 	nMamba := 0
 	for i := 0; i < nLayers; i++ {
-		if m.GraniteMambaLayer(i) {
+		if m.BackendView().Layer(i).GraniteMamba() {
 			nMamba++
 		}
 	}

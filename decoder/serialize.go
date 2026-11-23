@@ -4,13 +4,15 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"os"
 
-	"github.com/townsendmerino/aikit/linalg"
 	"hash/crc32"
 	"io"
 	"math"
 	"unsafe"
+
+	"github.com/townsendmerino/aikit/linalg"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/logs"
 )
 
 // This file defines the binary format of an already-quantized *Weights bundle (a ".giw", goinfer weights), so the
@@ -69,6 +71,8 @@ import (
 //	   aliased on load through linalg.WrapQ4K. group is 0.
 //	9  bf16: u16, rows×cols bf16 values, aliased on load through linalg.WrapBF16. group is 0. Written for an island
 //	   matrix the load holds bf16 (giwWriter.island); an f32 island is a standalone f32 array instead.
+//	11 Q5_K, 12 Q6_K: raw, as kind 8, for the file's Q5_K and Q6_K tensors a q4k load keeps (q4kNative56), aliased through
+//	   linalg.WrapQ5K / WrapQ6K. Written on a cpu-amd64 target only; every other target widens them to kind 2.
 //
 // Kinds 4 and 7 existed before v16 and are not read.
 
@@ -89,6 +93,10 @@ const (
 	giwKindF32 = 10
 	// giwKindBF16 is a bf16 weight matrix's kind: one aligned binary16 array of rows×cols values, aliased on load.
 	giwKindBF16 = 9
+	// giwKindQ5K and giwKindQ6K are a q4k load's native Q5_K and Q6_K tensors (q4kNative56): the GGUF super-blocks as they
+	// are (176 and 210 bytes per 256 values), aliased on load. Written for the cpu-amd64 target only.
+	giwKindQ5K = 11
+	giwKindQ6K = 12
 	// Sanity ceilings on the count fields, generous against any real checkpoint but low enough that a corrupt or hostile blob
 	// cannot drive a multi-GB make() before the body reader hits its first short read. A LayerWeights is a large struct, so an
 	// unbounded layer count is the worst offender.
@@ -103,8 +111,8 @@ const (
 )
 
 // SerializeError is returned by LoadSerializedWeights on any magic/version/
-// quant/CRC mismatch. It is distinct so callers can fall back to building from
-// the source GGUF rather than treating a stale blob as fatal.
+// quant/CRC mismatch, and by the writer for weights the format cannot hold (a bf16 or f16 load). It is distinct so callers can
+// fall back to building from the source GGUF rather than treating a stale blob as fatal.
 type SerializeError struct{ Reason string }
 
 func (e *SerializeError) Error() string { return "decoder: serialized weights: " + e.Reason }
@@ -152,7 +160,7 @@ func SerializeWeightsTo(out io.Writer, w *Weights, id string) (int64, error) {
 	return wr.n + 4, nil
 }
 
-// SerializeWeightsForTarget is SerializeWeights for a bundle promised to ONE consumer (docs/tasks/task-int4-layout-2026-09.md):
+// SerializeWeightsForTarget is SerializeWeights for a bundle promised to ONE consumer:
 // on a cpu-arm64 target, every eligible int4 tensor (see weightMat vs weightMatKind3Only) writes kind 5 (row4-only)
 // instead of kind 3; every other target, including GIWTargetNone, writes kind 3 for every int4 tensor exactly like
 // SerializeWeights. TranscodeGIW/EnsureCachedGIW (sidecar.go) and cmd/prequant drive this.
@@ -186,6 +194,13 @@ func SerializeWeightsToForTarget(out io.Writer, w *Weights, id string, target GI
 func (wr *giwWriter) writeBundle(w *Weights, id string) error {
 	if err := canSerialize(w.arch); err != nil {
 		return err
+	}
+	// The format has no 16-bit matmul weight kind (LFM2's bf16 conv islands, kind 9, are not matmul weights): refused before a
+	// byte is written, not emitted as a bundle that leaves them out.
+	for _, m := range w.matmulWeights() {
+		if k := m.Kind(); k == "bf16" || k == "f16" {
+			return &SerializeError{"a .giw has no " + k + " matmul weight kind: serialize a load at int4, int8, int8int8 or f32"}
+		}
 	}
 	wr.arch = w.arch // gates the gemma4 model-level PLE + per-layer tail
 	if err := wr.writeHeadGlobals(w, id); err != nil {
@@ -361,7 +376,7 @@ func walkSerializedWeights(data []byte, crcAlreadyVerified bool, beforeWalk func
 	}
 
 	if cfg.Sampling != nil {
-		cfg.Sampling = cfg.Sampling.normalized() // the bundle's bytes are input, held to the same ranges as the checkpoint's
+		cfg.Sampling = cfg.Sampling.Normalized() // the bundle's bytes are input, held to the same ranges as the checkpoint's
 	}
 	arch, _, err := resolveArchitecture(&cfg)
 	if err != nil {
@@ -700,13 +715,15 @@ func validateShapes(w *Weights, arch *Architecture) *SerializeError {
 			}
 		}
 
-		// The v6 completeness tail. forward_gptoss.go indexes AttnSinks[qh] for every head and addBias iterates every expert bias
-		// with no nil check, so for this family these are required, not optional; a gpt-oss sidecar written before v6 is
-		// sink-free, within giwMinReadV, and judged fresh by mtime.
-		if arch.gptoss != nil {
-			if e := req(fmt.Sprintf("layer %d AttnSinks", i), len(lw.AttnSinks), arch.NumHeads); e != nil {
+		// The v6 completeness tail. forward_gptoss.go and the generic sink attention path index AttnSinks[qh] for every head, and
+		// addBias iterates every expert bias with no nil check, so for these families they are required, not optional; a sidecar
+		// written before v6 is sink-free, within giwMinReadV, and judged fresh by mtime.
+		if arch.hasAttnSinks() {
+			if e := req(fmt.Sprintf("layer %d AttnSinks", i), len(lw.AttnSinks), arch.headsAt(i)); e != nil {
 				return e
 			}
+		}
+		if arch.gptoss != nil {
 			for xe := range lw.Experts {
 				ex := &lw.Experts[xe]
 				if ex.Gate.Rows() == 0 {
@@ -850,7 +867,7 @@ func (w *Weights) quantLabel() string {
 			continue
 		}
 		switch m.Kind() {
-		case "q4k":
+		case "q4k", "q5k", "q6k":
 			hasQ4K = true
 		case "int4":
 			hasInt4 = true
@@ -864,7 +881,7 @@ func (w *Weights) quantLabel() string {
 	}
 	switch {
 	case hasQ4K:
-		return "q4k" // its other tensors are int8 W8A8 by construction (matmulQuant)
+		return "q4k" // its other tensors are the file's Q5_K/Q6_K blocks or int8 W8A8 by construction (matmulQuant, q4kNative56)
 	case hasInt4 && (hasInt8I8 || hasInt8):
 		return "int4mix"
 	case hasInt4:
@@ -898,7 +915,7 @@ func NewModelWithOptions(w *Weights, opts Options) (*Model, error) {
 	}
 	be, beErr := NewBackend(opts.Backend)
 	if beErr != nil {
-		fmt.Fprintln(os.Stderr, beErr) // webgpu/cuda requested but fell back — not fatal.
+		logs.Warnf("%v", beErr) // webgpu/cuda requested but fell back — not fatal.
 	}
 	return modelFromOptions(w, be, opts).withBackendNames(opts.Backend, beErr).bindKnobs(opts.Knobs.values()).withResidency(), nil
 }
@@ -921,7 +938,7 @@ type giwWriter struct {
 
 	// target opts weightMat into emitting kind 5 (row4-only, no canonical arrays) for every eligible int4 tensor on a
 	// cpu-arm64 target, instead of kind 3: the one-representation-per-target policy, .giw's counterpart to
-	// wantsCanonicalInt4's in-RAM decision (docs/tasks/task-int4-layout-2026-09.md). GIWTargetNone (the zero value) keeps
+	// wantsCanonicalInt4's in-RAM decision. GIWTargetNone (the zero value) keeps
 	// kind 3 for every int4 tensor.
 	target GIWTarget
 
@@ -1073,6 +1090,24 @@ func (w *giwWriter) weightMatKind3Only(m *linalg.WeightMat) { w.weightMatKind(m,
 func (w *giwWriter) weightMatKind(m *linalg.WeightMat, eligible bool) {
 	if raw, ok := m.Q4K(); ok {
 		w.raw([]byte{8})
+		w.u32(uint32(m.Rows()))
+		w.u32(uint32(m.Cols()))
+		w.u32(0)
+		w.raw([]byte{0})
+		w.alignArray()
+		w.bytesField(raw)
+		return
+	}
+	if raw, kind, ok := kquant56Raw(m); ok {
+		// Kinds 11 and 12 are written for the cpu-amd64 target only, the one q4kNative56 builds them for; a bundle for any other
+		// reader must not carry them.
+		if w.target != GIWTargetCPUAmd64 {
+			if w.err == nil {
+				w.err = fmt.Errorf("decoder: a %dx%d tensor is held as native %s (a Backend \"cpu\" q4k load keeps the file's blocks); only a cpu-amd64 .giw carries it — write for that target, or load with another Backend", m.Rows(), m.Cols(), m.Kind())
+			}
+			return
+		}
+		w.raw([]byte{kind})
 		w.u32(uint32(m.Rows()))
 		w.u32(uint32(m.Cols()))
 		w.u32(0)
@@ -1263,7 +1298,7 @@ func (w *giwWriter) v6Layer(l *LayerWeights) {
 	} else {
 		w.raw([]byte{1})
 		m := l.mla
-		w.mambaProj(m.qAProj, &m.qAQ) // a quantized load's int8 projections as weight records, else f32 arrays (MEM11-int8)
+		w.mambaProj(m.qAProj, &m.qAQ) // a quantized load's int8 projections as weight records, else f32 arrays
 		w.f32(m.qALayernorm)
 		w.mambaProj(m.qBProj, &m.qBQ)
 		w.mambaProj(m.qProj, &m.qQ)
@@ -1637,7 +1672,7 @@ func (r *giwReader) weightMat() linalg.WeightMat {
 	if kind == 0 {
 		return linalg.WeightMat{}
 	}
-	if kind != 1 && kind != giwKindF32 && kind != 2 && kind != 3 && kind != 5 && kind != 8 && kind != giwKindBF16 { // kind 6 is read as a fused group, never here
+	if kind != 1 && kind != giwKindF32 && kind != 2 && kind != 3 && kind != 5 && kind != 8 && kind != giwKindBF16 && kind != giwKindQ5K && kind != giwKindQ6K { // kind 6 is read as a fused group, never here
 		r.unknownEncoding(kind)
 		return linalg.WeightMat{}
 	}
@@ -1745,6 +1780,19 @@ func (r *giwReader) weightMat() linalg.WeightMat {
 		wm, err := linalg.WrapQ4K(raw, rows, cols)
 		if err != nil {
 			r.fail(fmt.Sprintf("q4k weightMat %d×%d: %v", rows, cols, err))
+			return linalg.WeightMat{}
+		}
+		return wm
+	case giwKindQ5K, giwKindQ6K:
+		r.alignArray()
+		raw := r.rawAlias() // zero-copy: the super-blocks are aliased from the mapping
+		wrap, name := linalg.WrapQ5K, "q5k"
+		if kind == giwKindQ6K {
+			wrap, name = linalg.WrapQ6K, "q6k"
+		}
+		wm, err := wrap(raw, rows, cols)
+		if err != nil {
+			r.fail(fmt.Sprintf("%s weightMat %d×%d: %v", name, rows, cols, err))
 			return linalg.WeightMat{}
 		}
 		return wm
@@ -2050,4 +2098,15 @@ func (r *giwReader) hybridLayer(l *LayerWeights) {
 	default:
 		r.fail("unknown per-layer hybrid kind")
 	}
+}
+
+// kquant56Raw returns m's super-blocks and .giw kind when m holds native Q5_K or Q6_K blocks.
+func kquant56Raw(m *linalg.WeightMat) ([]byte, byte, bool) {
+	if raw, ok := m.Q5K(); ok {
+		return raw, giwKindQ5K, true
+	}
+	if raw, ok := m.Q6K(); ok {
+		return raw, giwKindQ6K, true
+	}
+	return nil, 0, false
 }

@@ -7,9 +7,11 @@ import (
 	"math"
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
-// Bailing Hybrid parity (G5, docs/completed/task-families-2026-09.md; inclusionAI Ling 3.0, model_type
+// Bailing Hybrid parity (G5; inclusionAI Ling 3.0, model_type
 // "bailing_hybrid"): DeepSeek-style Multi-head Latent Attention alternating with Kimi Delta Attention (KDA),
 // every layer_group_size-th layer being MLA, over a DeepSeekMoE FFN. MLA and the MoE router compose the existing
 // deepseekArchitecture primitives (two parameterized naming departures: both mixers are self.attention, and
@@ -90,7 +92,7 @@ func TestBailingHybrid_forwardParity(t *testing.T) {
 		t.Fatalf("got %d logits, want vocab %d", len(logits), g.Vocab)
 	}
 
-	if got := argmax(logits); got != g.Argmax {
+	if got := sampling.Argmax(logits); got != g.Argmax {
 		t.Errorf("argmax = %d, want %d (logit[got]=%.4f logit[want]=%.4f)",
 			got, g.Argmax, logits[got], logits[g.Argmax])
 	}
@@ -116,6 +118,6 @@ func TestBailingHybrid_forwardParity(t *testing.T) {
 
 	cos := fullCosine(t, logits, bailingHybridForwardFullPath)
 	t.Logf("bailing_hybrid: argmax=%d (want %d) | maxSampleΔ=%.5f | cosine=%v",
-		argmax(logits), g.Argmax, maxSampleΔ, cos)
+		sampling.Argmax(logits), g.Argmax, maxSampleΔ, cos)
 	emitParityRow(t, "bailing_hybrid", "tiny-golden", "hand-assembled f32 reference (bailing_hybrid-tiny fixture, MLA+KDA composition, KDA's per-channel-decay recurrence via fla-org's own naive reference)", 100.0, cos, cos)
 }

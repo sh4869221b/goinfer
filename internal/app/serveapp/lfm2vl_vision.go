@@ -8,7 +8,7 @@ import (
 	"github.com/townsendmerino/goinfer/multimodal"
 )
 
-// lfm2vlTower is LFM2-VL's image path (S10, docs/tasks/task-multimodal-support-2026-10.md): aikit's SigLIP2 NaFlex tower,
+// lfm2vlTower is LFM2-VL's image path: aikit's SigLIP2 NaFlex tower,
 // the projector, the processor's settings and the <image> token id. The tower runs on the CPU in float32, one tile at a
 // time, and the decoder (lfm2) runs on the CPU only, so the turn goes through decoder.GenerateVLCausalSpans with one span
 // per tile and thumbnail.
@@ -17,6 +17,16 @@ type lfm2vlTower struct {
 	proj   *multimodal.Lfm2VLProjector
 	pp     multimodal.Lfm2VLPreprocessConfig
 	imgTok int
+}
+
+func (t *lfm2vlTower) family() string { return "LFM2-VL" }
+func (t *lfm2vlTower) kind() string   { return "lfm2vl" }
+func (t *lfm2vlTower) imageTok() int  { return t.imgTok }
+
+func (t *lfm2vlTower) close() {
+	if t.enc != nil {
+		t.enc.Close()
+	}
 }
 
 // loadLfm2VLVisionTower attaches LFM2-VL's tower to the single loaded model.
@@ -49,16 +59,15 @@ func (s *server) loadLfm2VLVisionTower(dir string) error {
 				return fmt.Errorf("vision: tokenizer has no %q token", t)
 			}
 		}
-		lm.lfm2vl = &lfm2vlTower{enc: enc, proj: proj, pp: pp, imgTok: id}
+		lm.vision = &lfm2vlTower{enc: enc, proj: proj, pp: pp, imgTok: id}
 		fmt.Fprintf(os.Stderr, "loaded LFM2-VL vision tower for %q (SigLIP2 NaFlex, %d layers, image token id %d, tower on CPU, float32) from %s\n", lm.name, enc.Cfg.NumHiddenLayers, id, dir)
 	}
 	return nil
 }
 
-// lfm2vlPrep prepares one image: its tiles (row-major, then the thumbnail), one <image> run per tile, and the lazy tower
+// prep prepares one image: its tiles (row-major, then the thumbnail), one <image> run per tile, and the lazy tower
 // and projector over each tile in turn.
-func (lm *loadedModel) lfm2vlPrep(img imageRef) (imagePrep, error) {
-	t := lm.lfm2vl
+func (t *lfm2vlTower) prep(lm *loadedModel, img imageRef) (imagePrep, error) {
 	layout, err := multimodal.Lfm2VLPreprocess(img.data, t.pp)
 	if err != nil {
 		return imagePrep{}, err

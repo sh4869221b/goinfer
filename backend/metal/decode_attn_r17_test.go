@@ -359,7 +359,8 @@ func r17ExactNull(t *testing.T, r *resident) Pipeline {
 //	GOINFER_METAL_R17=1 go test -tags goinfer_testhooks -run '^TestR17AttentionProto$' -v ./metal/
 //
 // Env: GOINFER_METAL_R17_MODEL, GOINFER_METAL_R17_DEPTHS (default 3900), GOINFER_METAL_R17_SPLITS (split counts for
-// the prototype, default "0,32"; 0 = production's rule), GOINFER_METAL_R17_REPS (5), GOINFER_METAL_R17_TOKENS (20).
+// the prototype, default "0,32"; 0 = production's rule), GOINFER_METAL_R17_REPS (5), GOINFER_METAL_R17_TOKENS (20),
+// GOINFER_METAL_R17_ABBA (1: the first two arms alternate their order rep by rep).
 func TestR17AttentionProto(t *testing.T) {
 	if os.Getenv("GOINFER_METAL_R17") != "1" {
 		t.Skip("set GOINFER_METAL_R17=1 (loads a real checkpoint; minutes of GPU time)")
@@ -403,7 +404,7 @@ func TestR17AttentionProto(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("build resident: %v", err)
 	}
@@ -545,9 +546,23 @@ func TestR17AttentionProto(t *testing.T) {
 
 		res := make([][]float64, len(arms))
 		idleRes := make([][]float64, len(arms)) // one token right after 2 s idle, per arm per rep (R17 precondition 3)
+		// GOINFER_METAL_R17_ABBA=1 swaps the first two arms on every odd rep, so the pairs run A B, B A, A B, …: a drift across the
+		// run lands on both arms alike.
+		abba := os.Getenv("GOINFER_METAL_R17_ABBA") == "1" && len(arms) >= 3
 		for rep := 0; rep < reps; rep++ {
-			for ai, a := range arms {
-				res[ai] = append(res[ai], runArm(a))
+			order := make([]int, len(arms))
+			for i := range order {
+				order[i] = i
+			}
+			if abba && rep%2 == 1 {
+				order[0], order[1] = 1, 0
+			}
+			got := make([]float64, len(arms))
+			for _, ai := range order {
+				got[ai] = runArm(arms[ai])
+			}
+			for ai := range arms {
+				res[ai] = append(res[ai], got[ai])
 			}
 			for ai, a := range arms {
 				restore := setArm(a)
@@ -1163,7 +1178,7 @@ func TestR17KernelAccuracy(t *testing.T) {
 	} // GOINFER_METAL_R17_ACC_ARMS=decision keeps only the arms the pre-registered decision grades
 	// (docs/measurements/metal-decode-attn-fidelity-setb-PREREGISTERED.md): the exact kernel and the two candidates.
 	// GOINFER_METAL_R17_ACC_ARMS=bp03 keeps the exact kernel and production's attention_fa (the block kernel since
-	// R17): B-P03's P1, at the depths below the floor as it then stood, 1536 (docs/tasks/task-metal-audit-2026-10.md); it moved to 1024 on that grade.
+	// R17): B-P03's P1, at the depths below the floor as it then stood, 1536; it moved to 1024 on that grade.
 	switch os.Getenv("GOINFER_METAL_R17_ACC_ARMS") {
 	case "bp03":
 		keep := map[string]bool{"exact (shipped attention)": true, "production (r.pAttnFA)": true}
@@ -1233,7 +1248,7 @@ func TestR17KernelAccuracy(t *testing.T) {
 			r.stopExec()
 			copy(r.x.Floats(), m.EmbedResidentForTest(tok))
 			r.addLearnedPos(K)
-			r.setPos(K)
+			r.setPosAheadForTest(K)
 			nKeys := K + 1
 			for l := 0; l < r.nL; l++ {
 				e := r.q.Begin()
@@ -1436,7 +1451,7 @@ func TestR17KernelAccuracy(t *testing.T) {
 						}
 					}
 				}
-				r.setPos(K) // restore the production split uniform for the next layer's encode
+				r.setPosAheadForTest(K) // restore the production split uniform for the next layer's encode
 			}
 			fmt.Fprintf(os.Stderr, "[r17-acc] prompt %d/%d depth %d done (decode token %d at pos %d)\n", pi+1, nPrompts, K, tok, K)
 		}

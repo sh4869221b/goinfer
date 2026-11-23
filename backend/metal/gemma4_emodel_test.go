@@ -36,7 +36,7 @@ func eModelPrompt(t *testing.T) []int {
 	return append(append([]int(nil), g.PromptIDs...), g.ContinuationIDs...)
 }
 
-// eModelG1 is the measurement G1 grades (docs/tasks/task-multimodal-support-2026-10.md): Metal resident against the
+// eModelG1 is the measurement G1 grades: Metal resident against the
 // CPU, int4 on both sides, teacher-forced over eModelPrompt, plus the CPU's own int4-vs-f32 agreement for the
 // envelope.
 type eModelG1 struct {
@@ -62,7 +62,7 @@ func runEModelG1(t *testing.T) eModelG1 {
 	if err := program.Metal.Check(mg.Program()); err != nil || len(mg.FeaturesOutsideProgram()) > 0 {
 		t.Fatalf("metal declines the tiny E-model: %v, outside the program %v", err, mg.FeaturesOutsideProgram())
 	}
-	r, err := buildResident(mg)
+	r, err := buildResident(mg, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("buildResident: %v", err)
 	}
@@ -154,7 +154,17 @@ func TestGemma4EModel_metalResidentParity(t *testing.T) {
 	}
 }
 
-// TestGemma4EModel_plantedDefects is S1's G2 (docs/tasks/task-multimodal-support-2026-10.md): each planted defect,
+// g4OneFFNWidth plants G2's defect (4): every layer's FFN at the model's width (256), its declared gate and up lowered with it, so the
+// build's row check passes and G1, which reads each layer's own FFN, grades the defect.
+func g4OneFFNWidth(on bool) {
+	g4OneFFNWidthForTest = on
+	decodeRowsPlantForTest = nil
+	if on {
+		decodeRowsPlantForTest = func(r map[string]int) { r["gate"], r["up"] = 256, 256 }
+	}
+}
+
+// TestGemma4EModel_plantedDefects is S1's G2: each planted defect,
 // alone, must turn G1 red. A defect that stays green means the fixture is degenerate along that axis.
 func TestGemma4EModel_plantedDefects(t *testing.T) {
 	defects := []struct {
@@ -164,7 +174,7 @@ func TestGemma4EModel_plantedDefects(t *testing.T) {
 		{"(1) PLE branch skipped", func(on bool) { g4SkipPLEForTest = on }},
 		{"(2) PLE token-identity term zeroed", decoder.SetGemma4PLEDropTokenForTest},
 		{"(3) shared-KV source one owning layer off", func(on bool) { g4KVSrcOffForTest = on }},
-		{"(4) one FFN width for the model", func(on bool) { g4OneFFNWidthForTest = on }},
+		{"(4) one FFN width for the model", g4OneFFNWidth},
 		{"(6) layer scalar dropped", func(on bool) { g4DropLayerScalarForTest = on }},
 		{"(7) v_norm dropped on non-K=V layers", func(on bool) { g4DropVNormForTest = on }},
 	}
@@ -182,8 +192,7 @@ func TestGemma4EModel_plantedDefects(t *testing.T) {
 	}
 }
 
-// TestGemma4EModel_sharedStoreIsNoOp records why G2's defect (5) cannot go red on any fixture (amendment,
-// docs/tasks/task-multimodal-support-2026-10.md). A shared layer's Q-only GEMV writes only the Q region of the qkv
+// TestGemma4EModel_sharedStoreIsNoOp records why G2's defect (5) cannot go red on any fixture. A shared layer's Q-only GEMV writes only the Q region of the qkv
 // scratch, so its K/V slots still hold what its source layer — the last owning layer of the same attention type —
 // stored earlier in the same token: the other type's writes end below that slot (fixture: sliding writes floats
 // 0..191, the global K slot starts at 256; E2B: 0..2559 against 4096). An unskipped store therefore re-writes the
@@ -204,8 +213,7 @@ func TestGemma4EModel_sharedStoreIsNoOp(t *testing.T) {
 	t.Logf("shared-layer store kept: logits bit-identical to the clean run over %d positions", len(clean.metal))
 }
 
-// gemma4StepFixtures are the tracked Gemma 4 dense checkpoints the step's per-row Gemma 4 layers are checked on (OP4m-d5a,
-// docs/tasks/task-forward-architecture-2026-10.md §4.9): an E-model (PLE, layers sharing another's KV), and two plain dense
+// gemma4StepFixtures are the tracked Gemma 4 dense checkpoints the step's per-row Gemma 4 layers are checked on: an E-model (PLE, layers sharing another's KV), and two plain dense
 // ones, one with two attention geometries.
 var gemma4StepFixtures = []string{"../../testdata/gemma4-emodel-tiny", "../../testdata/gemma4-dense-twogeom-tiny", "../../testdata/gemma4-dense-scaled"}
 
@@ -216,7 +224,7 @@ func gemma4StepModel(t *testing.T, dir string, on bool) (*decoder.Model, *reside
 	if err != nil {
 		t.Fatalf("load %s: %v", dir, err)
 	}
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		m.Close()
 		t.Fatalf("build %s's resident: %v", dir, err)
@@ -391,7 +399,7 @@ func TestMC3Step_gemma4ScratchPriced(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { m.Close() })
-	metalMemoryCeilingForTest = residentNeedBytes(m) + metalSlotBytes(m)
+	metalMemoryCeilingForTest = residentNeedBytes(m, metalCtxPlan{}) + metalSlotBytes(m, metalCtxPlan{})
 	rf, ok, err := (&metalBackend{}).BuildResident(m)
 	if err != nil || !ok {
 		t.Fatalf("the load was refused: %v", err)

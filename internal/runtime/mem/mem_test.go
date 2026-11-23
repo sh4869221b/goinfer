@@ -242,3 +242,77 @@ func TestHostCheck_notOfferedStreamingWhereItCannotPage(t *testing.T) {
 		}
 	}
 }
+
+// TestUnpinnedExpertsHint_onlyWhenTheCopyIsWhatDoesNotFit: a refusal names --moe-experts-unpinned only when a pinned expert copy is in the need and
+// dropping it would bring the need within the budget: the .giw guard's pinned-context and floor refusals, and the .gguf build's decline.
+func TestUnpinnedExpertsHint_onlyWhenTheCopyIsWhatDoesNotFit(t *testing.T) {
+	const GB = int64(1) << 30
+	m, p := HostMachine(40*GB), DefaultPolicy()
+	kv := func(ctx int) int64 { return int64(ctx) << 10 }
+	for _, c := range []struct {
+		name   string
+		l      GIWLoad
+		want   bool
+		refuse bool
+	}{
+		{"device KV: the pinned copy is the whole need", GIWLoad{Ctx: 4096, Pinned: true, DeviceKV: true, PinnedExperts: 60 * GB, KV: kv}, true, true},
+		{"host KV alone is over the budget", GIWLoad{Ctx: 50 << 20, Pinned: true, PinnedExperts: 5 * GB, KV: kv}, false, true},
+		{"pinned copy only, over the budget, dropping it fits", GIWLoad{Ctx: 4096, Pinned: true, DeviceKV: true, PinnedExperts: 45 * GB, KV: kv}, true, true},
+		{"floor refusal, dropping the copy fits", GIWLoad{Ctx: 4096, DeviceKV: true, PinnedExperts: 45 * GB, KV: kv}, true, true},
+		{"no pinned copy", GIWLoad{Ctx: 1 << 26, Pinned: true, KV: kv}, false, true},
+		{"fits", GIWLoad{Ctx: 4096, Pinned: true, DeviceKV: true, PinnedExperts: 10 * GB, KV: kv}, false, false},
+	} {
+		d := SolveGIW(c.l, m, p)
+		if (d.Err != nil) != c.refuse {
+			t.Fatalf("%s: refused %v, want %v (%v)", c.name, d.Err != nil, c.refuse, d.Err)
+		}
+		if d.Err == nil {
+			continue
+		}
+		if got := strings.Contains(d.Err.Error(), "--moe-experts-unpinned"); got != c.want {
+			t.Errorf("%s: the refusal names --moe-experts-unpinned: %v, want %v: %v", c.name, got, c.want, d.Err)
+		}
+	}
+	// A .gguf CUDA expert-cache build: weights twice and the experts once.
+	hc := func(w, e int64) HostCheck {
+		return NewHostCheck(HostLoad{Name: "m", Quant: "int4", GGUF: true, WeightBytes: w, ExpertBytes: e, CUDABuildBytes: 2*w + e}, m, p)
+	}
+	if c := hc(10*GB, 12*GB); c.Fits() || !strings.Contains(c.Decline().Msg, "--moe-experts-unpinned") {
+		t.Errorf("a build refused by its pinned copy (fits %v) does not name the flag: %s", c.Fits(), c.Decline().Msg)
+	}
+	if c := hc(20*GB, 12*GB); c.Fits() || strings.Contains(c.Decline().Msg, "--moe-experts-unpinned") {
+		t.Errorf("a build that does not fit even without its copy names the flag: %s", c.Decline().Msg)
+	}
+	// The build peak without the copy fits, but the weights and the KV alone do not: the flag would not make the load fit, so it is not named.
+	kvBound := NewHostCheck(HostLoad{Name: "m", Quant: "int4", GGUF: true, WeightBytes: 10 * GB, KVBytes: 19 * GB, ExpertBytes: 12 * GB,
+		CUDABuildBytes: 32 * GB}, m, p)
+	if kvBound.Fits() || strings.Contains(kvBound.Decline().Msg, "--moe-experts-unpinned") {
+		t.Errorf("a load the flag would not save names it (fits %v): %s", kvBound.Fits(), kvBound.Decline().Msg)
+	}
+}
+
+// TestHostCheck_heapSlackBesideTheSource: a load that maps its source is priced 1% of its weights more, for its own heap beside them
+// (HeapSlackBytes); a load with no source term is not; and SmallerFittingContext takes the slack out of the budget as it does the source.
+func TestHostCheck_heapSlackBesideTheSource(t *testing.T) {
+	const GB = int64(1) << 30
+	const w, src = 100 * GB, 50 * GB
+	m, p := HostMachine(400*GB), DefaultPolicy()
+	with := NewHostCheck(HostLoad{Name: "m", Quant: "int4", GGUF: true, WeightBytes: w, SourceBytes: src}, m, p)
+	if got, want := with.Need(), int64(w+src+w/100); got != want {
+		t.Errorf("with a source: need %d, want weights + source + 1%% of the weights = %d", got, want)
+	}
+	if !strings.Contains(with.Arithmetic(), "1.00 GiB heap beside it") {
+		t.Errorf("the arithmetic does not name the heap slack: %q", with.Arithmetic())
+	}
+	without := NewHostCheck(HostLoad{Name: "m", Quant: "int4", WeightBytes: w}, m, p)
+	if got := without.Need(); got != w {
+		t.Errorf("with no source: need %d, want the weights alone %d", got, int64(w))
+	}
+	// A KV curve of 1 byte a position, with the budget leaving exactly 1,000 positions beside weights, source and slack.
+	kv := func(ctx int) int64 { return int64(ctx) }
+	c := HostCheck{HostLoad: HostLoad{Name: "m", GGUF: true, WeightBytes: w, SourceBytes: src, KV: kv, Ctx: 1 << 20}, Policy: Policy{WeightsFraction: 1, CtxFloor: 1}}
+	c.Available = w + src + w/100 + 1000
+	if got, ok := c.SmallerFittingContext(); !ok || got != 1000 {
+		t.Errorf("SmallerFittingContext = %d, %v; want 1000 positions once the slack is out of the budget", got, ok)
+	}
+}

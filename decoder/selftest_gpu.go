@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// The resident self-test (docs/tasks/task-hardware-coverage-2026-10.md, H2): for a GPU backend, run tiny committed checkpoints through the RESIDENT path and through the CPU path already in this
+// The resident self-test: for a GPU backend, run tiny committed checkpoints through the RESIDENT path and through the CPU path already in this
 // binary, and hold the resident logits to the CPU's with the numeric bars the resident-vs-CPU parity gates already use. It exercises the kernels the real model is about to use (the same resident
 // build, not reimplementations), on a fixed deterministic input, and it runs once per backend and quant per process, before the real model's resident is built, so the device memory its
 // fixture builds take is released (on CUDA the context goes with the last fixture, and its pool with it) or already held when the real build plans and fit-checks. On a mismatch the real
@@ -49,8 +49,8 @@ var (
 	gpuProbeCache = map[string]SelfTestResult{}
 )
 
-// probeMeasured lists the backends whose healthy-hardware margins against the bars were measured, each on ONE device
-// (figures: docs/tasks/task-hardware-coverage-2026-10.md). A backend not on it is NOT probed (its result is simply
+// probeMeasured lists the backends whose healthy-hardware margins against the bars were measured, each on ONE device.
+// A backend not on it is NOT probed (its result is simply
 // absent from the report) rather than probed against bars nobody has seen it clear. WebGPU's margins come from one
 // NVIDIA adapter over Vulkan, so AMD, Intel and DX12 adapters are probed against those bars unmeasured, a risk of a
 // false decline. Metal's come from one M1 Pro; a fixture Metal re-quantizes to int4 is not compared
@@ -61,7 +61,7 @@ var probeMeasured = map[string]bool{"cuda": true, "webgpu": true, "metal": true}
 // and whether a probe applies at all.
 func gpuProbeBeforeResident(m *Model) (SelfTestResult, bool) {
 	backend := probeBackendName(m.be)
-	if !probeMeasured[backend] || m.noSelfTest || SelfTestsSkipped() {
+	if !probeMeasured[backend] || m.opts.noSelfTest || SelfTestsSkipped() {
 		return SelfTestResult{}, false
 	}
 	if why, skip := probeIneligible(m.be); skip {
@@ -198,7 +198,7 @@ func probeFixture(backend, quant, name string, positions int, worst *probeWorst)
 		return nil, "", fmt.Errorf("load on cpu: %w", err)
 	}
 	defer cm.Close()
-	_, _, _, _, _, _, vocab := cm.Dims()
+	vocab := cm.Shape().Vocab
 	prompt := make([]int, positions)
 	for i := range prompt {
 		prompt[i] = (i*37 + 3) % vocab
@@ -232,13 +232,14 @@ func probeFixture(backend, quant, name string, positions int, worst *probeWorst)
 	}
 
 	// Batched prefill, when the backend has one: a real prompt takes this path. A decline is not a failure (the sequential path is then what runs, and was just checked).
-	if pf, ok := rf.(Prefiller); ok {
+	if canStep(rf, stepBatch{Pass: passRows, Emb: stepProbe}) {
 		rf.Reset()
 		embs := make([][]float32, positions)
 		for i, tok := range prompt {
 			embs[i] = gm.embedResident(tok)
 		}
-		got, perr := pf.PrefillLast(context.Background(), embs, 0)
+		sr, perr := stepOn(rf, stepBatch{Pass: passRows, Emb: embs})
+		got := sr.Logits
 		if perr == nil {
 			want, err := cm.prefillLogits(context.Background(), prompt, cm.NewCache(positions))
 			if err != nil {
@@ -258,11 +259,11 @@ func probeFixture(backend, quant, name string, positions int, worst *probeWorst)
 	return mismatches, "", nil
 }
 
-// residentPrecision is the quant a resident actually computes at: what it reports (ResidentQuantReporter), else the int4
+// residentPrecision is the quant a resident actually computes at: what it reports (ResidentCaps.Quant), else the int4
 // residentQuantLabel names for a re-quantizing (backend, quant), else the load quant.
 func residentPrecision(backend, quant string, rf ResidentForward) string {
-	if qr, ok := rf.(ResidentQuantReporter); ok && qr.ResidentQuant() != "" {
-		return qr.ResidentQuant()
+	if q := residentCapsOf(rf).Quant; q != "" {
+		return q
 	}
 	if residentQuantLabel(backend, quant) != quant {
 		return "int4"

@@ -66,7 +66,7 @@ the end cannot see it: one empty cell among several full ones leaves g.ran > 0, 
 reports clean and its coverage is simply gone. Every -run pattern in this file is a literal
 test-name prefix or alternation, so renaming a test silently empties its cell — the same
 shape as the qwen3next oracle, where a -run pattern that could not match a required gate
-produced "DID NOT RUN" for five weeks (docs/tasks/task-verification-surface-audit.md).
+produced "DID NOT RUN" for five weeks.
 ```
 
 ## noteIfAllSkipped
@@ -217,6 +217,24 @@ anywhere in the gate. TWO groups now, because they answer different questions an
 evidence for the other (audit G-01: the artifact must not be adjacent to what it is read as).
 ```
 
+## cudaParityCell: timeout
+
+The cell runs the whole `./backend/cuda/` package under `cuda goinfer_testhooks` as one test binary, so its timeout is
+that package's wall plus headroom. It was 10m until the package outgrew it (`docs/measurements/sb12-2026-10.md` §19),
+then 20m. The package's wall, from the nightly CUDA device suite on nobara (same package, same tags, `-timeout 25m`):
+
+| date | commit | package wall |
+|---|---|---|
+| 2026-11-03 | 112e64a75 | 1129 s |
+| 2026-11-18 | 1287a582a | 1231 s |
+| 2026-11-20 | b7ce0e1cb | 1297 s |
+
+By 2026-11-18 it had passed 1200 s, so every `gate gpu` from then on would time this cell out with no test failed. That
+happened on the v0.25.0 pre-flight run of 2026-11-20 at e0d661712, in `TestPrefillSteps_equalTheFlags` at test 1341,
+while the nightly suite passed the same code (b7ce0e1cb..e0d661712 changes only `README.md` and `docs/`). The growth is
+cumulative, with no single commit behind it. 35m is about 1.6x the 2026-11-20 wall. The nightly suite's own 25m cap
+then had about 3 minutes of headroom left.
+
 ## drainingTests
 
 Moved from `cmd/gate/gpu.go` (the comment above `drainingTests`) on 2026-10-09.
@@ -329,6 +347,22 @@ group as one process per model family, so no process holds two large checkpoints
   their memory sampled (under `timing_lock.py run` on the CUDA box).
 - **A single test can exceed the goal on its own.** Grouping cannot split one test. The 2026-10-15 readings are in
   `docs/measurements/b23-cuda-heavy-split-2026-10-15.md`.
+
+## cudaHeavy: the kv10 group
+
+Owner decision, Francis, 2026-11-21: option (c), both remedies, after the v0.25.0 pre-flight gate. Gate budgets are his call, as the
+20m to 35m parity-cell change (#1207) was.
+
+- **The cause.** `TestKV10_longContextFidelity` is KV10-b's long-context harness: a KV f16 against KV f32 logit comparison on
+  qwen3.5-0.8b at depths 3900, 65536 and 131000 (`docs/measurements/kv10-2026-11/README.md`). Its checkpoint classified it into
+  `small`. On the pre-flight run of 2026-11-20 at e0d661712 it took 3494 s: depth 65536 took 702 s, and depth 131000 most of the
+  rest, since prefill grows quadratically. With it, `small` hit its 120 m timeout at 7201 s; the group took 1809 s on 2026-10-16.
+  148 of its 621 tests never started, one was cut off mid-run, and the partition reconciliation failed on the same 149.
+- **The remedy.** `heavyFamilies` gives the harness its own group, `kv10`, keyed on `KV10_CKPT`, an env name only that test reads,
+  at a rank above `small`. `heavyGroupEnv` sets `GOINFER_KV10_DEPTHS=3900,65536` in every heavy process, which brings the harness to
+  about 12 min. The 131000 depth stays a by-hand measurement: its command is on the test's own doc comment.
+  `TestHeavyPartition_cudaTreeFitsTheTable` holds the derived group to that one test, and
+  `TestHeavyGroup_kv10RunsAloneAtTheGatesDepths` holds the depths.
 
 ## ptxVersionRe (group 4 header)
 
@@ -943,7 +977,7 @@ REQUIRED GATES GREEN, exit 0 (audit-2026-09-02 G-05).
 Moved from `cmd/gate/quick_select.go` (the comment above `quickModule`) on 2026-10-09.
 
 ```text
-`gate quick`'s SELECTION (TE7(a), docs/tasks/task-test-efficiency-2026-09.md): changed files ->
+`gate quick`'s SELECTION (TE7(a), docs/completed/task-test-efficiency-2026-09.md): changed files ->
 their packages -> every test binary, in any of the five modules, that can observe them.
 
 THREE TIERS, because "imports the change" is not the only way a test here observes one:
@@ -1271,7 +1305,7 @@ Moved from `cmd/gate/identity.go` (the comment above `identityDumperTmpl`) on 20
 
 ```text
 `gate identity <old-rev> <new-rev>` — inherit validation by identity (TE6(b),
-docs/tasks/task-test-efficiency-2026-09.md).
+docs/completed/task-test-efficiency-2026-09.md).
 
 For a change meant to be numerically neutral, the cheapest complete proof is byte-identical logits
 against the last validated build on the family's parity prompt. This formalizes what L1 did by hand
@@ -1504,7 +1538,7 @@ that "0 passed" could be told apart from "0 attempted", which are different bugs
 Moved from `cmd/gate/identity_record.go` (comments that named retired scripts, dates or audit ids; the new comments state the same contracts) on 2026-10-09.
 
 ```text
-`gate identity -record FILE` (TE6(b), docs/tasks/task-test-efficiency-2026-09.md; owner decision 2026-09-28: a
+`gate identity -record FILE` (TE6(b), docs/completed/task-test-efficiency-2026-09.md; owner decision 2026-09-28: a
 family's validation may be inherited by identity). It writes PARITY_ROW lines for the decoder package's
 TestParityManifest_merge, the manifest's one writer, and never writes the manifest itself.
 ```

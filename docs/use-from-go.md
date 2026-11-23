@@ -80,7 +80,7 @@ tokenizer to add one:
 // buildPrompt renders the checkpoint's own chat template when Detect recognizes it (ErrUnknownTemplate
 // means fall back to the raw prompt) and encodes it. A rendered template already carries the family's
 // own BOS marker (Template.Render's contract, chat/chat.go:Template.Render); addBOS=true would double it on
-// Gemma/Llama-3/Mistral (M-39, audit-2026-09-10). Only the raw-text fallback needs the tokenizer to
+// Gemma/Llama-3/Mistral. Only the raw-text fallback needs the tokenizer to
 // prepend one.
 func buildPrompt(tok *tokenizer.Tokenizer, prompt string) ([]int, error) {
 	text := prompt
@@ -138,23 +138,13 @@ type Person struct {
 
 The constraint is a logit mask. At every step, `Masker.Process` sets every token that would
 break the schema to −∞, so an invalid token cannot be sampled at all; nothing is retried.
-`StopWhenComplete` ends generation at the first complete document. The stop ids are the model's
-end-of-sequence and end-of-turn tokens, which the masker allows only once the document is
-complete:
+`StopWhenComplete` ends generation at the first complete document. The stop ids, from
+`Template.StopIDs`, are the model's end-of-sequence and end-of-turn tokens and the template's own
+stop markers, which the masker allows only once the document is complete:
 
 ```go
 	// The stop ids end generation; the masker allows them only once the document is complete.
-	var stop []int
-	for _, id := range []int{tok.Special().EOS, tok.Special().EndOfTurn} {
-		if id >= 0 {
-			stop = append(stop, id)
-		}
-	}
-	for _, s := range tmpl.Stops().Strings {
-		if id, ok := tok.TokenID(s); ok {
-			stop = append(stop, id)
-		}
-	}
+	stop := tmpl.StopIDs(tok)
 ```
 
 ```go
@@ -205,6 +195,8 @@ The supported subset:
 - objects, with required and optional properties and `additionalProperties: false`;
 - arrays, with `items`, `minItems` and `maxItems`;
 - `string`, `number`, `integer`, `boolean` and `null`;
+- a string's `format`, held for `date`, `time`, `date-time`, `uuid`, `ipv4` and `email` (any other
+  format is an annotation, so the string stays free);
 - `enum` and `const`;
 - nesting to any depth.
 
@@ -274,10 +266,20 @@ on a CPU. Over HTTP the same request is an `image_url` part plus `response_forma
   `PromptHiddenAll`, `PromptHiddenMany`, `PromptLogitsMany`, `ForwardCapture`,
   `OutputEmbeddingRow`, `NewBlockSpec` and `LoadAdapter`. One running at `Close` is cancelled (or
   waited for, when it takes no context) and one made afterward returns `decoder.ErrClosed`.
-- Not guarded: the accessors that return slices of the weights (`Weights`, `MLALayerWeights` and
+- Not guarded: the accessors that return slices of the weights (`Weights`, `Layer(l).MLAWeights` and
   the like) hand out views of the file mapping, which is gone after `Close`; keep them only while
   the model is open. `Config`, `Dims`, `Quant`, `NewCache` and `NewSession` only read the config or
   allocate, and still work afterward.
+
+## Errors and logging
+
+`decoder.Load` refuses a model you can branch on with `errors.Is`: `decoder.ErrUnsupportedModel`, `decoder.ErrUnknownQuant`,
+`decoder.ErrUnknownBackend`, and `decoder.ErrWontFitResident` for one the fit guard turned away.
+
+The library says what it decided (a context capped, a path declined, a fallback taken) as plain lines on stderr. To take them instead,
+call `decoder.SetLogger` with a `*slog.Logger`: each message becomes a record at debug, info or warn, attributed to the line that wrote it,
+and nothing reaches stderr. It covers `decoder` and the GPU backends. It does not cover the banner and request log of a server embedded
+with `server.NewHandler`, or `pull`'s download progress.
 
 ## What v1.0 will bind
 

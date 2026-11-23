@@ -10,7 +10,7 @@ import (
 	"github.com/townsendmerino/goinfer/multimodal"
 )
 
-// Qwen2.5-VL's vision tower in float32 on the CUDA tower base (docs/tasks/task-multimodal-support-2026-10.md): the port
+// Qwen2.5-VL's vision tower in float32 on the CUDA tower base: the port
 // of metal/vl_towers.go's qwen25VResident, replacing aikit's gpu/qwencuda (unfused attention, and an allocation that
 // failed beside the decoder at serve's defaults). Everything positional comes from aikit's own exports, not a
 // reimplementation:
@@ -23,7 +23,7 @@ func init() {
 	vision.RegisterQwenResident(func(enc *vision.QwenVisionEncoder) (vision.QwenResidentEncoder, error) {
 		return newQwen25Tower(enc)
 	})
-	multimodal.MarkResidentTower(multimodal.TowerQwen25VL, "cuda") // S8: aikit's slot cannot be asked what is registered
+	multimodal.MarkResidentTower(multimodal.TowerQwen25VL, "cuda") // aikit's slot cannot be asked what is registered
 }
 
 type qwen25Tower struct {

@@ -45,12 +45,12 @@ import json, os, re, signal, socket, subprocess, sys, threading, time, urllib.re
 GOINFER = os.environ.get("GOINFER_SERVE", "./goinfer-serve")
 OLLAMA = os.environ.get("OLLAMA_BIN", os.path.expanduser("~/ollama-0325/bin/ollama"))
 OLLAMA_MODELS = os.environ.get("OLLAMA_MODELS", os.path.expanduser("~/ollama-0325/models"))
-# llama-server (docs/tasks/task-peer-benchmarks.md §1): verified live 2026-09-04 that its
+# llama-server: verified live 2026-09-04 that its
 # /v1/chat/completions stream is byte-for-byte the shape parse_openai already handles --
 # same role/content/finish_reason delta framing, same usage.completion_tokens final chunk --
 # so it reuses parse_openai directly rather than a third parser.
 LLAMACPP = os.environ.get("LLAMACPP_BIN", "llama-server")
-# MLX (Mac only, docs/tasks/task-peer-benchmarks.md §1/§7): "mlx_lm.server ... speak[s] OpenAI-compatible
+# MLX (Mac only): "mlx_lm.server ... speak[s] OpenAI-compatible
 # chat completions, so one client covers them" -- verified live 2026-09-04, its stream is the same
 # role/content/finish_reason delta framing plus a final usage.completion_tokens chunk parse_openai
 # already handles (the terminal chunk has empty `choices` and `object: chat.completion`, not
@@ -68,7 +68,7 @@ MLX_BIN = os.environ.get("MLX_SERVER_BIN", "mlx_lm.server")
 # with extra weight"). Populated per-model as pulled; a model key with no entry here is skipped by
 # plan_engines() rather than failing the whole sweep -- see run_cell's mlx branch.
 MLX_MODELS = {
-    # S / 1.5B, pulled 2026-09-04 (docs/tasks/task-peer-benchmarks.md tier-1/tier-2 base cell). Verified
+    # S / 1.5B, pulled 2026-09-04 (tier-1/tier-2 base cell). Verified
     # via HfApi.model_info before pulling, same as 7B/M35/M26 below.
     "1.5B": os.path.expanduser(os.environ.get("MLX_MODEL_1_5B",
         "~/models/mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit")),
@@ -90,7 +90,7 @@ MLX_MODELS = {
 MODELS = {
     "0.5B": (os.path.expanduser("~/models/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf"), "q05"),
     "1.5B": (os.path.expanduser("~/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"), "q15"),
-    # E2B added 2026-10-06 for S1.9 of docs/tasks/task-multimodal-support-2026-10.md: goinfer's own Metal-resident vs
+    # E2B added 2026-10-06 for S1.9 of docs/completed/task-multimodal-support-2026-10.md: goinfer's own Metal-resident vs
     # CPU decode record (BENCH_ENGINES=goinfer). The peer tag is a placeholder: no peer row is taken for it yet.
     "E2B":  (os.path.expanduser("~/models/gemma-4-e2b-gguf/gemma-4-E2B_q4_0-it.gguf"), "e2b-none"),
     # 7B added 2026-08-22. Both other rows are TINY, and this repo has already been burned by
@@ -106,18 +106,22 @@ MODELS = {
     # gemma3-1b's GGUF is the ollama blob copied into ~/models under a real name. It was in neither
     # ~/models nor the archive: the geometry is not optional -- its sliding window is the case that
     # exposed the split-KV gate testing nKeys instead of the window-clamped nWin.
-    # p3m-local, not p3m (2026-09-25, docs/tasks/task-peer-claim-2026-09.md): the old p3m tag is a
+    # p3m-local, not p3m: the old p3m tag is a
     # DIFFERENT phi3-mini revision -- gguf_same_weights.py found 0/195 tensors identical against this
     # file, f32 norms included -- so every phi3-mini peer row before this date compared different
     # weights. p3m-local is this file imported with `ollama create` (FROM <this path>): 195/195
     # identical, and its template closes turns with <|end|>, where p3m used </s>.
     "phi3-mini":  (os.path.expanduser("~/models/phi3-mini-4k-gguf/Phi-3-mini-4k-instruct-q4.gguf"), "p3m-local"),
     "gemma3-1b":  (os.path.expanduser("~/models/gemma3-1b-q4_k_m.gguf"), "g31b"),
-    # gemma3-4b added 2026-10-13 for OP1's Metal speed guard (docs/tasks/task-forward-architecture-2026-10.md §4.6, G2-S):
+    # gemma3-4b added 2026-10-13 for OP1's Metal speed guard (docs/completed/task-forward-architecture-2026-10.md §4.6, G2-S):
     # head dimension 256 on the exact attention kernel, new against base (BENCH_ENGINES=goinfer,goinfer_old). The peer
     # tag is a placeholder: no peer row is taken for it.
     "gemma3-4b":  (os.path.expanduser("~/models/gemma-3-4b-it-gguf/gemma-3-4b-it-Q4_K_M.gguf"), "g34b-none"),
-    # M35/M26 added 2026-09-04 (docs/tasks/task-peer-benchmarks.md §2, tier 1). The GGUF path here is
+    # gemma2-2b added 2026-11-15 for OP1-o2's timed cell (docs/measurements/op1o2-fa-softcap-2026-11/README.md): the capped flash-decode lane
+    # (--flash-decode-softcap) against the exact split-KV lane on one binary, BENCH_ENGINES=goinfer,goinfer_old with the flag in
+    # BENCH_GOINFER_ARGS. The checkpoint is the one the fidelity gate read (the Q8_0 GGUF, loaded at int4). The peer tag is a placeholder.
+    "gemma2-2b":  (os.path.expanduser("~/models/gemma-2-2b-it-Q8_0.gguf"), "g22b-none"),
+    # M35/M26 added 2026-09-04. The GGUF path here is
     # what ollama and llama-server load -- Q4_K_M, same quant family as every other row. Neither
     # checkpoint had a Q4_K_M GGUF on this box: the archive only carried M35 as Q8_0 and M26 as a
     # legacy Q4_0, so both were REQUANTIZED locally with llama-quantize --allow-requantize (source
@@ -133,7 +137,7 @@ MODELS = {
     # README.md): goinfer arms only, no peer tag, and prompts at depths 512 and 4096 only (no phase-A depth 128: BENCH_PHASES=B).
     "Q9": (os.path.expanduser("~/models/Qwen3.5-9B-Q4_K_M.gguf"), "q9-none"),
     "M26": (os.path.expanduser("~/models/gemma4-26b-q4_k_m.gguf"), "m26q4km"),
-    # G20 added 2026-09-05 (docs/tasks/task-peer-benchmarks.md §2/§5, tier 2: "fits the Mac, not the
+    # G20 added 2026-09-05 (tier 2: "fits the Mac, not the
     # card: a resident cell on one box and an offload cell on the other"). gpt-oss-20b's OWN
     # shipped MXFP4 quant (OpenAI's native format) -- the only GGUF for it on this box, and the
     # SAME file all three engines load (unlike M35/M26 below): decoder/gguf.go's gptOssArchitecture
@@ -179,7 +183,7 @@ MOE_MODELS = {"M35", "M26", "G20", "G26Q", "qmoe", "dsv2lite"}
 
 # goinfer's OWN path for the MOE_MODELS set, distinct from MODELS[key][0] above (which is the
 # Q4_K_M GGUF ollama/llama-server load). goinfer runs its native kind-4 .giw bundle instead --
-# the shipped-default configuration for these two models (docs/tasks/task-peer-benchmarks.md §2) -- so
+# the shipped-default configuration for these two models -- so
 # the two engines are NOT reading the same file for these cells, only the same nominal quant tier.
 GOINFER_MOE_PATH = {
     "M35": os.path.expanduser("~/models/qwen3.6-35b-a3b-int4.giw"),
@@ -190,7 +194,7 @@ GOINFER_MOE_PATH = {
 # Qwen3.5-35B-A3B-Q4_K_M.gguf and a Q4_0 gemma4-26b GGUF (see the Mac-side results already
 # recorded in docs/measurements/peer-matrix-2026-09/mac-m1pro-m35m26-tier1-2026-09-04.json,
 # which carry their own provenance notes for those paths). M35/M26 are parked on the Mac
-# (kernel panic + swap-thrashing incident, 2026-09-04/05 -- see docs/tasks/task-peer-benchmarks.md
+# (kernel panic + swap-thrashing incident, 2026-09-04/05 -- see the
 # session notes) so this canonical (nobara-quality, real Q4_K_M) path set is not expected to
 # resolve there; a Mac re-pull/requantize is a separate follow-up if M35/M26 work resumes on
 # that box.
@@ -202,7 +206,7 @@ SERVE = {
     "cpu":    os.environ.get("GOINFER_SERVE_CPU",    "/home/francis/bench-v0.15.0/serve-cpu"),
     "cuda":   os.environ.get("GOINFER_SERVE_CUDA",   "/home/francis/bench-v0.15.0/serve-cuda"),
     "webgpu": os.environ.get("GOINFER_SERVE_WEBGPU", "/home/francis/bench-v0.15.0/serve-webgpu"),
-    # Metal, added 2026-09-04 for the Mac side of docs/tasks/task-peer-benchmarks.md. Built from the
+    # Metal, added 2026-09-04 for the Mac side. Built from the
     # `metal/` submodule (M-19: the root cmd/serve builds no backend) -- `go build
     # github.com/townsendmerino/goinfer/backend/metal/cmd/serve`, darwin-only, no build tag needed. No
     # Linux-box default exists (there is nothing to default to), so this path is DELIBERATELY
@@ -236,7 +240,7 @@ GPORT, OPORT, LPORT, MPORT = 8099, 11499, 8098, 8097
 # measured, so deep cells deliberately use FEWER requests with MORE decode tokens each — the same
 # protocol difference §B7 recorded, not a shortcut.
 DEEP_CTX = int(os.environ.get("BENCH_DEEP_CTX", "0"))
-# CONTEXT PIN (added 2026-09-25, docs/tasks/task-peer-claim-2026-09.md). BENCH_CTX pins the context
+# CONTEXT PIN. BENCH_CTX pins the context
 # on all three engines -- goinfer -ctx, Ollama num_ctx, llama-server --ctx-size -- and changes
 # NOTHING else: gen_params stay the standard 64 x 8 x runs, and each peer keeps its own shipped
 # flash-attention setting. BENCH_DEEP_CTX does more than pin a context: it switches to the deep
@@ -265,7 +269,7 @@ STREAM_WEIGHTS_MODELS = {m.strip() for m in os.environ.get("BENCH_STREAM_WEIGHTS
 # "int4" and needed no override -- this is per-model, not something -stream-weights implies
 # uniformly, so it is its own dict rather than folded into STREAM_WEIGHTS_MODELS.
 # phi3-mini=int8int8: goinfer loads Phi-3 at int8int8 with per-32 activation scales by default
-# (queue-engineering.md H2; docs/tasks/task-actquant-pergroup-2026-09.md). Per-row int8 activations
+# (queue-engineering.md H2). Per-row int8 activations
 # round its outliers to zero and the output is junk. This harness always passes an explicit -quant,
 # and an explicit int8int8 gets per-32 added for Phi-3 (an explicit int4 does not), so this entry
 # times the path a user gets by default. CAVEAT, measured 2026-09-26: on the 8 GB card the CUDA
@@ -281,7 +285,7 @@ for _kv in os.environ.get("BENCH_QUANT_OVERRIDE", "M35=int4mix,phi3-mini=q4k").s
 # wait_llamacpp_ready window is sized for a small model's load, not a 15-22 GB checkpoint's
 # first-use .gguf->.giw transcode, which can itself run past 180s before the port ever opens.
 LOAD_TIMEOUT = int(os.environ.get("BENCH_LOAD_TIMEOUT", "180"))
-# TE1 (docs/tasks/task-test-efficiency-2026-09.md): the idle gate before each cell. "load" is the original: the 1-min load
+# TE1 (docs/completed/task-test-efficiency-2026-09.md): the idle gate before each cell. "load" is the original: the 1-min load
 # average under BENCH_MAX_LOADAVG. That is an exponentially damped average with a ~60 s time constant, so after a cell
 # that loaded the box to ~8 it waits ~2 min for the harness's OWN previous cell to drain, and it measured 44% of timed-run
 # wall. "instant" gates on what is running NOW: the share of all CPUs busy over BENCH_BUSY_WINDOW_S seconds (under
@@ -305,7 +309,7 @@ NGEN = int(os.environ.get("BENCH_NGEN", "64"))  # tokens generated per completio
 NCOMP = 8          # completions per run  (>= 8 required)
 NRUNS = 2          # runs per cell        (>= 2 required, spread reported)
 
-# --- EMBEDDINGS PEER (docs/tasks/task-peer-benchmarks.md W8; scoped 2026-09-03, never run before this
+# --- EMBEDDINGS PEER (W8; scoped 2026-09-03, never run before this
 # harness gained the capability) -------------------------------------------------------------
 # goinfer's /v1/embeddings takes a CodeRankEmbed-family HF dir (config.json + model.safetensors +
 # tokenizer.json) via -embed-model, NOT a GGUF -- a structurally different checkpoint format from
@@ -386,6 +390,19 @@ def check_bench_disk(paths):
                  "reads it measures that disk, not the engine, and does so WITHOUT ERRORING. "
                  "Copy to the local bench set first (`models-pull <name>`) and re-run. "
                  "See docs/benchmarks.md, 'Model storage'.")
+
+def selected_bench_paths():
+    """The checkpoint paths this run loads: each selected model's GGUF and, where goinfer runs its own bundle, that bundle; plus the vision
+    checkpoint when phase E is on. check_bench_disk takes these and no others, so a table entry this run does not select cannot refuse it,
+    and every one it does select still must be off the archive."""
+    paths = []
+    for mk in plan_models():
+        paths.append(MODELS[mk][0])
+        if mk in GOINFER_MOE_PATH:
+            paths.append(GOINFER_MOE_PATH[mk])
+    if plan_vision():
+        paths.append(VISION_MODEL_PATH)
+    return paths
 
 def _sh(cmd, default=""):
     try:
@@ -585,8 +602,8 @@ def swapins_mb():
 class SwapWatch:
     """Swap growth over one cell, from a baseline taken before its server starts (peer-vetted 2026-10-07: "any swap
     growth voids that engine's arm"). Polls system swap every POLL_S on a thread; the peak growth goes in the cell's
-    counts. BENCH_SWAP_VOID_MB (unset: off, the old behaviour) voids a cell whose peak growth exceeds it, 0 meaning any
-    growth. BENCH_SWAP_KILL_MB (unset: off) also kills the server's process group the moment growth passes it, so a
+    counts. BENCH_SWAP_VOID_MB (unset: 0, the void rule's bar, unless BENCH_SWAPIN_VOID_MB or BENCH_SWAPOUT_VOID_MB is set) voids a cell
+    whose peak growth exceeds it, 0 meaning any growth. BENCH_SWAP_KILL_MB (unset: off) also kills the server's process group the moment growth passes it, so a
     runaway load is stopped, not just recorded (the Mac's 2026-09-04/05 swap spiral; scripts/swap_killwatch.sh is the
     out-of-process twin)."""
     POLL_S = 1.0
@@ -597,6 +614,8 @@ class SwapWatch:
         self.swapin = None
         self.swapout = None
         self.peak = 0.0
+        self.peak_abs = self.base  # the highest absolute reading, kept raw: base + a rounded growth is not the reading
+        self.unreadable = self.base is None  # swap could not be read at the start, or at a poll or the last read
         self.killed = None
         self.pgid = None
         kill = os.environ.get("BENCH_SWAP_KILL_MB", "").strip()
@@ -604,17 +623,25 @@ class SwapWatch:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
+    def poll_once(self):
+        """One poll: the peak growth over the baseline, the kill bar, and a reading that fails marks the cell unreadable (a guard that
+        cannot read what it guards must not pass the cell)."""
+        now = swap_used_mb()
+        if now is None or self.base is None:
+            self.unreadable = True
+            return
+        self.peak = max(self.peak, now - self.base)
+        self.peak_abs = max(self.peak_abs, now)
+        if self.kill_mb is not None and self.peak > self.kill_mb and self.pgid and not self.killed:
+            self.killed = f"swap grew +{self.peak:.0f} MB (> {self.kill_mb:.0f}); server killed"
+            try:
+                os.killpg(self.pgid, signal.SIGKILL)
+            except Exception:
+                pass
+
     def _run(self):
         while not self._stop.is_set():
-            now = swap_used_mb()
-            if self.base is not None and now is not None:
-                self.peak = max(self.peak, now - self.base)
-                if self.kill_mb is not None and self.peak > self.kill_mb and self.pgid and not self.killed:
-                    self.killed = f"swap grew +{self.peak:.0f} MB (> {self.kill_mb:.0f}); server killed"
-                    try:
-                        os.killpg(self.pgid, signal.SIGKILL)
-                    except Exception:
-                        pass
+            self.poll_once()
             self._stop.wait(self.POLL_S)
 
     def start(self, pid):
@@ -626,12 +653,15 @@ class SwapWatch:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout=5)
+        self.poll_once()  # the last reading; a failure here marks the cell unreadable too
         now_in, now_out = swap_io_mb()
         if self.base_in is not None and now_in is not None:
             self.swapin = now_in - self.base_in
         if self.base_out is not None and now_out is not None:
             self.swapout = now_out - self.base_out
-        return {"swap_base_mb": self.base, "swap_growth_mb": round(self.peak, 1), "swap_killed": self.killed,
+        # a failed reading leaves no numeric peak for a caller to mistake for a clean one (void_rule.SwapSampler.result's rule)
+        growth, peak_abs = (None, None) if self.unreadable else (round(self.peak, 4), self.peak_abs)
+        return {"swap_base_mb": self.base, "swap_growth_mb": growth, "swap_peak_mb": peak_abs, "swap_killed": self.killed,
                 "swapin_mb": None if self.swapin is None else round(self.swapin, 1),
                 "swapout_mb": None if self.swapout is None else round(self.swapout, 1), "swap_void": self.void_reason()}
 
@@ -640,18 +670,10 @@ class SwapWatch:
         BENCH_SWAPOUT_VOID_MB void on swap-ins and swap-outs over them (0: any). Nobara takes swap-ins alone (peer-vetted
         2026-10-08: idle pages pushed out under page-cache pressure grew swap by 1.9-46 MB beside a 12-14 GB load with 58 GB
         free, which slows nothing being timed); a never-swap gate takes both at 0."""
-        lim = os.environ.get("BENCH_SWAP_VOID_MB", "").strip()
-        inlim = os.environ.get("BENCH_SWAPIN_VOID_MB", "").strip()
-        outlim = os.environ.get("BENCH_SWAPOUT_VOID_MB", "").strip()
+        import void_rule
         if self.killed:
             return self.killed
-        if lim and self.peak > float(lim):
-            return f"swap grew +{self.peak:.1f} MB during the cell (> {float(lim):.0f} MB): void"
-        if inlim and self.swapin is not None and self.swapin > float(inlim):
-            return f"swap-ins of {self.swapin:.2f} MB during the cell (> {float(inlim):.0f} MB): void"
-        if outlim and self.swapout is not None and self.swapout > float(outlim):
-            return f"swap-outs of {self.swapout:.2f} MB during the cell (> {float(outlim):.0f} MB): void"
-        return None
+        return void_rule.swap_verdict(None if self.unreadable else self.peak, self.swapin, self.swapout)
 
 
 class RSSSampler:
@@ -740,6 +762,8 @@ def provenance():
     return {
         "kind": "provenance",
         "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "fit_need": "goinfer's fit: banner when one has been read, else BENCH_FIT_NEED_GB, else the checkpoint's file size, which is a lower "
+                    "bound (no KV or scratch) and is flagged per cell (machine.fit_need_lower_bound); the start check has no margin",
         "free_mem_override": _FREE_MEM_OVERRIDE_USED,  # the run went ahead without a free-memory reading (check_free_mem)
         "host": socket.gethostname(),
         "uname": _sh(["uname", "-srm"]),
@@ -772,19 +796,19 @@ def provenance():
     }
 
 def free_mem_mb():
-    """This box's free memory in MiB for the void rule: the reclaimable figure cmd/hostmem prints (scripts/hostmem.py), what a cell
-    can take without macOS compressing or swapping other memory under it, not the load-decision figure. None when it cannot be
-    read."""
+    """This box's available memory in MiB for the void rule: the figure the fit guard decides loads by (cmd/hostmem via
+    scripts/hostmem.py). The reclaimable figure is recorded beside it (machine_state) but is not a void term. None when it
+    cannot be read."""
     import hostmem
-    return hostmem.reclaimable_mb()
+    return hostmem.available_mb()
 
 
-# THE HEAVY-LOAD VOID (owner rule 2026-10-19; CLAUDE.md "Run budget", docs/measurements/noise-registry.md §8). A cell is VOID if,
-# at its start, this box (the one doing the timed work) has a 1-minute load average above half its cores, or free memory below the
-# fit guard's need for the cell's load plus 2 GB. A void start is listed in the cell's record and the cell re-runs in place; it is
-# never run and averaged. The need is weights + KV from goinfer's own `fit:` banner for the model (learned from its goinfer cells),
+# THE HEAVY-LOAD VOID (owner rule 2026-10-19, changed by Francis 2026-11-08; scripts/void_rule.py is the one definition,
+# docs/measurements/noise-registry.md §8). A cell is VOID if, at its start, this box (the one doing the timed work) has a 1-minute
+# load average above half its cores, or available memory (the fit guard's reading) below the fit guard's need for the cell's load,
+# with no margin; and if system swap grows at all while it runs (SwapWatch). A void start is listed in the cell's record and the
+# cell re-runs in place; it is never run and averaged. The need is weights + KV from goinfer's own `fit:` banner for the model (learned from its goinfer cells),
 # BENCH_FIT_NEED_GB when set ("5.6", or per model "phi3-mini=5.6,M7=9.3"), else the checkpoint's file size, recorded as such.
-VOID_HEADROOM_MB = 2048
 _FIT_NEED = {}   # model key -> MB, from a goinfer fit banner
 
 
@@ -809,20 +833,39 @@ def fit_need(model_key):
 def learn_fit_need(model_key, log_text):
     """Records weights + KV from the last `fit: … needs X GB KV (weights Y GB …` line in a goinfer serve log."""
     found = None
-    for m in re.finditer(r"needs ([\d.]+) GB KV \(weights ([\d.]+) GB", log_text or ""):
+    for m in re.finditer(r"needs ([\d.]+) Gi?B KV \(weights ([\d.]+) Gi?B", log_text or ""):
         found = (float(m.group(1)) + float(m.group(2))) * 1024
     if found:
         _FIT_NEED[model_key] = int(found)
 
 
+def need_is_lower_bound(source):
+    """Whether a fit need from `source` leaves out KV and scratch: the checkpoint's file size does; goinfer's `fit:` banner and an
+    explicit BENCH_FIT_NEED_GB do not. Recorded with the cell (machine.fit_need_lower_bound) because the zero-margin start check then
+    asks for no more than the weights."""
+    return source == "file size"
+
+
+_LOAD_SKIP_SAID = False
+_MEM_SKIP_SAID = False
+
+
 def heavy_void(state, need_mb):
-    """The reason a cell starting in machine state `state` is void, or None. state carries loadavg, free_mem_mb and ncores."""
-    la, ncores, free = state.get("loadavg"), state.get("ncores"), state.get("free_mem_mb")
-    if la and ncores and la[0] > ncores / 2:
-        return f"load {la[0]:.2f} above half of {ncores} cores"
-    if need_mb is not None and free is not None and free < need_mb + VOID_HEADROOM_MB:
-        return f"free memory {free} MB below the fit need {need_mb} MB + {VOID_HEADROOM_MB} MB"
-    return None
+    """The reason a cell starting in machine state `state` is void, or None, by void_rule.start_void. state carries loadavg,
+    available_mb (the fit guard's reading) and ncores; an unreadable core count skips the load term, said once."""
+    global _LOAD_SKIP_SAID, _MEM_SKIP_SAID
+    import void_rule
+    la, ncores = state.get("loadavg"), state.get("ncores")
+    if not ncores and not _LOAD_SKIP_SAID:
+        _LOAD_SKIP_SAID = True
+        print("# core count unreadable: the heavy-load void's load term is skipped for this run", flush=True)
+    snap = {"load1": la[0] if la else None, "ncores": ncores, "available_mb": state.get("available_mb")}
+    # BENCH_ALLOW_NO_FREE_MEM=1 (check_free_mem) lets a run go ahead on a box with no memory reading: the memory term is skipped, said once
+    allow = _FREE_MEM_OVERRIDE_USED and snap["available_mb"] is None
+    if allow and need_mb and not _MEM_SKIP_SAID:
+        _MEM_SKIP_SAID = True
+        print("# BENCH_ALLOW_NO_FREE_MEM=1: no available-memory reading, so the heavy-load void's memory term is skipped for this run", flush=True)
+    return void_rule.start_void(snap, need_mb, allow_unreadable_memory=allow)
 
 
 def start_clean(sample, need_mb, run, wait=time.sleep, limit_s=None):
@@ -845,14 +888,74 @@ def start_clean(sample, need_mb, run, wait=time.sleep, limit_s=None):
         waited += step
 
 
+def _reclaimable_mb():
+    import hostmem
+    return hostmem.reclaimable_mb()
+
+
 def machine_state():
-    """Recorded at the START of each cell: the load average, free memory and core count the void rule reads (heavy_void), and
-    the GPU and thermal state as a record."""
-    m = {"loadavg": _loadavg(), "free_mem_mb": free_mem_mb(), "ncores": os.cpu_count(), "gpu": _gpu_state()}
+    """Recorded at the START of each cell: the load average, available memory and core count the void rule reads (heavy_void), the
+    reclaimable memory and swap in use as a record (void_rule.py: a record taken under this rule can be told from the old one),
+    and the GPU and thermal state."""
+    swapin, swapout = swap_io_mb()
+    m = {"loadavg": _loadavg(), "available_mb": free_mem_mb(), "ncores": os.cpu_count(), "gpu": _gpu_state(),
+         "reclaimable_mb": _reclaimable_mb(), "swap_mb": swap_used_mb(), "swapin_mb": swapin, "swapout_mb": swapout}
     th = thermal_state()
     if th:
         m["therm"] = th
     return m
+
+def end_state():
+    """Recorded at the END of each cell (void_rule.py: the four readings at a cell's start and end): the same load, available and
+    reclaimable memory and swap in use as machine_state, so a record taken under the 2026-11-08 rule shows what the cell left."""
+    swapin, swapout = swap_io_mb()
+    return {"loadavg": _loadavg(), "available_mb": free_mem_mb(), "reclaimable_mb": _reclaimable_mb(), "swap_mb": swap_used_mb(),
+            "swapin_mb": swapin, "swapout_mb": swapout}
+
+
+_END_MEM_SKIP_SAID = False
+
+
+def _say_end_mem_skip(msg):
+    global _END_MEM_SKIP_SAID
+    if not _END_MEM_SKIP_SAID:
+        _END_MEM_SKIP_SAID = True
+        print("# " + msg, flush=True)
+
+
+def cell_end_void(start, end, need_mb, peak_mb=None):
+    """The reason a cell is void from the readings at its start and its end, or None: void_rule.end_void over this harness's readings
+    (swap that grew between them or an unreadable swap, end load or end available-memory reading). SwapWatch votes on the peak inside
+    the cell; this couples the cell's own start and end readings to its verdict, so a record whose end readings fail cannot be called
+    clean. peak_mb is SwapWatch's peak, in absolute MB, against the cell's own start reading: swap that rose between machine_state and
+    the watch's later baseline and receded before the end is a spike over the cell's start that neither reading alone shows."""
+    import void_rule
+    keys = ("swap_mb", "swapin_mb", "swapout_mb")
+    la = end.get("loadavg")
+    s = {k: start.get(k) for k in keys}
+    s.update(ncores=start.get("ncores"), need_mb=need_mb)
+    e = {k: end.get(k) for k in keys}
+    e.update(load1=la[0] if la else None, available_mb=end.get("available_mb"))
+    return void_rule.end_void(s, e, peak_mb, say=_say_end_mem_skip)
+
+
+def apply_cell_end_check(result, need_mb):
+    """Takes the cell's end readings, records them in its machine state, and marks the cell void in its record (counts.swap.swap_void,
+    which run_with_swap_voids re-runs on) when cell_end_void says so, unless SwapWatch already did."""
+    (rates, err, counts), machine, void_starts = result
+    end = end_state()
+    machine["end"] = end
+    sw = (counts or {}).get("swap") or {}
+    peak = sw.get("swap_peak_mb")  # the raw peak reading: base + the rounded growth drifts from it by float noise
+    why = cell_end_void(machine, end, need_mb, peak)
+    if why:
+        counts = dict(counts or {})
+        swap = dict(counts.get("swap") or {})
+        if not swap.get("swap_void"):
+            swap["swap_void"] = why
+        counts["swap"] = swap
+    return (rates, err, counts), machine, void_starts
+
 
 def preflight():
     """The idle check, and the ONLY place it is answerable -- before this harness loads the box.
@@ -883,7 +986,7 @@ def preflight():
         sys.exit(f"REFUSED: 1-min load average {la[0]:.2f} exceeds {cap:.2f}. The box is not idle, "
                  f"and a number measured on a busy box is not distinguishable afterwards from a "
                  f"number measured on a quiet one. Wait, or raise BENCH_MAX_LOADAVG deliberately.")
-    check_bench_disk([p for p, _ in MODELS.values()] + list(GOINFER_MOE_PATH.values()))
+    check_bench_disk(selected_bench_paths())
     apps = _gpu_compute_apps()
     if len(apps) > 1:
         sys.exit("REFUSED: %d compute processes already hold the GPU (1 = the compositor, expected):\n  %s"
@@ -897,7 +1000,7 @@ _FREE_MEM_OVERRIDE_USED = False  # set by check_free_mem when BENCH_ALLOW_NO_FRE
 
 def check_free_mem():
     """Refuses a run that cannot read this box's free memory, since the heavy-load void's memory term would then never apply and
-    every cell would record free_mem_mb null. BENCH_ALLOW_NO_FREE_MEM=1 runs anyway; provenance() records that it did, and only
+    every cell would record available_mb null. BENCH_ALLOW_NO_FREE_MEM=1 runs anyway; provenance() records that it did, and only
     when it did (a set override with a reading present is not recorded). Returns whether the override was used."""
     global _FREE_MEM_OVERRIDE_USED
     _FREE_MEM_OVERRIDE_USED = False
@@ -1479,7 +1582,7 @@ def run_cell(engine, model_key, depth, cfg_name, backend="cuda"):
     load_timeout = 900 if model_key in MOE_MODELS else LOAD_TIMEOUT
     proc = None
     decode_path = None   # what goinfer's own load resolved to, read from its serve log (goinfer engines only)
-    # TE0 (docs/tasks/task-test-efficiency-2026-09.md): where a cell's wall goes, measured rather than inferred. The dict
+    # TE0 (docs/completed/task-test-efficiency-2026-09.md): where a cell's wall goes, measured rather than inferred. The dict
     # is shared with the returned counts, so the teardown in `finally` (which runs after the return value is built)
     # still lands in the record.
     phases = {}
@@ -1503,7 +1606,7 @@ def run_cell(engine, model_key, depth, cfg_name, backend="cuda"):
             _q = GOINFER_QUANT_OVERRIDE.get(model_key, "int4")
             quant_args = [] if (has_own_bundle or _q == "default") else ["-quant", _q]
             # Metal too since 2026-10-07 (peer-vetted): a 12-14 GB MoE on a 16 GB Mac runs paged (the M26 day-use rule in
-            # docs/tasks/task-m26-mac-2026-10.md), as the 8 GB card does; both are disclosed on the cell.
+            # docs/completed/task-m26-mac-2026-10.md), as the 8 GB card does; both are disclosed on the cell.
             moe_args = ["-moe-cache-experts"] if (model_key in MOE_MODELS and backend in ("cuda", "metal")) else []
             # "goinfer_old" picks SERVE_OLD instead of SERVE -- same flags, same port (the two never
             # run concurrently: run_cell always tears one engine down before the next starts), a
@@ -1574,7 +1677,7 @@ def run_cell(engine, model_key, depth, cfg_name, backend="cuda"):
             port, url, parse, mk = LPORT, f"http://127.0.0.1:{LPORT}/v1/chat/completions", \
                 parse_openai, (lambda: llamacpp_payload(prompt_next(), cfg))
         elif engine == "mlx":
-            # Mac only (docs/tasks/task-peer-benchmarks.md §1): MLX_MODELS holds only the checkpoints
+            # Mac only: MLX_MODELS holds only the checkpoints
             # actually pulled -- a model_key with no entry is a clean skip, not a crash, since a
             # release sweep run without a full mlx-community pull (35B/26B are tens of GB) must
             # still complete its other cells.
@@ -1740,7 +1843,7 @@ def run_embed_cell(engine, approx_tokens, n_inputs):
     tokens/s is reported too where the engine's own usage field gives a count. goinfer and Ollama
     only -- llamacpp/mlx have no embeddings endpoint this harness speaks to.
 
-    docs/tasks/task-peer-benchmarks.md W8, scoped 2026-09-03, never run until this function existed.
+    W8, scoped 2026-09-03, never run until this function existed.
     """
     texts = [_embed_filler_text(approx_tokens) for _ in range(n_inputs)]
     proc = None
@@ -1837,7 +1940,7 @@ def run_vision_cell(engine):
     underlying cost). goinfer and Ollama only. CPU only, matching the existing row's own backend.
     """
     import base64
-    # A NEW image every request, warm-up included (S13's harness fix, docs/tasks/task-multimodal-support-2026-10.md,
+    # A NEW image every request, warm-up included (S13's harness fix, docs/completed/task-multimodal-support-2026-10.md,
     # 2026-10-07). Sending the same bytes every time measured a re-send: Ollama/llama.cpp and goinfer all cache an
     # image's encode by its bytes, so the 2026-09-20 row's 0.4 s for gemma3:4b on the CPU was most likely a cache hit.
     # fresh_image(i) is VISION_IMAGE_PATH with request i's own pseudorandom least-significant-bit pattern in the red
@@ -2225,9 +2328,11 @@ def main():
                 return run_vision_cell(engine)
             return run_cell(engine, mk, depth, cfg, backend)
         t0 = time.time()
-        ((rates, err, counts), machine, void_starts), swap_voids = run_with_swap_voids(lambda: start_clean(machine_state, need, _run))
+        ((rates, err, counts), machine, void_starts), swap_voids = run_with_swap_voids(
+            lambda: apply_cell_end_check(start_clean(machine_state, need, _run), need))
         machine["gate"] = gate
         machine["fit_need_mb"], machine["fit_need_source"] = need, need_src
+        machine["fit_need_lower_bound"] = need_is_lower_bound(need_src)
         # prompt_tokens(depth, mk) only resolves for phases A/B/C -- "embed"/"vision" aren't real
         # MODELS keys and D's "depth" is an approximate embeddings length, not a calibrated one, so
         # phases D/E record None here rather than raising a KeyError against prompts.json.
@@ -2321,7 +2426,7 @@ def _term_exits(signum, frame):
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, _term_exits)
     signal.signal(signal.SIGINT, _term_exits)  # Ctrl-C takes the same masked teardown, not a KeyboardInterrupt a second one can cut short
-    # TE9 (docs/tasks/task-test-efficiency-2026-09.md): one timed run per box. The lock is held for the whole run and
+    # TE9 (docs/completed/task-test-efficiency-2026-09.md): one timed run per box. The lock is held for the whole run and
     # taken before preflight(), so a second timed run refuses, naming this one; BENCH_LOCK_WAIT=<seconds> waits for a
     # holder instead. Under a night.py job or a `timing_lock.py run` wrapper the lock is inherited, not re-taken.
     import timing_lock

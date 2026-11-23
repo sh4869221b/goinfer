@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -79,7 +80,7 @@ func mc3LoadCheckpoint(t *testing.T, slots, ctx int) (*decoder.Model, *resident)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		m.Close()
 		t.Fatalf("build resident: %v", err)
@@ -181,7 +182,7 @@ func moeStepResident(t *testing.T, dir string, on bool) *resident {
 	if err != nil {
 		t.Fatalf("load %s: %v", dir, err)
 	}
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		m.Close()
 		t.Fatalf("build %s's resident: %v", dir, err)
@@ -190,16 +191,17 @@ func moeStepResident(t *testing.T, dir string, on bool) *resident {
 	return r
 }
 
-// TestMC3Step_moeBitIdentical is OP4m-d3's identity gate (docs/tasks/task-forward-architecture-2026-10.md §4.9): with the
+// TestMC3Step_moeBitIdentical is OP4m-d3's identity gate: with the
 // step's MoE block on, each tracked generic-MoE fixture builds the batched step, and four sequences at different depths stepped
 // together equal production's single-token forward bit for bit, every logit of every step. With the block off, which is the
 // default, none builds it.
-// TestOP4mD3_moeStepSpeed is OP4m-d3's D3-3 (docs/tasks/task-forward-architecture-2026-10.md §4.9): on the MoE checkpoint at
+// TestOP4mD3_moeStepSpeed is OP4m-d3's D3-3: on the MoE checkpoint at
 // GOINFER_OP4MD3_MODEL, loaded int4 with the step's MoE block on, four slots filled to depth 128, then 64 greedy tokens of all four
 // sequences timed two ways: the batched step (device argmax), against the do-nothing arm, each sequence decoded one token at a
 // time on its own slot as today (ForwardArgmax). A B B A over 10 pairs after one warm run each; both arms' tokens must be
-// equal. The cell records the 1-minute load and the reclaimable memory against the resident's need plus a free-memory margin
-// (the void rule's 2 GiB), read after the load and before the resident allocates. A pair voids the cell when the test process itself pages (its own
+// equal, and on a recurrent resident every run starts from a refill (stepCellFill). The cell starts only under the void rule's start terms (stepCellStartVoid), read after the load maps the file and
+// before the resident allocates; the reclaimable reading is recorded beside them. Swap growth over the whole cell is the
+// runner's to judge (scripts/void_rule.py watch and end). A pair voids the cell when the test process itself pages (its own
 // major faults rise during the pair) or system swap in use grows; system-wide pageouts are recorded as context only. A
 // pair whose starting 1-minute load is above half the cores plus GOMAXPROCS voids the cell. Pass: a median rate ratio, step ÷
 // sequential, of at least 1.05 with at least 9 of 10 pairs faster; fail: a median under 1.00; parked otherwise. A fail or a
@@ -215,6 +217,168 @@ func TestOP4mD3_moeStepSpeed(t *testing.T) {
 func TestOP4mD4b_recurrentStepSpeed(t *testing.T) {
 	op4mStepSpeed(t, stepSpeedCell{env: "GOINFER_OP4MD4B", label: "[OP4m-d4b D4b-4]", recurrent: true,
 		want: func(r *resident) bool { return r.dnet != nil }, wantWhat: "a Qwen3.5-family resident"})
+}
+
+// TestOP4mD6b_mambaStepSpeed is OP4m-d6b's D6b-5, D4b-4's cell on the Nemotron-H checkpoint at GOINFER_OP4MD6B_MODEL with
+// the step's recurrent blocks on (GOINFER_OP4MD6B_TIMING=1, under the timing lock).
+func TestOP4mD6b_mambaStepSpeed(t *testing.T) {
+	op4mStepSpeed(t, stepSpeedCell{env: "GOINFER_OP4MD6B", label: "[OP4m-d6b D6b-5]", recurrent: true,
+		want: func(r *resident) bool { return r.mamba != nil }, wantWhat: "a Mamba-2 (Nemotron-H) resident"})
+}
+
+// cellLoad1 is the 1-minute load average (vm.loadavg), a timed cell's start and pair term.
+func cellLoad1(t *testing.T) float64 {
+	t.Helper()
+	out, err := exec.Command("sysctl", "-n", "vm.loadavg").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v float64
+	if _, err := fmt.Sscanf(strings.Trim(strings.TrimSpace(string(out)), "{} "), "%g", &v); err != nil {
+		t.Fatalf("vm.loadavg %q: %v", out, err)
+	}
+	return v
+}
+
+// cellPaging is swap in use (MiB, vm.swapusage), whose growth voids a pair, and the system-wide pageouts count (vm_stat),
+// recorded as context. A swap reading that does not parse fails the cell rather than reading as zero.
+func cellPaging(t *testing.T) (swapMiB float64, pageouts int64) {
+	t.Helper()
+	out, err := exec.Command("sysctl", "-n", "vm.swapusage").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := strings.Fields(string(out)) // total = X  used = Y  free = Z ...
+	parsed := false
+	for i := range f {
+		if f[i] == "used" && i+2 < len(f) {
+			_, err := fmt.Sscanf(strings.TrimSuffix(f[i+2], "M"), "%g", &swapMiB)
+			parsed = err == nil
+		}
+	}
+	if !parsed {
+		t.Fatalf("vm.swapusage %q: no swap-in-use reading", out)
+	}
+	vs, err := exec.Command("vm_stat").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for line := range strings.SplitSeq(string(vs), "\n") {
+		if strings.HasPrefix(line, "Pageouts:") {
+			fmt.Sscanf(strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(line, "Pageouts:")), "."), "%d", &pageouts)
+		}
+	}
+	return swapMiB, pageouts
+}
+
+// stepCellStartVoid is why a timed cell may not start, or "" when it may: the void rule's start terms
+// (docs/measurements/noise-registry.md §8, scripts/void_rule.py start). The 1-minute load must not be above half of ncpu, and
+// available, the fit guard's reading (probe.Reading.Available), must cover need with no margin.
+func stepCellStartVoid(load1 float64, ncpu int, available, need int64) string {
+	if limit := float64(ncpu) / 2; load1 > limit {
+		return fmt.Sprintf("1-minute load %.2f above %.1f", load1, limit)
+	}
+	if available < need {
+		return fmt.Sprintf("available %.2f GiB under need %.2f GiB", float64(available)/(1<<30), float64(need)/(1<<30))
+	}
+	return ""
+}
+
+func TestStepCellStartVoid(t *testing.T) {
+	const gib = int64(1) << 30
+	for _, c := range []struct {
+		load1           float64
+		available, need int64
+		void            bool
+	}{
+		{4.0, 4 * gib, 4 * gib, false},       // both terms at their bound: starts
+		{4.01, 8 * gib, 4 * gib, true},       // load above half of 8 cores
+		{1.0, 4*gib - 1, 4 * gib, true},      // a byte short of the need
+		{1.0, 4*gib + 1<<20, 4 * gib, false}, // no margin is added to the need
+	} {
+		if why := stepCellStartVoid(c.load1, 8, c.available, c.need); (why != "") != c.void {
+			t.Errorf("load %.2f, available %d, need %d: void %q, want void %v", c.load1, c.available, c.need, why, c.void)
+		}
+	}
+}
+
+// stepCellFill fills KV slot i with fills[i] from position 0: through ForwardBatch, or token by token through ForwardEmb when
+// full (rows that carry more than the embedding). A recurrent resident's slot states are zeroed first, since a pass at
+// position 0 does not reset them, so a refill puts every slot back where the first fill left it.
+func stepCellFill(t *testing.T, r *resident, fills [][]int, row func(int) []float32, full bool) {
+	t.Helper()
+	if r.recurrentModel() {
+		r.stopExec()
+		for sl := range fills {
+			r.resetRecurrentSlot(sl)
+		}
+	}
+	for sl, ids := range fills {
+		if !full {
+			mc3Fill(t, r, sl, ids)
+			continue
+		}
+		if err := r.useKVSlot(sl); err != nil {
+			t.Fatal(err)
+		}
+		for i, id := range ids {
+			r.ForwardEmb(row(id), i)
+		}
+	}
+}
+
+// TestStepCellFill_rewindsRecurrentState: on nemotron-tiny with the step on, two slots, steps run after a refill equal
+// the steps run after the first fill, every logit; run again without the refill they differ, so the fixture's state carries
+// the earlier steps and a cell that skipped the refill would compare arms from different states.
+func TestStepCellFill_rewindsRecurrentState(t *testing.T) {
+	r := recurrentStepResidentSlots(t, recurrentFixture{dir: "../../testdata/nemotron-tiny"}, true, 2)
+	if r.batch == nil || r.mamba == nil {
+		t.Fatalf("step built %v, Mamba-2 %v: want both (%s)", r.batch != nil, r.mamba != nil, r.batchIneligible())
+	}
+	const depth, steps = 20, 6
+	rng := rand.New(rand.NewSource(11))
+	fills := [][]int{make([]int, depth), make([]int, depth)}
+	for _, f := range fills {
+		for i := range f {
+			f[i] = rng.Intn(r.V)
+		}
+	}
+	row := func(id int) []float32 { return mc3Emb(r, id) }
+	run := func() [][]float32 {
+		var out [][]float32
+		cur := []int{1, 2}
+		for s := range steps {
+			logits, _, err := r.forwardMultiInto([]batchSeq{{slot: 0, pos: depth + s, emb: row(cur[0])}, {slot: 1, pos: depth + s, emb: row(cur[1])}}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := range cur {
+				cur[i] = argmaxF32(logits[i])
+				out = append(out, slices.Clone(logits[i]))
+			}
+		}
+		return out
+	}
+	differ := func(a, b [][]float32) int {
+		n := 0
+		for i := range a {
+			for j := range a[i] {
+				if math.Float32bits(a[i][j]) != math.Float32bits(b[i][j]) {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	stepCellFill(t, r, fills, row, false)
+	want := run()
+	stepCellFill(t, r, fills, row, false)
+	if n := differ(want, run()); n != 0 {
+		t.Errorf("after a refill, %d logits differ from the run after the first fill", n)
+	}
+	if n := differ(want, run()); n == 0 {
+		t.Error("a run without a refill equals the first: the fixture's state does not carry earlier steps, so this test proves nothing")
+	}
 }
 
 // stepSpeedCell is one feature-bar cell's model and arms (op4mStepSpeed).
@@ -246,47 +410,10 @@ func op4mStepSpeed(t *testing.T, c stepSpeedCell) {
 	if strings.HasPrefix(path, "/Volumes/") || strings.HasPrefix(path, "/srv/models") {
 		t.Fatalf("%s is on the archive, not the bench set: a timing from it measures the disk", path)
 	}
-	const B, depth, steps, pairs, ctx = 4, 128, 64, 10, 1024
-	load1 := func() float64 {
-		out, err := exec.Command("sysctl", "-n", "vm.loadavg").Output()
-		if err != nil {
-			t.Fatal(err)
-		}
-		var v float64
-		if _, err := fmt.Sscanf(strings.Trim(strings.TrimSpace(string(out)), "{} "), "%g", &v); err != nil {
-			t.Fatalf("vm.loadavg %q: %v", out, err)
-		}
-		return v
-	}
-	// paging is swap in use (MiB, vm.swapusage), whose growth voids a pair, and the system-wide pageouts count (vm_stat),
-	// recorded as context. A swap reading that does not parse fails the cell rather than reading as zero.
-	paging := func() (swapMiB float64, pageouts int64) {
-		out, err := exec.Command("sysctl", "-n", "vm.swapusage").Output()
-		if err != nil {
-			t.Fatal(err)
-		}
-		f := strings.Fields(string(out)) // total = X  used = Y  free = Z ...
-		parsed := false
-		for i := range f {
-			if f[i] == "used" && i+2 < len(f) {
-				_, err := fmt.Sscanf(strings.TrimSuffix(f[i+2], "M"), "%g", &swapMiB)
-				parsed = err == nil
-			}
-		}
-		if !parsed {
-			t.Fatalf("vm.swapusage %q: no swap-in-use reading", out)
-		}
-		vs, err := exec.Command("vm_stat").Output()
-		if err != nil {
-			t.Fatal(err)
-		}
-		for line := range strings.SplitSeq(string(vs), "\n") {
-			if strings.HasPrefix(line, "Pageouts:") {
-				fmt.Sscanf(strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(line, "Pageouts:")), "."), "%d", &pageouts)
-			}
-		}
-		return swapMiB, pageouts
-	}
+	const B, depth, steps, ctx = 4, 128, 64, 1024
+	const pairs = 10
+	load1 := func() float64 { return cellLoad1(t) }
+	paging := func() (swapMiB float64, pageouts int64) { return cellPaging(t) }
 	majFaults := func() int64 { // this process's major faults (page-ins from disk), the never-swap rule's own reading
 		var ru syscall.Rusage
 		if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
@@ -301,29 +428,29 @@ func op4mStepSpeed(t *testing.T, c stepSpeedCell) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	need := m.ResidentNeedBytes("metal", 0, ctx, false, false) + int64(B-1)*metalSlotBytes(m) // every slot's KV and recurrent state
-	const margin = 2048                                                                       // MiB, the void rule's registered margin
-	r0, ok := probe.Read()                                                                    // the fit check: after the load maps the file, before the resident allocates
+	need := m.ResidentNeedBytes("metal", 0, ctx, false, false) + int64(B-1)*metalSlotBytes(m, metalCtxPlan{}) // every slot's KV and recurrent state
+	r0, ok := probe.Read()                                                                                    // the fit check: after the load maps the file, before the resident allocates
 	if !ok {
 		t.Fatal("no memory reading")
 	}
 	gib := func(b int64) float64 { return float64(b) / (1 << 30) }
 	bar := float64(runtime.NumCPU())/2 + float64(runtime.GOMAXPROCS(0))
-	memOK := int64(r0.Reclaimable) >= need+margin<<20
+	why := stepCellStartVoid(l0, runtime.NumCPU(), r0.Available, need)
 	name := filepath.Base(path)
-	fmt.Fprintf(os.Stderr, label+" %s: cell start: 1-minute load %.2f; reclaimable %.2f GiB against need %.2f GiB + %d MiB (%s); pair bar %.1f\n",
-		name, l0, gib(int64(r0.Reclaimable)), gib(need), margin, map[bool]string{true: "ok", false: "VOID"}[memOK], bar)
-	if !memOK {
-		t.Fatalf("cell void: reclaimable %.2f GiB under need %.2f GiB + %d MiB", gib(int64(r0.Reclaimable)), gib(need), margin)
+	fmt.Fprintf(os.Stderr, label+" %s: cell start: 1-minute load %.2f; available %.2f GiB against need %.2f GiB (%s); reclaimable %.2f GiB (recorded); pair bar %.1f\n",
+		name, l0, gib(r0.Available), gib(need), map[bool]string{true: "ok", false: "VOID"}[why == ""], gib(r0.Reclaimable), bar)
+	if why != "" {
+		t.Fatalf("cell void: %s", why)
 	}
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("build the resident: %v", err)
 	}
 	defer r.Close()
-	if scratch := r.stepScratchBytes(); int64(r0.Reclaimable) < need+scratch+margin<<20 {
-		t.Fatalf("cell void: reclaimable %.2f GiB under need %.2f GiB, the step's scratch %.1f MiB and %d MiB", gib(int64(r0.Reclaimable)), gib(need),
-			float64(scratch)/(1<<20), margin)
+	scratch := r.stepScratchBytes()
+	fmt.Fprintf(os.Stderr, label+" %s: the step's scratch %.1f MiB\n", name, float64(scratch)/(1<<20))
+	if why := stepCellStartVoid(l0, runtime.NumCPU(), r0.Available, need+scratch); why != "" {
+		t.Fatalf("cell void, with the step's scratch: %s", why)
 	}
 	if !want(r) || r.batch == nil || len(r.kvSlotBufs) < B {
 		t.Fatalf("%s %v, batched step %v, %d KV slots: want %s with the step and %d slots (%s)", wantWhat, want(r), r.batch != nil,
@@ -340,22 +467,14 @@ func op4mStepSpeed(t *testing.T, c stepSpeedCell) {
 	if c.rows != nil {
 		row = c.rows(m)
 	}
-	for sl := range B {
-		ids := make([]int, depth)
-		for i := range ids {
-			ids[i] = rnd()
-		}
-		if c.rows == nil {
-			mc3Fill(t, r, sl, ids)
-			continue
-		}
-		if err := r.useKVSlot(sl); err != nil {
-			t.Fatal(err)
-		}
-		for i, id := range ids {
-			r.ForwardEmb(row(id), i)
+	fills := make([][]int, B)
+	for sl := range fills {
+		fills[sl] = make([]int, depth)
+		for i := range fills[sl] {
+			fills[sl][i] = rnd()
 		}
 	}
+	stepCellFill(t, r, fills, row, c.rows != nil)
 	first := make([]int, B)
 	for i := range first {
 		first[i] = rnd()
@@ -363,6 +482,9 @@ func op4mStepSpeed(t *testing.T, c stepSpeedCell) {
 	run := func(batched bool) (float64, []int) {
 		if c.stepArms != nil {
 			c.stepArms(batched)
+		}
+		if r.recurrentModel() { // every run starts from the state the fill left, as the KV rows it rewrites in place do
+			stepCellFill(t, r, fills, row, c.rows != nil)
 		}
 		cur := append([]int(nil), first...)
 		var toks []int
@@ -557,13 +679,17 @@ func mc3ScratchPricedAtTwoSlots(t *testing.T, dir string, moeStep bool) {
 		t.Cleanup(func() { a.r.Close() })
 		return a
 	}
-	tight := build(func(m *decoder.Model) int64 { return residentNeedBytes(m) + residentKVBytes(m) })
+	tight := build(func(m *decoder.Model) int64 {
+		return residentNeedBytes(m, metalCtxPlan{}) + residentKVBytes(m, metalCtxPlan{})
+	})
 	if len(tight.r.kvSlotBufs) != 2 || tight.r.batch != nil || tight.r.stepDecline == "" {
 		t.Fatalf("a ceiling of the weights and two slots' KV: %d slots, step built %v, decline %q; want 2 slots and the step declined",
 			len(tight.r.kvSlotBufs), tight.r.batch != nil, tight.r.stepDecline)
 	}
 	scratch := tight.r.stepScratchBytes()
-	roomy := build(func(m *decoder.Model) int64 { return residentNeedBytes(m) + residentKVBytes(m) + scratch })
+	roomy := build(func(m *decoder.Model) int64 {
+		return residentNeedBytes(m, metalCtxPlan{}) + residentKVBytes(m, metalCtxPlan{}) + scratch
+	})
 	if len(roomy.r.kvSlotBufs) != 2 || roomy.r.batch == nil || roomy.r.stepDecline != "" {
 		t.Errorf("that ceiling plus the step's %d bytes of scratch: %d slots, step built %v, decline %q; want 2 slots and the step",
 			scratch, len(roomy.r.kvSlotBufs), roomy.r.batch != nil, roomy.r.stepDecline)
@@ -671,7 +797,7 @@ func recurrentStepResidentSlots(t *testing.T, fx recurrentFixture, on bool, slot
 	if err != nil {
 		t.Fatalf("load %s: %v", fx.dir, err)
 	}
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		m.Close()
 		t.Fatalf("build %s's resident: %v", fx.dir, err)
@@ -729,8 +855,89 @@ func mc3IdentityDiff(t *testing.T, r *resident, depths []int) int {
 	return diff
 }
 
-// TestMC3Step_recurrentBitIdentical is OP4m-d4b's D4b-1 and OP4m-d6b's D6b-1 (docs/tasks/task-forward-architecture-2026-10.md
-// §4.9): with the step's recurrent blocks on, each tracked recurrent fixture builds the batched step. Four sequences at
+// TestMC3Step_recurrentMatchesDecodeOnServeHistories: the recurrent step against production's single-token forward when each slot's
+// history is built the way serve builds it, by single-token decodes or by PrefillLast, as well as by ForwardBatch. Slots 0 and 1 run
+// the step and their twins 2 and 3 the decode, from the same history; each side then decodes 40 tokens greedily on its own choices.
+// Every step row must equal its twin's decode bit for bit. It prints, per fixture and history, the widest logit difference, how many
+// rows' argmax agree and how many greedy tokens agree before the first divergence.
+func TestMC3Step_recurrentMatchesDecodeOnServeHistories(t *testing.T) {
+	const depth, steps = 20, 40
+	for _, fx := range recurrentStepFixtures {
+		for _, how := range []string{"decode", "PrefillLast", "ForwardBatch", "decode-bound"} {
+			t.Run(filepath.Base(fx.dir)+"/"+how, func(t *testing.T) {
+				r := recurrentStepResidentSlots(t, fx, true, 4)
+				if r.batch == nil {
+					t.Fatalf("no batched step: %s", r.batchIneligible())
+				}
+				for s := range 4 {
+					if err := r.useKVSlot(s); err != nil {
+						t.Fatal(err)
+					}
+					embs := make([][]float32, depth)
+					for i := range embs {
+						embs[i] = mc3Emb(r, (i*37+(s%2)*11+5)%r.V) // slots s and s+2 get the same history
+					}
+					switch how {
+					case "decode", "decode-bound":
+						for i, e := range embs {
+							r.ForwardEmb(e, i)
+						}
+					case "PrefillLast":
+						r.PrefillLast(embs, 0)
+					case "ForwardBatch":
+						if _, err := r.ForwardBatch(embs, 0); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				tokStep, tokDec := []int{3, 9}, []int{3, 9}
+				worst, argAgree, rows, agreeUntil := 0.0, 0, 0, -1
+				for st := range steps {
+					seqs := []batchSeq{{slot: 0, pos: depth + st, emb: mc3Emb(r, tokStep[0])}, {slot: 1, pos: depth + st, emb: mc3Emb(r, tokStep[1])}}
+					dec := make([][]float32, 2)
+					for m := range 2 {
+						if err := r.useKVSlot(2 + m); err != nil {
+							t.Fatal(err)
+						}
+						dec[m] = slices.Clone(r.ForwardEmb(mc3Emb(r, tokDec[m]), depth+st))
+					}
+					if how == "decode-bound" { // the step then runs on the bound slot, as serve's step does
+						if err := r.useKVSlot(0); err != nil {
+							t.Fatal(err)
+						}
+					}
+					got := mc3Step(t, r, seqs)
+					same := tokStep[0] == tokDec[0] && tokStep[1] == tokDec[1]
+					for m := range 2 {
+						if same {
+							for i := range got[m] {
+								worst = max(worst, math.Abs(float64(got[m][i]-dec[m][i])))
+							}
+							rows++
+							if argmaxF32(got[m]) == argmaxF32(dec[m]) {
+								argAgree++
+							}
+						}
+						tokStep[m], tokDec[m] = argmaxF32(got[m]), argmaxF32(dec[m])
+					}
+					if agreeUntil < 0 && (tokStep[0] != tokDec[0] || tokStep[1] != tokDec[1]) {
+						agreeUntil = st
+					}
+				}
+				if agreeUntil < 0 {
+					agreeUntil = steps
+				}
+				fmt.Fprintf(os.Stderr, "[recurrent-step] %-14s %-12s max |step-decode| %.3g over %d rows on one history, argmax agree %d/%d, greedy tokens agree for %d of %d steps\n",
+					filepath.Base(fx.dir), how, worst, rows, argAgree, rows, agreeUntil, steps)
+				if worst != 0 {
+					t.Errorf("the step's rows differ from production's single-token forward (max %.3g; greedy agrees for %d of %d steps)", worst, agreeUntil, steps)
+				}
+			})
+		}
+	}
+}
+
+// TestMC3Step_recurrentBitIdentical is OP4m-d4b's D4b-1 and OP4m-d6b's D6b-1: with the step's recurrent blocks on, each tracked recurrent fixture builds the batched step. Four sequences at
 // different depths, each on its own slot with its own recurrent state, stepped together 12 times, equal production's
 // single-token forward on every logit. With the blocks off, none builds it.
 func TestMC3Step_recurrentBitIdentical(t *testing.T) {
@@ -1085,7 +1292,7 @@ func TestMC3Step_recurrentScratchPriced(t *testing.T) {
 		return a
 	}
 	twoSlots := func(m *decoder.Model) int64 {
-		return residentNeedBytes(m) + metalSlotBytes(m)
+		return residentNeedBytes(m, metalCtxPlan{}) + metalSlotBytes(m, metalCtxPlan{})
 	}
 	tight := build(2, twoSlots)
 	if len(tight.r.kvSlotBufs) != 2 || tight.r.batch != nil || tight.r.stepDecline == "" {
@@ -1106,11 +1313,11 @@ func TestMC3Step_recurrentScratchPriced(t *testing.T) {
 	}(); state <= 0 {
 		t.Fatalf("the fixture's recurrent state is %d bytes: this test no longer discriminates", state)
 	}
-	one := build(1, func(m *decoder.Model) int64 { return residentNeedBytes(m) + scratch - 1 })
+	one := build(1, func(m *decoder.Model) int64 { return residentNeedBytes(m, metalCtxPlan{}) + scratch - 1 })
 	if one.r.batch != nil {
 		t.Error("one slot, a ceiling a byte short of the need, the slot's recurrent state in it, and the scratch: the step built")
 	}
-	if ok := build(1, func(m *decoder.Model) int64 { return residentNeedBytes(m) + scratch }); ok.r.batch == nil {
+	if ok := build(1, func(m *decoder.Model) int64 { return residentNeedBytes(m, metalCtxPlan{}) + scratch }); ok.r.batch == nil {
 		t.Errorf("one slot, its state and the scratch: no step (%s)", ok.r.stepDecline)
 	}
 }
@@ -1542,8 +1749,8 @@ func TestMC3StepWallVsGPU(t *testing.T) {
 	}
 }
 
-// TestMC3Verify_sameSlotRowsBitIdentical is the first gate of Metal spec verify on the step kernels
-// (docs/tasks/task-concurrency-2026-09.md, MC4): a step whose rows are CONSECUTIVE positions of one sequence on one slot
+// TestMC3Verify_sameSlotRowsBitIdentical is the first gate of Metal spec verify on the step kernels:
+// a step whose rows are CONSECUTIVE positions of one sequence on one slot
 // (a verify round) gives every logit and every K/V element bit-identical to production decoding those tokens one after
 // another. Twin slots are filled with the same history; M = 2, 4, 8 rows at depths 128 and 2048, and a run straddling
 // attnFADepthFloor, so one step mixes per-head and attention_fa rows.
@@ -1801,6 +2008,172 @@ func TestKVPages_decodeThroughTheTable(t *testing.T) {
 			}
 			if n := differ(inOrder, run(false, true)); n == 0 {
 				t.Error("two table entries swapped under a filled cache moved no logit: the kernels do not read the table")
+			}
+		})
+	}
+}
+
+// TestKVPages_prefillThroughTheTable: a resident's prefill stores and reads KV through the table, so blocks handed out reversed and
+// interleaved across slots give the in-order layout's logits bit for bit. Each of three slots prefills a 300-token prompt (its pass
+// crosses block edges and takes the multi-row kernels) and decodes past it; then each takes a second turn whose prefill starts inside a
+// block, and a batched step runs over all three. It runs at f16 and int8 KV on each prefill attention kernel the fixture can take,
+// and asserts by the pass's own launches that the kernel ran. The plant swaps two entries of slot 0's table under a filled cache, which
+// must move the second turn's prefill logits. Keys this fixture's attention gives no weight cannot move a logit here, so the kernel
+// tests above hold each key row on its own.
+func TestKVPages_prefillThroughTheTable(t *testing.T) {
+	const ctx, slots, prompt, decodeN, turn2 = 1024, 3, 300, 8, 70
+	for _, kv := range []string{"", "i8"} {
+		for _, arm := range []struct {
+			name, kernel string
+			set          func(t *testing.T, r *resident)
+		}{
+			{"steel", "attention_prefill_steel", nil},
+			{"fused", "attention_prefill_fused", func(t *testing.T, r *resident) {
+				prefillSteelAttnOff = true
+				t.Cleanup(func() { prefillSteelAttnOff = false })
+			}},
+			{"exact", "attention_prefill", func(t *testing.T, r *resident) { setResidentKnob(t, r, "GOINFER_METAL_FUSED_ATTENTION", "0") }},
+			{"tiled", "attention_prefill_tiled", func(t *testing.T, r *resident) {
+				setResidentKnob(t, r, "GOINFER_METAL_FUSED_ATTENTION", "0")
+				exactAttnTileForTest = 48
+				t.Cleanup(func() { exactAttnTileForTest = 0 })
+			}},
+		} {
+			t.Run("kv="+kv+"/"+arm.name, func(t *testing.T) {
+				mc3TestKV = kv
+				defer func() { mc3TestKV = "" }()
+				run := func(scramble, plant bool) [][]float32 {
+					kvScrambleForTest = scramble
+					defer func() { kvScrambleForTest = false }()
+					_, r := mc3Resident(t, slots, ctx)
+					if arm.set != nil {
+						arm.set(t, r)
+					}
+					prefillAttnRanForTest = map[string]int{}
+					defer func() { prefillAttnRanForTest = nil }()
+					var out [][]float32
+					add := func(l []float32) { out = append(out, slices.Clone(l)) }
+					bind := func(s int) {
+						t.Helper()
+						if err := r.useKVSlot(s); err != nil {
+							t.Fatal(err)
+						}
+					}
+					embs := func(seed, n int) [][]float32 {
+						e := make([][]float32, n)
+						for i := range e {
+							e[i] = mc3Emb(r, (i*7+seed*13+1)%r.V)
+						}
+						return e
+					}
+					for s := range slots {
+						bind(s)
+						add(r.PrefillLast(embs(s, prompt), 0))
+						for i := range decodeN {
+							add(r.ForwardEmb(mc3Emb(r, (i*5+s+3)%r.V), prompt+i))
+						}
+					}
+					if plant {
+						r.stopExec()
+						tab := r.kvTab.U32s()
+						tab[0], tab[1] = tab[1], tab[0] // the first block: this fixture's attention is too peaked for a later block's keys to move a logit
+					}
+					at := prompt + decodeN
+					for s := range slots {
+						bind(s)
+						add(r.PrefillLast(embs(s+7, turn2), at))
+					}
+					seqs := []batchSeq{{slot: 2, pos: at + turn2, emb: mc3Emb(r, 5)}, {slot: 0, pos: at + turn2, emb: mc3Emb(r, 7)}, {slot: 1, pos: at + turn2, emb: mc3Emb(r, 9)}}
+					for _, l := range mc3Step(t, r, seqs) {
+						add(l)
+					}
+					if prefillAttnRanForTest[arm.kernel] == 0 {
+						t.Fatalf("the passes never launched %s; they launched %v", arm.kernel, prefillAttnRanForTest)
+					}
+					return out
+				}
+				differ := func(a, b [][]float32) int {
+					n := 0
+					for i := range a {
+						for j := range a[i] {
+							if math.Float32bits(a[i][j]) != math.Float32bits(b[i][j]) {
+								n++
+							}
+						}
+					}
+					return n
+				}
+				inOrder := run(false, false)
+				if n := differ(inOrder, run(true, false)); n != 0 {
+					t.Errorf("%d logits differ between scrambled and in-order blocks", n)
+				}
+				// The second turns' prefill logits alone: the step after them reads the table too.
+				turn2At := slots * (1 + decodeN)
+				if n := differ(inOrder[turn2At:turn2At+slots], run(false, true)[turn2At:turn2At+slots]); n == 0 {
+					t.Error("two table entries swapped under a filled cache moved no second-turn prefill logit: prefill does not read the table")
+				}
+			})
+		}
+	}
+}
+
+// TestKVPages_uploadKVThroughTheTable: UploadKV writes each position's K and V (and int8 scales) at its row through the bound slot's
+// table, so rows uploaded into blocks handed out reversed and interleaved across slots decode as in-order ones bit for bit, at every
+// KV precision, on two slots, with uploads (each slot one pass, as the decoder uploads) that cross block edges.
+func TestKVPages_uploadKVThroughTheTable(t *testing.T) {
+	const ctx, slots, rows = 512, 2, 150
+	for _, kv := range []string{"", "i8", "f32"} {
+		t.Run("kv="+kv, func(t *testing.T) {
+			mc3TestKV = kv
+			defer func() { mc3TestKV = "" }()
+			run := func(scramble bool) [][]float32 {
+				kvScrambleForTest = scramble
+				defer func() { kvScrambleForTest = false }()
+				_, r := mc3Resident(t, slots, ctx)
+				a := &metalResident{r: r, hidden: r.H}
+				var out [][]float32
+				for s := range slots {
+					if err := r.useKVSlot(s); err != nil {
+						t.Fatal(err)
+					}
+					if err := a.BeginKVUpload(); err != nil {
+						t.Fatal(err)
+					}
+					for l := range r.layers {
+						g := r.layers[l].geom
+						if g == nil || r.layers[l].kvShared {
+							continue
+						}
+						rng := rand.New(rand.NewSource(int64(100*s + l)))
+						vals := func(n int) []float32 {
+							v := make([]float32, n)
+							for i := range v {
+								v[i] = float32(rng.NormFloat64())
+							}
+							return v
+						}
+						if err := a.UploadKV(l, 0, vals(rows*g.kvDim), vals(rows*g.kvDim)); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := a.EndKVUpload(false); err != nil {
+						t.Fatal(err)
+					}
+					out = append(out, slices.Clone(r.ForwardEmb(mc3Emb(r, 11+s), rows)))
+				}
+				return out
+			}
+			a, b := run(false), run(true)
+			n := 0
+			for i := range a {
+				for j := range a[i] {
+					if math.Float32bits(a[i][j]) != math.Float32bits(b[i][j]) {
+						n++
+					}
+				}
+			}
+			if n != 0 {
+				t.Errorf("%d logits differ between uploads into scrambled and in-order blocks", n)
 			}
 		})
 	}

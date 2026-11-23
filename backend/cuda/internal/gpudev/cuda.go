@@ -76,9 +76,9 @@ type Device struct {
 	allocs []devAlloc // every device allocation handed out, for ReleaseAll
 	objs   []closer   // modules + streams, for ReleaseObjects
 	hosts  map[closer]func()
-	leaser Leaser // every allocation's lease (MM3); nil leases nothing
+	leaser Leaser // every allocation's lease; nil leases nothing
 	// launches and waits count every kernel launch and every host wait on the device (Activity), always on: the device-level
-	// count SB11's per-kernel counts are checked against.
+	// count the resident's per-kernel cost counts are checked against.
 	launches, waits atomic.Int64
 }
 
@@ -115,7 +115,7 @@ type Leaser interface {
 	Lease(onDevice bool, line string, requested, charged int64) (release func())
 }
 
-// NewLeaser, when set, gives every device CreateSystemDefaultDevice creates its leaser: the backend sets it at init, so a device
+// NewLeaser (when set) gives every device CreateSystemDefaultDevice creates its leaser: the backend sets it at init, so a device
 // any package creates is leased.
 var NewLeaser func() Leaser
 
@@ -162,7 +162,7 @@ func ChargedBytes(n int64) int64 {
 // package may set it to its test line for its own buffers.
 var UnlinedLine string
 
-// ReleasedForTest, when set, is called by ReleaseObjects after everything the device tracked is freed, so a test can read the
+// ReleasedForTest (when set) is called by ReleaseObjects after everything the device tracked is freed, so a test can read the
 // leaser's account then (I1, I2). A test seam, nil in production.
 var ReleasedForTest func(*Device)
 
@@ -321,7 +321,7 @@ func (d *Device) ReleaseObjects() {
 // swap-remove scan: fine for coarse per-request scratch, never a per-token path.
 // A zero Buffer is a no-op. Mirrors metal.go's ReleaseBuf.
 func (d *Device) ReleaseBuf(b Buffer) {
-	if b.b == nil {
+	if b.b == nil || b.lim != 0 { // a sub-allocation is freed with its allocation
 		return
 	}
 	d.mu.Lock()
@@ -334,6 +334,9 @@ func (d *Device) ReleaseBuf(b Buffer) {
 		}
 	}
 	d.mu.Unlock()
+	if TraceForTest != nil {
+		TraceForTest(TraceEvent{Op: TraceFree, Dst: uint64(b.b.DevicePtr())})
+	}
 	_ = b.b.Close()
 }
 
@@ -429,6 +432,9 @@ type Buffer struct {
 	d   *Device     // owning device, whose Activity counts this buffer's host waits
 	n   int         // element count in the constructor's unit (floats, int8s, u32s, …)
 	off uintptr     // byte offset for binding (a sub-view into a larger buffer; 0 = whole)
+	// A sub-allocation (Sub) is the bytes [base, lim) of its allocation: At binds relative to base, and every bounds check reads
+	// lim. lim == 0 is a whole allocation.
+	base, lim uintptr
 	// raw != 0 ⇒ this Buffer is a device-usable pointer into MAPPED PINNED HOST memory (see
 	// NewMappedHostBuffer): b is nil, the bytes live in host RAM, and a kernel reads them
 	// directly over PCIe (zero-copy). arg() binds raw instead of b.b.DevicePtr().
@@ -437,7 +443,26 @@ type Buffer struct {
 
 // At returns a view of the buffer bound at byteOff — for reading a slice of a
 // combined buffer. Zero-copy; only the bind offset changes. Mirrors metal.go's At.
-func (b Buffer) At(byteOff int) Buffer { b.off = uintptr(byteOff); return b }
+func (b Buffer) At(byteOff int) Buffer { b.off = b.base + uintptr(byteOff); return b }
+
+// Sub is the sub-allocation of nBytes (more than 0) at byteOff of a whole allocation b, holding n elements of its caller's unit:
+// a buffer of its own for every verb (At, Len, the copies and their bounds checks), sharing b's device memory. It is freed with b,
+// never on its own (ReleaseBuf ignores it).
+func (b Buffer) Sub(byteOff, nBytes, n int) Buffer {
+	if b.lim != 0 || b.b == nil || byteOff < 0 || nBytes <= 0 || uint64(byteOff)+uint64(nBytes) > b.b.Bytes() {
+		panic(fmt.Sprintf("cuda: Sub [%d,%d) of a buffer that is not a whole allocation holding it", byteOff, byteOff+nBytes))
+	}
+	b.base, b.off, b.lim, b.n = uintptr(byteOff), uintptr(byteOff), uintptr(byteOff+nBytes), n
+	return b
+}
+
+// bytes is the end of the bytes this buffer may address: its allocation's size, or a sub-allocation's lim.
+func (b Buffer) bytes() uint64 {
+	if b.lim != 0 {
+		return uint64(b.lim)
+	}
+	return b.b.Bytes()
+}
 
 // Len is the buffer's element count in its constructor's unit.
 func (b Buffer) Len() int { return b.n }
@@ -450,6 +475,30 @@ func (d *Device) MustBuf(nBytes, n int, what string) Buffer {
 	return d.MustBufOn(UnlinedLine, nBytes, n, what)
 }
 
+// AllocFailure is the value MustBufOn panics with when the device has no memory for an allocation. Callers that can degrade recover
+// it and tell it from a bug with internal/runtime/mem.DeviceAllocFailed, which matches it by its DeviceAllocFailure method (this
+// package imports nothing of goinfer's, so it cannot name mem's interface).
+type AllocFailure struct {
+	What  string // the allocation's label
+	Bytes int
+	Err   error // the driver's error
+}
+
+func (f *AllocFailure) Error() string {
+	return fmt.Sprintf("cuda: device allocation failed (%s, %d bytes): %v", f.What, f.Bytes, f.Err)
+}
+
+func (f *AllocFailure) Unwrap() error { return f.Err }
+
+// DeviceAllocFailure marks f as a failed device allocation for internal/runtime/mem.AllocFailure.
+func (*AllocFailure) DeviceAllocFailure() {}
+
+// AllocFailedPanic is the value to panic with for a failed allocation of nBytes labelled what; a test seam that stands in an
+// out-of-memory device panics with it too.
+func AllocFailedPanic(what string, nBytes int, err error) *AllocFailure {
+	return &AllocFailure{What: what, Bytes: nBytes, Err: err}
+}
+
 // MustBufOn is MustBuf leasing the bytes on plan line line.
 func (d *Device) MustBufOn(line string, nBytes, n int, what string) Buffer {
 	if d.cx == nil {
@@ -457,13 +506,40 @@ func (d *Device) MustBufOn(line string, nBytes, n int, what string) Buffer {
 	}
 	buf, err := gc.Alloc[uint8](d.cx, nBytes)
 	if err != nil {
-		panic(fmt.Sprintf("cuda: device allocation failed (%s, %d bytes): %v", what, nBytes, err))
+		panic(AllocFailedPanic(what, nBytes, err))
 	}
 	release := d.lease(true, line, int64(nBytes), ChargedBytes(int64(nBytes)))
 	d.mu.Lock()
 	d.allocs = append(d.allocs, devAlloc{b: buf, release: release})
 	d.mu.Unlock()
+	if TraceForTest != nil {
+		TraceForTest(TraceEvent{Op: TraceAlloc, Dst: uint64(buf.DevicePtr()), Bytes: nBytes, Line: line})
+	}
 	return Buffer{b: buf, cx: d.cx, d: d, n: n}
+}
+
+// MustBufSplitOn is MustBufOn for an allocation whose bytes the plan prices on two lines: the first lineBytes on line, requested
+// and charged at that size, and the rest, with all of the driver's rounding, on restLine.
+func (d *Device) MustBufSplitOn(line string, nBytes int, lineBytes int64, restLine string, what string) Buffer {
+	if d.cx == nil {
+		panic(fmt.Sprintf("cuda: allocation on a released device (%s, %d bytes)", what, nBytes))
+	}
+	if lineBytes < 0 || lineBytes > int64(nBytes) {
+		panic(fmt.Sprintf("cuda: %s: %d of %d bytes on line %q", what, lineBytes, nBytes, line))
+	}
+	buf, err := gc.Alloc[uint8](d.cx, nBytes)
+	if err != nil {
+		panic(AllocFailedPanic(what, nBytes, err))
+	}
+	relLine := d.lease(true, line, lineBytes, lineBytes)
+	relRest := d.lease(true, restLine, int64(nBytes)-lineBytes, ChargedBytes(int64(nBytes))-lineBytes)
+	d.mu.Lock()
+	d.allocs = append(d.allocs, devAlloc{b: buf, release: func() { relLine(); relRest() }})
+	d.mu.Unlock()
+	if TraceForTest != nil {
+		TraceForTest(TraceEvent{Op: TraceAlloc, Dst: uint64(buf.DevicePtr()), Bytes: nBytes, Line: line})
+	}
+	return Buffer{b: buf, cx: d.cx, d: d, n: nBytes}
 }
 
 // asBytes reinterprets a slice of fixed-size scalars as the []byte gocudrv copies.
@@ -505,17 +581,20 @@ func (b Buffer) upload(src []byte) error {
 	if len(src) == 0 {
 		return nil
 	}
-	if got, want := b.b.Bytes(), uint64(b.off)+uint64(len(src)); got < want {
+	if got, want := b.bytes(), uint64(b.off)+uint64(len(src)); got < want {
 		return fmt.Errorf("cuda: upload of %d bytes at offset %d overruns a %d-byte buffer", len(src), b.off, got)
 	}
-	// SYNCHRONIZE BEFORE THE COPY TOO, not just after (audit C-01).
+	if TraceForTest != nil {
+		TraceForTest(TraceEvent{Op: TraceUpload, Dst: b.BindAddr(), Bytes: len(src), Src: src})
+	}
+	// SYNCHRONIZE BEFORE THE COPY TOO, not just after.
 	//
 	// The trailing Synchronize below orders this copy before LATER launches —
 	// the read-after-write race the comment above describes. It does nothing
 	// about the mirror image: a launch ALREADY QUEUED on the (non-blocking)
 	// stream that READS this buffer, while the null-stream DMA lands new bytes
-	// underneath it. That write-after-read is how qwencuda's mid-forward segment
-	// upload could feed full-image bounds to layers still running with shared
+	// underneath it. That write-after-read let a mid-forward segment
+	// upload feed full-image bounds to layers still running with shared
 	// memory sized for the windowed ones.
 	//
 	// Same reasoning as the trailing sync: a full device sync is heavier than
@@ -545,8 +624,11 @@ func (b Buffer) download(dst []byte) error {
 	if len(dst) == 0 {
 		return nil
 	}
-	if got, want := b.b.Bytes(), uint64(b.off)+uint64(len(dst)); got < want {
+	if got, want := b.bytes(), uint64(b.off)+uint64(len(dst)); got < want {
 		return fmt.Errorf("cuda: download of %d bytes at offset %d overruns a %d-byte buffer", len(dst), b.off, got)
+	}
+	if TraceForTest != nil {
+		TraceForTest(TraceEvent{Op: TraceDownload, Dst: b.BindAddr(), Bytes: len(dst)})
 	}
 	b.d.noteWait() // a blocking copy to the host
 	return b.b.CopyToAt(bg, dst, int(b.off))
@@ -730,7 +812,15 @@ type MappedHostBuffer struct {
 	hb      *HostBuffer[uint8]        // origin: NewMappedHostBuffer (allocates, caller fills after)
 	rh      *gc.RegisteredHost[uint8] // origin: RegisterMappedHostBuffer (caller already filled, this pins in place)
 	buf     Buffer
-	release func() // RegisterMappedHostBuffer's pin's lease (NewMappedHostBuffer's is its HostBuffer's)
+	release func() // RegisterMappedHostBuffer's pin's lease (NewMappedHostBuffer's is its HostBuffer's); NewPageableHostSource's release
+	page    []byte // origin: NewPageableHostSource (caller-owned pageable bytes, nothing pinned)
+}
+
+// NewPageableHostSource wraps caller-owned bytes (a file mapping, say) as a MappedHostBuffer that pins nothing: Bytes() is data, Buffer() is
+// the zero Buffer (no kernel may read it), and an upload from it copies from pageable memory, which the driver stages. Close runs release.
+// The CUDA expert cache builds one per stack under --moe-experts-unpinned (docs/measurements/mem10-2026-11/README.md, "MEM10 opt-in").
+func NewPageableHostSource(data []byte, release func()) *MappedHostBuffer {
+	return &MappedHostBuffer{page: data, release: release}
 }
 
 // NewMappedHostBuffer allocates nBytes of pinned, device-mapped host memory. Bytes() is the
@@ -829,6 +919,9 @@ func (m *MappedHostBuffer) Bytes() []byte {
 	if m == nil {
 		return nil
 	}
+	if m.page != nil {
+		return m.page
+	}
 	if m.rh != nil {
 		return m.rh.Slice()
 	}
@@ -849,6 +942,14 @@ func (m *MappedHostBuffer) Buffer() Buffer {
 // Device.
 func (m *MappedHostBuffer) Close() error {
 	if m == nil {
+		return nil
+	}
+	if m.page != nil {
+		if m.release != nil {
+			m.release()
+			m.release = nil
+		}
+		m.page = nil
 		return nil
 	}
 	if m.rh != nil {
@@ -1016,6 +1117,9 @@ func (q Queue) Launch(p Pipeline, cfg LaunchConfig, args ...KernelArg) error {
 		}
 		ga[i] = a.a
 	}
+	if TraceForTest != nil {
+		TraceForTest(TraceEvent{Op: TraceLaunch, Pipe: p.Ptr(), Cfg: cfg, Args: append([]KernelArg(nil), args...)})
+	}
 	if q.d != nil {
 		q.d.launches.Add(1)
 	}
@@ -1107,6 +1211,9 @@ func (q Queue) UploadAsync(dst Buffer, src *HostBuffer[uint8]) error {
 	}
 	if src == nil || src.h == nil {
 		return fmt.Errorf("cuda: UploadAsync from a nil pinned buffer")
+	}
+	if dst.lim != 0 {
+		return fmt.Errorf("cuda: UploadAsync into a sub-allocation: it writes from the allocation's base")
 	}
 	if src.h.Bytes() > dst.b.Bytes() {
 		return fmt.Errorf("cuda: UploadAsync src %d bytes exceeds dst %d bytes", src.h.Bytes(), dst.b.Bytes())

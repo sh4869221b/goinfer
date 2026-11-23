@@ -1,7 +1,7 @@
 //go:build goinfer_testhooks
 
-// Test-only hooks for the prefill fidelity gate (docs/completed/task-prefill-gap.md §3: a backend's fast/batched prefill
-// vs its own exact path) and the peer-benchmark fidelity column (docs/tasks/task-peer-benchmarks.md §4: goinfer vs a
+// Test-only hooks for the prefill fidelity gate ( a backend's fast/batched prefill
+// vs its own exact path) and the peer-benchmark fidelity column (goinfer vs a
 // peer engine). Both want the same teacher-forced top-1 agreement and KL scorer, so it is written once here. They gate
 // correctness and quality, not production inference, so they stay off the public API surface.
 
@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 	"github.com/townsendmerino/goinfer/tokenizer"
 )
 
@@ -63,7 +64,7 @@ func (m *Model) PrefillLogitsWithAdapterForTest(ctx context.Context, prompt []in
 }
 
 // ResidentAdapterLayersForTest exposes residentAdapterLayers, the conversion generateInto applies to a loaded adapter, so
-// a backend parity test can call ResidentAdapter.SetAdapter directly with exactly the deltas a request would bind.
+// a backend parity test can call AdapterAvailable.SetAdapter directly with exactly the deltas a request would bind.
 func (m *Model) ResidentAdapterLayersForTest(adapterName string) []ResidentAdapterLayer {
 	return residentAdapterLayers(m.adapter(adapterName))
 }
@@ -74,12 +75,12 @@ func (m *Model) PrefillLogitsVLForTest(ctx context.Context, ids []int, imageFeat
 	return m.prefillLogitsVL(ctx, ids, imageFeats, imgPos, imgLen, cache)
 }
 
-// PrefillLogitsVLSpansForTest exposes prefillLogitsVLSpans (S11, several images) for a backend's multi-block gate.
+// PrefillLogitsVLSpansForTest exposes prefillLogitsVLSpans (several images) for a backend's multi-block gate.
 func (m *Model) PrefillLogitsVLSpansForTest(ctx context.Context, ids []int, spans []ImageSpan, imageFeats []float32, cache *KVCache) ([]float32, error) {
 	return m.prefillLogitsVLSpans(ctx, ids, spans, imageFeats, cache, false)
 }
 
-// PrefillLogitsVLCausalSpansForTest is PrefillLogitsVLSpansForTest with the image tokens causal (Pixtral, S10).
+// PrefillLogitsVLCausalSpansForTest is PrefillLogitsVLSpansForTest with the image tokens causal (Pixtral).
 func (m *Model) PrefillLogitsVLCausalSpansForTest(ctx context.Context, ids []int, spans []ImageSpan, imageFeats []float32, cache *KVCache) ([]float32, error) {
 	return m.prefillLogitsVLSpans(ctx, ids, spans, imageFeats, cache, true)
 }
@@ -133,7 +134,7 @@ const NearTieHardFailPct = 0.03
 // separation between probabilities 0.85 and 0.11. The same threshold is used inline by cuda/realforward_test.go and
 // gpu/kv_i8_parity_test.go; changing it means changing all three together.
 func NearTieArgmaxForTest(refLogits, candLogits []float32) (agree bool, gapPct float64, hardFail bool) {
-	refArg, candArg := argmax(refLogits), argmax(candLogits)
+	refArg, candArg := sampling.Argmax(refLogits), sampling.Argmax(candLogits)
 	if refArg == candArg {
 		return true, 0, false
 	}
@@ -166,7 +167,7 @@ func TeacherForcedTop1AgreementForTest(candLogits [][]float32, refTokens []int) 
 	firstDivergence = -1
 	agree := 0
 	for i, lg := range candLogits {
-		if argmax(lg) == refTokens[i] {
+		if sampling.Argmax(lg) == refTokens[i] {
 			agree++
 		} else if firstDivergence == -1 {
 			firstDivergence = i
@@ -179,8 +180,8 @@ func TeacherForcedTop1AgreementForTest(candLogits [][]float32, refTokens []int) 
 // (softmaxStable, temperature 1); p is the reference distribution, q the candidate. Terms where p is ~0 are skipped: the
 // limit of p*log(p/q) as p->0 is 0 regardless of q, and evaluating it risks NaN from log(0).
 func KLDivergenceForTest(pLogits, qLogits []float32) float64 {
-	p := softmaxStable(pLogits, 1)
-	q := softmaxStable(qLogits, 1)
+	p := sampling.SoftmaxStable(pLogits, 1)
+	q := sampling.SoftmaxStable(qLogits, 1)
 	var kl float64
 	for i, pi := range p {
 		if pi < 1e-12 {
@@ -191,45 +192,43 @@ func KLDivergenceForTest(pLogits, qLogits []float32) float64 {
 	return kl
 }
 
-// PrefillGateProseFiles are real prose documents from this repo, read at run time, for content-dependent prefill
-// fidelity (not scripts/prompts.json's word-repetition filler, which docs/completed/task-prefill-gap.md §0 rules out
-// for that). Each encodes to well over 3900 tokens, so no prompt repeats to reach the deepest K. Paths are relative to a
-// package directory one level under the repo root, so the decoder and metal test packages resolve the same list: the
-// CPU reference (decoder/prefill_ref_gen_test.go) and the Metal arms (metal/prefill_gate_test.go) score the same ten
-// prompts.
+// PrefillGateProseFiles names the ten real prose documents of this repository that prompt set A was snapshotted from, for
+// content-dependent prefill fidelity (not scripts/prompts.json's word-repetition filler, which cannot exercise it). Each encodes
+// to well over 3900 tokens, so no prompt repeats to reach the deepest K. Only the base names matter: the gate reads the
+// snapshots under testdata/prefill-gate-prose-a/ (see PrefillGatePromptSet), so the decoder and backend test packages score the
+// same ten prompts whatever the live documents say now.
 var PrefillGateProseFiles = []string{
-	"../docs/completed/audit-2026-09-02.md", // moved from ../docs/audit-2026-09-02.md when archived
-	"../docs/QUEUE.md",
-	"../docs/queue-engineering.md",
-	"../docs/ollama-chase.md",
-	"../docs/benchmarks.md",
-	"../docs/parity-coverage-policy.md",
-	"../docs/completed/task-w4a8-neon-bandwidth.md", // moved from ../docs/task-w4a8-neon-bandwidth.md when archived
-	"../docs/legacy-benchmarks.md",
-	"../docs/completed/task-zeno-compare.md", // moved from ../docs/task-zeno-compare.md when archived
-	"../docs/queue-release.md",
+	"audit-2026-09-02.md",
+	"QUEUE.md",
+	"queue-engineering.md",
+	"ollama-chase.md",
+	"benchmarks.md",
+	"parity-coverage-policy.md",
+	"task-w4a8-neon-bandwidth.md",
+	"legacy-benchmarks.md",
+	"task-zeno-compare.md",
+	"queue-release.md",
 }
 
-// PrefillGateProseFilesB is prompt set B: ten more real repo documents, disjoint from set A, each over 3900 tokens, with
-// the same path convention. The gate reads the snapshot under testdata/prefill-gate-prose-b/ (see PrefillGatePromptSet),
-// not these live paths; this list records what the snapshot was populated from.
+// PrefillGateProseFilesB is prompt set B: ten more real repo documents, disjoint from set A, each over 3900 tokens, named by
+// base name like set A. The gate reads the snapshot under testdata/prefill-gate-prose-b/, not the live documents.
 var PrefillGateProseFilesB = []string{
-	"../docs/completed/task-attention-decode-cost.md", // moved from ../docs/task-attention-decode-cost.md when archived
-	"../docs/completed/task-moe-streaming.md",         // moved from ../docs/task-moe-streaming.md via docs/tasks/ to docs/completed/
-	"../docs/completed/queue-performance.md",
-	"../docs/ARCHITECTURE.md",
-	"../docs/how-inference-works.md",
-	"../docs/tasks/task-peer-benchmarks.md", // moved from ../docs/task-peer-benchmarks.md, still LIVE
-	"../docs/tasks/task-recompute-audit.md", // moved from ../docs/task-recompute-audit.md, still LIVE
-	"../docs/tasks/task-gpu-paths-2026-09.md",
-	"../docs/cuda-backend.md",
-	"../docs/completed/audit-2026-08-05.md",
+	"task-attention-decode-cost.md",
+	"task-moe-streaming.md",
+	"queue-performance.md",
+	"ARCHITECTURE.md",
+	"how-inference-works.md",
+	"task-peer-benchmarks.md",
+	"task-recompute-audit.md",
+	"task-gpu-paths-2026-09.md",
+	"cuda-backend.md",
+	"audit-2026-08-05.md",
 }
 
-// PrefillGatePromptSet selects the snapshot prompt files for the L1 gate per GOINFER_PREFILL_GATE_PROMPTS ("" or "a" =
+// PrefillGatePromptSet selects the snapshot prompt files for the prose prefill gate per GOINFER_PREFILL_GATE_PROMPTS ("" or "a" =
 // set A, "b" = set B). It returns the set's label, so set A and set B outputs never collide, and the snapshot paths
-// testdata/prefill-gate-prose-<label>/<basename>, resolved with the "../testdata/..." convention PrefillGateProseFiles
-// documents.
+// testdata/prefill-gate-prose-<label>/<basename>, relative to a package directory one level under the repo root (the
+// "../testdata/..." convention).
 //
 // The gate reads snapshots, not the live documents: several change most days, and a gate whose prompt content drifts
 // between the reference phase and a later re-run is not reproducible. Each set is snapshotted once.
@@ -304,7 +303,7 @@ func PrefillGateProseIDsForTest(t *testing.T, tk *tokenizer.Tokenizer, f string,
 	return ids
 }
 
-// WritePrefillReferenceForTest serializes the CPU f32-activation reference (docs/completed/task-prefill-gap.md §3.1)
+// WritePrefillReferenceForTest serializes the CPU f32-activation reference
 // for a cross-process read by ReadPrefillReferenceForTest: the CPU-only phase (decoder/prefill_ref_gen_test.go) writes
 // it and the Metal phase (metal/prefill_gate_ref_test.go) scores both arms against it. Layout, little-endian: int32
 // vocab, int32 continuationN, seedLogits [vocab]float32, refTokens [continuationN]int32, then continuationN rows of
@@ -384,7 +383,7 @@ func ReadPrefillReferenceForTest(path string) (seedLogits []float32, refTokens [
 	return seedLogits, refTokens, refLogits, nil
 }
 
-// W8F3Ref is the CPU f32 reference for the metal W8 F3′ gate (docs/tasks/task-metal-int8-2026-10.md): the 8 prompts,
+// W8F3Ref is the CPU f32 reference for the metal W8 F3′ gate: the 8 prompts,
 // the f32 model's greedy continuation (the tokens every arm is teacher-forced on) and its logits at every position.
 // TestW8F3Reference_write writes it where the f32 model fits; metal's TestW8Native_F3amended_closerToF32 reads it
 // through GOINFER_W8_F3_REF_IN.

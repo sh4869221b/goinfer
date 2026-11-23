@@ -58,14 +58,11 @@ func (s *server) serveChatToolsWith(w http.ResponseWriter, r *http.Request, req 
 		writeServerErr(w, "encode: "+err.Error())
 		return
 	}
-	req.sampling.fixedTokens = func() int { return lm.fixedPromptTokens(tm, system, tools) }
-	gr, err := lm.prepare(req.sampling, ids, lm.residentPath())
+	gr, err := lm.prepareTurn(req.sampling, tm, system, turns, tools, ids)
 	if err != nil {
 		writePrepareErr(w, err)
 		return
 	}
-	gr.boundary = lm.prefixBoundary(tm, system, turns, tools, ids)
-	gr.keep = lm.recurrentKeep(tm, system, turns, tools, ids)
 
 	// Tight when unambiguous: a forced function or a lone tool constrains the call to that tool's schema (when the family has
 	// a JSON call form). A NAMED tool_choice that cannot be constrained is a 400, not a silent unconstrained decode.
@@ -159,7 +156,7 @@ func (s *server) serveChatToolsWith(w http.ResponseWriter, r *http.Request, req 
 		msg["reasoning_content"] = rb.String()
 	}
 	choice := map[string]any{"index": 0, "message": msg, "finish_reason": finish}
-	empty := emptyAnswerOf(gr, finish, t.stopSeq, len(t.calls), nComp)
+	empty := emptyAnswerOf(gr, finish, t.stopHit, len(t.calls), nComp)
 	if empty != nil {
 		choice["goinfer_empty_answer"] = empty
 	}
@@ -187,7 +184,7 @@ func (s *server) serveChatToolsWith(w http.ResponseWriter, r *http.Request, req 
 		sseDone(ss)
 		return
 	}
-	writeJSON(w, http.StatusOK, gr.clock.addTurn(map[string]any{
+	writeJSON(w, http.StatusOK, gr.clock.AddTurn(map[string]any{
 		"id": id, "object": "chat.completion", "created": created, "model": lm.name,
 		"choices": []any{choice}, "usage": usagev,
 	}))
@@ -197,8 +194,7 @@ func (s *server) serveChatToolsWith(w http.ResponseWriter, r *http.Request, req 
 // FIRST token (a forced or lone tool, or union "required"): the requests think.go must render thinking-off, because an open
 // think block in the prompt contradicts a mask that demands `<tool_call>` immediately. Conservative by design — a grammar
 // that then fails to compile still gets the thinking-off prompt. The lazy "auto" union is NOT included: it arms on the
-// family's call opener, so reasoning before it is legal (a model quoting the opener inside its reasoning would arm it early;
-// that hazard is recorded in docs/tasks/task-qwen35-think-prompt-2026-09.md).
+// family's call opener, so reasoning before it is legal (a model quoting the opener inside its reasoning would arm it early).
 func toolsConstrainedFromStart(forced *chat.Tool, namedForce bool, union string, tools []chat.Tool) bool {
 	if forced != nil {
 		return true
@@ -215,7 +211,7 @@ func toolsConstrainedFromStart(forced *chat.Tool, namedForce bool, union string,
 // Anthropic Messages surface so all three degrade identically.
 //
 // union ("", "auto" or "required") says what to do when no single tool is forced (usually two or more tools; also Anthropic
-// auto's lone tool; docs/tasks/task-tool-grammar-union-2026-09.md): "required" (OpenAI required, Anthropic any) constrains the
+// auto's lone tool): "required" (OpenAI required, Anthropic any) constrains the
 // call to ANY supplied tool from token 1; "auto" arms the same union lazily, on the family's call opener, so a prose answer
 // stays legal.
 func constrainForcedTool(lm *loadedModel, gr *genRequest, forced *chat.Tool, namedForce bool, union string, tools []chat.Tool) error {
@@ -252,7 +248,7 @@ func constrainForcedTool(lm *loadedModel, gr *genRequest, forced *chat.Tool, nam
 	g, gerr := constrain.ToolCallGrammar(prefix, suffix, argsKey, forced.Name, array, forced.Parameters)
 	if gerr != nil {
 		if namedForce {
-			return fmt.Errorf("tool_choice forces function %q but its schema cannot be constrained: %v", forced.Name, gerr)
+			return fmt.Errorf("tool_choice forces function %q but its schema cannot be constrained: %w", forced.Name, gerr)
 		}
 		return nil
 	}
@@ -283,24 +279,17 @@ func constrainToolUnion(lm *loadedModel, gr *genRequest, mode string, tools []ch
 	if !toolUnionEnabled || (mode != "auto" && mode != "required") || (mode == "auto" && !toolUnionAuto) {
 		return
 	}
-	// A server started with speculative decoding keeps its pre-union auto behaviour: every speculative path refuses a
-	// LogitProcessor (gated or not), so arming the lazy union would silently cost such a server its drafter on every
-	// multi-tool auto turn, a regression it opted out of by opting in. required is unaffected: it rides the grammar-fused
-	// speculative path.
-	if mode == "auto" && (lm.spec || lm.blockSpec != nil) {
-		return
-	}
 	prefix, suffix, argsKey, array, ok := lm.tmpl.ToolCallWrapper()
 	if !ok {
 		gr.callPostCheck = mode == "required" && forcedCallEnforcement(lm.tmpl) == "post-check"
 		return
 	}
-	specs := make([]constrain.ToolSpec, len(tools))
-	for i, t := range tools {
-		specs[i] = constrain.ToolSpec{Name: t.Name, Parameters: t.Parameters}
-	}
 	eos := append(append([]int(nil), lm.eosIDs...), lm.stopIDs...)
 	if mode == "required" {
+		specs := make([]constrain.ToolSpec, len(tools))
+		for i, t := range tools {
+			specs[i] = constrain.ToolSpec{Name: t.Name, Parameters: t.Parameters}
+		}
 		// The model must call something, and cannot call it badly. Forced from token 1 exactly like a named tool, so
 		// grammar-fused speculative decode applies.
 		g, err := constrain.ToolCallsGrammar(prefix, suffix, argsKey, array, specs)
@@ -313,30 +302,25 @@ func constrainToolUnion(lm *loadedModel, gr *genRequest, mode string, tools []ch
 		gr.masker = m
 		return
 	}
-	// auto: arm on the opener. A family whose call has no opener (llama3's bare JSON) arms instead on the output beginning
-	// with a call object's name key: nothing is masked before the model has written `{"name": "`, so a prose answer (or JSON
-	// with another first key) is never touched and there is nothing to back out of.
-	trigger := strings.TrimRight(prefix, " \t\r\n")
-	if trigger == "" {
-		g, err := constrain.ToolCallsGrammar("", suffix, argsKey, array, specs)
-		if err != nil {
-			warnToolUnionOff(err)
-			return
-		}
-		lazy := constrain.NewCallKeyLazyMasker(constrain.NewMasker(g, lm.cachedTokenBytes(), eos), "<|python_tag|>")
-		gr.sp.LogitProcessor = lazy.Process
-		gr.sp.LogitProcessorGate = lazy.Gate
-		return
-	}
-	g, err := constrain.ToolCallsGrammar(trigger, suffix, argsKey, array, specs)
+	// auto: the template's lazy masker (chat.Template.ToolGrammar) masks nothing until the call opener arrives, so a prose
+	// answer is never touched.
+	lazy, err := lm.tmpl.ToolGrammar(tools, lm.cachedTokenBytes(), eos)
 	if err != nil {
 		warnToolUnionOff(err)
 		return
 	}
-	// A LogitProcessor only: gr.masker stays nil, because the grammar-fused speculative path
-	// assumes a grammar live from token 1, which a lazy one is not. The Gate keeps the decoder's
-	// on-device fast paths until the opener arrives (SamplingParams.LogitProcessorGate).
-	lazy := constrain.NewLazyMasker(constrain.NewMasker(g, lm.cachedTokenBytes(), eos), trigger)
+	armLazy(lm, gr, lazy)
+}
+
+// armLazy puts an auto turn's lazy union on gr. On a server that speculates it goes to gr.lazy, with no LogitProcessor, which every
+// speculative path refuses: the engine then speculates until the call's opener and takes the constrained path from there
+// (engine.Request.Lazy). Elsewhere it is a LogitProcessor only, gated (SamplingParams.LogitProcessorGate): gr.masker stays nil,
+// because the grammar-fused speculative path assumes a grammar live from token 1, which a lazy one is not.
+func armLazy(lm *loadedModel, gr *genRequest, lazy *constrain.LazyMasker) {
+	if lm.spec || lm.blockSpec != nil {
+		gr.lazy = lazy
+		return
+	}
 	gr.sp.LogitProcessor = lazy.Process
 	gr.sp.LogitProcessorGate = lazy.Gate
 }

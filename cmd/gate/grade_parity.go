@@ -8,8 +8,13 @@ import (
 	"strings"
 )
 
-// checkRow is one named gate's outcome, ready to print.
-type checkRow struct{ Family, Test, Mark string }
+// checkRow is one named gate's outcome, ready to print. Kind is its outcome class, which the verdict line counts: a blocker
+// is "fail" (it ran and failed), or one of "asset", "env" and "norun" (it was not evaluated).
+type checkRow struct{ Family, Test, Mark, Kind string }
+
+// envGateSkip finds the variable a skip names as an opt-in to set ("set GOINFER_HEAVY_TESTS=1"). An asset skip names a
+// variable too, as a path to point it at, but never with "=".
+var envGateSkip = regexp.MustCompile(`\bset (GOINFER_[A-Z0-9_]+)=`)
 
 // classifyChecks applies the sweep's four-outcome decision to the named gates. Split out from
 // runParity so the decision — which is the entire gate — is mutation-testable without a real sweep.
@@ -17,13 +22,14 @@ type checkRow struct{ Family, Test, Mark string }
 func classifyChecks(res *results, checks []gateCheck, ledger func(string) string, cells []cell, lists parityLists) (rows []checkRow, blockers, gaps, firstRuns int) {
 	for _, g := range checks {
 		act, seen := res.lookupTop(g.Test)
-		var mark string
+		var mark, kind string
 		switch {
 		case !seen:
 			// THE OUTCOME A TALLY CANNOT SEE. A required gate that produced no result at all — a
 			// renamed test, a -run filter that stopped matching, a package that failed to build —
 			// leaves a pass/skip/fail count entirely undisturbed. It is a blocker.
 			mark = "⛔ DID NOT RUN (blocker) — " + whyNoResult(g.Test, cells)
+			kind = "norun"
 			blockers++
 		case act == "pass":
 			mark = "✅ pass"
@@ -33,7 +39,7 @@ func classifyChecks(res *results, checks []gateCheck, ledger func(string) string
 			mark = "FAIL - but in neverConfirmed (NOT a blocker): " + lists.NeverConfirmed[g.Test]
 			gaps++
 		case act == "fail":
-			// THE FOURTH OUTCOME (B14). A gate failing with no confirmed prior result is asserting a
+			// THE FOURTH OUTCOME. A gate failing with no confirmed prior result is asserting a
 			// DELTA IT HAS NO SECOND POINT TO COMPUTE, so it is an ITEM, not a blocker — the change
 			// that made a failure visible is the one change that provably did not cause it. This is
 			// about ATTRIBUTION, not harmlessness: the first observed value must not be banked as a
@@ -44,9 +50,11 @@ func classifyChecks(res *results, checks []gateCheck, ledger func(string) string
 				firstRuns++
 			case "SOURCE-CHANGED":
 				mark = "FAIL (blocker) - NOTE: confirmed before this gate last changed"
+				kind = "fail"
 				blockers++
 			default:
 				mark = "FAIL (blocker)"
+				kind = "fail"
 				blockers++
 			}
 		case act == "skip":
@@ -61,11 +69,17 @@ func classifyChecks(res *results, checks []gateCheck, ledger func(string) string
 				mark = "SKIP - asset missing, but in neverConfirmed (NOT a blocker): " + lists.NeverConfirmed[g.Test]
 				gaps++
 			default:
-				mark = "SKIP - asset missing (blocker)"
+				if m := envGateSkip.FindStringSubmatch(skipReason(res.topOutput(g.Test))); m != nil {
+					mark = "SKIP - not evaluated, " + m[1] + " unset (blocker)"
+					kind = "env"
+				} else {
+					mark = "SKIP - asset missing (blocker)"
+					kind = "asset"
+				}
 				blockers++
 			}
 		}
-		rows = append(rows, checkRow{g.Family, g.Test, mark})
+		rows = append(rows, checkRow{g.Family, g.Test, mark, kind})
 	}
 	return rows, blockers, gaps, firstRuns
 }
@@ -137,7 +151,7 @@ func whyNoResult(test string, cells []cell) string {
 // family test outside the checkset leaves the verdict reading ALL REQUIRED GATES GREEN.
 //
 // EXACT match, unlike catchAllSkips' containment: a test whose name merely CONTAINS a gate name is a
-// different test, and hiding its failure is the defect. Exactness also keeps B14 intact: a named gate's
+// different test, and hiding its failure is the defect. Exactness also keeps the fourth outcome intact: a named gate's
 // FIRST-RUN failure matches exactly, so it is excluded here and stays an ITEM.
 func unlistedFailures(res *results, checks []gateCheck) []string {
 	named := map[string]bool{}
@@ -291,7 +305,7 @@ func gradeParity(w io.Writer, res *results, cfgCells []cell, cells []cellResult,
 	}
 	verdict := "ALL REQUIRED GATES GREEN"
 	if blockers > 0 {
-		verdict = fmt.Sprintf("%d BLOCKER(S)", blockers)
+		verdict = fmt.Sprintf("%d BLOCKER(S): %s", blockers, blockerSplit(rows, blockers))
 	}
 	extra := ""
 	if gaps > 0 {
@@ -305,6 +319,23 @@ func gradeParity(w io.Writer, res *results, cfgCells []cell, cells []cellResult,
 		fmt.Fprintf(w, "full log: %s\n", c.LogPath)
 	}
 	return blockers, gaps, firstRuns
+}
+
+// blockerSplit says what the blockers are, so a red tree and a box that could not evaluate read differently: the named gates
+// that ran and failed, the ones not evaluated (by cause), and the rest of the total, which the
+// catch-alls and the manifest add.
+func blockerSplit(rows []checkRow, blockers int) string {
+	n := map[string]int{}
+	for _, r := range rows {
+		n[r.Kind]++
+	}
+	notEval := n["asset"] + n["env"] + n["norun"]
+	out := fmt.Sprintf("%d FAILED, %d NOT EVALUATED (%d asset absent, %d env gate unset, %d did not run)",
+		n["fail"], notEval, n["asset"], n["env"], n["norun"])
+	if rest := blockers - n["fail"] - notEval; rest > 0 {
+		out += fmt.Sprintf(", %d from the catch-alls", rest)
+	}
+	return out
 }
 
 // writeParityCell is a finished cell's line in the sweep's report, printed after its "-- running" line.

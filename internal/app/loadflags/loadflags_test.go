@@ -58,17 +58,18 @@ func TestOptions_everyFlagReachesOptions(t *testing.T) {
 		arg  string
 		took func(o decoder.Options, f *Flags) bool
 	}{
-		"backend":           {"--backend=cuda", func(o decoder.Options, _ *Flags) bool { return o.Backend == "cuda" }},
-		"quant":             {"--quant=int8", func(o decoder.Options, _ *Flags) bool { return o.Quant == "int8" }},
-		"lora":              {"--lora=/adapter", func(o decoder.Options, _ *Flags) bool { return o.LoRA == "/adapter" }},
-		"kv":                {"--kv=i8", func(o decoder.Options, _ *Flags) bool { return o.KVPrecision == "i8" && o.KVQuant == "i8" }},
-		"ctx":               {"--ctx=12345", func(o decoder.Options, _ *Flags) bool { return o.ResidentContext == 12345 }},
-		"stream-weights":    {"--stream-weights", func(o decoder.Options, _ *Flags) bool { return o.StreamWeights }},
-		"weight-cache":      {"--weight-cache=2.5", func(o decoder.Options, _ *Flags) bool { return o.WeightCacheBytes == 2_500_000_000 }},
-		"moe-cache-experts": {"--moe-cache-experts", func(o decoder.Options, _ *Flags) bool { return o.MoECacheExperts }},
-		"moe-cache-slots":   {"--moe-cache-slots=7", func(o decoder.Options, _ *Flags) bool { return o.MoECacheSlots == 7 }},
-		"moe-pager":         {"--moe-pager=" + otherPager(), func(o decoder.Options, _ *Flags) bool { return o.MoEPager == otherPager() }},
-		"accept-slow":       {"--accept-slow", func(o decoder.Options, _ *Flags) bool { return o.AcceptSlowMoE }},
+		"backend":              {"--backend=cuda", func(o decoder.Options, _ *Flags) bool { return o.Backend == "cuda" }},
+		"quant":                {"--quant=int8", func(o decoder.Options, _ *Flags) bool { return o.Quant == "int8" }},
+		"lora":                 {"--lora=/adapter", func(o decoder.Options, _ *Flags) bool { return o.LoRA == "/adapter" }},
+		"kv":                   {"--kv=i8", func(o decoder.Options, _ *Flags) bool { return o.KVPrecision == "i8" && o.KVQuant == "i8" }},
+		"ctx":                  {"--ctx=12345", func(o decoder.Options, _ *Flags) bool { return o.ResidentContext == 12345 }},
+		"stream-weights":       {"--stream-weights", func(o decoder.Options, _ *Flags) bool { return o.StreamWeights }},
+		"weight-cache":         {"--weight-cache=2.5", func(o decoder.Options, _ *Flags) bool { return o.WeightCacheBytes == 2_500_000_000 }},
+		"moe-cache-experts":    {"--moe-cache-experts", func(o decoder.Options, _ *Flags) bool { return o.MoECacheExperts }},
+		"moe-experts-unpinned": {"--moe-experts-unpinned", func(o decoder.Options, _ *Flags) bool { return o.MoEExpertsUnpinned }},
+		"moe-cache-slots":      {"--moe-cache-slots=7", func(o decoder.Options, _ *Flags) bool { return o.MoECacheSlots == 7 }},
+		"moe-pager":            {"--moe-pager=" + otherPager(), func(o decoder.Options, _ *Flags) bool { return o.MoEPager == otherPager() }},
+		"accept-slow":          {"--accept-slow", func(o decoder.Options, _ *Flags) bool { return o.AcceptSlowMoE }},
 		// Default is true: the row must probe the opt-out, not the (now-default) bare flag, or the "default does NOT look like
 		// the non-default value" check below is vacuous.
 		"embed-int4": {"--embed-int4=false", func(o decoder.Options, _ *Flags) bool { return !o.EmbedInt4 }},
@@ -77,12 +78,13 @@ func TestOptions_everyFlagReachesOptions(t *testing.T) {
 			return o.ExactPrefill && (*o.Knobs)["GOINFER_CPU_FAST_ATTENTION"] == "0"
 		}},
 		"cpu-exact-prefill": {"--cpu-exact-prefill", func(o decoder.Options, _ *Flags) bool { return (*o.Knobs)["GOINFER_CPU_FAST_ATTENTION"] == "0" }},
-		// Default is true (docs/tasks/task-cuda-windowed-kv-2026-10.md, section 12): the row probes the opt-out.
+		// Default is true: the row probes the opt-out.
 		"windowed-kv": {"--windowed-kv=false", func(o decoder.Options, _ *Flags) bool { return !o.ResidentWindowedKV }},
-		// Default is true (docs/tasks/task-forward-architecture-2026-10.md §4.9, D3-3r): the row probes the opt-out.
-		"moe-step":       {"--moe-step=false", func(o decoder.Options, _ *Flags) bool { return !o.ResidentMoEStep }},
-		"recurrent-step": {"--recurrent-step", func(o decoder.Options, _ *Flags) bool { return o.ResidentRecurrentStep }},
-		"gemma4-step":    {"--gemma4-step", func(o decoder.Options, _ *Flags) bool { return o.ResidentGemma4Step }},
+		// Default is true: the row probes the opt-out.
+		"moe-step":             {"--moe-step=false", func(o decoder.Options, _ *Flags) bool { return !o.ResidentMoEStep }},
+		"recurrent-step":       {"--recurrent-step", func(o decoder.Options, _ *Flags) bool { return o.ResidentRecurrentStep }},
+		"gemma4-step":          {"--gemma4-step", func(o decoder.Options, _ *Flags) bool { return o.ResidentGemma4Step }},
+		"flash-decode-softcap": {"--flash-decode-softcap", func(o decoder.Options, _ *Flags) bool { return o.FlashDecodeSoftcap }},
 		// Not a decoder option: modelload.Request.DirectLoad reads it.
 		"direct-load": {"--direct-load", func(_ decoder.Options, f *Flags) bool { return f.DirectLoad }},
 	}
@@ -286,25 +288,49 @@ func TestBackend_autoOnThisTestBinary(t *testing.T) {
 }
 
 // --windowed-kv is on by default and --windowed-kv=false turns it off; both reach Options.
-func TestWindowedKV_defaultOnAndOptOut(t *testing.T) {
-	_, def := parse(t, Chat)
-	if !def.Options().ResidentWindowedKV {
-		t.Fatal("windowed KV must be on by default")
-	}
-	_, off := parse(t, Chat, "--windowed-kv=false")
-	if off.Options().ResidentWindowedKV {
-		t.Fatal("--windowed-kv=false must turn it off")
+// --moe-step is on by default and --moe-step=false turns it off; both reach Options.
+// Each of these is on by default, and its flag turns it off.
+func TestDefaultOn_flagOptsOut(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		app  App
+		flag string
+		on   func(decoder.Options) bool
+	}{
+		{"windowed KV", Chat, "--windowed-kv=false", func(o decoder.Options) bool { return o.ResidentWindowedKV }},
+		{"MoE step", Serve, "--moe-step=false", func(o decoder.Options) bool { return o.ResidentMoEStep }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if _, def := parse(t, c.app); !c.on(def.Options()) {
+				t.Fatalf("%s must be on by default", c.name)
+			}
+			if _, off := parse(t, c.app, c.flag); c.on(off.Options()) {
+				t.Fatalf("%s must turn it off", c.flag)
+			}
+		})
 	}
 }
 
-// --moe-step is on by default and --moe-step=false turns it off; both reach Options.
-func TestMoEStep_defaultOnAndOptOut(t *testing.T) {
-	_, def := parse(t, Serve)
-	if !def.Options().ResidentMoEStep {
-		t.Fatal("the MoE step must be on by default")
-	}
-	_, off := parse(t, Serve, "--moe-step=false")
-	if off.Options().ResidentMoEStep {
-		t.Fatal("--moe-step=false must turn it off")
+// TestEmbedInt4_defaultIsMarked: an --embed-int4 left at its default reaches the load as EmbedInt4Default, so the model's
+// size can keep the int8 head (decoder.EmbedInt4For); the flag given either way, or a serve per-model key, is a choice.
+func TestEmbedInt4_defaultIsMarked(t *testing.T) {
+	on, off := true, false
+	for _, c := range []struct {
+		args []string
+		ov   *bool
+		want bool
+	}{
+		{nil, nil, true},
+		{[]string{"--embed-int4"}, nil, false},
+		{[]string{"--embed-int4=false"}, nil, false},
+		{nil, &on, false},
+		{nil, &off, false},
+	} {
+		for _, app := range []App{Chat, Serve} {
+			_, f := parse(t, app, c.args...)
+			if got := f.OptionsWith(Overrides{EmbedInt4: c.ov}).EmbedInt4Default; got != c.want {
+				t.Errorf("%v ov %v (app %d): EmbedInt4Default %v, want %v", c.args, c.ov, app, got, c.want)
+			}
+		}
 	}
 }

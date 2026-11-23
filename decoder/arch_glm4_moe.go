@@ -10,10 +10,9 @@ import (
 // sigmoid (not softmax), an e_score_correction_bias steers the top-k SELECTION while the weights stay the un-biased sigmoid scores, the
 // routed weights are scaled by routed_scaling_factor, and the always-on shared expert is added UNGATED. first_k_dense_replace layers at the
 // top are plain dense MLPs (no router), handled by the loader populating Experts only on i ≥ FirstKDense. The num_nextn_predict_layers MTP
-// head is dropped (only num_hidden_layers load). The tensor schema is glm4moeTensorSchema. See
-// docs/completed/task-model-families-glm-granite.md.
+// head is dropped (only num_hidden_layers load). The tensor schema is glm4moeTensorSchema.
 func glm4moeArchitecture(cfg *Config) (*Architecture, *tensorSchema, error) {
-	if err := cfg.validateGlm4Moe(); err != nil {
+	if err := cfg.ValidateGlm4Moe(); err != nil {
 		return nil, nil, err
 	}
 	// GLM nests rope_theta + partial_rotary_factor inside rope_parameters
@@ -22,7 +21,7 @@ func glm4moeArchitecture(cfg *Config) (*Architecture, *tensorSchema, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("decoder(glm4_moe): %w", err)
 	}
-	hd := cfg.headDim()
+	hd := cfg.EffectiveHeadDim()
 	rotaryDim := 0
 	if partialRotary > 0 && partialRotary < 1 {
 		rotaryDim = int(partialRotary * float64(hd))

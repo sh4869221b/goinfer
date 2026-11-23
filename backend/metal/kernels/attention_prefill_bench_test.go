@@ -55,7 +55,7 @@ func BenchmarkAttentionPrefill(b *testing.B) {
 	run := func() {
 		e := q_.Begin()
 		for range reps {
-			e.Dispatch(pipe, M*nH*128, 128, dQkv, dKc, dVc, dOut, uNH, uNKV, uHd, uStartPos, uScale, uQStride, uWindow)
+			e.Dispatch(pipe, M*nH*128, 128, dQkv, dKc, dVc, dOut, uNH, uNKV, uHd, uStartPos, uScale, uQStride, uWindow, kvIdentityTable(d))
 		}
 		e.End()
 	}
@@ -76,7 +76,7 @@ func BenchmarkAttentionPrefill(b *testing.B) {
 }
 
 // benchAttentionPrefillFused is shared by the short (M=140, apples-to-apples with
-// BenchmarkAttentionPrefill) and long-context (M=3900, the depth docs/completed/task-prefill-gap.md §4
+// BenchmarkAttentionPrefill) and long-context (M=3900, the depth
 // prices L2-Metal against) variants below.
 func benchAttentionPrefillFused(b *testing.B, M int) {
 	d, err := CreateSystemDefaultDevice()
@@ -128,7 +128,7 @@ func benchAttentionPrefillFused(b *testing.B, M int) {
 	run := func() {
 		e := q_.Begin()
 		for range reps {
-			e.Dispatch(pipe, total, sgpt*32, dQkv, dKc, dVc, dOut, uNH, uNKV, uHd, uStartPos, uScale, uQStride, uWindow, uM)
+			e.Dispatch(pipe, total, sgpt*32, dQkv, dKc, dVc, dOut, uNH, uNKV, uHd, uStartPos, uScale, uQStride, uWindow, uM, kvIdentityTable(d))
 		}
 		e.End()
 	}
@@ -153,7 +153,7 @@ func benchAttentionPrefillFused(b *testing.B, M int) {
 func BenchmarkAttentionPrefillFused(b *testing.B) { benchAttentionPrefillFused(b, 140) }
 
 // BenchmarkAttentionPrefillLongCtx / BenchmarkAttentionPrefillFusedLongCtx: M=3900, the depth
-// docs/completed/task-prefill-gap.md §4's "then, and now sized" paragraph prices the fused kernel against
+// the fused kernel is priced against
 // (S model K=3900, where the exact kernel's per-token cost is least flat).
 func BenchmarkAttentionPrefillLongCtx(b *testing.B) {
 	d, err := CreateSystemDefaultDevice()
@@ -197,7 +197,7 @@ func BenchmarkAttentionPrefillLongCtx(b *testing.B) {
 	run := func() {
 		e := q_.Begin()
 		for range reps {
-			e.Dispatch(pipe, M*nH*128, 128, dQkv, dKc, dVc, dOut, uNH, uNKV, uHd, uStartPos, uScale, uQStride, uWindow)
+			e.Dispatch(pipe, M*nH*128, 128, dQkv, dKc, dVc, dOut, uNH, uNKV, uHd, uStartPos, uScale, uQStride, uWindow, kvIdentityTable(d))
 		}
 		e.End()
 	}

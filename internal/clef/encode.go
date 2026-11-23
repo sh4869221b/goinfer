@@ -1,5 +1,5 @@
-// Package clef is the Go side of Cloudflare's Clef-flash joint decision model (Route C of docs/tasks/task-constrained-confidence.md,
-// D10-D14): the record encoder here (D12), the joint head beside it.
+// Package clef is the Go side of Cloudflare's Clef-flash joint decision model: the record encoder here,
+// the joint head beside it.
 //
 // The encoder is a port of encode_record in the checkpoint's own joint_schema_model.py, read in full for
 // docs/measurements/decisions-d10-clef-2026-10-02.md. It turns {state, questions} into ONE token sequence
@@ -50,7 +50,7 @@ type Question struct {
 	OptionIDs    []string
 }
 
-// Encoded is encode_record's EncodedRecord, without the media half (images and videos are refused until multimodal.md P8a).
+// Encoded is encode_record's EncodedRecord, without the media half (images and videos are refused).
 type Encoded struct {
 	InputIDs  []int
 	Questions []Question
@@ -74,10 +74,10 @@ func Encode(request []byte, tok Tokenize, maxLength int) (*Encoded, error) {
 		return nil, errors.New("clef: the request must be a JSON object")
 	}
 	if imgs := root.get("images"); !imgs.falsy() {
-		return nil, errors.New("clef: images are not supported on this route yet (multimodal.md P8a)")
+		return nil, errors.New("clef: images are not supported on this route yet")
 	}
 	if vids := root.get("videos"); !vids.falsy() {
-		return nil, errors.New("clef: videos are not supported on this route yet (multimodal.md P8a)")
+		return nil, errors.New("clef: videos are not supported on this route yet")
 	}
 	stateV := root.get("state")
 	if stateV == nil {

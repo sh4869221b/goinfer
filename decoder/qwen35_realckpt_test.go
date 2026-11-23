@@ -18,6 +18,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // realQwen35Dir returns the on-disk path to the real Qwen3.6-35B-A3B checkpoint,
@@ -49,7 +51,7 @@ func loadQwen35Slice(t *testing.T, dir string, nLayer int) (*Model, func()) {
 	}
 	cfg.NumLayers = nLayer // load only the slice
 	if len(cfg.LayerTypes) >= nLayer {
-		cfg.LayerTypes = cfg.LayerTypes[:nLayer] // validateQwen35 wants len==NumLayers
+		cfg.LayerTypes = cfg.LayerTypes[:nLayer] // ValidateQwen35 wants len==NumLayers
 	}
 	arch, schema, err := resolveArchitecture(cfg)
 	if err != nil {
@@ -59,7 +61,7 @@ func loadQwen35Slice(t *testing.T, dir string, nLayer int) (*Model, func()) {
 	if err != nil {
 		t.Fatalf("openCheckpointMmap: %v", err)
 	}
-	w, err := buildWeightsFromSafetensors(cfg, arch, schema, st, quantNone, false, true, false, nil)
+	w, err := buildWeightsFromSafetensors(cfg, arch, schema, st, weightLoadOpts{needCanonical: true})
 	if err != nil {
 		_ = st.Close()
 		t.Fatalf("buildWeightsFromSafetensors (loader on real tensors): %v", err)
@@ -83,7 +85,7 @@ func loadQwen35Slice(t *testing.T, dir string, nLayer int) (*Model, func()) {
 // layer, plus the softmax layer (3). The numeric parity compare vs HF is the
 // sibling test below (gated on a slice reference file).
 func TestQwen35Real_loaderSlice(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	dir := realQwen35Dir(t)
 	m, free := loadQwen35Slice(t, dir, 4)
 	defer free()
@@ -172,7 +174,7 @@ func TestQwen35Real_loaderSlice(t *testing.T) {
 // the compare fail for the wrong reason.) Skipped until the file exists so the
 // loader probe above can run on its own.
 func TestQwen35Real_gate1SliceParity(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	dir := realQwen35Dir(t)
 	ref := os.Getenv("GOINFER_QWEN35_SLICE_REF")
 	if ref == "" {

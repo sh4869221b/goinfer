@@ -15,8 +15,8 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// TestResidentPrefillLast_TTFT is the end-to-end TTFT number the batched-prefill build exists for
-// (docs/completed/task-gpu-batched-prefill.md): sequential per-token Forward (the
+// TestResidentPrefillLast_TTFT is the end-to-end TTFT number the batched-prefill build exists for:
+// sequential per-token Forward (the
 // residentPrefillSeed loop) vs one PrefillLast call, at realistic prompt lengths, on the actual
 // resident decode pipeline, not an isolated matmul microbenchmark like TestTiledDP4A_microbench
 // (which measures the projection GEMM alone).
@@ -54,7 +54,8 @@ func TestResidentPrefillLast_TTFT(t *testing.T) {
 	if rf == nil {
 		t.Fatal("ResidentActive but no resident forward")
 	}
-	pf, ok := rf.(decoder.Prefiller)
+	pf := decoder.SubsystemsOf(rf).Prefill
+	ok := pf.PrefillAvailable()
 	if !ok {
 		t.Skip("resident forward does not implement Prefiller (arch outside PrefillLastW8A8's dense-W8A8 scope)")
 	}

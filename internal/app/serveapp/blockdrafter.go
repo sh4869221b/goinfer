@@ -10,14 +10,14 @@ import (
 
 // minDrafterWidth is the narrowest -drafter-width serve takes. The acceptance guard (decoder/blockspec.go:breakEvenTokensPerRound)
 // stops drafting when a generation commits under 2.5 tokens a round, and a round of width w commits at most w, so under 4 it
-// trips on many turns and they finish on plain decode (docs/measurements/sp2-35b-2026-10/README.md, "G4's width amended").
+// trips on many turns and they finish on plain decode (docs/measurements/sp2-35b-2026-10/README.md, Readings, "width amended").
 const minDrafterWidth = 4
 
 // attachBlockDrafter attaches an already-loaded block drafter (--drafter) to an already-loaded model, so requests can
 // take the block-speculative path.
 //
 // The caller loads dw in loadDecoder before the target model, because drafter-aware sizing needs the drafter's byte
-// footprint priced into Options.ExtraResidentBytes ahead of BuildResident (docs/tasks/task-fit-to-hardware.md section 2). Taking
+// footprint priced into Options.ExtraResidentBytes ahead of BuildResident. Taking
 // the loaded value here means that pricing and this attach see the same weights, not two independent reads of one
 // file.
 //

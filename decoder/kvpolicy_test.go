@@ -93,6 +93,7 @@ func TestCUDAKVF16Decline_table(t *testing.T) {
 		{"gemma3", KVFacts{Family: "gemma3", SlidingWindow: true}, Options{}, ""},
 		{"gemma2", KVFacts{Family: "gemma2", SlidingWindow: true}, Options{}, ""},
 		{"gpt-oss", KVFacts{Family: "gpt-oss", MoE: true, SlidingWindow: true}, Options{}, ""},
+		{"flint", KVFacts{Family: "flint", MoE: true, SlidingWindow: true}, Options{}, ""},
 		{"laguna not delivered", dense("laguna"), Options{}, "keeps f32"},
 		{"qwen3_5", KVFacts{Family: "qwen3_5", Hybrid: true}, Options{}, ""},
 		{"gemma4", KVFacts{Family: "gemma4", Hybrid: true, SlidingWindow: true}, Options{}, ""},
@@ -167,6 +168,9 @@ func TestCUDAKVF16AutoDecline_table(t *testing.T) {
 	if got := CUDAKVF16AutoDecline(KVFacts{Family: "qwen3_5", Hybrid: true}, Options{}); !strings.Contains(got, "did not pass") {
 		t.Errorf("qwen3_5: auto decline %q does not publish the hybrids' failed gate", got)
 	}
+	if got := CUDAKVF16AutoDecline(KVFacts{Family: "gemma3", SlidingWindow: true}, Options{}); !strings.Contains(got, "did not pass") {
+		t.Errorf("gemma3: auto decline %q does not publish the sliding-window group's failed gate", got)
+	}
 	// The three the owner narrowed auto away from (D-KV4-10) keep f32 under auto, each naming what would clear it.
 	for _, c := range []struct {
 		f    KVFacts
@@ -179,5 +183,59 @@ func TestCUDAKVF16AutoDecline_table(t *testing.T) {
 		if got := CUDAKVF16AutoDecline(c.f, Options{}); !strings.Contains(got, c.want) {
 			t.Errorf("%s: auto decline %q, want it to name %q", c.f.Family, got, c.want)
 		}
+	}
+}
+
+// TestResidentSpec_matchesLegacyAccessors verifies that Model.ResidentSpec() populates all sub-specs
+// and agrees with the accessors (MoE, MLA, Qwen35).
+func TestResidentSpec_matchesLegacyAccessors(t *testing.T) {
+	m := &Model{
+		w: &Weights{
+			arch: &Architecture{
+				Name:      "flint",
+				AttnScale: 0.125,
+				MoE: &MoEConfig{
+					NumExperts:            8,
+					TopK:                  2,
+					IntermediateDim:       1024,
+					SharedIntermediateDim: 512,
+					RouterSigmoid:         false,
+					NormTopKProb:          true,
+					SharedUngated:         false,
+					RoutedScale:           1.0,
+					NGroup:                1,
+					TopkGroup:             1,
+				},
+				mla: &mlaParams{
+					QLoRARank:      1536,
+					KVLoRARank:     512,
+					QKNopeHeadDim:  128,
+					QKRopeHeadDim:  64,
+					VHeadDim:       128,
+					ropeInterleave: true,
+				},
+				qwen35: &qwen35Params{
+					ConvKernel:    4,
+					KeyHeadDim:    64,
+					ValueHeadDim:  64,
+					NumKeyHeads:   8,
+					NumValueHeads: 8,
+					AttnGate:      true,
+				},
+			},
+		},
+	}
+	spec := m.ResidentSpec()
+	if spec.MoE == nil || spec.MLA == nil || spec.Qwen35 == nil {
+		t.Fatalf("ResidentSpec() missing sub-spec: %+v", spec)
+	}
+	if mo, ok := m.BackendView().MoE(); !ok || mo != *spec.MoE {
+		t.Errorf("ResidentSpec().MoE = %+v, disagrees with MoE() = %+v", *spec.MoE, mo)
+	}
+	if mla, ok := m.BackendView().MLA(); !ok || mla != *spec.MLA {
+		t.Errorf("ResidentSpec().MLA = %+v, disagrees with MLA() = %+v", *spec.MLA, mla)
+	}
+	if q, ok := m.BackendView().Qwen35(); !ok || q != *spec.Qwen35 {
+		t.Errorf("ResidentSpec().Qwen35 = %+v, disagrees with Qwen35() = %+v", *spec.Qwen35, q)
 	}
 }

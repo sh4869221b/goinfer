@@ -40,7 +40,7 @@ usage:
 
 serve starts a job when: its --not-before HH:MM has passed and its estimate ends by the deadline after it (a night-only job);
 its retry time has passed; the box is not under heavy load (1-min load at most half the cores, free memory at least the job's
---fit-need-gb plus 2 GB); and the timing lock is free. It takes the lock, then waits SERVE_SETTLE_S with the box quiet, then
+--fit-need-gb); and the timing lock is free. It takes the lock, then waits SERVE_SETTLE_S with the box quiet, then
 runs the before_queue step and the job under that lock. A job that exits 75 (its own check refused) is re-queued every
 RETRY_BACKOFF_MIN until --retry-until, or RETRY_MAX tries, then recorded VOID-refused. It holds the machine awake while a job
 runs and, on AC power, while a night-only job is due within AWAKE_AHEAD_H hours, and the day's SUMMARY.md says when it slept.
@@ -63,7 +63,8 @@ which.
 The same file sets the jobs' PATH once for the box: `path_prepend = ["/usr/local/go/bin"]` goes in front of the PATH every job
 (and the before_queue command) runs with, and `require_on_path = ["go", "nvidia-smi"]` names tools that must be found on that
 final PATH. `start` and `start --dry-run` check them; a missing tool refuses the start (no job starts, every job stays queued,
-SUMMARY.md names what was missing), with no warning-only mode.
+SUMMARY.md names what was missing), with no warning-only mode. Whatever the file says, the runner and every job get go's
+directories (GO_DIRS) in front of a PATH that lacks them: a launchd or systemd service starts with a bare one.
 """
 import argparse
 import datetime as dt
@@ -107,7 +108,6 @@ RETRY_MAX = int(os.environ.get("NIGHT_RETRY_MAX", "8"))  # attempts when a job s
 SERVE_POLL_S = float(os.environ.get("NIGHT_SERVE_POLL_S", "30"))
 SERVE_SETTLE_S = float(os.environ.get("NIGHT_SERVE_SETTLE_S", "60"))  # the lock held, the box quiet, this long before a job starts
 AWAKE_AHEAD_H = 12               # hold the machine awake when a night-only job is due within this many hours
-HEADROOM_MB = 2048               # the 2026-10-19 rule: free memory under a job's fit need plus 2 GB is heavy load
 
 
 # ---------------------------------------------------------------- helpers
@@ -200,10 +200,16 @@ def parse_deadline(s, start):
     return d
 
 
+RUN_DAY_RE = re.compile(r"^\d{4}-\d\d-\d\d$")
+
+
 def latest_run_dir():
+    """The newest night's directory: runs/YYYY-MM-DD no later than today. Anything else under runs/ (a test's scratch directory,
+    a date ahead of the clock) is not a night; it would sort after the real ones."""
     if not RUNS.exists():
         return None
-    dirs = sorted(d for d in RUNS.iterdir() if d.is_dir())
+    today = now().strftime("%Y-%m-%d")
+    dirs = sorted(d for d in RUNS.iterdir() if d.is_dir() and RUN_DAY_RE.match(d.name) and d.name <= today)
     return dirs[-1] if dirs else None
 
 
@@ -399,7 +405,7 @@ def night_profile(host, t, readings, floor):
     floor, (name, bytes), is required: the day profile the figure may not exceed (MM6 option C, Francis 2026-11-01 07:55 PST). A
     figure above it is priced at the floor, the recorded one kept as recorded_available_bytes; the floor can only lower the
     figure. An unreadable floor (bytes not an int) raises ValueError: the caller refuses instead (fit_check), never prices the
-    unfloored figure (docs/tasks/task-subsystems-2026-10.md §8, "MM6 option C")."""
+    unfloored figure (docs/completed/task-subsystems-2026-10.md §8, "MM6 option C")."""
     if not (isinstance(floor, tuple) and len(floor) == 2 and isinstance(floor[1], int)):
         raise ValueError(f"night_profile: the floor must be (name, bytes), got {floor!r}")
     last = last_night_begun(t)
@@ -627,10 +633,22 @@ def hook_list(key):
     return v, None
 
 
+# Where go and the tools `go install` writes live on every box. A launchd agent or systemd user service starts with a bare PATH,
+# and jobs, the before_queue command and the runner's own memory readings (`go run ./cmd/hostmem`) all need go.
+GO_DIRS = ("/usr/local/go/bin", "~/go/bin")
+
+
+def with_go(path):
+    """path with each GO_DIRS entry it lacks put in front, in GO_DIRS order; an entry already on it keeps its place."""
+    have = path.split(os.pathsep) if path else []
+    return os.pathsep.join([*(d for d in (str(Path(x).expanduser()) for x in GO_DIRS) if d not in have), *have])
+
+
 def queue_path():
-    """The PATH every job and the before_queue command runs with: HOOKS' path_prepend in front of the starter's PATH."""
+    """The PATH every job and the before_queue command runs with: HOOKS' path_prepend in front of the starter's PATH, which
+    with_go has given go."""
     pre, _ = hook_list("path_prepend")
-    return os.pathsep.join([*(str(Path(x).expanduser()) for x in pre), os.environ.get("PATH", "")])
+    return os.pathsep.join([*(str(Path(x).expanduser()) for x in pre), with_go(os.environ.get("PATH", ""))])
 
 
 def queue_env(**extra):
@@ -995,6 +1013,8 @@ class Runner:
                 record_reading(t0, name, in_night(t0), avail)  # the box at night, whichever job read it (as backfill reads)
             else:
                 self.log(f"{name}: the available reading failed (cmd/hostmem), so no reading is recorded for the night profile")
+            j["readings"] = {"start": readings()}
+            f.write(f"=== READINGS start {json.dumps(j['readings']['start'])}\n")
             f.flush()
             j["_out_from"] = f.tell()  # where the job's own output starts: the header above (its note, its cmd) is not scanned
             # TE9: the job holds the timing lock, and its children (a run-*.sh, bench_peer.py) inherit it through the
@@ -1031,14 +1051,28 @@ class Runner:
         st = read_json(STATE) or {}
         st["pid"] = self.proc.pid
         write_json(STATE, st)
+        import job_mem
+        memp = self.rundir / f"{name}.mem.tsv"
+        mem = job_mem.start(self.proc.pid, str(memp))  # its servers' memory, swap and the slice, once a second (None off Linux)
+        if mem:
+            f.write(f"=== MEMORY   {memp}\n")
+            f.flush()
         limit = t0 + dt.timedelta(minutes=j["timeout_min"])
         outcome = None
+        import void_rule
+        # The job's swap peak, sampled each poll (POLL_S, 10 s: one sysctl of about 4 ms, from this process, not the job's), from the SAME
+        # baseline as the growth below, the job's start reading. Information, like the end readings.
+        start_swap = j["readings"]["start"].get("swap_mb")
+        sampler = void_rule.SwapSampler(base=start_swap) if start_swap is not None else None  # no start reading: no peak, not a rebased one
+        if sampler:
+            sampler.sample()
         while True:
             try:
                 self.proc.wait(timeout=POLL_S)
                 break
             except subprocess.TimeoutExpired:
-                pass
+                if sampler:
+                    sampler.sample()
             if self.stop_now:
                 self.kill_job("night.py stop --now")
                 outcome = "stopped"
@@ -1046,7 +1080,23 @@ class Runner:
                 self.kill_job(f"timeout {j['timeout_min']} min")
                 outcome = "timeout"
         rc = self.proc.returncode
-        f.write(f"\n=== END      {now().strftime('%F %T %Z')}  rc={rc}\n")
+        if mem:
+            mem.stop()
+        # The four readings at the end of the job are recorded beside those at its start, with the swap growth between them as information.
+        # The cell is the unit of the void rule (scripts/void_rule.py): a multi-cell job that voids a cell and re-runs it in place still ends
+        # above its start baseline, and a spike that settles is invisible to two readings, so the job-level pair never voids a job. The
+        # runner's own per-cell void (bench_peer.py's SwapWatch, void_rule.py's start/end exit codes) is the verdict.
+        end = readings()
+        j["readings"]["end"] = end
+        s0, s1 = j["readings"]["start"].get("swap_mb"), end.get("swap_mb")
+        j["readings"]["swap_growth_mb"] = round(s1 - s0, 1) if s0 is not None and s1 is not None else None
+        if sampler:
+            sampler.observe(end.get("swap_mb"))  # the end reading is part of the peak
+            j["readings"]["swap_peak_growth_mb"] = sampler.result()["peak_growth_mb"]
+        else:
+            j["readings"]["swap_peak_growth_mb"] = None
+        f.write(f"\n=== READINGS end {json.dumps(end)}\n")
+        f.write(f"=== END      {now().strftime('%F %T %Z')}  rc={rc}\n")
         f.flush()
         if outcome is None:
             outcome = "ok" if rc == 0 else ("retry" if rc == RETRY_RC and self.retries else f"FAILED rc={rc}")
@@ -1209,12 +1259,17 @@ def fcntl_flock(fd):
     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
+def readings():
+    """The four readings a job records at its start and end (void_rule.snapshot): load, available and reclaimable memory, swap in use."""
+    import void_rule
+    return void_rule.snapshot()
+
+
 def free_mem_mb():
-    """This box's free memory in MiB for a job's start check (fit need + 2 GB): the reclaimable figure cmd/hostmem prints
-    (scripts/hostmem.py), what a timed job can take without macOS compressing or swapping other memory under it, not the
-    load-decision figure. None when unreadable."""
+    """This box's available memory in MiB for a job's start check (the fit need, no margin): the figure the fit guard decides loads by
+    (cmd/hostmem via scripts/hostmem.py), the one void_rule.py reads. None when unreadable."""
     import hostmem
-    return hostmem.reclaimable_mb()
+    return hostmem.available_mb()
 
 
 def night_start(hhmm, added, deadline=DEFAULT_DEADLINE):
@@ -1266,22 +1321,21 @@ class Server(Runner):
         return os.getloadavg()[0]
 
     def ncores(self):
-        return os.cpu_count() or 1
+        return os.cpu_count()  # None when unreadable: heavy() then skips the load term and says so
 
     def free_mb(self):
         return free_mem_mb()
 
 
     def heavy(self, j):
-        """Why the box is under heavy load for job j now (the 2026-10-19 rule), or None."""
-        la, n = self.load1(), self.ncores()
-        if la > n / 2:
-            return f"load {la:.2f} above half of {n} cores"
-        need = float(j.get("fit_need_gb") or 0) * 1024
-        free = self.free_mb()
-        if need and free is not None and free < need + HEADROOM_MB:
-            return f"free memory {free} MB under the job's fit need {need:.0f} MB + {HEADROOM_MB} MB"
-        return None
+        """Why the box is under heavy load for job j now (the void rule, scripts/void_rule.py), or None."""
+        import void_rule
+        ncores = self.ncores()
+        if not ncores and not getattr(self, "_cores_said", False):
+            self._cores_said = True
+            self.log("core count unreadable: the heavy-load void's load term is skipped")
+        snap = {"load1": self.load1(), "ncores": ncores, "available_mb": self.free_mb()}
+        return void_rule.start_void(snap, float(j.get("fit_need_gb") or 0) * 1024)
 
     def eligible(self, j, t):
         """Why j may not start at t, or None."""
@@ -1404,7 +1458,7 @@ class Server(Runner):
         SAMPLE_EVERY_MIN into the memory log, as a night reading the profile prices. tick calls it only on a pass that starts no
         job, and not while paused. The reading (cmd/hostmem, a `go run`) loads the box, so it holds the timing lock shared and is
         skipped while a timed run holds it, to be tried on a later pass. A reading while a job runs would also hold the job's own
-        memory (docs/tasks/task-subsystems-2026-10.md §8, "MM6 option B")."""
+        memory (docs/completed/task-subsystems-2026-10.md §8, "MM6 option B")."""
         if not in_night(t) or (self.last_sample is not None and t - self.last_sample < dt.timedelta(minutes=SAMPLE_EVERY_MIN)):
             return
         try:
@@ -1574,7 +1628,7 @@ def cmd_update_runner(a):
 # ---------------------------------------------------------------- status / stop / morning
 
 # The fit guard's own line: "... this machine currently has 6.6 GB of memory available ...".
-FIT_AVAIL_RE = re.compile(r"currently has ([0-9.]+) GB of memory available")
+FIT_AVAIL_RE = re.compile(r"currently has ([0-9.]+) Gi?B of memory available")  # logs older than the GiB formatter say GB
 START_RE = re.compile(r"^=== START\s+(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", re.M)  # after the job's header lines
 
 
@@ -1789,7 +1843,7 @@ def main():
                    help="queue a command that is already queued (a pre-registered repeat only)")
     s.add_argument("--not-before", metavar="HH:MM", help="night-only: start no earlier than this, and end by the deadline after it")
     s.add_argument("--retry-until", metavar="HH:MM", help=f"an exit {RETRY_RC} (the job's own check refused) re-queues it until then")
-    s.add_argument("--fit-need-gb", type=float, help="memory the job needs; serve starts it only with this plus 2 GB free")
+    s.add_argument("--fit-need-gb", type=float, help="memory the job needs; serve starts it only with at least this much available (the fit guard's reading)")
     s.add_argument("--fit-model", action="append", metavar="PATH",
                    help="a checkpoint the job loads (repeatable): priced at queue time with `fit -profile` on this box's recorded "
                         "profile (night for --not-before, else day); a load it would refuse is not queued")
@@ -1846,6 +1900,7 @@ def main():
         argv, cmd = argv[:i], argv[i + 1:]
     a = p.parse_args(argv)
     a.cmd = cmd
+    os.environ["PATH"] = with_go(os.environ.get("PATH", ""))  # this process's own hostmem readings run go
     ROOT.mkdir(parents=True, exist_ok=True)
     a.fn(a)
 

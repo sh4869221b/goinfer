@@ -20,8 +20,7 @@ import (
 	"time"
 )
 
-// `gate identity <old-rev> <new-rev>`: inherit validation by identity (TE6(b),
-// docs/tasks/task-test-efficiency-2026-09.md).
+// `gate identity <old-rev> <new-rev>`: inherit validation by identity.
 //
 // For a change meant to be numerically neutral, the cheapest complete proof is byte-identical logits
 // against the last validated build on the family's parity prompt: build ONE small dumper at each revision,
@@ -34,7 +33,8 @@ import (
 //   - DETERMINISM FIRST: the NEW build runs every cell twice, in separate processes, and must be
 //     byte-identical to itself. A cell that is not is compared against the old build in tolerance
 //     mode (identityTolFactor × its own run-to-run max |diff|, argmax and tokens exact) and reported
-//     WITHIN TOLERANCE, never IDENTICAL. On the CPU that nondeterminism is TE6's kill criterion.
+//     WITHIN TOLERANCE, never IDENTICAL. On the CPU that nondeterminism is the kill criterion of
+//     identity-inherited validation (docs/parity-coverage-policy.md).
 //   - A SKIP IS NOT A PASS: a family whose asset is missing, whose load fails in both builds, or whose
 //     GPU cell fell back to the CPU is NOT RUN, listed separately with the reason.
 //   - BOTH SIDES SEE ONE ENVIRONMENT. Every GOINFER_* variable is removed from the dumpers' env: a
@@ -86,7 +86,7 @@ func runIdentity(argv []string, w io.Writer) int {
 	fs.IntVar(&o.Steps, "steps", 0, "tokens generated per prompt; logits are dumped for each (default: tiny 8, real 32)")
 	fs.StringVar(&o.LogDir, "logdir", os.TempDir(), "where the run directory (worktrees, builds, dumps, logs) is created")
 	fs.BoolVar(&o.Keep, "keep", false, "keep the dumps, binaries and logs (worktrees are always removed)")
-	fs.StringVar(&o.Record, "record", "", "write PARITY_ROW lines for families whose T3 validation this run inherits (TE6(b)); merge them with the decoder's TestParityManifest_merge")
+	fs.StringVar(&o.Record, "record", "", "write PARITY_ROW lines for families whose real-checkpoint validation this run inherits (bit-identical output to the validated build); merge them with the decoder's TestParityManifest_merge")
 	fs.DurationVar(&o.Timeout, "timeout", 15*time.Minute, "per dumper process, and per transcode with -giw")
 	fs.StringVar(&o.Giw, "giw", "", "compare through each revision's OWN transcode of the source: bytes (the two .giw files' sha256) | logits (the dumper on each side's own .giw)")
 	replay := fs.String("replay", "", "grade the run record a -keep run wrote ("+identityRunRecordFile+" in its run directory) instead of running")
@@ -400,11 +400,11 @@ func resolveIdentitySides(o identityOpts, sides ...*identitySide) string {
 // would not; calling it twice is safe. extra names one more subdirectory to remove.
 func identityRunDir(o identityOpts, t0 time.Time, old, nw *identitySide, extra string) (wd, logs string, cleanup func(), err error) {
 	if err := os.MkdirAll(o.LogDir, 0o755); err != nil {
-		return "", "", nil, fmt.Errorf("logdir: %v", err)
+		return "", "", nil, fmt.Errorf("logdir: %w", err)
 	}
 	wd, err = os.MkdirTemp(o.LogDir, "gate-identity-"+t0.Format("20060102-150405")+"-")
 	if err != nil {
-		return "", "", nil, fmt.Errorf("run dir: %v", err)
+		return "", "", nil, fmt.Errorf("run dir: %w", err)
 	}
 	if r, err := filepath.EvalSymlinks(wd); err == nil {
 		wd = r
@@ -544,7 +544,7 @@ func gitOut(dir string, args ...string) (string, error) {
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return strings.TrimSpace(string(out)), fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return strings.TrimSpace(string(out)), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return strings.TrimSpace(string(out)), nil
 }
@@ -620,7 +620,7 @@ func buildIdentitySide(o identityOpts, wd string, s *identitySide) error {
 	out, err := cmd.CombinedOutput()
 	_ = os.WriteFile(s.Log, append([]byte("go "+strings.Join(args, " ")+"\n"), out...), 0o644)
 	if err != nil {
-		return fmt.Errorf("go build: %v", err)
+		return fmt.Errorf("go build: %w", err)
 	}
 	return nil
 }

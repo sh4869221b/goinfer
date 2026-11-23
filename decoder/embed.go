@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 )
 
-// Decoder-as-embedder seam (docs/completed/task-decoder-as-embedder.md). qwen3-embedding and embeddinggemma are causal
+// Decoder-as-embedder seam. qwen3-embedding and embeddinggemma are causal
 // decoders used as embedders: the sentence-transformers stack around them is Transformer -> Pooling -> Normalize, so the
 // decoder must expose the final hidden state. forward() consumes it through the LM head (logitsFromHidden normalizes it
 // in place), and ForwardCapture returns per-layer residuals, which are pre-final-norm and not what pooling wants.
@@ -19,8 +19,8 @@ import (
 // It takes one sequence, so the last token is always the last real token; there is no padded batch whose last slot
 // could be a pad. Callers that want a batch call it per sequence. The returned slice is a fresh copy the caller owns.
 //
-// Every family: its layers run through the program walker. Gate H of docs/tasks/task-forward-architecture-2026-10.md §4.8
-// ("OP3's seams PR") holds the row to the forward's final hidden state, bit for bit.
+// Every family: its layers run through the program walker. TestSeams_gates
+// (gateH) holds the row to the forward's final hidden state, bit for bit.
 func (m *Model) HiddenLast(ids []int) ([]float32, error) {
 	_, done, err := m.enterCall(context.Background())
 	if err != nil {
@@ -40,12 +40,12 @@ func (m *Model) hiddenLast(ids []int) ([]float32, error) {
 		return nil, err
 	}
 	// On a GPU box this arch may decode resident, so try the resident backend first, under the same resBusy claim Generate
-	// uses: a loser (a generation already in flight on this Model) falls through to the CPU path below. resIDs is left
-	// unknown either way (residentForgetIDs), since a HiddenLast prefill leaves nothing durable to reuse in the next
+	// uses: a loser (a generation already in flight on this Model) falls through to the CPU path below. The slot it
+	// writes is left unknown (residentForgetScratch), since a HiddenLast prefill leaves nothing durable to reuse in the next
 	// Generate call.
 	if m.resident != nil {
-		if rh, ok := m.resident.(ResidentHiddenLast); ok && m.tryClaimResident() {
-			out, err := m.hiddenLastResident(context.Background(), rh, ids)
+		if canStep(m.resident, stepBatch{Pass: passRows, Emb: stepProbe, Out: outHidden}) && m.tryClaimResident() {
+			out, err := m.hiddenLastResident(context.Background(), ids)
 			atomic.StoreInt32(&m.resBusy, 0)
 			if err == nil {
 				return out, nil
@@ -65,15 +65,16 @@ func (m *Model) hiddenLast(ids []int) ([]float32, error) {
 
 // hiddenLastResident runs the resident twin of hiddenLastBatched: embed ids on the host (the
 // same embedResident the plain resident forward uses) and hand the whole sequence to the
-// backend's ResidentHiddenLast in one call, starting at position 0 — HiddenLast never reuses a
+// backend's HiddenLastAvailable in one call, starting at position 0 — HiddenLast never reuses a
 // previous resident KV (each call is a fresh sequence), unlike Generate's prefix reuse.
-func (m *Model) hiddenLastResident(ctx context.Context, rh ResidentHiddenLast, ids []int) ([]float32, error) {
-	m.residentForgetIDs()
+func (m *Model) hiddenLastResident(ctx context.Context, ids []int) ([]float32, error) {
+	m.residentForgetScratch()
 	embs := make([][]float32, len(ids))
 	for i, id := range ids {
 		embs[i] = m.embedResident(id)
 	}
-	return rh.HiddenLast(ctx, embs, 0)
+	sr, err := m.step(stepBatch{Pass: passRows, Ctx: ctx, Emb: embs, Out: outHidden})
+	return sr.Hidden, err
 }
 
 // hiddenLastBatched is HiddenLast's fast path: one batched forward over the whole
@@ -135,8 +136,8 @@ func (m *Model) checkHiddenIDs(who string, ids []int) error {
 }
 
 // PromptHidden returns the final-norm hidden state at the last position of prompt: HF's output_hidden_states[-1][:, -1],
-// equal to last_hidden_state[:, -1]. It is the input a Route B decision head reads
-// (docs/tasks/task-constrained-confidence.md): a linear head over the last prompt token's final-norm hidden state.
+// equal to last_hidden_state[:, -1]. It is the input a Route B decision head reads:
+// a linear head over the last prompt token's final-norm hidden state.
 //
 // Like HiddenLast it serves every family: it runs the per-token forward
 // Generate's CPU path runs (runLayers), in a fresh cache, then the final norm logitsFromHidden applies before the LM
@@ -144,7 +145,7 @@ func (m *Model) checkHiddenIDs(who string, ids []int) error {
 // take hiddenLastBatched, which ends at the same final norm, and Qwen3.5 takes runLayersQwen35N;
 // TestPromptHidden_batchedMatchesSequential bounds both against the per-token forward.
 //
-// On a resident backend it runs on the device first, through ResidentHiddenLast, and falls back to the CPU on a decline.
+// On a resident backend it runs on the device first, through HiddenLastAvailable, and falls back to the CPU on a decline.
 // The resident's numerics are its kernels', not the CPU reference's; TestPromptHidden_residentMatchesCPU in the backend
 // modules bounds the difference. ctx is checked between tokens (CPU) or at the backend's own granularity, so a long
 // prompt can be abandoned.
@@ -171,8 +172,8 @@ func (m *Model) promptHidden(ctx context.Context, prompt []int) ([]float32, erro
 	// decline (an arch the headless forward does not cover, a paged MoE, a cap) falls through to the CPU as if there were no
 	// resident; a cancellation returns. The resident's prefix-reuse record is forgotten either way, since the prompt
 	// overwrote its KV.
-	if rh, ok := m.resident.(ResidentHiddenLast); ok && m.tryClaimResident() {
-		out, err := m.hiddenLastResident(ctx, rh, prompt)
+	if canStep(m.resident, stepBatch{Pass: passRows, Emb: stepProbe, Out: outHidden}) && m.tryClaimResident() {
+		out, err := m.hiddenLastResident(ctx, prompt)
 		atomic.StoreInt32(&m.resBusy, 0)
 		if err == nil {
 			return out, nil

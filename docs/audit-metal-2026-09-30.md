@@ -5,7 +5,7 @@
 **Tree:** goinfer `844700f8` (2026-09-30) + aikit `v1.51.0` (the `gpu/` Metal bindings goinfer's `metal/` calls through) +
 MLX `9c3d355` (2026-09-30; MLX paths below are relative to `mlx/backend/metal/` unless they start with `mlx/`). The
 working repo is at `cd7eb362` (v0.20.0 and later): seven commits after the audited snapshot, none of them under `metal/`,
-`decoder/model.go`, `decoder/fitguard.go`, `decoder/fitplan.go`, `docs/benchmarks.md` or `docs/tasks/red-october.md`
+`decoder/model.go`, `decoder/fitguard.go`, `decoder/fitplan.go`, `docs/benchmarks.md` or `docs/completed/red-october.md`
 (checked with `git log 844700f8..HEAD -- <those paths>`), so every `path:line` below holds in the working tree for those
 files. Files outside that list were read at the snapshot only.
 
@@ -20,7 +20,7 @@ onto a different quantisation scheme), so the MLX lens here is technique-by-tech
 
 **Method:** six independent reviewers by area (A prefill; B decode kernels; C runtime; D MoE, paging, DeltaNet, gpt-oss;
 E batched decode, speculative verify, multi-slot KV, LoRA, sampling; F correctness, gates and claims). Each read the
-record first (the Sep 12 audit's §0, §5 and §7, `docs/tasks/red-october.md` §2/§6 and R1–R19, the measurement records
+record first (the Sep 12 audit's §0, §5 and §7, `docs/completed/red-october.md` §2/§6 and R1–R19, the measurement records
 and the autoresearch notes inside kernel comments) so that no recorded negative is re-proposed, then the area's Metal
 code in full, then the MLX analog, and each carried forward its share of the Sep 12 IDs. Where a recorded negative's
 premise looks stale the finding is filed as a REVISIT with the premise named and the cheapest probe. The consolidation
@@ -64,8 +64,8 @@ most of `docs/tasks/` were not in the audited snapshot; findings that lean on th
 - The rest are release and dependency bumps, test skips on memory-guard declines (`4223d381`) and R17's `-backend auto`
   (`5946e8f7`). None closes a finding. Every other finding stands as written.
 
-Outside the findings: Metal re-quantizes every int8 body weight to int4 (G10 in `docs/tasks/task-gpu-paths-2026-09.md`,
-labelled since M-25). Running those weights natively is planned in `docs/tasks/task-metal-int8-2026-10.md`.
+Outside the findings: Metal re-quantizes every int8 body weight to int4 (G10 in `docs/completed/task-gpu-paths-2026-09.md`,
+labelled since M-25). Running those weights natively is planned in `docs/completed/task-metal-int8-2026-10.md`.
 
 The order §10's items run in, under the run-budget rules and this Mac's limits, is `docs/completed/task-metal-audit-2026-10.md`.
 
@@ -1463,7 +1463,7 @@ task doc ("C-P02: built, pending its grade").
 3. metal/model.go:3220-3225 `attnFACoreCount = 14` against the 16-core M1 Pro target (area B owns the effect; the constant is a runtime-visible stale value).
 4. N-20's premise (an f32 heap copy of the scales exists) no longer holds under v15 (C-P01).
 5. `ForwardArgmax` carries two contradictory comments: "NOT actually production's greedy decode path ... exercised only by tests/gates" (metal/model.go:2664-2669) and "a genuine production entry point (the fast-greedy path)" (:2051-2053). The first is right (no `ResidentGreedy`, decoder/model.go:1947).
-6. docs/tasks/task-metal-runtime-selftest.md specifies a runtime self-test that is not implemented. (2026-10-01: folded into docs/tasks/task-hardware-coverage-2026-10.md §H2; the original is archived in docs/completed/.)
+6. docs/completed/task-metal-runtime-selftest.md specifies a runtime self-test that is not implemented. (2026-10-01: folded into docs/completed/task-hardware-coverage-2026-10.md §H2; the original is archived in docs/completed/.)
 
 #### C-N01 [N] Fixed-size binding scratch
 
@@ -1519,7 +1519,7 @@ task doc ("C-P02: built, pending its grade").
 
 | ID | Sep 12 claim | Status | Evidence |
 |---|---|---|---|
-| M-01 | `ResidentPrefillKV` missing on Metal: every sequential prompt token ran the full LM head and 608 KB readback | CLOSED-VERIFIED | `ForwardNoLogits` implemented, pipelined with a `noHead` bit on `execJob`; paged-MoE fell back to the head-bearing path by design until 2026-10-04, when the paged path began skipping the head too (`pagedNoHead`, `docs/tasks/task-m26-mac-2026-10.md` step 4a) (metal/backend.go:651-672; metal/model.go:587,2382,2430-2462) |
+| M-01 | `ResidentPrefillKV` missing on Metal: every sequential prompt token ran the full LM head and 608 KB readback | CLOSED-VERIFIED | `ForwardNoLogits` implemented, pipelined with a `noHead` bit on `execJob`; paged-MoE fell back to the head-bearing path by design until 2026-10-04, when the paged path began skipping the head too (`pagedNoHead`, `docs/completed/task-m26-mac-2026-10.md` step 4a) (metal/backend.go:651-672; metal/model.go:587,2382,2430-2462) |
 | M-07 | Three host copies of every dense int4 projection on a GGUF/safetensors load | CLOSED-VERIFIED for the row4-skip half; host-release half declined as permanent | decoder/weights.go:824-828,769-775,805-808,1244-1249,1558-1562; audit :1753-1756, :396, :432-442 |
 | M-11 | Paged decode pays a ~14 ms command-buffer boundary 61-81x per token | OPEN. The boundary cost fell (9 to 0.44 ms/CB idle, M-14), shared-event re-run not done | audit :1766; metal/model.go:2016,2038 (area D owns it) |
 | M-12 | Serial per-expert staging | CLOSED, cross-expert half only (as recorded) | audit :1763-1766 |
@@ -1584,7 +1584,7 @@ repo for M26 experts (3.19) equal 3.19 MiB by my count (5.95M weights x 4.5 bits
 
 Geometry used for counts (rec): M26 = Gemma-4-26B-A4B, 30 layers all MoE, hidden 2816, 128 experts,
 moe_inter 704 (`docs/measurements/prefill-moe-m26-2026-09-04.md:20`), top_k 8 (N=8 is "top_k itself",
-`docs/tasks/red-october.md:424`), 3.19 MB per expert (`metal/gemma4_26b_paged_test.go:128,168`).
+`docs/completed/red-october.md:424`), 3.19 MB per expert (`metal/gemma4_26b_paged_test.go:128,168`).
 
 ### (a) Summary
 
@@ -2461,7 +2461,7 @@ removed the test fails 2 of 2 or 3 of 3; with both it passes 3 of 3. Bit-identic
 
 #### E-C02 [C, Minor, default-off] `fp contract(fast)` restore and `GOINFER_PRECISE_MATH`
 
-**Status, 2026-10-04: probed, no defect on this build.** `TestMC3Step_bitIdenticalPreciseMath` runs the batched step with the library compiled precise: 0 logits differ from single-token decode, shallow and deep. It now matters by default, because native int8 compiles precise (docs/tasks/task-metal-int8-2026-10.md, O3); `TestMC3Step_w8BitIdentical` holds for the int8 step too. The pragma order is unchanged. The test is the guard against a toolchain that compiles it differently.
+**Status, 2026-10-04: probed, no defect on this build.** `TestMC3Step_bitIdenticalPreciseMath` runs the batched step with the library compiled precise: 0 logits differ from single-token decode, shallow and deep. It now matters by default, because native int8 compiles precise (docs/completed/task-metal-int8-2026-10.md, O3); `TestMC3Step_w8BitIdentical` holds for the int8 step too. The pragma order is unchanged. The test is the guard against a toolchain that compiles it differently.
 
 `gumbelMSLKernels` is the last block of `allKernels` and is bracketed by `#pragma METAL fp contract(off)` (metal/gumbel.go:49) and
 `#pragma METAL fp contract(fast)` (:164). `mc3RowsKernels` is appended after it (metal/model.go:1088) and the whole library is compiled with
@@ -2563,7 +2563,7 @@ task-never-swap-2026-09.md:281-283. `attnFACoreCount = 14` (metal/model.go:3220)
 7. Whether Metal's precise-math mode defaults `fp contract` to off (E-C02).
 8. `simd_sum` tree on M3 and later: `batchSimdSumTreeOK` guards it at build, but only an M3+ run shows it holding.
 9. Stability of `calibrateRows` (metal/batch.go:446-505) run to run; its choice at B=2/3 on the 7B decides how much E-P02 can buy.
-10. `docs/tasks/task-concurrency-2026-09.md` and its log directories are cited by many records and absent from the snapshot.
+10. `docs/tasks/parked/task-concurrency-2026-09.md` and its log directories are cited by many records and absent from the snapshot.
 
 
 ## 9. Area F — Correctness of recently changed code, gates and tests, stale claims
@@ -3001,7 +3001,7 @@ One row for every ID in `docs/audit-metal-2026-09-12.md`: 16 M-, 10 C-, 10 G- an
 | M-12 | CLOSED-VERIFIED, cross-expert half only | Cross-expert goroutines `metal/expertpool.go:392-407`; per-expert spans `metal/moe.go:831-845`, `metal/gemma4_moe.go:376-380` (D). The per-expert 3-pread half is not done, as recorded. |
 | M-13 | CLOSED-VERIFIED | `autoMoESlots` `metal/backend.go:273-303`, floor `moeTopK`, ceiling 64. |
 | M-14 | CLOSED-VERIFIED (wiring); saving not re-measured | `e2.UseResidencySet` `metal/moe.go:1196`, `metal/gemma4_moe.go:668`; aikit `TestEncoder_useResidencySet`; rationale `metal/model.go:2016-2079` (C, D). REVISIT of the dense case: C-B02. |
-| M-15 | OPEN; not re-audited | Outside the six areas. Re-checked only that goinfer imports neither `visioncuda` nor `visionmetal` (`docs/tasks/task-aikit-boundary-2026-09.md:33`, verified 2026-09-24) and that `docs/multimodal.md:211` still says Metal is not started. The Sep 12 reasoning for not wiring aikit's Metal tower is unchanged; `metal_vit.go` in v1.51.0 was not re-read. |
+| M-15 | OPEN; not re-audited | Outside the six areas. Re-checked only that goinfer imports neither `visioncuda` nor `visionmetal` and that `docs/multimodal.md:211` still says Metal is not started. The Sep 12 reasoning for not wiring aikit's Metal tower is unchanged; `metal_vit.go` in v1.51.0 was not re-read. |
 | M-16 | NEGATIVE-CLOSED (serial-encoder premise) | Untracked 99.6–101.5% of tracked (aikit `hazard_tracking_probe_test.go`). Holds for the dense chain; REVISIT for the batched step only (E-P05). |
 | C-01 | CLOSED-VERIFIED | `metal/model.go:1653-1667` pads the allocation to 8 rows; `metal/attention_prefill_fused_cachepad_test.go:14,31` asserts `Buffer.Len`. The steel kernel only loads keys `< jEnd` (`metal/prefill.go:792-795`), so it does not rely on the padding. |
 | C-02 | CLOSED-VERIFIED | `metal/backend.go:1202-1204` declines `HiddenLast` on a paged MoE (also `:569`, `:842`, `:869`); chokepoint panics at `metal/moe.go:963`, `metal/gemma4_moe.go:454`; test `metal/c02_paged_forward_entrypoints_test.go:28`. |
@@ -3097,6 +3097,6 @@ them. Everything here needs the Mac or a file the audited snapshot did not carry
 | Prompt-length distribution of real first turns | A-P02 | Not recorded anywhere; log it |
 | MLX's per-chip commit bucket and `sdpa_vector` 2-pass switch for an M1 Pro; whether mlx-lm quantises `lm_head`; the same-session MLX ratio | §0, B-N01 | T1.14 (the first two affect only the MLX comparison, never a goinfer change) |
 | GPU watchdog behaviour for a whole-prompt single command buffer | C-N02 | A long-prompt run |
-| Files absent from the snapshot that the reports cite: `docs/completed/metal-verdict.md`, `scripts/autoresearch_rmsnorm_results.tsv`, `docs/tasks/task-concurrency-2026-09.md` and its log directories, `docs/task-mxfp4-gptoss.md`, the S0 logs | B-P09, M-09 loose ends, E-P03, D-B03 | Read them in the working repo before acting on those items |
+| Files absent from the snapshot that the reports cite: `docs/completed/metal-verdict.md`, `scripts/autoresearch_rmsnorm_results.tsv`, `docs/tasks/parked/task-concurrency-2026-09.md` and its log directories, `docs/task-mxfp4-gptoss.md`, the S0 logs | B-P09, M-09 loose ends, E-P03, D-B03 | Read them in the working repo before acting on those items |
 
 <!-- citation-lint: allow-path visionmetal/threadgroup_budget_test.go aikit's own separate Go module (gpu/visionmetal), not pinned by goinfer, so no checked-out or module-cache root can verify it here; same reason as visionmetal/encoder.go in audit-metal-2026-09-12.md. -->

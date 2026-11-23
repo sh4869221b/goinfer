@@ -9,7 +9,7 @@ cross-compile it like anything else. No Python, no llama.cpp, no C toolchain, no
 - **Output your types guarantee** — constrain generation to a Go struct or a JSON Schema; an
   invalid token is unreachable, not retried.
 - **One static binary** — and, if you want, the model baked into it.
-- **44 model families**, with HuggingFace logit-parity coverage tracked in the [capability matrix](docs/capability-matrix.md).
+- **45 model families**, with HuggingFace logit-parity coverage tracked in the [capability matrix](docs/capability-matrix.md).
 - Experimental [PLaMo 3 Translate](docs/plamo3.md) support, with a dedicated translation example and CPU tests.
 - **CPU, CUDA and Metal**, cgo-free; **WebGPU** as an opt-in cgo build.
 - **Runs offline** — no telemetry, no update check, no account. The one thing that reaches the network is fetching a
@@ -56,7 +56,8 @@ It works from any JSON Schema too (`constrain.JSONSchema(bytes)`), and from the 
 
 Supported subset: objects (required and optional, `additionalProperties:false`), arrays
 (`items`/`minItems`/`maxItems`), `string`/`number`/`integer`/`boolean`/`null`, `enum`/`const`,
-and arbitrary nesting. A property-based test asserts that every constrained generation validates
+a string's `format` for `date`, `time`, `date-time`, `uuid`, `ipv4` and `email`, and arbitrary
+nesting. A property-based test asserts that every constrained generation validates
 against its schema.
 
 **Tool calls get the same treatment.** On the Qwen families (Qwen2 through Qwen3.8),
@@ -161,7 +162,7 @@ goinfer-chat  --model demo:0.5b
 ```
 
 Interrupted transfers resume. Downloads land in your user cache dir and print the exact `--model`
-command to run them; `goinfer-chat cache` lists what is there. A family that ships no GGUF (safetensors only) is fetched whole with
+command to run them; `goinfer-chat cache` lists what is there, and `goinfer-chat cache prune-sidecars` the old-format `.giw` sidecars it can reclaim. A family that ships no GGUF (safetensors only) is fetched whole with
 `:safetensors` — `pull HuggingFaceTB/SmolLM3-3B:safetensors`, or `--model hf:…:safetensors` — as one verified set
 of config, tokenizer and weight shards; nothing lands until every file has checked out. Access is anonymous only; a gated repo is detected and named before the
 transfer starts. A plain path still means a plain path — only the `hf:` and `demo:` prefixes are
@@ -349,13 +350,13 @@ Every row is a dated record on one machine, not a promise for yours.
 | measure | result | date | record |
 | --- | --- | --- | --- |
 | Nothing → first answer, M1 Pro / 16 GB | 25 s against Ollama's 33 s, from that day's 8 MB binary with no daemon | 2026-09-06 | [cold-user run](docs/measurements/cold-user-2026-09-06.md), scenario E |
-| Greedy decode, CUDA (RTX 2070 SUPER), 0.5B / 1.5B / 7B, depth 128 to 8,000 | ahead of Ollama in all 12 cells, 1.05–1.47×; the margin narrows with depth on the 7B | 2026-09-29 | [peer sweep](docs/measurements/peer-sweep-2026-09-29.md) |
-| Greedy decode, CUDA, depth 128, every arm sent the same seed, context and sampling fields | 1.33× Ollama on the 0.5B and on gemma3-1b (0.90× on phi3-mini) | 2026-10-17 | [benchmarks §B11](docs/benchmarks.md#b11--peer-decode-like-for-like-2026-10-1718) |
+| Greedy decode, CUDA (RTX 2070 SUPER), 0.5B / 1.5B / 7B, depth 128 to 8,000, every arm sent the same seed, context and sampling fields | ahead of Ollama in 10 of 11 graded cells, 1.04–1.94× (the 1.5B and 7B at the int8-head default); level on the 7B at 8,000 (0.98×); the 0.5B at 8,000 void | 2026-11-19/20 | [peer re-anchor](docs/measurements/peer-reanchor-2026-11-19/README.md) |
+| Greedy decode, CUDA, depth 128, gemma3-1b and phi3-mini | 1.91× Ollama on gemma3-1b, 0.91× on phi3-mini | 2026-11-19/20 | [peer re-anchor](docs/measurements/peer-reanchor-2026-11-19/README.md) |
 | Greedy decode, Apple Metal (M1 Pro), 0.5B / 1.5B / 7B, depth 128 / 2,048 / 3,900 | ahead of Ollama in all 12 cells, 1.05–1.40× | 2026-10-04 | [benchmarks, Apple Silicon Metal decode](docs/benchmarks.md) (the 2026-10-05 peer refresh) |
 | Greedy decode, Apple Metal (M1 Pro), depth 128, like for like | 1.37× / 1.10× / 1.20× Ollama on the 0.5B / 1.5B / 7B | 2026-10-17 | [benchmarks §B11](docs/benchmarks.md#b11--peer-decode-like-for-like-2026-10-1718) |
 
-Where it is behind: Phi-3 mini decode on CUDA (0.72–0.90× Ollama, 0.89× llama.cpp at depth 128), and against llama.cpp on CUDA at matched
-4-bit quants (0.94× on the 0.5B, 0.95× on gemma3-1b; 2026-10-17). On Metal it is behind mlx-lm's single-request path, 0.67× on the 1.5B and 0.75× on the 7B
+Where it is behind: Phi-3 mini decode on CUDA (0.79–0.91× Ollama, 0.88× llama.cpp at depth 128), the 7B against llama.cpp on CUDA from
+3,900 tokens (0.97× / 0.91×), and x86 CPU decode on the 0.5B and 1.5B (0.87× / 0.93× Ollama) and on two vetted checkpoints (phi3-mini 0.76×, gpt-oss 20B 0.92×; 2026-11-19/20). On Metal it is behind mlx-lm's single-request path, 0.67× on the 1.5B and 0.75× on the 7B
 (2026-10-18). CPU decode on a Mac against llama.cpp was 0.84× on the 0.5B (2026-09-25). Long-prompt prefill on Metal read level with Ollama at a
 3,900-token prompt on 2026-10-06 (0.98×, 1.5B, [peer refresh](docs/measurements/peer-refresh-2026-10-06.md)) and 0.90× behind mlx-lm there. The Metal decode figures are for the resident GPU path. `--embed-int4` defaults off on
 Metal, because that path does not take an int4 embedding table yet
@@ -392,9 +393,9 @@ in-process. Longer form: [docs/positioning.md](docs/positioning.md).
 
 ## What it runs
 
-- **44 model families** — Gemma 1/2/3/4 (and CodeGemma), the Qwen line (Qwen2, Qwen2.5, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5-MoE, Qwen3.8, Qwen2.5-VL,
+- **45 model families** — Gemma 1/2/3/4 (and CodeGemma), the Qwen line (Qwen2, Qwen2.5, Qwen3, Qwen3-MoE, Qwen3-Next, Qwen3.5-MoE, Qwen3.8, Qwen2.5-VL,
   Qwen3-VL and its MoE, Qwen3-ASR), Llama, Mistral, Mixtral, Phi-3, DeepSeek/MLA,
-  GLM, Kimi, Granite, Nemotron, Mellum, Olmo 3, Olmo Hybrid (on Metal at `int4` only; on WebGPU read only on the M1 Pro's adapter) and more; one page each at
+  GLM, Kimi, Granite, Nemotron, Mellum, Olmo 3, Olmo Hybrid (on Metal at `int4` only; on WebGPU read only on the M1 Pro's adapter), Flint and more; one page each at
   [goinfer.dev/models](https://goinfer.dev/models/), generated from the `decoder` registry
   ([capability-matrix.md](docs/capability-matrix.md)).
 - **All four sequence-mixing families** — softmax·GQA, gated-linear (DeltaNet), state-space
@@ -432,24 +433,24 @@ Each cell: where the image or audio **tower** runs / where the **decoder** runs 
 
 | family (`model_type`) | CPU | CUDA | Metal | WebGPU |
 |---|---|---|---|---|
-| Gemma 3 (`gemma3`) | CPU / CPU | GPU / GPU | GPU / GPU | CPU / GPU |
-| Gemma 4 E2B, E4B (`gemma4`) | CPU / CPU | GPU / GPU | GPU / GPU | CPU / GPU |
+| Gemma 3 (`gemma3`) | CPU / CPU | GPU / GPU | GPU / GPU | GPU / GPU |
+| Gemma 4 E2B, E4B (`gemma4`) | CPU / CPU | GPU / GPU | GPU / GPU | GPU / GPU |
 | Gemma 4 E2B, E4B audio (`gemma4`) | CPU / CPU | CPU / GPU | GPU / GPU | CPU / GPU |
-| Gemma 4 26B (`gemma4`) | CPU / CPU | GPU / GPU | GPU / GPU | CPU / GPU |
-| Gemma 4 31B (`gemma4`) | CPU / CPU | GPU / GPU | GPU / GPU | CPU / GPU |
-| Qwen2.5-VL (`qwen2_5_vl`) | CPU / CPU | GPU / GPU | GPU / GPU | CPU / GPU |
-| Qwen3.5+ dense (`qwen3_5`) | CPU / CPU | GPU / GPU | GPU / CPU | CPU / CPU |
-| Qwen3.5+ MoE (`qwen3_5_moe`) | CPU / CPU | GPU / CPU | GPU / CPU | CPU / CPU |
-| Qwen3-VL (`qwen3_vl`) | CPU / CPU | GPU / GPU | GPU / GPU | CPU / GPU |
-| Qwen3-VL MoE (`qwen3_vl_moe`) | CPU / CPU | GPU / GPU | GPU / GPU | CPU / GPU |
-| GLM-OCR (`glm_ocr`) | CPU / CPU | GPU / GPU | GPU / GPU | CPU / CPU |
+| Gemma 4 26B (`gemma4`) | CPU / CPU | GPU / GPU | GPU / GPU | GPU / GPU |
+| Gemma 4 31B (`gemma4`) | CPU / CPU | GPU / GPU | GPU / GPU | GPU / GPU |
+| Qwen2.5-VL (`qwen2_5_vl`) | CPU / CPU | GPU / GPU | GPU / GPU | GPU / GPU |
+| Qwen3.5+ dense (`qwen3_5`) | CPU / CPU | GPU / GPU | GPU / CPU | GPU / CPU |
+| Qwen3.5+ MoE (`qwen3_5_moe`) | CPU / CPU | GPU / CPU | GPU / CPU | GPU / CPU |
+| Qwen3-VL (`qwen3_vl`) | CPU / CPU | GPU / GPU | GPU / GPU | GPU / GPU |
+| Qwen3-VL MoE (`qwen3_vl_moe`) | CPU / CPU | GPU / GPU | GPU / GPU | GPU / GPU |
+| GLM-OCR (`glm_ocr`) | CPU / CPU | GPU / GPU | GPU / GPU | GPU / CPU |
 | LFM2.5-VL (`lfm2_vl`) | CPU / CPU | CPU / CPU | CPU / CPU | CPU / CPU |
 | Ministral 3 (`mistral3`) | CPU / CPU | CPU / GPU | CPU / GPU | CPU / CPU |
 
 <!-- END images-and-audio support table -->
 
-Not yet: video. Under `--backend webgpu` every image tower stays on the CPU by default (the table's WebGPU column); `--vision-device gpu` puts the Gemma 3, Gemma 4, Qwen2.5-VL, Qwen3.5+, Qwen3-VL and GLM-OCR towers on the GPU there, and the other families' towers have no WebGPU form.
-Qwen3-VL MoE (a 30B model, too large for a 16 GB Mac or an 8 GB card) has been checked against HuggingFace on the CPU; its served check on a GPU has not passed, because a two-image request on CUDA's paged path read as a fail and is still open ([S10q-paged](docs/tasks/task-multimodal-remaining-2026-10.md)).
+Not yet: video. Under `--backend webgpu` the Gemma 3, Gemma 4, Qwen2.5-VL, Qwen3.5+, Qwen3-VL and GLM-OCR towers run on the GPU by default on a unified-memory Mac (the table's WebGPU column; `--vision-device cpu` keeps them on the CPU). A discrete GPU keeps the CPU tower until `--vision-device gpu` asks, since WebGPU cannot price a card's memory, and a Qwen3.5+ `.gguf` mmproj tower likewise; the other families' towers have no WebGPU form.
+Qwen3-VL MoE (a 30B model, too large for a 16 GB Mac or an 8 GB card) has been checked against HuggingFace on the CPU; its served check on a GPU has not passed, because a two-image request on CUDA's paged path read as a fail and is still open.
 
 ## Docs
 
@@ -471,6 +472,7 @@ is the one to read if you read only one. Source: [docs/book/](docs/book).
 | [docs/giw-bundles.md](docs/giw-bundles.md) | prequantized `.giw` bundles and `cmd/prequant` |
 | [docs/positioning.md](docs/positioning.md) | what goinfer is for, and what it is not |
 | [docs/api-tiers.md](docs/api-tiers.md) | which surfaces v1.0 will semver-bind |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | how to build, test and send a change, for a person or an AI tool |
 
 Demos: `demo/chat` (single-binary local chat), `demo/agent` (fully-local stdlib RAG coding agent).
 

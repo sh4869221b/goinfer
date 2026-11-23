@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/decoder/fit"
 	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 )
 
@@ -24,14 +25,14 @@ func TestResidentKVBytes_excludesDeltaNetLayers(t *testing.T) {
 	}
 	defer m.Close()
 
-	_, _, _, _, _, _, dnetOK := m.Qwen35ResidentParams()
+	_, dnetOK := m.BackendView().Qwen35()
 	if !dnetOK {
 		t.Fatal("test setup: qwen35-tiny did not resolve to a DeltaNet-hybrid model")
 	}
 	_, nLayers, _, _, _, _, _ := m.Dims()
 	var wantAttnLayers, wantLinearLayers int
 	for l := range nLayers {
-		if m.Qwen35LinearLayer(l) {
+		if m.BackendView().Layer(l).Qwen35Linear() {
 			wantLinearLayers++
 		} else {
 			wantAttnLayers++
@@ -46,7 +47,7 @@ func TestResidentKVBytes_excludesDeltaNetLayers(t *testing.T) {
 	t.Logf("qwen35-tiny: %d layers, %d linear-attention (no KV), %d full-attention (KV)",
 		nLayers, wantLinearLayers, wantAttnLayers)
 
-	ctxCap, err := resolveMetalCtxCap(m)
+	ctxCap, err := resolveMetalCtxCap(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("resolveMetalCtxCap: %v", err)
 	}
@@ -57,10 +58,10 @@ func TestResidentKVBytes_excludesDeltaNetLayers(t *testing.T) {
 	const bytesPerElem = 2
 	var want int64
 	for l := range nLayers {
-		if m.Qwen35LinearLayer(l) {
+		if m.BackendView().Layer(l).Qwen35Linear() {
 			continue
 		}
-		kvDim := int64(m.KVHeadsAtResident(l)) * int64(m.HeadDimAtResident(l))
+		kvDim := int64(m.BackendView().Layer(l).KVHeads()) * int64(m.BackendView().Layer(l).HeadDim())
 		want += 2 * (int64(kvBlocksFor(ctxCap)) + 1) * decoder.KVBlockRows * kvDim * bytesPerElem // the layer's blocks, and its pool's null block
 	}
 	want += 4 * int64(kvBlocksFor(ctxCap)) // the slot's table
@@ -68,7 +69,7 @@ func TestResidentKVBytes_excludesDeltaNetLayers(t *testing.T) {
 		t.Fatal("test setup: expected KV bytes computed as 0 — oracle itself is degenerate")
 	}
 
-	got := residentKVBytes(m)
+	got := residentKVBytes(m, metalCtxPlan{})
 	if got != want {
 		// The pre-fix behavior charged every layer, including the linear-attention ones — if the
 		// fix regresses, this is what it would look like: got > want by roughly the linear
@@ -80,8 +81,7 @@ func TestResidentKVBytes_excludesDeltaNetLayers(t *testing.T) {
 	}
 }
 
-// deltaNetSlotFixtures are the tracked Gated-DeltaNet checkpoints the per-slot state is checked on (OP4m-d4a,
-// docs/tasks/task-forward-architecture-2026-10.md §4.9).
+// deltaNetSlotFixtures are the tracked Gated-DeltaNet checkpoints the per-slot state is checked on.
 var deltaNetSlotFixtures = []string{"../../testdata/qwen35-tiny", "../../testdata/qwen3next-tiny"}
 
 // mambaSlotFixture is the tracked Mamba-2 hybrid (Nemotron-H) the per-slot state is checked on (OP4m-d6a).
@@ -268,18 +268,18 @@ func recurrentSlotPrice(t *testing.T, dir string) {
 	t.Cleanup(func() { metalMemoryCeilingForTest = 0 })
 	m := recurrentSlotsLoad(t, dir, decoder.Options{ResidentKVSlots: 2})
 	state := metalRecurrentSlotBytes(m)
-	ctxCap, err := resolveMetalCtxCap(m)
+	ctxCap, err := resolveMetalCtxCap(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state <= 0 || metalSlotBytes(m) != m.MetalKVSlotBytes(ctxCap)+state {
-		t.Fatalf("per-slot price %d with a recurrent state of %d and KV of %d", metalSlotBytes(m), state, m.MetalKVSlotBytes(ctxCap))
+	if state <= 0 || metalSlotBytes(m, metalCtxPlan{}) != m.MetalKVSlotBytes(ctxCap)+state {
+		t.Fatalf("per-slot price %d with a recurrent state of %d and KV of %d", metalSlotBytes(m, metalCtxPlan{}), state, m.MetalKVSlotBytes(ctxCap))
 	}
-	if plan := m.Plan("metal", 1<<50, decoder.PlanRequest{Ctx: 64, CtxPinned: true}).StateBytes; plan != state {
+	if plan := m.Plan("metal", 1<<50, fit.PlanRequest{Ctx: 64, CtxPinned: true}).StateBytes; plan != state {
 		t.Errorf("Plan prices one slot's state at %d bytes; metalRecurrentSlotBytes prices %d", plan, state)
 	}
-	metalMemoryCeilingForTest = residentNeedBytes(m) + metalSlotBytes(m)
-	if n := metalKVSlots(m); n != 2 {
+	metalMemoryCeilingForTest = residentNeedBytes(m, metalCtxPlan{}) + metalSlotBytes(m, metalCtxPlan{})
+	if n := metalKVSlots(m, metalCtxPlan{}); n != 2 {
 		t.Fatalf("a ceiling of the need and one further slot's price: %d slots; want 2", n)
 	}
 	two := recurrentSlotsBuild(t, m)
@@ -291,8 +291,8 @@ func recurrentSlotPrice(t *testing.T, dir string) {
 		t.Errorf("slot 1's recurrent buffers are %d bytes; metalRecurrentSlotBytes prices %d", got, state)
 	}
 	m2 := recurrentSlotsLoad(t, dir, decoder.Options{ResidentKVSlots: 2})
-	metalMemoryCeilingForTest = residentNeedBytes(m2) + metalSlotBytes(m2) - 1
-	if n := metalKVSlots(m2); n != 1 {
+	metalMemoryCeilingForTest = residentNeedBytes(m2, metalCtxPlan{}) + metalSlotBytes(m2, metalCtxPlan{}) - 1
+	if n := metalKVSlots(m2, metalCtxPlan{}); n != 1 {
 		t.Errorf("a ceiling one byte short of a second slot's price: %d slots; want 1", n)
 	}
 }

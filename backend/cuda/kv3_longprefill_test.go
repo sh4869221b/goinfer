@@ -3,15 +3,25 @@
 package cuda
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/internal/runtime/modelload"
+	"hash/fnv"
 	"math"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
+	"sort"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // KV3's gates for the span bound (docs/measurements/kv3-cuda-2026-10-13.md §2.3): the shared-memory guard holds a layer to the
@@ -242,15 +252,20 @@ func TestKV3_residentReportsItsChunks(t *testing.T) {
 	const base = "../../testdata/llama-attnfa-tiny"
 	requireDeviceAndFixture(t, base)
 	g := kv0LoadCtx(t, base, "f16", 2048, kv0RandomTokens)
-	pc, ok := any(g.r).(decoder.ResidentPrefillChunks)
-	if !ok {
-		t.Fatal("cudaResident does not satisfy decoder.ResidentPrefillChunks")
+	pc := decoder.SubsystemsOf(g.r).Prefill
+	if !pc.PrefillChunksAvailable() {
+		t.Fatal("cudaResident's prefill subsystem does not report prefill chunks")
 	}
-	if _, ok := any(g.r).(decoder.ResidentPrefillTailMin); !ok {
-		t.Fatal("cudaResident does not satisfy decoder.ResidentPrefillTailMin")
+	cr := decoder.SubsystemsOf(g.r).Runtime
+	if got := cr.ResidentCaps().TailMinRows; got <= 0 || got != g.r.PrefillTailMinRows() {
+		t.Fatalf("ResidentCaps().TailMinRows = %d, want PrefillTailMinRows %d (> 0)", got, g.r.PrefillTailMinRows())
 	}
-	if _, ok := any(g.r).(decoder.ResidentPrefillSpanScratch); !ok {
-		t.Fatal("cudaResident does not satisfy decoder.ResidentPrefillSpanScratch")
+	// The fused attention serves this fixture and needs no span scratch, so the row kernels are forced for this one check.
+	prefillSplitKVForceForTest = true
+	spanScratch := pc.PrefillSpanScratchBytes(512, 512)
+	prefillSplitKVForceForTest = false
+	if spanScratch <= 0 {
+		t.Fatal("cudaResident's prefill subsystem reports no span scratch with the row kernels forced (PrefillSpanScratchBytes(512, 512) <= 0)")
 	}
 	if c := pc.PrefillChunkRows(); c != g.r.prefillWidth || !slices.Contains(prefillWidths, c) || c%64 != 0 {
 		t.Errorf("PrefillChunkRows %d, want the build's chosen width %d, one of %v (each a multiple of the block size 64)", c, g.r.prefillWidth, prefillWidths)
@@ -276,7 +291,7 @@ func TestKV3_admissionPricesTheChunk(t *testing.T) {
 	g := kv0LoadCtx(t, path, "f16", 21000, kv0TextTokens(t, path))
 	const prompt, maxTok = 20954, 8
 	whole := g.m.WholePromptScratchBytesForTest(prompt)
-	chunk := g.r.PrefillScratchBytes(g.r.PrefillChunkRows()) + int64(prompt)*4*int64(g.m.ResidentEmbedLen())
+	chunk := g.r.PrefillScratchBytes(g.r.PrefillChunkRows()) + int64(prompt)*4*int64(g.m.BackendView().EmbedLen())
 	frac := 0.7 // decoder.prefillAvailFraction: the share of available memory a request may take
 	t.Logf("whole-prompt price %.2f GB, per-chunk price %.3f GB (device scratch for %d rows plus the suffix's host embeddings)", float64(whole)/(1<<30), float64(chunk)/(1<<30), g.r.PrefillChunkRows())
 	if chunk*4 > whole {
@@ -344,6 +359,425 @@ func TestKV3_chunkerKeepsPassStartsOnTheGrid(t *testing.T) {
 			if last := ps[len(ps)-1]; chunk >= 2*attnFusedMinRows && last.m < attnFusedMinRows {
 				t.Fatalf("chunk %d, M=%d: last pass of %d rows", chunk, M, last.m)
 			}
+		}
+	}
+}
+
+// MEM6 on CUDA (docs/measurements/mem6-cuda-2026-11/README.md): a resident prefill reads the suffix's embeddings a pass at a time into one reused slab
+// (decoder.ResidentPrefillSubsystem), so the host holds a pass of them, not the suffix. The most embedding rows the decoder holds at once during a prefill of 2,048
+// rows is at most one pass (prefillPassRows), and the last logits and 32 decode steps after them are byte-equal to the slice entry point's.
+//
+//	go test -count=1 -tags 'cuda goinfer_testhooks' -run '^TestMEM6_cudaPrefillHostRows$' -v ./backend/cuda/
+func TestMEM6_cudaPrefillHostRows(t *testing.T) {
+	requireCUDADevice(t)
+	dir := kv3LongContextCopy(t, filepath.Join("../../testdata", "llama-tiny"), 4096)
+	m, err := decoder.Load(dir, decoder.Options{Backend: "cuda", Quant: "int4", ResidentContext: 2112})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	a, ok := m.ResidentForwardForTest().(*cudaResident)
+	if !ok {
+		t.Fatalf("not the CUDA resident: %s", m.ResidentDecline())
+	}
+	_, _, _, _, _, _, vocab := m.Dims()
+	// A tiny fixture runs a prompt this long in one pass; a real model's pass is a few hundred rows, which the learned chunk cap stands in for.
+	a.prefillChunkCap.Store(256)
+	defer a.prefillChunkCap.Store(0)
+	pass := a.prefillPassRows()
+	if pass != 256 {
+		t.Fatalf("the pass is %d rows, want the 256 the test set", pass)
+	}
+	held := 0
+	decoder.SetEmbedRowsObserverForTest(func(rows int) { held = max(held, rows) })
+	defer decoder.SetEmbedRowsObserverForTest(nil)
+	hash := func(lg []float32, n int) uint64 {
+		h := fnv.New64a()
+		put := func(l []float32) {
+			for _, x := range l {
+				b := math.Float32bits(x)
+				h.Write([]byte{byte(b), byte(b >> 8), byte(b >> 16), byte(b >> 24)})
+			}
+		}
+		put(lg)
+		next := argmaxF(lg)
+		for j := range 32 {
+			l, err := a.Forward(m.EmbedResidentForTest(next), n+j)
+			if err != nil {
+				t.Fatal(err)
+			}
+			put(l)
+			next = argmaxF(l)
+		}
+		return h.Sum64()
+	}
+	for _, n := range []int{1024, 2048} {
+		ids := make([]int, n)
+		for i := range ids {
+			ids[i] = (i*37 + 11) % vocab
+		}
+		// the slice entry point: every row embedded up front, as the decoder did before
+		a.Reset()
+		emb := make([][]float32, n)
+		for i, id := range ids {
+			emb[i] = m.EmbedResidentForTest(id)
+		}
+		lgSlice, err := a.PrefillLast(context.Background(), emb, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := hash(lgSlice, n)
+		held = 0
+		a.Reset()
+		lg, err := m.ResidentPrefillSeedForTest(context.Background(), ids)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%d rows: at most %d embedding rows held at once (one pass is %d)", n, held, pass)
+		// The observer must have fired: a prefill that never called it would read 0 and pass "at most one pass" without reading anything. The
+		// prompt is longer than a pass, so the most rows held at once is exactly one pass.
+		if held != pass {
+			t.Errorf("%d rows: the decoder held at most %d embedding rows at once, want exactly one pass (%d): at most it, and not 0 because the observer never fired", n, held, pass)
+		}
+		if got := hash(lg, n); got != want {
+			t.Errorf("%d rows: the last logits and 32 decode steps differ from the slice entry point's (%#x, want %#x)", n, got, want)
+		}
+	}
+}
+
+// The Go bytes a prompt row adds to a resident prefill stay under one embedding row. With the slab alone the batched pass still copied each pass's
+// embeddings into a fresh contiguous host block, so a 20K prompt left its whole size in garbage that the runtime holds resident after the request (MEM0's +218 MiB
+// on the 1.5B): the block is one reused buffer now. The slope is read between two lengths so the fixed costs of a prefill drop out.
+func TestMEM6_cudaPrefillAllocatesNoRowCopy(t *testing.T) {
+	requireCUDADevice(t)
+	dir := kv3LongContextCopy(t, filepath.Join("../../testdata", "llama-tiny"), 4096)
+	m, err := decoder.Load(dir, decoder.Options{Backend: "cuda", Quant: "int4", ResidentContext: 2112})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	a, ok := m.ResidentForwardForTest().(*cudaResident)
+	if !ok {
+		t.Fatalf("not the CUDA resident: %s", m.ResidentDecline())
+	}
+	_, _, _, _, _, _, vocab := m.Dims()
+	a.prefillChunkCap.Store(256)
+	defer a.prefillChunkCap.Store(0)
+	bytesFor := func(n int) uint64 {
+		ids := make([]int, n)
+		for i := range ids {
+			ids[i] = (i*37 + 11) % vocab
+		}
+		a.Reset()
+		if _, err := m.ResidentPrefillSeedForTest(context.Background(), ids); err != nil { // warm: the first pass sizes any reused buffer
+			t.Fatal(err)
+		}
+		a.Reset()
+		runtime.GC()
+		var s0, s1 runtime.MemStats
+		runtime.ReadMemStats(&s0)
+		if _, err := m.ResidentPrefillSeedForTest(context.Background(), ids); err != nil {
+			t.Fatal(err)
+		}
+		runtime.ReadMemStats(&s1)
+		return s1.TotalAlloc - s0.TotalAlloc
+	}
+	b1, b2 := bytesFor(1024), bytesFor(2048)
+	perRow := float64(int64(b2)-int64(b1)) / 1024
+	embRow := float64(4 * m.BackendView().EmbedLen())
+	t.Logf("Go bytes allocated by the prefill: %d at 1,024 rows, %d at 2,048; %.0f B per prompt row against %.0f B per embedding row (%.2f)", b1, b2, perRow, embRow, perRow/embRow)
+	if perRow > embRow {
+		t.Errorf("a prompt row adds %.0f B of Go allocation, over one embedding row (%.0f B): a pass copies its embeddings again", perRow, embRow)
+	}
+}
+
+// TestKV10_fusedPrefillRule is KV10-a's rule test (docs/measurements/kv10-2026-11/README.md): on a resident whose fused attention module loaded, useAttnFused answers
+// yes for exactly the head dims 64 and 128 of every width from 1 to 512, and no under an attention softcap. docs/measurements/kv10-2026-11/fused_census.py applies the
+// same rule to the checkpoints' configs.
+func TestKV10_fusedPrefillRule(t *testing.T) {
+	const base = "../../testdata/llama-tiny"
+	requireDeviceAndFixture(t, base)
+	g := kv0LoadCtx(t, base, "f16", 128, kv0RandomTokens)
+	r := g.r
+	if r.bAttnFused64 == (Pipeline{}) || r.bAttnFused128 == (Pipeline{}) || !r.fastAttn {
+		t.Fatalf("VOID: the fused modules did not load (64 %v, 128 %v, fastAttn %v), so every answer would be no", r.bAttnFused64 != (Pipeline{}), r.bAttnFused128 != (Pipeline{}), r.fastAttn)
+	}
+	g.floorKnob("0") // fast kernels at any prompt length, so the floor does not answer for the head dim
+	r.passPromptLen = 4096
+	var served []int
+	for hd := 1; hd <= 512; hd++ {
+		if _, ok := r.useAttnFused(hd, attnFusedMinRows); ok {
+			served = append(served, hd)
+		}
+	}
+	if !slices.Equal(served, []int{64, 128}) {
+		t.Errorf("the fused kernel serves head dims %v, want exactly [64 128]", served)
+	}
+	r.attnCap = 30
+	if _, ok := r.useAttnFused(128, attnFusedMinRows); ok {
+		t.Errorf("the fused kernel serves head dim 128 under an attention softcap")
+	}
+	r.attnCap = 0
+	if _, ok := r.useAttnFused(128, attnFusedMinRows-1); ok {
+		t.Errorf("the fused kernel serves a pass of %d rows, under attnFusedMinRows", attnFusedMinRows-1)
+	}
+}
+
+// kv10Beat prints a heartbeat to stderr every 45 seconds while a long step runs (with -v it streams), and returns the function that stops it.
+func kv10Beat(label string) func() {
+	t0, done := time.Now(), make(chan struct{})
+	go func() {
+		tk := time.NewTicker(45 * time.Second)
+		defer tk.Stop()
+		for {
+			select {
+			case <-tk.C:
+				fmt.Fprintf(os.Stderr, "[kv10] %s: %.0f s elapsed\n", label, time.Since(t0).Seconds())
+			case <-done:
+				return
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		fmt.Fprintf(os.Stderr, "[kv10] %s: done in %.1f s\n", label, time.Since(t0).Seconds())
+	}
+}
+
+// kv10Tail loads the checkpoint at kv precision with room for depth rows, prefills depth-tail rows, then reads the last tail rows' logits
+// (PrefillLastN: row m predicts position start+m+1). A load the fit check refuses skips the test as NOT RUN.
+func kv10Tail(t *testing.T, ckpt, kv string, ids []int, tail int) [][]float32 {
+	t.Helper()
+	depth := len(ids)
+	m, err := decoder.Load(ckpt, decoder.Options{Backend: "cuda", Quant: "int4", ResidentContext: depth + 64, KVPrecision: kv})
+	if err != nil {
+		t.Skipf("NOT RUN: %s at depth %d, kv %s: %v", filepath.Base(ckpt), depth, kv, err)
+	}
+	defer m.Close()
+	r, ok := m.ResidentForwardForTest().(*cudaResident)
+	if !ok {
+		t.Skipf("NOT RUN: %s is not CUDA-resident at depth %d, kv %s: %s", filepath.Base(ckpt), depth, kv, m.ResidentDecline())
+	}
+	if batched, why := r.PrefillPath(); !batched {
+		t.Fatalf("batched prefill declined: %s", why)
+	}
+	for l := range r.layers {
+		if r.layers[l].kvHalf != (kv == "f16") && !r.layers[l].isDeltaNet() && !r.layers[l].noKV() {
+			t.Fatalf("layer %d holds f16=%v, kv %s was asked for", l, r.layers[l].kvHalf, kv)
+		}
+	}
+	embs := make([][]float32, depth)
+	for i, id := range ids {
+		embs[i] = m.EmbedResidentForTest(id)
+	}
+	stop := kv10Beat(fmt.Sprintf("depth %d kv %s: prefill of %d rows", depth, kv, depth-tail))
+	if _, err := r.PrefillLast(context.Background(), embs[:depth-tail], 0); err != nil {
+		stop()
+		t.Fatalf("PrefillLast(%d rows): %v", depth-tail, err)
+	}
+	stop()
+	outs, err := r.PrefillLastN(embs[depth-tail:], depth-tail)
+	if err != nil {
+		t.Fatalf("PrefillLastN(%d rows at %d): %v", tail, depth-tail, err)
+	}
+	out := make([][]float32, len(outs))
+	for i := range outs {
+		out[i] = append([]float32(nil), outs[i]...)
+	}
+	return out
+}
+
+// kv10Compare is the metric over the tail rows: the min cosine of b against a, the argmax agreement (all rows, and rows where a's top-1 margin is at least
+// 0.5), the mean KL(a || b) in nats, and whether any logit is NaN or Inf.
+func kv10Compare(a, b [][]float32) (minCos float64, agree, agreeM, rows, rowsM int, meanKL float64, bad bool) {
+	minCos = 1
+	for i := range a {
+		for j := range a[i] {
+			if x, y := float64(a[i][j]), float64(b[i][j]); math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) {
+				bad = true
+			}
+		}
+		if c := kv0Cosine(a[i], b[i]); c < minCos {
+			minCos = c
+		}
+		top, second := float32(math.Inf(-1)), float32(math.Inf(-1))
+		for _, v := range a[i] {
+			if v > top {
+				top, second = v, top
+			} else if v > second {
+				second = v
+			}
+		}
+		rows++
+		same := kv0Argmax(a[i]) == kv0Argmax(b[i])
+		if same {
+			agree++
+		}
+		if top-second >= 0.5 {
+			rowsM++
+			if same {
+				agreeM++
+			}
+		}
+		meanKL += kv10KL(a[i], b[i])
+	}
+	return minCos, agree, agreeM, rows, rowsM, meanKL / float64(len(a)), bad
+}
+
+// kv10KL is KL(softmax(p) || softmax(q)) in nats, in float64.
+func kv10KL(p, q []float32) float64 {
+	lse := func(v []float32) float64 {
+		mx := math.Inf(-1)
+		for _, x := range v {
+			mx = math.Max(mx, float64(x))
+		}
+		var s float64
+		for _, x := range v {
+			s += math.Exp(float64(x) - mx)
+		}
+		return mx + math.Log(s)
+	}
+	lp, lq := lse(p), lse(q)
+	var kl float64
+	for i := range p {
+		lpi := float64(p[i]) - lp
+		kl += math.Exp(lpi) * (lpi - (float64(q[i]) - lq))
+	}
+	return kl
+}
+
+// kv10Text is this repository's source and docs as tokens of the checkpoint's tokenizer, at least n of them (real text, never cycled).
+func kv10Text(t *testing.T, ckpt string, n int) []int {
+	t.Helper()
+	tk, err := modelload.Tokenizer(ckpt)
+	if err != nil {
+		t.Fatalf("tokenizer: %v", err)
+	}
+	var files []string
+	for _, g := range []string{"../../decoder/*.go", "../../docs/*.md", "../../backend/cuda/*.go"} {
+		m, _ := filepath.Glob(g)
+		sort.Strings(m)
+		files = append(files, m...)
+	}
+	var sb strings.Builder
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sb.Write(b)
+		if sb.Len() > 3_000_000 {
+			break
+		}
+	}
+	ids, err := tk.Encode(sb.String(), false)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if len(ids) < n {
+		t.Fatalf("VOID: the repository's text is %d tokens, the deepest cell needs %d", len(ids), n)
+	}
+	return ids[:n]
+}
+
+// TestKV10_longContextFidelity is KV10-b's harness (docs/measurements/kv10-2026-11/README.md): at each depth, the last 16 rows' logits of the checkpoint with KV f16 against
+// KV f32, on this repository's text. GOINFER_KV10_DEPTHS (default "3900,65536,131000"), KV10_CKPT (default ~/models/qwen3.5-0.8b), KV10_OUT (a JSON-lines file).
+//
+//	GOINFER_HEAVY_TESTS=1 KV10_OUT=<file> go test -tags 'cuda goinfer_testhooks' -run '^TestKV10_longContextFidelity$' -v -timeout 90m ./backend/cuda/
+func TestKV10_longContextFidelity(t *testing.T) {
+	requireCUDADevice(t)
+	testgate.RequireHeavy(t)
+	ckpt := os.Getenv("KV10_CKPT")
+	if ckpt == "" {
+		ckpt = os.ExpandEnv("$HOME/models/qwen3.5-0.8b")
+	}
+	depths := []int{3900, 65536, 131000}
+	if v := os.Getenv("GOINFER_KV10_DEPTHS"); v != "" {
+		depths = nil
+		for _, f := range strings.Split(v, ",") {
+			n, err := strconv.Atoi(strings.TrimSpace(f))
+			if err != nil || n < 64 {
+				t.Fatalf("GOINFER_KV10_DEPTHS: %q", f)
+			}
+			depths = append(depths, n)
+		}
+	}
+	const tail = 16
+	ids := kv10Text(t, ckpt, slices.Max(depths))
+	var out *os.File
+	if p := os.Getenv("KV10_OUT"); p != "" {
+		f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		out = f
+	}
+	var control float64
+	for _, depth := range depths {
+		t.Run(fmt.Sprintf("depth%d", depth), func(t *testing.T) {
+			t0 := time.Now()
+			fmt.Fprintf(os.Stderr, "[kv10] depth %d: start %s\n", depth, t0.Format("15:04:05"))
+			f32 := kv10Tail(t, ckpt, "f32", ids[:depth], tail)
+			f16 := kv10Tail(t, ckpt, "f16", ids[:depth], tail)
+			minCos, agree, agreeM, rows, rowsM, kl, bad := kv10Compare(f32, f16)
+			verdict := "HOLDS"
+			switch {
+			case bad || minCos < 0.99:
+				verdict = "FAILS"
+			case minCos < 0.999 || agreeM < rowsM || (control > 0 && kl > 2*control):
+				verdict = "DEGRADES"
+			}
+			if depth == depths[0] {
+				control = kl
+			}
+			t.Logf("depth %d: min cosine %.6f, argmax agrees on %d of %d rows (%d of %d with a margin of 0.5+), mean KL %.3e nats (control %.3e), NaN/Inf %v: %s; %.0f s",
+				depth, minCos, agree, rows, agreeM, rowsM, kl, control, bad, verdict, time.Since(t0).Seconds())
+			if out != nil {
+				rec, _ := json.Marshal(map[string]any{"depth": depth, "min_cos": minCos, "agree": agree, "rows": rows, "agree_margin": agreeM, "rows_margin": rowsM, "mean_kl": kl,
+					"control_kl": control, "nan_inf": bad, "verdict": verdict, "seconds": time.Since(t0).Seconds(), "ckpt": filepath.Base(ckpt)})
+				fmt.Fprintf(out, "%s\n", rec)
+			}
+			if verdict == "FAILS" {
+				t.Errorf("depth %d FAILS: min cosine %.6f, NaN/Inf %v", depth, minCos, bad)
+			}
+		})
+	}
+}
+
+// TestKV3_gluQuantWritesInPlace is KV3-S1's red-first gate (docs/measurements/kv3-s1-2026-11/README.md): glu_quant_batched leaves its product in the gate
+// buffer, so a pass allocates two M x inter float buffers (the gate's and the up's) and no third for the product, and PrefillScratchBytes prices the pass without it.
+func TestKV3_gluQuantWritesInPlace(t *testing.T) {
+	const base = "../../testdata/llama-tiny" // intermediate width 128 against a hidden width of 64: no other scratch row is that wide
+	requireDeviceAndFixture(t, base)
+	g := kv0LoadCtx(t, base, "f16", 2048, kv0RandomTokens)
+	r := g.r
+	maxQDim, maxKvDim := r.prefillMaxGeom()
+	for _, d := range []int{r.hidden, maxQDim, maxKvDim, r.hidden / 4, maxQDim / 4} {
+		if d == r.inter || d*4 == r.inter*4 {
+			t.Fatalf("VOID: the fixture's intermediate width %d equals another scratch row width, so counting M x inter buffers proves nothing", r.inter)
+		}
+	}
+	for _, M := range []int{16, 100} {
+		var sizes []int64
+		var seen int64
+		prefillScratchSeenForTest = func(b int64) { sizes = append(sizes, b); seen += b + allocRoundSlack(b) }
+		g.prefill(g.embs(g.tokens(M, 5)), 0)
+		prefillScratchSeenForTest = nil
+		n := 0
+		for _, b := range sizes {
+			if b == int64(M)*int64(r.inter)*4 {
+				n++
+			}
+		}
+		if n != 2 {
+			t.Errorf("M=%d: the pass allocated %d buffers of M x inter floats (%d B), want 2: the gate's and the up's, the product written into the gate's", M, n, int64(M)*int64(r.inter)*4)
+		}
+		if want := r.PrefillScratchBytes(M); want != seen {
+			t.Errorf("M=%d: PrefillScratchBytes %d B, the pass allocated %d B", M, want, seen)
 		}
 	}
 }

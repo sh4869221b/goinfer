@@ -1,6 +1,8 @@
 package decoder
 
 import (
+	"os"
+	"reflect"
 	"testing"
 )
 
@@ -31,10 +33,10 @@ func loadSkippableTiny(t *testing.T, dir, what string) *Model {
 	return m
 }
 
-// TestPlan_tableDriven is G4 (docs/tasks/task-fit-to-hardware.md §6): a table over dense, MoE, hybrid, every backend
+// TestPlan_tableDriven is G4: a table over dense, MoE, hybrid, every backend
 // and every budget that pins the placement and the ctx cap. A change to the priority order is a change to this table,
-// reviewed. It runs on real tiny checkpoints through Load() rather than synthetic headers
-// (docs/tasks/task-gpu-paths-2026-09.md, G11), with budgets scaled to each fixture's OWN byte counts: a literal "6 to
+// reviewed. It runs on real tiny checkpoints through Load() rather than synthetic headers,
+// with budgets scaled to each fixture's OWN byte counts: a literal "6 to
 // 64 GB" range would never reach the decline path on toy-sized fixtures.
 func TestPlan_tableDriven(t *testing.T) {
 	const ctxWant = 8192
@@ -176,7 +178,7 @@ func TestPlan_tableDriven(t *testing.T) {
 		}
 	})
 
-	// webgpu is admitted to Plan (docs/tasks/task-fit-to-hardware.md §7, Phase 3; M-32).
+	// webgpu is admitted to Plan.
 	t.Run("dense/webgpu/generous_admits_like_other_backends", func(t *testing.T) {
 		m := loadDenseTiny(t)
 		dense := m.ResidentDenseWeightBytes()
@@ -196,8 +198,9 @@ func TestPlan_tableDriven(t *testing.T) {
 		perPos := m.kvBytesPerPositionAllLayers(false, true) // i8
 		const wantCtx = 100000                               // above the 65536 i8 ceiling
 		// Deliberately generous: bytes alone would fit wantCtx, so only the fixed ceiling — not
-		// the budget — should be what caps it.
-		budget := dense + perPos*int64(wantCtx)*2
+		// the budget — should be what caps it. WebGPU's plan prices Vulkan's device and its blocks
+		// (webgpu_vulkan.go) beside the buffers, so the room includes them.
+		budget := dense + perPos*int64(wantCtx)*2 + webgpuVkFixed + 2*webgpuVkDevMax
 		p := m.Plan("webgpu", budget, PlanRequest{Ctx: wantCtx, KVI8: true})
 		if p.Placement != PlacementResident {
 			t.Fatalf("Placement = %v, want resident (unpinned ctx shrinks to the ceiling, does not decline): %s", p.Placement, p.Reason)
@@ -221,9 +224,9 @@ func TestPlan_tableDriven(t *testing.T) {
 
 	t.Run("hybrid/webgpu/kv_precision_declines_on_family_not_bytes", func(t *testing.T) {
 		m := loadHybridTiny(t)
-		_, _, _, _, _, _, _, _, mlaOK := m.MLAResidentParams()
-		_, _, _, _, _, _, dnetOK := m.Qwen35ResidentParams()
-		_, _, _, _, _, _, _, nemoOK := m.NemotronResidentParams()
+		_, mlaOK := m.BackendView().MLA()
+		_, dnetOK := m.BackendView().Qwen35()
+		_, nemoOK := m.BackendView().Nemotron()
 		dense := m.ResidentDenseWeightBytes()
 		kv := m.kvBytesPerPositionAllLayers(true, false) * ctxWant
 		p := m.Plan("webgpu", 100*(dense+kv), PlanRequest{Ctx: ctxWant, KVF16: true})
@@ -241,10 +244,8 @@ func TestPlan_tableDriven(t *testing.T) {
 }
 
 // TestPlan_extraBytesReservedAheadOfExperts: PlanRequest.ExtraBytes lets the CALLER price a companion allocation (a
-// drafter, a vision tower) as a FIXED term ahead of the elastic expert-slot count (docs/tasks/task-fit-to-hardware.md
-// §2: every allocation is a term of the plan, including the ones that attach after load). The motivating case is a
-// --drafter attach after BuildResident taking VRAM an MoE expert cache had already claimed
-// (docs/tasks/task-gpu-paths-2026-09.md).
+// drafter, a vision tower) as a FIXED term ahead of the elastic expert-slot count (every allocation is a term of the plan, including the ones that attach after load). The motivating case is a
+// --drafter attach after BuildResident taking VRAM an MoE expert cache had already claimed.
 func TestPlan_extraBytesReservedAheadOfExperts(t *testing.T) {
 	m := loadGemma4MoETiny(t)
 	nExperts, _, isMoE := m.moeGeometry()
@@ -254,8 +255,8 @@ func TestPlan_extraBytesReservedAheadOfExperts(t *testing.T) {
 	dense := m.ResidentDenseWeightBytes()
 	full := m.ResidentWeightBytesPaged(0) - dense
 	perExpert := full / int64(nExperts)
-	kv := m.ResidentKVBytes("cuda", 8192, m.kvF16, false) // what Plan prices for CUDA's paged KV (whole blocks, null blocks, tables)
-	budget := dense + kv + perExpert*int64(nExperts)      // enough for EVERY expert with nothing else
+	kv := m.ResidentKVBytes("cuda", 8192, m.kvF16, false)                        // what Plan prices for CUDA's paged KV (whole blocks, null blocks, tables)
+	budget := dense + m.cudaDerivedTableBytes() + kv + perExpert*int64(nExperts) // enough for EVERY expert with nothing else
 
 	without := m.Plan("cuda", budget, PlanRequest{Ctx: 8192, CtxPinned: true})
 	if without.Placement != PlacementResident {
@@ -289,5 +290,104 @@ func TestPlan_unrecognisedBackendDeclinesEvenForAFeatureFreeArch(t *testing.T) {
 	if p.Placement != PlacementDecline {
 		t.Fatalf("Placement = %v, want decline — a feature-free arch on an unregistered backend name "+
 			"must still decline (M-08), not fall through to resident: %s", p.Placement, p.Reason)
+	}
+}
+
+// A fit search calls Plan once per probe. What Plan derives from the model alone (the config's facts, and the programs coverage
+// and admission check) comes from the model's memo after the first probe. A plan is the same from a cold memo, from one every
+// backend has warmed, and from none (a hand-built Model's). Coverage reaches a plan only where the backend is compiled, so the
+// facts the probes stored in the warm memo are also held to fresh ones, and every backend must have stored some: a probe that
+// declines before pricing (an eligibility decline) derives none. Decoder's default build demand reports stand in for cuda's and
+// metal's in an untagged binary. webgpu warms first, so facts kept without their backend would reach cuda and metal. A model's
+// first probes build at most its two programs, none for
+// webgpu, which has no operation table, and later probes build none. Not parallel: buildProgramCalls counts the whole process,
+// and a test that is not parallel runs alone.
+func TestPlan_derivesTheModelsOwnFactsOnce(t *testing.T) {
+	backends := []string{"cuda", "metal", "webgpu"}
+	reqs := []PlanRequest{{Ctx: 2048}, {Ctx: 32768, KVF16: true}}
+	frees := []int64{1 << 26, 1 << 30, 1 << 36}
+	compared := map[string]int{}
+	// Dense; recurrent MoE; refused by cuda's and metal's operation tables; covered by cuda and metal and not webgpu.
+	for _, path := range []string{"../testdata/llama-tiny", "../testdata/qwen3next-tiny", "../testdata/bailing_hybrid-tiny", "../testdata/cohere-tiny"} {
+		m, err := Load(path, Options{Backend: "cpu"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer m.Close()
+		if m.fitOf == nil {
+			t.Fatal("Load built a model without the fit memo")
+		}
+		warm := new(fitMemo)
+		for _, be := range []string{"webgpu", "cuda", "metal"} {
+			m.fitOf = warm
+			m.Plan(be, 1<<30, reqs[0])
+		}
+		for be, got := range warm.facts {
+			compared[be]++
+			if want := new(fitMemo).factsFor(m.Config(), be); !reflect.DeepEqual(got, want) {
+				t.Errorf("%s on %s: the warm memo's facts are %+v, fresh ones %+v", path, be, got, want)
+			}
+		}
+		for _, be := range backends {
+			for _, req := range reqs {
+				for _, free := range frees {
+					m.fitOf = new(fitMemo)
+					cold := m.Plan(be, free, req)
+					m.fitOf = warm
+					fromWarm := m.Plan(be, free, req)
+					m.fitOf = nil
+					none := m.Plan(be, free, req)
+					if !reflect.DeepEqual(cold, fromWarm) || !reflect.DeepEqual(cold, none) {
+						t.Errorf("%s on %s, %+v with %d free: a cold memo plans\n%+v\na warm one\n%+v\nand none\n%+v", path, be, req, free, cold,
+							fromWarm, none)
+					}
+				}
+			}
+		}
+
+		m.fitOf = new(fitMemo)
+		before := buildProgramCalls.Load()
+		m.Plan("webgpu", 1<<30, reqs[0])
+		if n := buildProgramCalls.Load() - before; n != 0 {
+			t.Errorf("%s: a webgpu probe built %d programs", path, n)
+		}
+		for _, be := range backends {
+			m.Plan(be, 1<<30, reqs[0])
+		}
+		if n := buildProgramCalls.Load() - before; n > 2 {
+			t.Errorf("%s: the first probe on each backend built %d programs, want at most coverage's and admission's", path, n)
+		}
+		before, probes := buildProgramCalls.Load(), 0
+		for free := int64(1) << 26; free <= 1<<36; free <<= 1 {
+			for _, be := range backends {
+				m.Plan(be, free, reqs[0])
+				probes++
+			}
+		}
+		if n := buildProgramCalls.Load() - before; n != 0 {
+			t.Errorf("%s: %d programs built over %d probes after each backend's first", path, n, probes)
+		}
+	}
+	for _, be := range backends {
+		if compared[be] == 0 {
+			t.Errorf("no fixture's probe on %s stored facts in the memo, so none were compared", be)
+		}
+	}
+}
+
+// A memo asked first with no config (BuildQueryFor before the config is read) must still resolve the config it is given next.
+func TestFitMemo_aNilConfigDoesNotLatch(t *testing.T) {
+	cfg, err := loadConfig(os.DirFS("../testdata/llama-tiny"), "config.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, second := range []string{"cuda", "webgpu"} { // the same backend as the nil call, and another
+		memo := new(fitMemo)
+		if a := memo.factsFor(nil, "cuda"); a.resolved {
+			t.Fatalf("no config resolved: %+v", a)
+		}
+		if a := memo.factsFor(cfg, second); !a.resolved {
+			t.Errorf("after a call with no config on cuda, the memo never resolved the config it was given on %s", second)
+		}
 	}
 }

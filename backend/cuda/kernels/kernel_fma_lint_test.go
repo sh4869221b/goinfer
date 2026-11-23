@@ -26,7 +26,7 @@ var lintedKernels = []string{
 	"router_f32.cu", "gemv_w4f32.cu", "argmax.cu", "attn_block.cu", "gptoss_act.cu", "deltanet.cu",
 	"attn_fused.cu", "attn_fused_bm.cu", "attn_fused_vit.cu", "gemm_w4a8_mma.cu", "lora.cu", "attn_img_prefill.cu", "rope_mrope_prefill.cu", "rope_pairwise.cu",
 	"layernorm_quant.cu", "gelu_quant.cu", "mla.cu", "topk.cu", "gumbel.cu", "decode_fa.cu", "fused_qkv_rows.cu", "fused_gu_rows.cu",
-	"actgroup.cu", "tower_base.cu", "moe_fold.cu", "moe_rows.cu", "audio_encoder.cu", "mamba.cu", "nongated_act.cu", "prefill_splitkv.cu",
+	"actgroup.cu", "tower_base.cu", "moe_fold.cu", "moe_rows.cu", "audio_encoder.cu", "mamba.cu", "nongated_act.cu", "prefill_splitkv.cu", "kv8_store.cu",
 }
 
 // fmaLintExempt lists embedded PTX deliberately outside the lint, with the reason. Anything else
@@ -42,8 +42,7 @@ var fmaLintExempt = map[string]string{
 // in any kernel under a bit-identity contract. A bare MAC (`x += a*b`, `= a*b + c`) lets the compiler
 // CHOOSE fma vs mul+add, and separately-compiled kernels that share a contract (a decode kernel and
 // its batched counterpart) then compile to ~1 ULP-different, DATA-DEPENDENT numerics — invisible on
-// uniform fixtures, a token-stream divergence on real weights (docs/completed/task-batched-prefill-
-// bitidentity.md). Every MAC must be an explicit intrinsic (__fmaf_rn / __fmul_rn / __fadd_rn) so no
+// uniform fixtures, a token-stream divergence on real weights. Every MAC must be an explicit intrinsic (__fmaf_rn / __fmul_rn / __fadd_rn) so no
 // compiler discretion remains. This catches the CAUSE at compile time — before any numerical test,
 // and independent of the NVRTC version that JITs the PTX. A new bare MAC fails the build. (aikit's
 // gemv_quant.cu carries the same rule in its own repo — see its header.)

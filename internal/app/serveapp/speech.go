@@ -16,7 +16,7 @@ import (
 	"github.com/townsendmerino/goinfer/multimodal"
 )
 
-// A Whisper model is served as a speech model (docs/tasks/task-multimodal-support-2026-10.md, G-S14i): it is not a decoder.Model, so it lives in server.speech and not in server.models, which everything
+// A Whisper model is served as a speech model: it is not a decoder.Model, so it lives in server.speech and not in server.models, which everything
 // (sessions, KV slots, templates, adapters, the resident path) assumes holds decoders. It answers POST /v1/audio/transcriptions and is listed by GET /v1/models.
 
 // speechEngine is what the route needs of a Whisper model; *whisper.Transcriber is the real one, a stub stands in for the handler tests.
@@ -50,7 +50,7 @@ func loadSpeech(spec modelSpec, cfg config) (*speechModel, error) {
 					continue
 				}
 			}
-			return nil, fmt.Errorf("--model %q: a Whisper directory needs %s (%v)", spec.path, f, err)
+			return nil, fmt.Errorf("--model %q: a Whisper directory needs %s (%w)", spec.path, f, err)
 		}
 	}
 	t0 := time.Now()
@@ -129,7 +129,7 @@ func clock(sec float64, sep string) string {
 	return fmt.Sprintf("%02d:%02d:%02d%s%03d", h, m, ms/1000, sep, ms%1000)
 }
 
-// handleTranscriptions is POST /v1/audio/transcriptions (OpenAI's route, multipart/form-data); the accepted fields and what is refused are in the task doc's G-S14i.
+// handleTranscriptions is POST /v1/audio/transcriptions (OpenAI's route, multipart/form-data); the accepted fields and what is refused are in docs/completed/task-multimodal-support-2026-10.md (the transcriptions route's gate).
 func (s *server) handleTranscriptions(w http.ResponseWriter, r *http.Request) {
 	form, ok := parseUpload(w, r, "the request must be multipart/form-data with a file part")
 	if !ok {

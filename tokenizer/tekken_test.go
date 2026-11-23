@@ -5,12 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-// G-S14e1 (docs/tasks/task-multimodal-support-2026-10.md): the Tekken tokenizer against mistral_common 1.12.0's own ids, pinned by scripts/pin_tekken.py into
+// G-S14e1: the Tekken tokenizer against mistral_common 1.12.0's own ids, pinned by scripts/pin_tekken.py into
 // testdata/tekken_golden.json.gz. The tekken.json (14.9 MB) is not committed: it is read from the Voxtral Mini directory under GOINFER_MODELS_DIR (default ~/models) and the
 // test is skipped without it (and refuses a file whose sha256 is not the golden's).
 
@@ -194,6 +196,24 @@ func TestTekken_splitMatchesPattern(t *testing.T) {
 				t.Errorf("splitTekken(%q) = %q, want %q", c.in, got, c.want)
 				break
 			}
+		}
+	}
+}
+
+// A vocab entry whose token_bytes is not base64, or decodes to nothing, is refused as not Tekken, with a message that names the entry
+// and, for bad base64, carries the decoder's error.
+func TestTekken_refusesABadTokenBytesEntry(t *testing.T) {
+	file := func(tokenBytes string) []byte {
+		return []byte(`{"config":{"pattern":"\\w+","default_vocab_size":2,"default_num_special_tokens":1},` +
+			`"vocab":[{"rank":0,"token_bytes":"` + tokenBytes + `"}],"special_tokens":[{"rank":0,"token_str":"<s>","is_control":true}]}`)
+	}
+	if _, err := LoadTekken(file("YQ==")); err != nil {
+		t.Fatalf("a one-entry vocab was refused: %v", err)
+	}
+	for name, tb := range map[string]string{"empty": "", "not base64": "!!"} {
+		_, err := LoadTekken(file(tb))
+		if !errors.Is(err, ErrNotTekken) || strings.Contains(err.Error(), "%!") || !strings.Contains(err.Error(), "vocab entry 0") {
+			t.Errorf("%s token_bytes: %v; want ErrNotTekken naming vocab entry 0, with no misformatted verb", name, err)
 		}
 	}
 }

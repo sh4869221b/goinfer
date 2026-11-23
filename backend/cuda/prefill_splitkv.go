@@ -2,7 +2,10 @@
 
 package cuda
 
-import gpu "github.com/townsendmerino/goinfer/backend/cuda/internal/gpudev"
+import (
+	gpu "github.com/townsendmerino/goinfer/backend/cuda/internal/gpudev"
+	"github.com/townsendmerino/goinfer/backend/cuda/internal/launchgeom"
+)
 
 // prefillSplitKVBudget bounds the score scratch of the row-batched exact attention: a launch group takes as many rows as fit
 // it (at least one), so the scratch does not grow with the pass's rows.
@@ -14,7 +17,7 @@ var prefillSplitKVForceForTest bool
 
 // loadPrefillSplitKV binds prefill_splitkv.cu's three kernels, all or none: a pass routes to them only when every one loaded.
 func (r *cudaResident) loadPrefillSplitKV() {
-	mod, e := r.dev.CompileLibrary(r.kvPTX(prefillSplitKVPTX, prefillSplitKVKV16PTX))
+	mod, e := r.compileKV(r.kvPTX8(prefillSplitKVPTX, prefillSplitKVKV16PTX, prefillSplitKVKV8PTX))
 	if e != nil {
 		return
 	}
@@ -90,7 +93,7 @@ func (r *cudaResident) prefillSplitKVPlan(M, keys int, fused func(hd int) bool, 
 			maxNWin = int(Ly.window)
 		}
 		if len(blocks) > 0 {
-			maxNWin = imgBlocksMaxNWin(maxNWin, int(Ly.window), blocks) // the widest row an image block gives this layer, as attn_img_batched sizes it
+			maxNWin = launchgeom.ImgBlocksMaxNWin(maxNWin, int(Ly.window), blocks) // the widest row an image block gives this layer, as attn_img_batched sizes it
 		}
 		if !r.prefillSplitKVServes(maxNWin) || (fused != nil && fused(Ly.hd)) {
 			continue
@@ -103,7 +106,7 @@ func (r *cudaResident) prefillSplitKVPlan(M, keys int, fused func(hd int) bool, 
 	return stride, min(M, max(1, prefillSplitKVBudget/4/(r.nH*stride)))
 }
 
-// PrefillSpanScratchBytes (decoder.ResidentPrefillSpanScratch, matched structurally) bounds what any pass of rows rows of a prompt
+// PrefillSpanScratchBytes (decoder.ResidentPrefillSubsystem, matched structurally) bounds what any pass of rows rows of a prompt
 // whose last row attends keys keys allocates beyond PrefillScratchBytes(rows): the row-batched exact attention's scores and
 // inverses. It is not the last pass's own figure (prefillSpanScratchPass). A launch group holds as many rows as the split-KV
 // budget allows at its span, so an earlier pass at a shorter span can take a little more. The bound is a group of up to rows rows
@@ -162,9 +165,9 @@ func (r *cudaResident) prefillSplitKVAttn(l, startPos, M int, qBb, cctxB, scB, i
 			widest = stride // a row inside an image block sees past its own position: launch the plan's widest span, the surplus tiles return at once
 		}
 		if e := r.launch(r.psScores, LaunchConfig{GridX: uint32(r.nH), GridY: uint32((widest + 127) / 128), GridZ: uint32(n), BlockX: 128, BlockY: 1, BlockZ: 1, SharedMemBytes: uint32(Ly.hd * 4)},
-			Arg(qBb), Arg(r.kvK(l)), Arg(r.kvT(l)), gpu.ArgValue(int32(r.nH)), gpu.ArgValue(int32(Ly.nKV)), gpu.ArgValue(int32(Ly.hd)),
-			gpu.ArgValue(int32(startPos)), gpu.ArgValue(Ly.window), gpu.ArgValue(int32(row0)), gpu.ArgValue(r.attnScale),
-			Arg(scB), gpu.ArgValue(int32(stride)), blocksArg, gpu.ArgValue(int32(nBlocks))); e != nil {
+			r.kvScaled(l, Arg(qBb), Arg(r.kvK(l)), Arg(r.kvT(l)), gpu.ArgValue(int32(r.nH)), gpu.ArgValue(int32(Ly.nKV)), gpu.ArgValue(int32(Ly.hd)),
+				gpu.ArgValue(int32(startPos)), gpu.ArgValue(Ly.window), gpu.ArgValue(int32(row0)), gpu.ArgValue(r.attnScale),
+				Arg(scB), gpu.ArgValue(int32(stride)), blocksArg, gpu.ArgValue(int32(nBlocks)))...); e != nil {
 			return e
 		}
 		// Block 128: the softmax partition and ladder are attn_batched's only at that width.
@@ -174,8 +177,8 @@ func (r *cudaResident) prefillSplitKVAttn(l, startPos, M int, qBb, cctxB, scB, i
 			return e
 		}
 		if e := r.launch(r.psVsum, LaunchConfig{GridX: uint32(r.nH), GridY: uint32((Ly.hd + dTile - 1) / dTile), GridZ: uint32(n), BlockX: dTile, BlockY: 1, BlockZ: 1},
-			Arg(scB), Arg(r.kvV(l)), Arg(r.kvT(l)), Arg(invB), gpu.ArgValue(int32(r.nH)), gpu.ArgValue(int32(Ly.nKV)), gpu.ArgValue(int32(Ly.hd)),
-			gpu.ArgValue(int32(startPos)), gpu.ArgValue(Ly.window), gpu.ArgValue(int32(row0)), gpu.ArgValue(int32(stride)), Arg(cctxB), blocksArg, gpu.ArgValue(int32(nBlocks))); e != nil {
+			r.kvScaled(l, Arg(scB), Arg(r.kvV(l)), Arg(r.kvT(l)), Arg(invB), gpu.ArgValue(int32(r.nH)), gpu.ArgValue(int32(Ly.nKV)), gpu.ArgValue(int32(Ly.hd)),
+				gpu.ArgValue(int32(startPos)), gpu.ArgValue(Ly.window), gpu.ArgValue(int32(row0)), gpu.ArgValue(int32(stride)), Arg(cctxB), blocksArg, gpu.ArgValue(int32(nBlocks)))...); e != nil {
 			return e
 		}
 		r.psLaunches++

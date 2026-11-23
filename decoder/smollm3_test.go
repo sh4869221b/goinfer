@@ -7,9 +7,11 @@ import (
 	"math"
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
-// G4 (docs/completed/task-families-2026-09.md, batch 2) SmolLM3-3B parity: a plain llama-shaped dense GQA
+// G4 SmolLM3-3B parity: a plain llama-shaped dense GQA
 // model with per-layer NoPE via `no_rope_layers` — a field whose VALUES are the opposite of what
 // its name suggests (1 = HAS rope, 0 = NoPE, verified against the real modeling_smollm3.py), on
 // every 4th layer. Reuses the SAME Config field/convention llama4_text already established and
@@ -73,7 +75,7 @@ func TestSmolLM3_forwardParity(t *testing.T) {
 		t.Fatalf("got %d logits, want vocab %d", len(logits), g.Vocab)
 	}
 
-	if got := argmax(logits); got != g.Argmax {
+	if got := sampling.Argmax(logits); got != g.Argmax {
 		t.Errorf("argmax = %d, want %d (logit[got]=%.4f logit[want]=%.4f)",
 			got, g.Argmax, logits[got], logits[g.Argmax])
 	}
@@ -99,11 +101,11 @@ func TestSmolLM3_forwardParity(t *testing.T) {
 
 	cos := fullCosine(t, logits, smollm3ForwardFullPath)
 	t.Logf("smollm3: argmax=%d (want %d) | maxSampleΔ=%.5f | cosine=%v",
-		argmax(logits), g.Argmax, maxSampleΔ, cos)
+		sampling.Argmax(logits), g.Argmax, maxSampleΔ, cos)
 	emitParityRow(t, "smollm3", "tiny-golden", "HF f32 (smollm3-tiny seeded fixture, per-layer NoPE on layer 3)", 100.0, cos, cos)
 }
 
-// TestRopeInvFreqLayer_NoPEIsZero is G5's real gate (docs/tasks/task-gpu-paths-2026-09.md, FeatNoPE): a resident
+// TestRopeInvFreqLayer_NoPEIsZero is G5's real gate: a resident
 // backend's rope kernel gets an all-zero invFreq table for a NoPE layer (RopeInvFreqLayer, decoder/residency.go) instead
 // of a new kernel path, which is exact identity rotation by construction (cos(pos·0)=1, sin(pos·0)=0; the rope kernels
 // in cuda/gemv_fwd.cu and metal/kernels.go's rope2 both compute c=cos(th)*scale, s=sin(th)*scale with th=pos·invf[dd]).

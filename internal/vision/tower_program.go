@@ -6,7 +6,7 @@ import (
 	"slices"
 )
 
-// A tower block as a program (docs/tasks/task-subsystems-2026-10.md §8, "SB9 step M"): one description of a block's
+// A tower block as a program: one description of a block's
 // operations, which the CPU and every device backend walk over their own operation layers. Every block of a tower runs
 // the same program over its own weights. A walker implements each kind exactly as its hand-written loop did, so a tower's
 // output is bit-identical to its golden (internal/towerid); a fusion is its own kind (TowerLinearAdd), never folded in by
@@ -112,7 +112,7 @@ type TowerOp struct {
 // TowerBlock is one block's operations, in order.
 type TowerBlock []TowerOp
 
-// TowerProgramPlantForTest, when set, rewrites every program a constructor returns, given the program's name
+// TowerProgramPlantForTest (when set) rewrites every program a constructor returns, given the program's name
 // (siglip, qwen3, glm-ocr, gemma4, qwen2.5, pixtral here; whisper, gemma4-audio and qwen3-asr in internal/audio,
 // through PlantedProgram): the seam the programs' plants (G-SB9M-2) use on every backend. Nil in production and in
 // every other test.

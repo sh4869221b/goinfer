@@ -8,10 +8,12 @@ import (
 
 	gc "github.com/eitamring/gocudrv/cuda"
 	"github.com/townsendmerino/goinfer/decoder"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TestResidentCloseFreesVRAM_7B is TestResidentCloseFreesVRAM's shape at the scale that reproduces
-// A12 (docs/QUEUE.md): qwen2.5-7B and a real decode loop, rather than the 0.5B coder and one token.
+// A12: qwen2.5-7B and a real decode loop, rather than the 0.5B coder and one token.
 //
 // A SECOND GATE RATHER THAN WIDENING THE FIRST. The existing gate is correctly scoped and silently
 // narrow, which is the variant that looks most like a working gate; keeping both makes the scopes
@@ -29,7 +31,7 @@ import (
 //	loss repeating every cycle          -> a genuine leak; hunt for what Close does not release.
 //	loss shrinking but not vanishing    -> both, and the components separate before either is fixed.
 func TestResidentCloseFreesVRAM_7B(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	gguf := os.ExpandEnv("$HOME/models/qwen2.5-7b-instruct-q4_k_m.gguf")
 	if _, err := os.Stat(gguf); err != nil {
 		t.Skipf("no 7B gguf at %s", gguf)

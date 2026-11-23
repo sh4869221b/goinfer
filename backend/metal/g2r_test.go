@@ -8,10 +8,11 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/decoder"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// TestG2R_registered is OP1's real Gemma 2 gate, G2-R, run as registered in docs/tasks/task-forward-architecture-2026-10.md
-// §4.6 ("G2-R's baseline step", and the 2026-10-15 amendment): the Metal process, reading the CPU side from the file
+// TestG2R_registered is OP1's real Gemma 2 gate, G2-R, run as registered: the Metal process, reading the CPU side from the file
 // TestG2R_cpuReference wrote (g2r_split_test.go), in this order.
 //
 //  0. The hook check: on the CPU, removing the softcap (decoder.SetAttnSoftcapOffForTest) must have changed the 2B's logits.
@@ -24,7 +25,7 @@ import (
 //
 // It prints a verdict block and fails on anything but a pass. Run by run-g2r-split-night.sh, after the CPU process.
 func TestG2R_registered(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	const bar, stopMargin, band = 0.88, 0.001, 0.03
 	ref := g2rLoadRef(t)
 	g2, g3, dense := g2rPaths()
@@ -152,7 +153,7 @@ func g2rRun(t *testing.T, path, quant string, seed []int, steps int, softcapOff 
 		t.Fatalf("load (cpu): %v", err)
 	}
 	defer m.Close()
-	if got := m.AttnLogitSoftcapResident(); (got == 0) != softcapOff {
+	if got := m.BackendView().AttnLogitSoftcap(); (got == 0) != softcapOff {
 		t.Fatalf("VOID: the CPU model's cap is %v with the softcap removed = %v", got, softcapOff)
 	}
 	_, nL, _, nKV, hd, _, _ := m.Dims()

@@ -9,17 +9,17 @@ import (
 // geometry, MoE dims, QK-norm and the Gemma-style (1+w) RMSNorm all match modular_qwen3_next.py), with two config-SHAPE deltas, not just
 // value changes:
 //
-//  1. No layer_types field: the per-layer pattern is COMPUTED from full_attention_interval (normalizeQwen3NextLayerTypes, called below,
-//     before validateQwen35 can require LayerTypes to be populated).
+//  1. No layer_types field: the per-layer pattern is COMPUTED from full_attention_interval (NormalizeQwen3NextLayerTypes, called below,
+//     before ValidateQwen35 can require LayerTypes to be populated).
 //  2. partial_rotary_factor is a TOP-LEVEL field, not nested inside rope_parameters, and the released config has no rope_parameters object
 //     at all (top-level rope_theta + rope_scaling). So this mirrors deepseekArchitecture's dual-path RoPE resolution (nested if present, flat
 //     fields otherwise) rather than qwen35Architecture's nested-only parseRopeFlat, which hard-errors on an empty rope_parameters
 //     (parseRopeSpec refuses it).
 func qwen3NextArchitecture(cfg *Config) (*Architecture, *tensorSchema, error) {
-	if err := cfg.normalizeQwen3NextLayerTypes(); err != nil {
+	if err := cfg.NormalizeQwen3NextLayerTypes(); err != nil {
 		return nil, nil, err
 	}
-	if err := cfg.validateQwen3Next(); err != nil {
+	if err := cfg.ValidateQwen3Next(); err != nil {
 		return nil, nil, err
 	}
 	var base float64

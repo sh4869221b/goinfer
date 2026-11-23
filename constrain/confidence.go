@@ -8,15 +8,15 @@ import (
 	"strings"
 )
 
-// Per-field confidence on constrained output (C1 of docs/tasks/task-constrained-confidence.md).
+// Per-field confidence on constrained output.
 //
 // WHAT THE NUMBER IS. A field's confidence is the model's probability over what the grammar allowed at the position(s)
 // that decided the field's value — narrower than the probability that the value is right, and not a calibrated
 // confidence unless a fitted temperature was supplied (FieldConfidence.Calibrated). It discriminates (a low-confidence
 // value is wrong more often; docs/measurements/confidence-c0-2026-09-27.md), but its calibration was not measured.
 //
-// WHICH FIELDS. Only the kinds C0's gates cleared are reported: enum, boolean and integer. Number and string fields
-// are omitted (C0 parked them for want of errors to judge them by), and so is any field with no free token — a
+// WHICH FIELDS. Only the kinds the confidence gates cleared are reported: enum, boolean and integer. Number and string fields
+// are omitted (parked for want of errors to judge them by), and so is any field with no free token — a
 // value the grammar forced says nothing about the model.
 //
 // HOW. CaptureConfidence makes Process record, at each position outside a free string, the normalizer of the
@@ -410,7 +410,7 @@ func fieldKind(n *node) string {
 			return "integer"
 		}
 	}
-	return "" // number, string: parked by C0; object / array: not scalars
+	return "" // number, string: parked; object / array: not scalars
 }
 
 // optionKey is an option's key in a Distribution: a string literal's decoded text, any other literal as written.

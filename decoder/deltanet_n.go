@@ -11,7 +11,7 @@ import (
 	"github.com/townsendmerino/goinfer/internal/runtime/hybridattn"
 )
 
-// P26c (docs/queue-performance.md). The batched Qwen3.5 forward (runLayersQwen35N) runs every projection as one matmul over the prompt, but deltaNetCore was then called once per token on ONE thread, serializing the recurrence and the conv's SiLU between matmuls that run on all threads.
+// The batched Qwen3.5 forward (runLayersQwen35N) runs every projection as one matmul over the prompt; deltaNetCore called once per token on ONE thread would serialize the recurrence and the conv's SiLU between matmuls that run on all threads.
 //
 // deltaNetCoreN is deltaNetCore over K consecutive rows with the independent parts fanned out, and NOTHING reordered inside any one element:
 //   - the depthwise conv (+SiLU) of row i reads only the mixed inputs of rows i-K+1..i, all known up front, so rows run in parallel;
@@ -123,8 +123,8 @@ func deltaNetCoreN(core, mixed, bt, at, z []float32, K int, w *deltaNetWeights, 
 				out[c] = silu(s)
 			}
 			for headK := range nk {
-				l2normScaledInto(qAll[i*keyDim+headK*hk:i*keyDim+(headK+1)*hk], out[headK*hk:(headK+1)*hk], qScale)
-				l2normScaledInto(kAll[i*keyDim+headK*hk:i*keyDim+(headK+1)*hk], out[keyDim+headK*hk:keyDim+(headK+1)*hk], 1)
+				hybridattn.L2NormScaledInto(qAll[i*keyDim+headK*hk:i*keyDim+(headK+1)*hk], out[headK*hk:(headK+1)*hk], qScale)
+				hybridattn.L2NormScaledInto(kAll[i*keyDim+headK*hk:i*keyDim+(headK+1)*hk], out[keyDim+headK*hk:keyDim+(headK+1)*hk], 1)
 			}
 		}
 	})
@@ -141,9 +141,9 @@ func deltaNetCoreN(core, mixed, bt, at, z []float32, K int, w *deltaNetWeights, 
 				q := qAll[i*keyDim+headK*hk : i*keyDim+(headK+1)*hk]
 				k := kAll[i*keyDim+headK*hk : i*keyDim+(headK+1)*hk]
 				v := conv[i*convDim+2*keyDim+headV*hv : i*convDim+2*keyDim+headV*hv+hv]
-				g := w.negExpA[headV] * softplusf(at[i*nv+headV]+w.dtBias[headV]) // log-decay (negExpA = −exp(A_log))
+				g := w.negExpA[headV] * hybridattn.Softplusf(at[i*nv+headV]+w.dtBias[headV]) // log-decay (negExpA = −exp(A_log))
 				gt := float32(math.Exp(float64(g)))
-				beta := sigmoidf(bt[i*nv+headV])
+				beta := hybridattn.Sigmoidf(bt[i*nv+headV])
 				if p.NegEigval {
 					beta *= 2
 				}
@@ -239,5 +239,5 @@ func deltaNetCoreN(core, mixed, bt, at, z []float32, K int, w *deltaNetWeights, 
 }
 
 // convWinSliceForTest leaves the conv window as slices of the pass's slab, as it was before the copy: the old arm of
-// MEM5-VL-convwin's identity gate.
+// the conv-window copy's identity gate (TestConvWin_qwen35BitIdentical).
 var convWinSliceForTest bool

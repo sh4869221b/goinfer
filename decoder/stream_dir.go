@@ -6,16 +6,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+
+	"github.com/townsendmerino/goinfer/decoder/config"
 )
 
-// streamDirSwapForTest writes layers 0 and 1 of a streamed directory transcode in each other's place: G-DS1's planted
-// defect, which its byte-identity test must catch. Set only through SetStreamDirSwapForTest (goinfer_testhooks).
+// streamDirSwapForTest writes layers 0 and 1 of a streamed directory transcode in each other's place: the planted
+// defect its byte-identity test (TestDirStream_plantedLayerSwapIsCaught) must catch. Set only through SetStreamDirSwapForTest (goinfer_testhooks).
 var streamDirSwapForTest bool
 
 // StreamTranscodeDir is StreamTranscodeGGUF for a safetensors model DIRECTORY: it writes a .giw weights body (the GINFW
 // serialization + trailing CRC) to out, loading ONE layer at a time and the embedding a row at a time, so peak memory is
-// about the globals plus one layer rather than the whole model (docs/tasks/task-prequant-dir-streaming-2026-10.md).
-// The bytes are those Load + SerializeWeightsToForTarget write for the same directory (G-DS1). Returns the bytes written.
+// about the globals plus one layer rather than the whole model.
+// The bytes are those Load + SerializeWeightsToForTarget write for the same directory. Returns the bytes written.
 //
 // A family whose dedicated safetensors loader does not stream yet returns an error IsDirNoStream reports; the caller
 // takes the resident transcode instead. int4mix and q4k are GGUF-only, as in Load.
@@ -23,7 +25,7 @@ func StreamTranscodeDir(ctx context.Context, dir string, out io.Writer, quant st
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	out = &ctxWriter{ctx: ctx, w: out} // cancellation observed at every write, as in StreamTranscodeGGUF (M-21)
+	out = &ctxWriter{ctx: ctx, w: out} // cancellation observed at every write, as in StreamTranscodeGGUF
 	q, err := parseQuant(quant)
 	if err != nil {
 		return 0, err
@@ -40,7 +42,7 @@ func StreamTranscodeDir(ctx context.Context, dir string, out io.Writer, quant st
 	}
 	// Load writes the EOS ids generation_config.json adds back into the config a bundle serializes (decoder/model.go); the
 	// stream writes the config in its head, before any layer, so it resolves them first, as StreamTranscodeGGUF does.
-	if raw, jerr := json.Marshal(resolveEOSIDs(dir, cfg)); jerr == nil {
+	if raw, jerr := json.Marshal(config.ResolveEOSIDs(dir, cfg)); jerr == nil {
 		cfg.EOSTokenID = raw
 	}
 	arch, schema, err := resolveArchitecture(cfg)
@@ -58,7 +60,7 @@ func StreamTranscodeDir(ctx context.Context, dir string, out io.Writer, quant st
 	// needCanonical=true: the writer chooses what to emit from canonical bytes in RAM, per layer, exactly as
 	// StreamTranscodeGGUF builds them. With a sink the build keeps nothing else in RAM (repackForDecode).
 	wr := &giwWriter{sink: out, target: target, layerBudget: streamLayerBudget()}
-	if _, err := buildWeightsFromSafetensorsTo(cfg, arch, schema, st, q, embedInt4, true, false, nil, wr, id); err != nil {
+	if _, err := buildWeightsFromSafetensorsTo(cfg, arch, schema, st, q, embedInt4, true, false, nil, wr, id, nil); err != nil {
 		return wr.n, err
 	}
 	var crc [4]byte

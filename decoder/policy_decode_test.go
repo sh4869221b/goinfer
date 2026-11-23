@@ -7,6 +7,8 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
 // fakeDecode is plainDecodeLoop's target over a scriptedForward: the row is the fake's logits after the history, pick
@@ -25,7 +27,7 @@ func (d *fakeDecode) target() decodeTarget {
 	return decodeTarget{
 		pick: func(*decodeClock) (SampleInfo, int, bool, error) {
 			if d.device {
-				return SampleInfo{}, argmax(d.cur), true, nil
+				return SampleInfo{}, sampling.Argmax(d.cur), true, nil
 			}
 			return SampleInfo{}, 0, false, nil
 		},
@@ -115,7 +117,7 @@ func runFakeDecode(t *testing.T, d *fakeDecode, prompt []int, n int, sp Sampling
 	return got, <-done, g
 }
 
-// TestPlainDecodeLoop_exactOnTheFake is SB5-P3 for plain decoding (docs/tasks/task-subsystems-2026-10.md §8 SB5): on a
+// TestPlainDecodeLoop_exactOnTheFake is SB5-P3 for plain decoding: on a
 // scripted fake, plainDecodeLoop emits what a direct decoding loop over the same fake emits, greedy and sampled, with a
 // stop id, a processor, a gated processor and logprobs, at maxTokens 0, 1, 7 and 40; a device-chosen token bypasses the
 // sampler; the commit callback sees each forwarded token once, in order, and finish sees what was emitted. A cancel

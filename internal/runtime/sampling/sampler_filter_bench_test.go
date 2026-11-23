@@ -7,7 +7,7 @@ import (
 
 // maxScanSerial reproduces topFilterLogits's own inline max-scan (a serial, 4x-unrolled loop at the top of the function,
 // not parallelMax in sampler_chunked.go) in isolation, for a same-session A/B against parallelMax; same design as the
-// softcap benchmark in softcap_test.go. Task: docs/tasks/red-october.md, R15.
+// softcap benchmark in softcap_test.go.
 func maxScanSerial(logits []float32) float32 {
 	maxF := logits[0]
 	i := 1
@@ -76,9 +76,8 @@ func BenchmarkMaxScan_152kVocab_parallel(b *testing.B)  { benchMaxScan(b, 151936
 func BenchmarkMaxScan_32kVocab_serial(b *testing.B)     { benchMaxScan(b, 32064, false) }
 func BenchmarkMaxScan_32kVocab_parallel(b *testing.B)   { benchMaxScan(b, 32064, true) }
 
-// topKByLogit and the min-p linear scan are sized here, not parallelized: unlike the max-scan, parallelizing a
-// heap-select or an order-preserving filter is real algorithmic work, and R15 asks whether either is worth it. topK
-// 1/8/40 span greedy-adjacent to a typical sampling config.
+// topKByLogit and the min-p linear scan, serial: the production forms. Their parallel arms, for R15's A/B, are in
+// sampler_filter_parallel_test.go. topK 1/8/40 span greedy-adjacent to a typical sampling config.
 func benchTopKByLogit(b *testing.B, n, k int) {
 	logits := benchRandLogits(n, 2)
 	b.ResetTimer()
@@ -113,6 +112,8 @@ func benchMinPScan(b *testing.B, n int) {
 }
 
 func BenchmarkMinPScan_gemmaVocab(b *testing.B) { benchMinPScan(b, 262144) }
+func BenchmarkMinPScan_152kVocab(b *testing.B)  { benchMinPScan(b, 151936) }
+func BenchmarkMinPScan_32kVocab(b *testing.B)   { benchMinPScan(b, 32064) }
 
 // End to end: the whole topFilterLogits call for each active-filter shape at gemma vocab, to put the per-component
 // numbers above against the per-token cost that reaches a decode token's budget (Z's chunkedZ is already parallel).

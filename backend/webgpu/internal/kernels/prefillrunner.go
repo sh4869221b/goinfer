@@ -52,7 +52,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 // ropeBatchedShaderWGSL is ropeShaderWGSL (attention.go) widened to M rows in one dispatch, grid (ceil(heads*half/64), M).
 // Positions are contiguous within one PrefillLastW8A8 call, so row r's position is p.start+row. Same per-(row, head, d)
 // math as the M=1 kernel, so bit-identical (TestRoPEBatched_parity).
-const ropeBatchedShaderWGSL = `
+const ropeBatchedShaderWGSL = ropeCosSinWGSL + `
 struct P { heads: u32, headDim: u32, half: u32, start: u32, scale: f32, _a: u32, _b: u32, _c: u32 };
 @group(0) @binding(0) var<storage, read_write> vec:     array<f32>;  // [M, heads*headDim]
 @group(0) @binding(1) var<storage, read>       invFreq: array<f32>;  // [half]
@@ -66,8 +66,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d = idx % p.half;
     let pos = p.start + row;
     let theta = f32(pos) * invFreq[d];
-    let c = cos(theta) * p.scale;
-    let s = sin(theta) * p.scale;
+    let cs = ropeCosSin(theta); let c = cs.x * p.scale;
+    let s = cs.y * p.scale;
     let base = row * p.heads * p.headDim;
     let off = base + h * p.headDim;
     let x1 = vec[off + d];
@@ -483,7 +483,7 @@ func runModelToModelW(rm *RunModel, hd int) (ModelW, bool) {
 	return mw, true
 }
 
-// runModelToPrefill narrows a resident runModel to the dense shapes the batched pass accepts, returning ok=false if
+// RunModelToPrefill narrows a resident runModel to the dense shapes the batched pass accepts, returning ok=false if
 // the model uses anything outside them: MoE (Gemma 4's parallel block included), MLA, SSM, DeltaNet, int8 KV,
 // whole-vector QK-norm, post-only norms, partial RoPE, a rope scale, an attention sink, an
 // o-proj bias. Each projection may be int8 or int4; the ModelW's own
@@ -694,12 +694,12 @@ func (c *Context) prefillLastRows(xs [][]float32, m ModelW, pp prefillProjs, mro
 	}
 	defer func() { enc.Release() }()
 
-	// buildErr accumulates the FIRST device-allocation/bind failure (audit C-27, mirrored
-	// from DecodeTokenFusedBatched): short-circuit once set, return it before Submit, so
+	// buildErr accumulates the FIRST device-allocation/bind failure (as DecodeTokenFusedBatched
+	// does): short-circuit once set, return it before Submit, so
 	// VRAM exhaustion is an error the caller falls back on rather than a panic or a
 	// downstream nil-buffer deref.
 	var buildErr error
-	// R-25 (docs/tasks/task-recompute-audit.md): a layer's buffers are dead once the layer is encoded (the residual
+	// A layer's buffers are dead once the layer is encoded (the residual
 	// stream is updated in place, K/V are copied into the cache), so each layer recycles the one before it: storF hands
 	// out a free buffer of the same size before it creates one. A recycled buffer was written before, so wgpu does not
 	// zero-fill it again, and the pass holds one layer's intermediates instead of every layer's. The queue orders the
@@ -1042,7 +1042,7 @@ func (c *Context) prefillLastRows(xs [][]float32, m ModelW, pp prefillProjs, mro
 	// instead of a separate add: the add has to be fused into the GEMM's expression to stay bit-exact with production's
 	// gemvBias (docs/code-notes/gpu.md#runModelToModelW). An int4 matrix adds it in a separate dispatch, as decode does.
 	var projQB func(aqC, asC *wgpu.Buffer, rowsM int, rm prefillProj, bias *wgpu.Buffer) *wgpu.Buffer
-	// sharedQ returns the projections of one quantized input through rms. R-25 (docs/tasks/task-recompute-audit.md): the
+	// sharedQ returns the projections of one quantized input through rms. The
 	// input is quantized once when every projection has the same K and reads it at the same padding, which q/k/v and
 	// gate/up of one precision always do. Quantization is deterministic, so each projection reads the bytes it would
 	// have read from its own copy; prefillQuantPerProj (tests only) restores a quantization each.
@@ -1140,7 +1140,7 @@ func (c *Context) prefillLastRows(xs [][]float32, m ModelW, pp prefillProjs, mro
 		keepBuf(pleIn)
 	}
 
-	// R10 prefill decomposition (gpu/prefill_prof.go): pt is a no-op (time.Time{}) whenever c.prefillProf is
+	// The prefill decomposition (gpu/prefill_prof.go): pt is a no-op (time.Time{}) whenever c.prefillProf is
 	// nil, so profiling off costs one nil-check per call. Category boundaries are syncs (as in cudaResident's
 	// profTic/profToc), so the category sum runs a bit over pipelined wall time; numbers in
 	// docs/measurements/webgpu-prefill-decomp-2026-09-22.md. residualB and swigluB (elementwise) fold into
@@ -1305,8 +1305,7 @@ func (c *Context) prefillLastRows(xs [][]float32, m ModelW, pp prefillProjs, mro
 			}
 		} else {
 			// ONE dispatch, grid (nH, M), against attnBatchedKernel's chosen kernel (the same tiled-vs-plain preference as
-			// attnKernel, attention.go); q/ctxv are read and written at each row's own offset inside the shader
-			// (docs/completed/task-gpu-batched-prefill.md, Increment 1).
+			// attnKernel, attention.go); q/ctxv are read and written at each row's own offset inside the shader.
 			attnPl, attnLy := c.attnBatchedKernel(lhd, lkvDim, m.KVF16)
 			ap := uni([]uint32{uint32(nH), uint32(lnKV), uint32(lhd), uint32(positions[0]), uint32(nH / lnKV), F32bits(scale), uint32(M), 0})
 			disp(attnPl, bind(attnLy, q, kCache, vCache, ctxv, ap), uint32(nH), uint32(M))
@@ -1405,7 +1404,7 @@ func (c *Context) prefillLastRows(xs [][]float32, m ModelW, pp prefillProjs, mro
 	return out, nil
 }
 
-// prefillDefectForTest plants one defect in the batched pass, for its gate's planted-defect arm (tests only): 1 rotates
+// PrefillDefectForTest plants one defect in the batched pass, for its gate's planted-defect arm (tests only): 1 rotates
 // every row one position late, 2 writes every row's K/V one slot late, 3 gives an int4 q projection the k projection's
 // scales, 4 binds each row's per-layer inputs to the next row's, 5 drops the per-layer-input branch, 6 lets a
 // sliding-window layer attend its whole prefix, 7 skips the post-attention norm, 8 skips the layer scalar, 9 uses the
@@ -1414,30 +1413,30 @@ func (c *Context) prefillLastRows(xs [][]float32, m ModelW, pp prefillProjs, mro
 // 14 swaps height and width.
 var PrefillDefectForTest int
 
-// prefillAttnRowsOff makes the batched pass run decode's kernel once a row where it would run a key-split kernel's rows
+// PrefillAttnRowsOff makes the batched pass run decode's kernel once a row where it would run a key-split kernel's rows
 // form, for the test that compares the two and the profile that times them. Tests only.
 var PrefillAttnRowsOff = false
 
-// prefillAttnPerRow makes the batched pass run decode's single-row attention kernel once a row in place of the batched
+// PrefillAttnPerRow makes the batched pass run decode's single-row attention kernel once a row in place of the batched
 // attention kernel. Tests only. It needs a row of q (nH*hd floats) to be a multiple of 64 floats, so each row's
 // binding offset is a multiple of 256 bytes.
 var PrefillAttnPerRow = false
 
-// prefillQuantPerProj restores the batched prefill's quantization per projection (R-25, sharedQ), for the test that
+// PrefillQuantPerProj restores the batched prefill's quantization per projection (sharedQ), for the test that
 // compares the two and the A/B that times them. Tests only.
 var PrefillQuantPerProj = false
 
-// prefillSharedQuants counts the quantizations sharedQ shared across projections (a test reads it to see R-25 ran).
+// PrefillSharedQuants counts the quantizations sharedQ shared across projections (a test reads it to see the sharing ran).
 var PrefillSharedQuants atomic.Int64
 
-// prefillBufFresh and prefillBufPoison are tests-only switches on the pass's buffer recycling (R-25, storF): fresh
-// buffers for every call, as before, and NaN-filled recycled buffers. prefillBufReused counts recycled buffers.
+// prefillBufFresh and prefillBufPoison are tests-only switches on the pass's buffer recycling (storF): fresh
+// buffers for every call, and NaN-filled recycled buffers. prefillBufReused counts recycled buffers.
 var (
 	PrefillBufFresh  = false
 	prefillBufPoison = false
 	prefillBufReused atomic.Int64
 )
 
-// prefillBufSeenForTest, when set (tests only), is told the size of every device buffer a batched pass creates (recycled ones are not
+// PrefillBufSeenForTest (when set; tests only) is told the size of every device buffer a batched pass creates (recycled ones are not
 // created again), so a test can hold PrefillScratchBytes to the pass.
 var PrefillBufSeenForTest func(bytes int64)

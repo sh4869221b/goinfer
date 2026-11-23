@@ -43,7 +43,7 @@ func olmo3Architecture(cfg *Config) (*Architecture, *tensorSchema, error) {
 			localBase = sliding.base
 			scalingLocal = sliding.scaling
 		}
-		cfg.RoPEGlobalBase = base // so validateLlama's rope_theta>0 check sees a populated base
+		cfg.RoPEGlobalBase = base // so ValidateLlama's rope_theta>0 check sees a populated base
 	} else {
 		sc, err := parseRopeScaling(cfg.RopeScaling)
 		if err != nil {
@@ -55,10 +55,10 @@ func olmo3Architecture(cfg *Config) (*Architecture, *tensorSchema, error) {
 		// layers, plain RoPE at the same theta on sliding-attention layers.
 		scaling = sc
 	}
-	if err := cfg.validateLlama(); err != nil {
+	if err := cfg.ValidateLlama(); err != nil {
 		return nil, nil, err
 	}
-	hd := cfg.headDim()
+	hd := cfg.EffectiveHeadDim()
 	layerTypes := append([]string(nil), cfg.LayerTypes...) // snapshot so the closure doesn't retain cfg
 	pattern := cfg.SlidingWindowPattern
 	isGlobal := func(i int) bool {
@@ -91,7 +91,7 @@ func olmo3Architecture(cfg *Config) (*Architecture, *tensorSchema, error) {
 		layerIsGlobal:    isGlobal,
 		RoPELocalBase:    localBase, // sliding-attention layers: same theta, no YaRN scaling
 		RoPEGlobalBase:   base,      // full-attention layers: YaRN-scaled
-		RotaryDim:        cfg.rotaryDim(),
+		RotaryDim:        cfg.RotaryDim(),
 		ropeScaling:      scaling,
 		ropeScalingLocal: scalingLocal,
 		EmbedScale:       0,

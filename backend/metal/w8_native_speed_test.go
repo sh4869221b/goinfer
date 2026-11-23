@@ -13,10 +13,13 @@ import (
 	"time"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/decoder/fit"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// TestW8Native_S_decodeSpeed is gate S of docs/tasks/task-metal-int8-2026-10.md, a night-queue measurement: an
+// TestW8Native_S_decodeSpeed is gate S, a night-queue measurement: an
 // in-process, interleaved A/B of decode speed for an int8int8 model in four arms. They are Metal on the native int8
 // path (precise math), the same with fast math kept (reported: the precise-math decision's price),
 // Metal re-quantized to int4 (what -backend metal ran before), and the CPU (what -backend auto gives an int8 model). Each sample loads one arm, prefills a deterministic prompt of the given depth through Generate, and times
@@ -25,9 +28,9 @@ import (
 // The 7B joins with GOINFER_W8_GATE_7B=1 when the fit guard admits it; nothing bypasses the guard.
 // GOINFER_W8_GATE_S_SMOKE=1 shrinks it to one sample per arm on the 0.5B at depth 128, to check the harness by day.
 func TestW8Native_S_decodeSpeed(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	if os.Getenv("GOINFER_W8_GATE_S") == "" {
-		t.Skip("gate S is a night-queue measurement (docs/tasks/task-metal-int8-2026-10.md): set GOINFER_W8_GATE_S=1")
+		t.Skip("gate S is a night-queue measurement: set GOINFER_W8_GATE_S=1")
 	}
 	if _, err := CreateSystemDefaultDevice(); err != nil {
 		t.Skipf("no metal device: %v", err)
@@ -164,7 +167,7 @@ func sampleW8Decode(t *testing.T, path string, a w8Arm, prompt []int, n int) w8S
 	nativeInt8, w8FastMath = a.native, a.fastMath
 	defer func() { nativeInt8, w8FastMath = prev, prevFast }()
 	m, err := decoder.Load(path, decoder.Options{Backend: a.backend, Quant: "int8int8", ResidentContext: len(prompt) + n + 64})
-	if errors.Is(err, decoder.ErrWontFitResident) {
+	if errors.Is(err, fit.ErrWontFitResident) {
 		return w8Sample{Note: "the fit guard refused the load: " + err.Error()}
 	}
 	if err != nil {
@@ -206,13 +209,12 @@ func sampleW8Decode(t *testing.T, path string, a w8Arm, prompt []int, n int) w8S
 	return s
 }
 
-// TestW8Native_S_ttft is S-auto's other half (docs/tasks/task-metal-int8-2026-10.md, gate S: "first-token latency at a
-// 1,000-token prompt is no worse than the CPU's"), measurable since slice 2 gave the native int8 path the batched
+// TestW8Native_S_ttft is S-auto's other half, measurable since slice 2 gave the native int8 path the batched
 // prefill pass. Per sample: load the arm (untimed), then time Generate from the call to its first token on a
 // 1,000-token prompt (w8SpeedPrompt). Arms: Metal native int8 (precise math), CPU int8int8, and Metal int4 re-quant
 // (reported), rotated every repetition, 7 repetitions, on the 0.5B and the 1.5B. Night-queue: GOINFER_W8_GATE_TTFT=1.
 func TestW8Native_S_ttft(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	if os.Getenv("GOINFER_W8_GATE_TTFT") == "" {
 		t.Skip("a night-queue measurement: set GOINFER_W8_GATE_TTFT=1")
 	}
@@ -274,7 +276,7 @@ func ttftW8(t *testing.T, path string, a w8Arm, prompt []int) (cold, warm float6
 	nativeInt8, w8FastMath = a.native, a.fastMath
 	defer func() { nativeInt8, w8FastMath = prev, prevFast }()
 	m, err := decoder.Load(path, decoder.Options{Backend: a.backend, Quant: "int8int8", ResidentContext: len(prompt) + 64})
-	if errors.Is(err, decoder.ErrWontFitResident) {
+	if errors.Is(err, fit.ErrWontFitResident) {
 		return 0, 0, "the fit guard refused the load"
 	}
 	if err != nil {

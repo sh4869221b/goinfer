@@ -16,9 +16,11 @@ import (
 	"github.com/townsendmerino/goinfer/internal/vision"
 
 	"github.com/townsendmerino/goinfer/multimodal"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// The grid towers' gates (docs/tasks/task-multimodal-support-2026-10.md, S12.3e): the WebGPU tower plus aikit's tail
+// The grid towers' gates: the WebGPU tower plus aikit's tail
 // against aikit's CPU Forward. Tiny norms are randomised first through the export's aliasing slices: the tiny
 // checkpoints' norms are all ones, which would hide a dropped or swapped norm.
 
@@ -347,7 +349,7 @@ func gvLoadReal(t *testing.T, name string, missing func(format string, a ...any)
 //
 //	GOINFER_HEAVY_TESTS=1 go test -count=1 -timeout 40m -tags 'gpu goinfer_testhooks' -run '^TestGridVisionWebGPU_real$' -v ./gpu/
 func TestGridVisionWebGPU_real(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	for _, name := range []string{"qwen3", "glm-ocr"} {
 		t.Run(name, func(t *testing.T) {
 			tw := gvLoadReal(t, name, t.Skipf)
@@ -393,7 +395,7 @@ func TestGridVisionWebGPU_real(t *testing.T) {
 //
 //	GOINFER_HEAVY_TESTS=1 go test -count=1 -timeout 40m -tags 'gpu goinfer_testhooks' -run '^TestGridVisionWebGPU_deepstackReal$' -v ./gpu/
 func TestGridVisionWebGPU_deepstackReal(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, "models", "qwen3-vl-2b-instruct")
 	if strings.HasPrefix(dir, "/Volumes/") || strings.HasPrefix(dir, "/srv/models") {

@@ -4,9 +4,11 @@ package cuda
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"unsafe"
 
 	"github.com/townsendmerino/aikit/linalg"
@@ -225,7 +227,7 @@ func (r *cudaResident) streamW(h hostW) cudaWQ {
 	if h.row != nil {
 		return r.streamKQuant(h)
 	}
-	w := cudaWQ{kind: h.kind, N: h.N, K: h.K, W: r.au32(h.nWpk)}
+	w := cudaWQ{kind: h.kind, N: h.N, K: h.K, W: wbuf[uint32](r, h.nWpk)}
 	putWords := func(st *packStage, r0, wpr int) { r.recordUpload(gpu.Upload(w.W.At(r0*wpr*4), st.outW)) }
 	switch h.kind {
 	case "int4":
@@ -234,8 +236,7 @@ func (r *cudaResident) streamW(h hostW) cudaWQ {
 			r.recordUpload(fmt.Errorf("cuda: int4 tensor lost its canonical bytes between planning and upload"))
 			return w
 		}
-		allocSeen(h.nWs16 * 2)
-		w.ws16 = gpu.NewBufferLenOfOn[uint16](r.dev, r.line, h.nWs16)
+		w.ws16 = wbuf[uint16](r, h.nWs16)
 		wpr, gpr := K/8, K/32
 		r.streamBlocks(N, rowsFor(wpr), func(st *packStage, r0, rows int) {
 			words := st.words(rows * wpr)
@@ -251,7 +252,7 @@ func (r *cudaResident) streamW(h hostW) cudaWQ {
 			linalg.F16ToF32Slice(wide, s16[r0*gpr:r0*gpr+n])
 			gs := st.halves(n)
 			for i, v := range wide {
-				gs[i] = f32tof16(v)
+				gs[i] = wpack.F32ToF16(v)
 			}
 			st.outH = gs
 		}, func(st *packStage, r0, rows int) {
@@ -264,7 +265,7 @@ func (r *cudaResident) streamW(h hostW) cudaWQ {
 			q8, sc, _, _ := h.src.Int8()
 			r.streamBlocks(N, rowsFor(wpr), func(st *packStage, r0, rows int) {
 				words := st.words(rows * wpr)
-				packI8Into(words, q8[r0*K:(r0+rows)*K])
+				wpack.PackI8Into(words, q8[r0*K:(r0+rows)*K])
 				st.outW = words
 			}, func(st *packStage, r0, rows int) { putWords(st, r0, wpr) })
 			w.ws = r.up32(sc)
@@ -277,7 +278,7 @@ func (r *cudaResident) streamW(h hostW) cudaWQ {
 		if h.src != nil {
 			f32, isF32 = h.src.F32()
 		}
-		w.ws = r.af(h.nWs)
+		w.ws = wbuf[float32](r, h.nWs)
 		r.streamBlocks(N, rowsFor(wpr), func(st *packStage, r0, rows int) {
 			var src []float32
 			switch {
@@ -296,7 +297,7 @@ func (r *cudaResident) streamW(h hostW) cudaWQ {
 			}
 			q8, sc := linalg.QuantizeRowsInt8(src, rows, K)
 			words := st.words(rows * wpr)
-			packI8Into(words, q8)
+			wpack.PackI8Into(words, q8)
 			st.outW, st.outS = words, sc
 		}, func(st *packStage, r0, rows int) {
 			if st.err != nil {
@@ -332,8 +333,7 @@ func kquantStageRows(rowBytes int) int { return max(1, stagePackWords/((rowBytes
 // rows in staging blocks. Q5_K rows are copied verbatim; Q6_K blocks are split into q6kPlanes, a block of rows landing in four
 // contiguous runs, one per plane.
 func (r *cudaResident) streamKQuant(h hostW) cudaWQ {
-	allocSeen(h.nBytes)
-	w := cudaWQ{kind: h.kind, N: h.N, K: h.K, W: gpu.NewBufferLenOfOn[uint8](r.dev, r.line, h.nBytes)}
+	w := cudaWQ{kind: h.kind, N: h.N, K: h.K, W: wbuf[uint8](r, h.nBytes)}
 	nSB := h.K / 256
 	if h.kind == "q5k" {
 		rb := nSB * 176
@@ -372,9 +372,6 @@ func (r *cudaResident) streamKQuant(h hostW) cudaWQ {
 	return w
 }
 
-// packI8Into is packI8 into a caller's slice: four int8 per word, little-endian.
-func packI8Into(dst []uint32, q8 []int8) { wpack.PackI8Into(dst, q8) }
-
 // planWeightStack is packWeightStack's validation and nothing else: the same errors in the same order for the same weights, no allocation beyond the
 // returned header, and a hostW that names the member weights (srcs) and the element counts of the stack's two host buffers. Only the C' expert cache
 // consumes it (cacheWQ packs the members straight into the pinned copy); every other path takes packWeightStack's packed slices.
@@ -408,12 +405,6 @@ func planWeightStack(ws ...*linalg.WeightMat) (hostW, error) {
 	return out, nil
 }
 
-// packInt4Into is packWeight's int4 layout written into caller-owned storage: the nibble-permuted words, and the group scales through the f16 -> f32 -> f16
-// trip packWeight makes. It allocates nothing.
-func packInt4Into(dstW []uint32, dstS []uint16, q4 []byte, s16 []uint16) {
-	wpack.PackInt4Into(dstW, dstS, q4, s16)
-}
-
 // packStackWorkers bounds the goroutines that pack one expert stack: the sources are mapped files, so more than a few readers only adds page-fault traffic.
 const packStackWorkers = 8
 
@@ -422,16 +413,23 @@ const packStackWorkers = 8
 // packWeight produces for it, at the offset packWeightStack puts it. An abort, a lost canonical payload or a malformed member is recorded as an upload
 // error and leaves the copy partly filled, which the failed build discards.
 func (r *cudaResident) packStackPinned(w *cudaWQ, h hostW) {
-	srcW, err := r.dev.NewMappedHostBufferOn(mem.LinePinnedExperts, h.nWpk*4)
-	if err != nil {
-		panic(fmt.Sprintf("cacheWQ: NewMappedHostBuffer(%d): %v", h.nWpk*4, err))
+	var srcW, srcS *gpu.MappedHostBuffer
+	var err error
+	if r.unpinnedExperts {
+		if srcW, srcS, err = pageableStackSources(r.unpinnedDir, h.nWpk*4, h.nWs16*2); err != nil {
+			r.recordUpload(fmt.Errorf("cuda: --moe-experts-unpinned: %w", err))
+			return
+		}
+		r.pageableStacks++
+	} else {
+		if srcW, err = r.dev.NewMappedHostBufferOn(mem.LinePinnedExperts, h.nWpk*4); err != nil {
+			panic(fmt.Sprintf("cacheWQ: NewMappedHostBuffer(%d): %v", h.nWpk*4, err))
+		}
+		if srcS, err = r.dev.NewMappedHostBufferOn(mem.LinePinnedExperts, h.nWs16*2); err != nil {
+			panic(fmt.Sprintf("cacheWQ: NewMappedHostBuffer(%d): %v", h.nWs16*2, err))
+		}
 	}
-	w.srcW = srcW
-	srcS, err := r.dev.NewMappedHostBufferOn(mem.LinePinnedExperts, h.nWs16*2)
-	if err != nil {
-		panic(fmt.Sprintf("cacheWQ: NewMappedHostBuffer(%d): %v", h.nWs16*2, err))
-	}
-	w.srcS = srcS
+	w.srcW, w.srcS = srcW, srcS
 	var dstW []uint32
 	var dstS []uint16
 	if h.nWpk > 0 {
@@ -468,11 +466,14 @@ func (r *cudaResident) packStackPinned(w *cudaWQ, h hostW) {
 					bad.Store(true)
 					return
 				}
-				packInt4Into(dw, ds, q4, s16)
+				wpack.PackInt4Into(dw, ds, q4, s16)
 			}
 		}()
 	}
 	wg.Wait()
+	if r.unpinnedExperts {
+		sealPageable(w.srcW.Bytes(), w.srcS.Bytes())
+	}
 	switch {
 	case aborted.Load():
 		r.recordUpload(fmt.Errorf("cuda: resident build aborted while packing an expert stack: %w", decoder.ErrLoadAborted))
@@ -480,3 +481,70 @@ func (r *cudaResident) packStackPinned(w *cudaWQ, h hostW) {
 		r.recordUpload(fmt.Errorf("cuda: an int4 expert lost its canonical bytes between planning and upload, or its payload is the wrong size"))
 	}
 }
+
+// pageableStackSources returns two shared file mappings of wBytes and sBytes under dir, writable for packStackPinned's fill, which then makes
+// them read-only (sealPageable). The files are unlinked once mapped, so their disk space goes with the mappings. A dir on tmpfs is refused:
+// its pages are shared memory, so the copy would still be held.
+func pageableStackSources(dir string, wBytes, sBytes int) (*gpu.MappedHostBuffer, *gpu.MappedHostBuffer, error) {
+	if dir == "" {
+		return nil, nil, fmt.Errorf("the model has no file path, so there is no directory to write the packed experts beside it")
+	}
+	var fs syscall.Statfs_t
+	if err := syscall.Statfs(dir, &fs); err != nil {
+		return nil, nil, fmt.Errorf("the packed-experts file's directory %s: %w", dir, err)
+	}
+	switch fs.Type {
+	case tmpfsMagic:
+		return nil, nil, fmt.Errorf("%s is tmpfs, whose pages are memory: the packed experts would still be held in RAM", dir)
+	case ramfsMagic:
+		return nil, nil, fmt.Errorf("%s is ramfs, whose pages are memory: the packed experts would still be held in RAM", dir)
+	}
+	one := func(n int) (*gpu.MappedHostBuffer, error) {
+		if n == 0 {
+			return gpu.NewPageableHostSource([]byte{}, nil), nil
+		}
+		f, err := os.CreateTemp(dir, "mem10-stack-*.bin")
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		defer os.Remove(f.Name())
+		// Reserve the blocks: a sparse file whose disk filled during packing would fault (SIGBUS) on a write instead of failing here.
+		if err := syscall.Fallocate(int(f.Fd()), 0, 0, int64(n)); err != nil {
+			return nil, fmt.Errorf("%s has no room for a %.2f GB packed-experts file: %w", dir, float64(n)/(1<<30), err)
+		}
+		m, err := syscall.Mmap(int(f.Fd()), 0, n, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+		if err != nil {
+			return nil, err
+		}
+		return gpu.NewPageableHostSource(m, func() { _ = syscall.Munmap(m) }), nil
+	}
+	w, err := one(wBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	s, err := one(sBytes)
+	if err != nil {
+		_ = w.Close()
+		return nil, nil, err
+	}
+	return w, s, nil
+}
+
+// sealPageable writes packed pageable sources back to their file and makes them read-only: after packing nothing writes them, and once
+// clean their pages are reclaimable like any file page, so a build holds at most one stack's dirty pages at a time.
+func sealPageable(bs ...[]byte) {
+	for _, b := range bs {
+		if len(b) > 0 {
+			_, _, _ = syscall.Syscall(syscall.SYS_MSYNC, uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)), msSync)
+			_ = syscall.Mprotect(b, syscall.PROT_READ)
+		}
+	}
+}
+
+// tmpfsMagic and ramfsMagic are statfs's f_type for tmpfs and ramfs (linux/magic.h); msSync is msync(2)'s MS_SYNC.
+const (
+	tmpfsMagic = 0x01021994
+	ramfsMagic = 0x858458f6
+	msSync     = 4
+)

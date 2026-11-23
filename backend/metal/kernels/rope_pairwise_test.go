@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// G-PR1 (docs/tasks/task-metal-pairwise-rope-2026-10.md): the pairwise rope twins against a float64 reference written
+// G-PR1: the pairwise rope twins against a float64 reference written
 // from decoder/rope.go's semantics (applyRoPEInterleaved, applyMRoPEPairwise): pair dd is dims (2dd, 2dd+1) at invf[dd],
 // partial rotary rotates [0, 2*rhalf) and leaves the tail alone, mscale scales cos and sin, the Q temperature multiplies
 // rotated Q only. Tolerances as registered: 2e-5 on the f32 kernels, 4e-3 on the f16 ones (inputs in [-2, 2]). Every
@@ -197,7 +197,7 @@ func TestRopePairwise_f16PrefillKernels(t *testing.T) {
 				pos3[3*m], pos3[3*m+1], pos3[3*m+2] = uint32(1+m%7), uint32(2+(m*3)%11), uint32(3+(m*5)%13)
 			}
 		}
-		// Contiguous sections [2,3,3] over rhalf 8 (GLM-OCR's layout through MRopeAxisResident), scaled down for rhalf 3.
+		// Contiguous sections [2,3,3] over rhalf 8 (GLM-OCR's layout through MRopeAxis), scaled down for rhalf 3.
 		axis := make([]uint32, tc.rhalf)
 		for dd := range axis {
 			switch {

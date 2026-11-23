@@ -4,7 +4,7 @@ package kernels
 
 import "github.com/oliverbestmann/webgpu/wgpu"
 
-// Nemotron-H squared-ReLU FFN (port from the granite SSM work). Nemotron-H's MLP block is
+// Relu2QuantWGSL serves the Nemotron-H squared-ReLU FFN (port from the granite SSM work). Nemotron-H's MLP block is
 // NON-gated: down(relu²(up(x))) — no gate projection, unlike every SwiGLU family. relu2Quant
 // is the fused activation+quant for it: relu²(up) → max-abs → int8, one dispatch (mirrors
 // swigluQuant but unary). relu²(x)=max(0,x)² ≥ 0, so the int8 is non-negative ([0,127]); the
@@ -71,10 +71,9 @@ func (c *Context) ensureRelu2() error {
 
 // relu2QuantOp records the fused relu²(up)→int8 dispatch into the resident plan, returning the
 // packed int8 activation + its scale (for the down-projection W8A8 GEMV).
-func (c *Context) relu2QuantBind(up, qout, scales, dims *wgpu.Buffer) *wgpu.BindGroup {
-	bg, _ := c.device.TryCreateBindGroup(&wgpu.BindGroupDescriptor{Layout: c.relu2Layout, Entries: []wgpu.BindGroupEntry{
+func (c *Context) relu2QuantBind(up, qout, scales, dims *wgpu.Buffer) (*wgpu.BindGroup, error) {
+	return c.device.TryCreateBindGroup(&wgpu.BindGroupDescriptor{Layout: c.relu2Layout, Entries: []wgpu.BindGroupEntry{
 		{Binding: 0, Buffer: up, Size: up.GetSize()}, {Binding: 1, Buffer: qout, Size: qout.GetSize()},
 		{Binding: 2, Buffer: scales, Size: scales.GetSize()}, {Binding: 3, Buffer: dims, Size: dims.GetSize()},
 	}})
-	return bg
 }

@@ -3,6 +3,7 @@ package serveapp
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/townsendmerino/goinfer/internal/app/serveapp/jobs"
 	"net/http"
 	"strings"
 
@@ -17,19 +18,19 @@ import (
 // --- request shapes (the subset we honor) ---
 
 type anthropicReq struct {
-	Model         string             `json:"model"`
-	MaxTokens     *int               `json:"max_tokens"` // REQUIRED for /v1/messages (400 if missing/<=0)
-	System        json.RawMessage    `json:"system"`     // string | [{"type":"text","text":…}, …]
-	Messages      []anthropicMessage `json:"messages"`
-	Tools         []anthropicTool    `json:"tools"`
-	ToolChoice    json.RawMessage    `json:"tool_choice"` // {"type":"auto"|"any"|"tool","name":…}
-	Temperature   *float64           `json:"temperature"` // Anthropic range 0..1 (no rescale)
-	TopP          *float64           `json:"top_p"`
-	TopK          *int               `json:"top_k"`
-	StopSequences []string           `json:"stop_sequences"`
-	Stream        bool               `json:"stream"`
-	LogitBias     map[string]float64 `json:"logit_bias"` // goinfer extension, as on the OpenAI routes (sampling.LogitBias)
-	Goinfer       *vendorOptions     `json:"goinfer"`    // goinfer vendor options, as on the OpenAI routes (sampling.Goinfer)
+	Model         string              `json:"model"`
+	MaxTokens     *int                `json:"max_tokens"` // REQUIRED for /v1/messages (400 if missing/<=0)
+	System        json.RawMessage     `json:"system"`     // string | [{"type":"text","text":…}, …]
+	Messages      []anthropicMessage  `json:"messages"`
+	Tools         []anthropicTool     `json:"tools"`
+	ToolChoice    json.RawMessage     `json:"tool_choice"` // {"type":"auto"|"any"|"tool","name":…}
+	Temperature   *float64            `json:"temperature"` // Anthropic range 0..1 (no rescale)
+	TopP          *float64            `json:"top_p"`
+	TopK          *int                `json:"top_k"`
+	StopSequences []string            `json:"stop_sequences"`
+	Stream        bool                `json:"stream"`
+	LogitBias     map[string]float64  `json:"logit_bias"` // goinfer extension, as on the OpenAI routes (sampling.LogitBias)
+	Goinfer       *jobs.VendorOptions `json:"goinfer"`    // goinfer vendor options, as on the OpenAI routes (sampling.Goinfer)
 	// Thinking: {type: enabled|adaptive|disabled, budget_tokens}. enabled/adaptive render the model's thinking mode on
 	// and return `thinking` content blocks (think.go); budget_tokens is enforced as a ceiling on the thinking block
 	// (budget.go): serve forces the block closed there, clamped so a quarter of max_tokens is left to answer. metadata is accepted and ignored.
@@ -633,7 +634,7 @@ func toolUseBlock(c chat.ToolCall) map[string]any {
 // stop_sequence (with the sequence); otherwise (EOS / turn-stop) → end_turn.
 func anthropicStopReason(finish, stopSeq string) (string, any) {
 	switch {
-	case finish == "cancelled": // not a real Anthropic stop_reason: a deliberate goinfer extension (docs/tasks/task-halt-2026-09.md)
+	case finish == "cancelled": // not a real Anthropic stop_reason: a deliberate goinfer extension
 		return "cancelled", nil
 	case finish == "length":
 		return "max_tokens", nil
@@ -741,13 +742,10 @@ func (s *server) serveMessagesWith(w http.ResponseWriter, r *http.Request, req a
 		return
 	}
 	s.noteIDs(r, idsOut)
-	sm.fixedTokens = func() int { return lm.fixedPromptTokens(tm, system, tools) }
-	if gr, err = lm.prepare(sm, ids, lm.residentPath()); err != nil {
+	if gr, err = lm.prepareTurn(sm, tm, system, turns, tools, ids); err != nil {
 		writeAnthropicPrepareErr(w, err)
 		return
 	}
-	gr.boundary = lm.prefixBoundary(tm, system, turns, tools, ids)
-	gr.keep = lm.recurrentKeep(tm, system, turns, tools, ids)
 	if toolsActive {
 		if cerr := applyToolConstraint(lm, &gr, mode, name, tools); cerr != nil {
 			writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", cerr.Error())
@@ -782,33 +780,30 @@ func (s *server) serveMessagesWith(w http.ResponseWriter, r *http.Request, req a
 	var rb strings.Builder
 	s.routeThink(lm, &gr, tm, turns, ts, func(t string) { rb.WriteString(t) })
 	var (
-		text                          string
-		calls                         []chat.ToolCall
-		lead                          string
-		finish, stopSeq, cancelReason string
-		nComp, reused                 int
-		gerr                          error
-		fromReasoning                 bool
+		text          string
+		calls         []chat.ToolCall
+		lead          string
+		res           turnResult
+		gerr          error
+		fromReasoning bool
 	)
 	if toolsActive {
 		// The shared tool turn (tool_turn.go) — buffered here: nothing to stream on this path.
 		var t toolTurn
 		t, gerr = s.runToolTurn(r.Context(), lm, gr, tools, nil, nil)
-		text, calls, lead, finish, stopSeq, cancelReason, nComp, reused = t.raw, t.calls, t.lead, t.finish, t.stopSeq, t.cancelReason, t.nComp, t.reused.Tokens
+		text, calls, lead, res = t.raw, t.calls, t.lead, t.turnResult
 		fromReasoning = t.fromReasoning && len(t.calls) > 0
 	} else {
 		var sb strings.Builder
-		var ru prefillReuse
-		finish, nComp, _, stopSeq, ru, cancelReason, gerr = lm.drive(r.Context(), gr, s.gens, s.jobs, func(t string) { sb.WriteString(t) })
-		reused = ru.Tokens
+		res, gerr = lm.drive(r.Context(), gr, s.gens, s.jobs, func(t string) { sb.WriteString(t) })
 		text = sb.String()
 	}
 	if gerr != nil {
 		writeAnthropicErr(w, http.StatusInternalServerError, "api_error", "generation failed: "+gerr.Error())
 		return
 	}
-	if cancelReason != "" {
-		writeAnthropicErr(w, statusCancelled, "cancelled", "generation cancelled: "+cancelReason)
+	if res.cancelReason != "" {
+		writeAnthropicErr(w, statusCancelled, "cancelled", "generation cancelled: "+res.cancelReason)
 		return
 	}
 
@@ -838,7 +833,7 @@ func (s *server) serveMessagesWith(w http.ResponseWriter, r *http.Request, req a
 		if !(thinking && text == "") {
 			content = append(content, textBlock(text))
 		}
-		reason, seq = anthropicStopReason(finish, stopSeq)
+		reason, seq = anthropicStopReason(res.finish, res.stopHit)
 	}
 
 	msg := map[string]any{
@@ -849,15 +844,15 @@ func (s *server) serveMessagesWith(w http.ResponseWriter, r *http.Request, req a
 		"content":       content,
 		"stop_reason":   reason,
 		"stop_sequence": seq,
-		"usage":         anthropicUsage(len(gr.promptIDs), reused, nComp),
+		"usage":         anthropicUsage(len(gr.promptIDs), res.reused.Tokens, res.nComp),
 	}
-	if e := emptyAnswerOf(gr, finish, stopSeq, len(calls), nComp); e != nil {
+	if e := emptyAnswerOf(gr, res.finish, res.stopHit, len(calls), res.nComp); e != nil {
 		msg["goinfer_empty_answer"] = e
 	}
 	if fromReasoning {
 		msg[fromReasoningField] = true
 	}
-	writeJSON(w, http.StatusOK, gr.clock.addTurn(msg))
+	writeJSON(w, http.StatusOK, gr.clock.AddTurn(msg))
 }
 
 // anthropicUsage is a finished Messages reply's usage, in the Messages API's split: cache_read_input_tokens is the leading

@@ -10,6 +10,8 @@ import (
 	gc "github.com/eitamring/gocudrv/cuda"
 	"github.com/townsendmerino/goinfer/decoder"
 	"github.com/townsendmerino/goinfer/internal/vision"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TestQwen25VLResidentReal_gate is the real-checkpoint continuation of decoder/qwen25vl_real_test.go's
@@ -28,7 +30,7 @@ import (
 //
 //	GOINFER_HEAVY_TESTS=1 go test -tags 'cuda goinfer_testhooks' ./cuda/ -run TestQwen25VLResidentReal_gate -v -timeout 30m
 func TestQwen25VLResidentReal_gate(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ckpt := decoder.AssetPathForTest(t, "GOINFER_QWEN25VL_3B")
 	const golden = "../../testdata/qwen25vl_real_golden.json.gz"
 	raw, err := readGolden(golden)
@@ -79,9 +81,10 @@ func TestQwen25VLResidentReal_gate(t *testing.T) {
 	if rf == nil {
 		t.Skip("qwen2_5_vl not resident-eligible on this build")
 	}
-	mrope, ok := rf.(decoder.ResidentMRoPE)
+	mrope := decoder.SubsystemsOf(rf).Decode
+	ok := mrope.MRoPEDecodeAvailable()
 	if !ok {
-		t.Fatal("cudaResident does not satisfy decoder.ResidentMRoPE")
+		t.Fatal("cudaResident does not satisfy decoder.ResidentDecodeSubsystem")
 	}
 	_, nLayers, _, _, _, _, _ := mc.Dims()
 

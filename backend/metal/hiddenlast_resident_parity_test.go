@@ -20,7 +20,7 @@ import (
 // nothing could ever fail.
 const hiddenLastResidentBar = 0.998
 
-// TestHiddenLastResidentParityMetal is the G4 gate (docs/tasks/task-gpu-paths-2026-09.md): the resident
+// TestHiddenLastResidentParityMetal is the G4 gate: the resident
 // HiddenLast path (metalResident.HiddenLast / resident.forwardHiddenNoHead) must match the CPU
 // HiddenLast to within hiddenLastResidentBar on real weights. resident_embed_seam_test.go
 // (decoder package) already proves the WIRING with a fake backend; this proves the NUMBERS with
@@ -47,9 +47,10 @@ func TestHiddenLastResidentParityMetal(t *testing.T) {
 	if rf == nil {
 		t.Fatalf("gpt2 did not go resident (BuildResident refused) — decode path %q; decline: %s", mRes.DecodePath(), mRes.ResidentDecline())
 	}
-	rh, ok := rf.(decoder.ResidentHiddenLast)
+	rh := decoder.SubsystemsOf(rf).Prefill
+	ok := rh.HiddenLastAvailable()
 	if !ok {
-		t.Fatalf("metal resident runner does not implement decoder.ResidentHiddenLast")
+		t.Fatalf("metal resident runner does not implement decoder.ResidentPrefillSubsystem")
 	}
 
 	mCPU, err := decoder.Load(ckpt, decoder.Options{Backend: "cpu", Quant: "int8int8"})

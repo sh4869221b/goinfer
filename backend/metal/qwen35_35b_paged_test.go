@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/townsendmerino/goinfer/decoder"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TestQwen35_35B_pagedRuns is the at-scale payoff run for the GENERIC Metal expert pager — the
@@ -40,7 +42,7 @@ import (
 //
 //	GOINFER_HEAVY_TESTS=1 go test -tags goinfer_testhooks ./metal/ -run TestQwen35_35B_pagedRuns -v -timeout 60m
 func TestQwen35_35B_pagedRuns(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	giw := modelPath("Qwen3.5-35B-A3B-Q4_K_M.int4.giw")
 	if _, err := os.Stat(giw); err != nil {
 		t.Skipf("no 35B .giw (%s)", giw)
@@ -90,7 +92,7 @@ func TestQwen35_35B_pagedRuns(t *testing.T) {
 	say("loaded %.1fs rss=%d MB", time.Since(tLoad).Seconds(), rssMB())
 
 	tBuild := time.Now()
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("buildResident (paged N=%d): %v — the 35B did not build", N, err)
 	}
@@ -195,7 +197,7 @@ func TestQwen35_35B_pagedRuns(t *testing.T) {
 // TestQwen35_35B_cpuPagedBaseline is the DO-NOTHING ARM for the run above: the same checkpoint, box and session, decoded
 // through the CPU expert pager (StreamWeights, decoder/moepaging.go) instead of the Metal one. Without it, "Metal paging is
 // faster" would be a cross-session ratio against a number measured on another day, which can drift by multiples from machine
-// load alone (docs/completed/task-zeno-compare.md).
+// load alone.
 //
 // IT LIVES IN metal/ AND USES NO METAL. That is deliberate: its only reason to exist is to be the baseline for the Metal
 // number, and a baseline that drifts away from its comparand into another package (and another run) goes stale. Same helpers,
@@ -209,12 +211,12 @@ func TestQwen35_35B_pagedRuns(t *testing.T) {
 //
 //	GOINFER_HEAVY_TESTS=1 go test -count=1 -tags goinfer_testhooks ./metal/ -run TestQwen35_35B_cpuPagedBaseline -v -timeout 60m
 func TestQwen35_35B_cpuPagedBaseline(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	giw := modelPath("Qwen3.5-35B-A3B-Q4_K_M.int4.giw")
 	if _, err := os.Stat(giw); err != nil {
 		t.Skipf("no 35B .giw (%s)", giw)
 	}
-	budgetGB := 6.0 // matches the 6 GB kind-3 row in docs/completed/task-zeno-compare.md (1.605 tok/s, 3-run avg)
+	budgetGB := 6.0 // matches the 6 GB kind-3 row (1.605 tok/s, 3-run avg)
 	if v := os.Getenv("GOINFER_CPU_BUDGET_GB"); v != "" {
 		budgetGB, _ = strconv.ParseFloat(v, 64)
 	}

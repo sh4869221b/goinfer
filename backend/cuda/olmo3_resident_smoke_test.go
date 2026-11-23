@@ -11,7 +11,7 @@ import (
 )
 
 // TestOlmo3ResidentSmokeCUDA and TestOlmoHybridResidentSmokeCUDA are G5's FeatPostOnlyNorm +
-// FeatQKNormWhole row (docs/tasks/task-gpu-paths-2026-09.md) smoke gates on CUDA — the Metal twin
+// FeatQKNormWhole row smoke gates on CUDA — the Metal twin
 // (metal/olmo3_resident_smoke_test.go) explains why this is deliberately a smoke check (admission
 // + no NaN) rather than a resident-vs-CPU cosine floor: testdata/olmo3-tiny and
 // testdata/olmo_hybrid-tiny are both seeded/synthetic, and this feature has no new pure-Go
@@ -23,7 +23,7 @@ import (
 //
 // Olmo Hybrid additionally gates a bug fix: both backends assumed every qwen35Params-carrying
 // family's full-attention layer used qwen3.5's own double-width q-gate scheme
-// (Qwen35ResidentParams hardcoded attnGate=true), while Olmo Hybrid's is plain (olmo3's own scheme);
+// (Qwen35Params hardcoded attnGate=true), while Olmo Hybrid's is plain (olmo3's own scheme);
 // Architecture.qwen35.AttnGate now carries it. This smoke test is the regression gate for that fix:
 // without it BuildResident declines ("qwen35 softmax layer has empty q_norm/k_norm").
 func TestOlmo3ResidentSmokeCUDA(t *testing.T) {
@@ -78,8 +78,8 @@ func testOlmoFamilyResidentSmokeCUDA(t *testing.T, ckpt string) {
 		}
 	}
 
-	// Prefill check: both admit batched prefill. Olmo Hybrid's DeltaNet layers take prefillDeltaNetRows
-	// (docs/tasks/task-cuda-deltanet-prefill-2026-09.md); at 24 rows the projections run the batched GEMM, so the bar
+	// Prefill check: both admit batched prefill. Olmo Hybrid's DeltaNet layers take prefillDeltaNetRows;
+	// at 24 rows the projections run the batched GEMM, so the bar
 	// against the per-token pass above is that task's: argmax equal, cosine >= 0.9999.
 	cr, isCR := rf.(*cudaResident)
 	if isCR {

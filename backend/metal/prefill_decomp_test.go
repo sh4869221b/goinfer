@@ -77,7 +77,7 @@ func TestMetalPrefillDecomp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("build resident: %v", err)
 	}
@@ -225,20 +225,20 @@ func runDecompAt(t *testing.T, r *resident, embs [][]float32, reps int, hb func(
 			e.Dispatch(pf.pRope, M*g0.nKV*g0.half, 128, qkvF, L.invf, g0.uHd, posB, uTotalK, uStride, uBaseK, g0.uHalf, L.mscale)
 		}},
 		{name: "kv store", enc: func(e *Encoder, l int) {
-			e.Dispatch(pf.pKv, M*kvDim, 128, qkvF, r.kc[l], r.vc[l], posB, g0.uKvDim, uStride, uKOff, uVOff)
+			e.Dispatch(pf.pKv, M*kvDim, 128, qkvF, r.kc[l].At(0), r.vc[l].At(0), posB, g0.uKvDim, uStride, uKOff, uVOff, r.kt)
 		}},
 		{name: "attention", enc: func(e *Encoder, l int) {
 			L := &r.layers[l]
 			if attnProtoOn {
-				e.Dispatch(pf.pAttnFused, attnFusedTotal, attnFusedSGPT*32, qkvF, r.kc[l], r.vc[l], ctxF, r.uNH, g0.uNKV, g0.uHd, uStartPos, r.uScale, uStride, L.uWindow, uMReal)
+				e.Dispatch(pf.pAttnFused, attnFusedTotal, attnFusedSGPT*32, qkvF, r.kc[l].At(0), r.vc[l].At(0), ctxF, r.uNH, g0.uNKV, g0.uHd, uStartPos, r.uScale, uStride, L.uWindow, uMReal, r.kt)
 				return
 			}
 			if useSteelAttn {
-				e.Dispatch(pf.steelFor(g0.hd), r.nH*((M+31)/32)*128, 128, qkvF, r.kc[l], r.vc[l], ctxF, r.uNH, g0.uNKV, g0.uHd, uStartPos, r.uScale, uStride, L.uWindow, uMReal)
+				e.Dispatch(pf.steelFor(g0.hd), r.nH*((M+31)/32)*128, 128, qkvF, r.kc[l].At(0), r.vc[l].At(0), ctxF, r.uNH, g0.uNKV, g0.uHd, uStartPos, r.uScale, uStride, L.uWindow, uMReal, r.kt)
 			} else if useFusedAttn {
-				e.Dispatch(pf.pAttnFused, attnFusedTotal, attnFusedSGPT*32, qkvF, r.kc[l], r.vc[l], ctxF, r.uNH, g0.uNKV, g0.uHd, uStartPos, r.uScale, uStride, L.uWindow, uMReal)
+				e.Dispatch(pf.pAttnFused, attnFusedTotal, attnFusedSGPT*32, qkvF, r.kc[l].At(0), r.vc[l].At(0), ctxF, r.uNH, g0.uNKV, g0.uHd, uStartPos, r.uScale, uStride, L.uWindow, uMReal, r.kt)
 			} else {
-				e.Dispatch(pf.pAttn, M*r.nH*tgReduceAttn, tgReduceAttn, qkvF, r.kc[l], r.vc[l], ctxF, r.uNH, g0.uNKV, g0.uHd, uStartPos, r.uScale, uStride, L.uWindow)
+				e.Dispatch(pf.pAttn, M*r.nH*tgReduceAttn, tgReduceAttn, qkvF, r.kc[l].At(0), r.vc[l].At(0), ctxF, r.uNH, g0.uNKV, g0.uHd, uStartPos, r.uScale, uStride, L.uWindow, r.kt)
 			}
 		}},
 		{name: "GEMM o (+residual)", flops: gemmFlops(H, qDim), enc: func(e *Encoder, l int) {
@@ -435,8 +435,8 @@ func runDecompAt(t *testing.T, r *resident, embs [][]float32, reps int, hb func(
 		fmt.Fprintln(os.Stderr)
 	}
 
-	// R16 / S2 (GOINFER_METAL_S2=1): the prototype against the current kernel, per the pre-registration in
-	// docs/tasks/red-october.md R16 — bitwise per GEMM on real inputs, full-replay logits, the registered metric
+	// R16 / S2 (GOINFER_METAL_S2=1): the prototype against the current kernel, per the pre-registration:
+	// bitwise per GEMM on real inputs, full-replay logits, the registered metric
 	// (sum of the four GEMM marginals by leave-one-out, both arms in the same session), and burst vs sustained.
 	if os.Getenv("GOINFER_METAL_S2") == "1" {
 		func() {

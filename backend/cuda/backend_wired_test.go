@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/townsendmerino/goinfer/decoder"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TestBackendResidentWired exercises the PRODUCTION path end to end: decoder.Load with
@@ -19,7 +21,7 @@ import (
 // backend-equivalence gate for the shipped path; it catches wiring regressions the
 // inline-forward parity test can't.
 func TestBackendResidentWired(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	gguf := os.Getenv("GOINFER_CUDA_MODEL")
 	if gguf == "" {
 		gguf = os.ExpandEnv("$HOME/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf")
@@ -47,14 +49,14 @@ func TestBackendResidentWired(t *testing.T) {
 	// (TestSlidingWindowAttention), but a window only engages past `window` keys — so if the
 	// per-layer value were silently 0, the short-prompt parity below could not tell. Assert the
 	// resident carries the arch's window on exactly the layers the decoder marks local.
-	if w := mc.SlidingWindowResident(); w > 0 {
+	if w := mc.BackendView().SlidingWindow(); w > 0 {
 		cr, ok := rf.(*cudaResident)
 		if !ok {
 			t.Fatalf("resident is %T, want *cudaResident", rf)
 		}
 		for l := range cr.layers {
 			want := int32(0)
-			if mc.LayerIsLocalResident(l) {
+			if mc.BackendView().Layer(l).IsLocal() {
 				want = int32(w)
 			}
 			if got := cr.layers[l].window; got != want {
@@ -116,7 +118,7 @@ func TestBackendResidentWired(t *testing.T) {
 // — measured here rather than assumed, since recovering it needs an interface addition
 // (a greedy-only fast path), not a drop-in.
 func TestProdThroughput(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	gguf := os.Getenv("GOINFER_CUDA_MODEL")
 	if gguf == "" {
 		gguf = os.ExpandEnv("$HOME/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf")
@@ -161,7 +163,8 @@ func TestProdThroughput(t *testing.T) {
 		}
 	}
 	// greedy fast path: same chain, 4 B readback instead of the logits vector
-	rg, ok := rf.(decoder.ResidentGreedy)
+	rg := decoder.SubsystemsOf(rf).Decode
+	ok := rg.GreedyAvailable()
 	bestG := 1e18
 	if ok {
 		stepG := func() {
@@ -195,7 +198,7 @@ func TestProdThroughput(t *testing.T) {
 // exercises the decode-loop restructure (fastNext), not just the kernel — the real risk. If
 // the two ever diverge, the fast path is silently changing output and must not ship.
 func TestGreedyFastPathIdentical(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	gguf := os.Getenv("GOINFER_CUDA_MODEL")
 	if gguf == "" {
 		gguf = os.ExpandEnv("$HOME/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf")
@@ -224,13 +227,13 @@ func TestGreedyFastPathIdentical(t *testing.T) {
 		return got
 	}
 	// TAUTOLOGY GUARD (v1.0 gate §2 census). Both arms below are one build with one env var
-	// flipped; the fast arm only DIFFERS if the resident implements ResidentGreedy, since that
+	// flipped; the fast arm only DIFFERS if the resident implements ResidentDecodeSubsystem, since that
 	// interface assertion — not the env var — is what routes decode to the on-device argmax. If
 	// cudaResident stopped satisfying it, both arms would take the logits path and this gate would
 	// report "token-identical" having compared the logits path to itself. The kv-only sibling
-	// (kvonly_prefill_test.go) already asserts its ResidentPrefillKV precondition this way.
-	if _, ok := m.ResidentForwardForTest().(decoder.ResidentGreedy); !ok {
-		t.Fatal("cuda resident does not implement ResidentGreedy — the fast arm would take the " +
+	// (kvonly_prefill_test.go) already asserts its ResidentDecodeSubsystem precondition this way.
+	if ok := decoder.SubsystemsOf(m.ResidentForwardForTest()).Decode.GreedyAvailable(); !ok {
+		t.Fatal("cuda resident does not implement ResidentDecodeSubsystem — the fast arm would take the " +
 			"logits path and this gate would compare it to itself")
 	}
 	decoder.SetKnobEnvForTest(t, m, "GOINFER_NO_GREEDY_FASTPATH", "1")

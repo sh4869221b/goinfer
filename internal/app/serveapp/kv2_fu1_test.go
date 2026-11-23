@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/internal/runtime/scheduler"
 )
 
 // TestPickSessionFor_ownRollback: with room in the LRU, a request that keeps its candidate's whole first prompt but its
@@ -56,7 +57,7 @@ type fu1CPUTurn struct {
 	reused, shared int
 }
 
-// TestKV2FU1_cpuOwnRollback is FU1-G3's CPU arm (docs/tasks/task-kv-architecture-2026-10.md §6, KV2 follow-up 1),
+// TestKV2FU1_cpuOwnRollback is FU1-G3's CPU arm,
 // through serve's session LRU on the CPU forward: a conversation that rolls back to its first prompt and first reply,
 // giving up more than it keeps, is handed its own session again, reuses what it kept, copies nothing, and replies, to
 // the bit of every step's log-probabilities, as it does alone in an LRU of one, with room in the LRU and without.
@@ -148,7 +149,7 @@ func TestKV2FU1_cpuOwnRollback(t *testing.T) {
 					}
 					prev := ts[tn-1]
 					full := append(slices.Clone(prev.prompt), prev.ids...)
-					keep := min(len(x.prompt)-1, commonPrefix(full, x.prompt))
+					keep := min(len(x.prompt)-1, scheduler.CommonPrefix(full, x.prompt))
 					if x.s != prev.s || x.reused != keep || x.shared != 0 {
 						t.Errorf("conversation %d turn %d: same session %v, reused %d, copied %d; want its own session, %d reused, nothing copied",
 							c, tn, x.s == prev.s, x.reused, x.shared, keep)

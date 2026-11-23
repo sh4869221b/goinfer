@@ -64,8 +64,7 @@ func sameBits(t *testing.T, what string, got, want []float32) {
 	}
 }
 
-// TestTowerRelease_gridTowersFallBackOnReloadedBlocks is TWR-G2's grid half (docs/tasks/task-memory-campaign-2026-10.md,
-// MEM4(b) gates): the Qwen3.5+ and GLM-OCR towers release their host blocks once the device tower starts, and when the
+// TestTowerRelease_gridTowersFallBackOnReloadedBlocks is TWR-G2's grid half: the Qwen3.5+ and GLM-OCR towers release their host blocks once the device tower starts, and when the
 // device runs out of memory the CPU fallback reloads them and returns the never-released CPU tower's features, bit for bit.
 func TestTowerRelease_gridTowersFallBackOnReloadedBlocks(t *testing.T) {
 	got := countReleases(t)
@@ -146,14 +145,14 @@ func TestTowerRelease_startupTowers(t *testing.T) {
 		want    int
 	}{{"metal", 1}, {"", 0}} {
 		before := got["Gemma 4"]
-		if err := s.loadGemma4VisionTower("../../../testdata/gemma4-vision-tiny", false, c.backend, false, false); err != nil {
+		if err := s.loadGemma4VisionTower("../../../testdata/gemma4-vision-tiny", false, c.backend, false); err != nil {
 			t.Fatal(err)
 		}
 		if n := got["Gemma 4"] - before; n != c.want {
 			t.Errorf("Gemma 4 on %q: %d releases, want %d", c.backend, n, c.want)
 		}
 		before = got["Qwen2.5-VL"]
-		if err := s.loadQwenVisionTower("../../../testdata/qwen25vl-tiny", false, c.backend, false, false); err != nil {
+		if err := s.loadQwenVisionTower("../../../testdata/qwen25vl-tiny", false, c.backend, false); err != nil {
 			t.Fatal(err)
 		}
 		if n := got["Qwen2.5-VL"] - before; n != c.want {

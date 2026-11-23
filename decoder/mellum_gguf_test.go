@@ -6,6 +6,9 @@ import (
 	"math"
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TestMellumGGUF_runs is the end-to-end smoke test for Mellum2 from a bare GGUF:
@@ -18,7 +21,7 @@ import (
 //	hf download CodeFault/Mellum2-12B-A2.5B-Instruct-GGUF \
 //	  Mellum2-12B-A2.5B-Instruct-Q4_K_M.gguf --local-dir testdata/mellum-gguf
 func TestMellumGGUF_runs(t *testing.T) {
-	requireHeavyModel(t) // loads a 12B Mellum GGUF (local, multi-GB)
+	testgate.RequireHeavy(t) // loads a 12B Mellum GGUF (local, multi-GB)
 	if testing.Short() {
 		t.Skip("slow: loads an ~8 GB Mellum2 GGUF")
 	}
@@ -70,7 +73,7 @@ func TestMellumGGUF_runs(t *testing.T) {
 			t.Fatalf("logit %d = %v (non-finite)", i, v)
 		}
 	}
-	am := argmax(logits)
+	am := sampling.Argmax(logits)
 	if am < 0 || am >= len(logits) {
 		t.Fatalf("argmax %d out of range", am)
 	}

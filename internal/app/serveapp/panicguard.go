@@ -2,6 +2,7 @@ package serveapp
 
 import (
 	"fmt"
+	"github.com/townsendmerino/goinfer/internal/app/serveapp/jobs"
 	"net/http"
 	"os"
 	"runtime/debug"
@@ -34,15 +35,15 @@ func recoverBatchLine(batch *batchRecord, i int) {
 }
 
 // recoverJob fails a job when its goroutine panics, and closes the event stream the way a failed job does.
-func (s *server) recoverJob(id string, log *jobEventLog, created int64) {
+func (s *server) recoverJob(id string, log *jobs.EventLog, created int64) {
 	if r := recover(); r != nil {
 		fmt.Fprintf(os.Stderr, "serve: job %s panicked: %v\n%s", id, r, debug.Stack())
-		if j := s.jobs.get(id); j != nil {
-			s.jobs.finish(j, jobFailed, nil, "internal error", nil)
+		if j := s.jobs.Get(id); j != nil {
+			s.jobs.Finish(j, jobs.Failed, nil, "internal error", nil)
 		}
-		if j, ok := s.jobs.snapshot(id); ok && log != nil {
+		if j, ok := s.jobs.Snapshot(id); ok && log != nil {
 			for _, e := range jobTerminalEvents(j, created, "api_error") {
-				log.append(e)
+				log.Append(e)
 			}
 		}
 	}
@@ -55,6 +56,21 @@ func (s *server) recoverFinalize(b *batchRecord) {
 		b.Status = "failed"
 		now := time.Now()
 		b.CompletedAt = &now
+	}
+}
+
+// recoverHeartbeat ends an SSE heartbeat whose write panicked; the response it pinged carries on without keep-alives.
+func recoverHeartbeat() {
+	if r := recover(); r != nil {
+		fmt.Fprintf(os.Stderr, "serve: SSE heartbeat panicked: %v\n%s", r, debug.Stack())
+	}
+}
+
+// recoverDrain keeps a panic while an unloaded model is drained and freed from taking the process down. The model stays marked
+// draining, so /health shows a free that never finished.
+func recoverDrain(name string) {
+	if r := recover(); r != nil {
+		fmt.Fprintf(os.Stderr, "serve: unloading model %q panicked: %v\n%s", name, r, debug.Stack())
 	}
 }
 

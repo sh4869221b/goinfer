@@ -29,10 +29,13 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 func TestQwen3NextSlice_realWeightOracle(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	const golden = "testdata/qwen3next_q3next_slice_golden.json.gz"
 	const ckpt = "testdata/qwen3next-q3next-slice"
 
@@ -90,7 +93,7 @@ func TestQwen3NextSlice_realWeightOracle(t *testing.T) {
 			t.Fatalf("forward: %v", err)
 		}
 	}
-	gotArg := argmax(logits)
+	gotArg := sampling.Argmax(logits)
 	cos := logitCosine(logits, g.LastLogits)
 	t.Logf("qwen3_next slice (REAL weights, %d layers: 3 DeltaNet + 1 full): argmax got=%d want=%d | cosine=%.8f",
 		g.NLayers, gotArg, g.Argmax, cos)
@@ -114,7 +117,7 @@ func TestQwen3NextSlice_realWeightOracle(t *testing.T) {
 				t.Fatalf("forward: %v", err)
 			}
 		}
-		nxt := argmax(lg)
+		nxt := sampling.Argmax(lg)
 		if i < len(g.ContinuationIDs) && nxt != g.ContinuationIDs[i] {
 			t.Errorf("continuation[%d] = %d, want %d — DeltaNet state drift shows here, not in "+
 				"the first logit", i, nxt, g.ContinuationIDs[i])

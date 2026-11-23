@@ -6,8 +6,9 @@ import (
 	"io/fs"
 	"math"
 	"os"
-	"strings"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
 const (
@@ -15,7 +16,7 @@ const (
 	gemma4EModelGolden = "../testdata/gemma4_emodel_tiny_golden.json"
 )
 
-// TestGemma4EModel_safetensorsParity is S1.1's gate (docs/tasks/task-multimodal-support-2026-10.md): a safetensors
+// TestGemma4EModel_safetensorsParity is S1.1's gate: a safetensors
 // Gemma 4 E-model (Per-Layer Embeddings, cross-layer KV sharing, double-wide FFNs on the shared layers) loads and its
 // CPU forward matches the HF oracle at EVERY prompt position, f32: argmax equal and cosine >= 0.99999 at each, then the
 // greedy continuation byte-identical. All positions, not just the last, because the KV-shared layers only differ from
@@ -88,7 +89,7 @@ func TestGemma4EModel_safetensorsParity(t *testing.T) {
 		}
 		cos := dot / math.Sqrt(na*nb)
 		worst = math.Min(worst, cos)
-		if got := argmax(logits); got != g.Argmax[p] {
+		if got := sampling.Argmax(logits); got != g.Argmax[p] {
 			t.Errorf("pos %d: argmax %d, want %d (cosine %.8f)", p, got, g.Argmax[p], cos)
 		}
 		if cos < 0.99999 {
@@ -106,7 +107,7 @@ func TestGemma4EModel_safetensorsParity(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		next = argmax(logits)
+		next = sampling.Argmax(logits)
 	}
 	for i := range cont {
 		if cont[i] != g.ContinuationIDs[i] {
@@ -115,49 +116,8 @@ func TestGemma4EModel_safetensorsParity(t *testing.T) {
 	}
 }
 
-// TestGemma4GlobalGeometry pins how the full-attention geometry is read: the flat fields as before, the
-// per_layer_config map transformers >= 5.16 writes in their place, and the refusals for any override goinfer
-// cannot represent (it has exactly two attention geometries).
-func TestGemma4GlobalGeometry(t *testing.T) {
-	types := []string{"sliding_attention", "full_attention", "sliding_attention", "full_attention"}
-	cases := []struct {
-		name         string
-		flatHD, flKV int
-		plc          string
-		hd, kv       int
-		err          string
-	}{
-		{name: "flat only", flatHD: 512, flKV: 1, hd: 512, kv: 1},
-		{name: "per_layer_config only", plc: `{"1":{"head_dim":64},"3":{"head_dim":64,"num_key_value_heads":2}}`, hd: 64, kv: 2},
-		{name: "null map", flatHD: 512, plc: `null`, hd: 512},
-		{name: "both agree", flatHD: 64, plc: `{"1":{"head_dim":64},"3":{"head_dim":64}}`, hd: 64},
-		{name: "both disagree", flatHD: 512, plc: `{"1":{"head_dim":64}}`, err: "disagrees"},
-		{name: "full layers differ", plc: `{"1":{"head_dim":64},"3":{"head_dim":128}}`, err: "different head_dim"},
-		{name: "sliding override", plc: `{"0":{"head_dim":64}}`, err: "sliding layer 0"},
-		{name: "unknown field", plc: `{"1":{"sliding_window":8}}`, err: `"sliding_window"`},
-		{name: "bad index", plc: `{"9":{"head_dim":64}}`, err: "not a layer index"},
-	}
-	for _, c := range cases {
-		cfg := &Config{NumLayers: len(types), LayerTypes: types, GlobalHeadDim: c.flatHD, NumGlobalKVHeads: c.flKV}
-		if c.plc != "" {
-			cfg.PerLayerConfig = json.RawMessage(c.plc)
-		}
-		hd, kv, err := cfg.gemma4GlobalGeometry()
-		switch {
-		case c.err != "":
-			if err == nil || !strings.Contains(err.Error(), c.err) {
-				t.Errorf("%s: err %v, want one containing %q", c.name, err, c.err)
-			}
-		case err != nil:
-			t.Errorf("%s: %v", c.name, err)
-		case hd != c.hd || kv != c.kv:
-			t.Errorf("%s: got (%d, %d), want (%d, %d)", c.name, hd, kv, c.hd, c.kv)
-		}
-	}
-}
-
 // TestGemma4EModel_residentEmbedRow is S1.2's check: the row a GPU backend receives for an E-model is
-// [h ‖ PLE inputs], ResidentEmbedLen() long, where h is the scaled token embedding and the tail matches HF's own
+// [h ‖ PLE inputs], EmbedLen() long, where h is the scaled token embedding and the tail matches HF's own
 // per-layer inputs (get_per_layer_inputs + project_per_layer_inputs, recorded by the pin script) at every prompt
 // position. The oracle is HF, not gemma4PLEInputs, so a helper that drifted from the CPU forward's old inline code
 // would show here even though both goinfer paths now share it. The reuse path (a caller-owned buffer)
@@ -190,9 +150,9 @@ func TestGemma4EModel_residentEmbedRow(t *testing.T) {
 	}
 	defer m.Close()
 	H := m.w.arch.HiddenDim
-	LP := m.w.arch.NumLayers * m.Gemma4PLEDimResident()
-	if LP != 6*32 || m.ResidentEmbedLen() != H+LP {
-		t.Fatalf("ResidentEmbedLen %d, PLE %d; want %d + %d", m.ResidentEmbedLen(), LP, H, 6*32)
+	LP := m.w.arch.NumLayers * m.BackendView().Gemma4PLEDim()
+	if LP != 6*32 || m.BackendView().EmbedLen() != H+LP {
+		t.Fatalf("EmbedLen %d, PLE %d; want %d + %d", m.BackendView().EmbedLen(), LP, H, 6*32)
 	}
 	var scratch []float32
 	worst := 0.0

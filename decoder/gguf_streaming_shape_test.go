@@ -5,11 +5,12 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// S2 (docs/tasks/task-never-swap-2026-09.md): a family's per-layer loader closure is safe to
+// S2: a family's per-layer loader closure is safe to
 // stream (build -> sink.layer -> release, the loadQ35/loadGptOss shape) only if EVERY tensor it reads is genuinely
 // per-layer: named "blk.{i}." + something, never a bare/model-level name.
 //
@@ -22,9 +23,19 @@ import (
 // checkpoint's numbers.
 func TestStreamableFamilyClosures_onlyReadPerLayerTensors(t *testing.T) {
 	fset := token.NewFileSet()
-	af, err := parser.ParseFile(fset, "gguf.go", nil, 0)
+	// The family closures live in gguf.go and in the gguf_build*.go family builders.
+	var files []*ast.File
+	names := []string{"gguf.go"}
+	builders, err := filepath.Glob("gguf_build*.go")
 	if err != nil {
-		t.Fatalf("parse gguf.go: %v", err)
+		t.Fatal(err)
+	}
+	for _, name := range append(names, builders...) {
+		af, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		files = append(files, af)
 	}
 	render := func(e ast.Expr) string {
 		var b strings.Builder
@@ -41,7 +52,7 @@ func TestStreamableFamilyClosures_onlyReadPerLayerTensors(t *testing.T) {
 	found := map[string]bool{}
 	for _, want := range families {
 		var lit *ast.FuncLit
-		ast.Inspect(af, func(n ast.Node) bool {
+		find := func(n ast.Node) bool {
 			asn, ok := n.(*ast.AssignStmt)
 			if !ok || len(asn.Lhs) != 1 || len(asn.Rhs) != 1 {
 				return true
@@ -56,9 +67,12 @@ func TestStreamableFamilyClosures_onlyReadPerLayerTensors(t *testing.T) {
 			}
 			lit = fl
 			return false
-		})
+		}
+		for _, af := range files {
+			ast.Inspect(af, find)
+		}
 		if lit == nil {
-			t.Errorf("%s: closure not found in gguf.go — this guard is watching nothing for this family", want)
+			t.Errorf("%s: closure not found in gguf.go or gguf_build*.go — this guard is watching nothing for this family", want)
 			continue
 		}
 		found[want] = true

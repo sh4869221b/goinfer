@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/townsendmerino/goinfer/decoder"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TestEncodeAhead — compares the synchronous forward vs the pipelined executor (encode-ahead),
@@ -15,7 +17,7 @@ import (
 // by hiding the ~0.9ms host encode bubble behind the previous token's GPU execution. Parity is
 // unchanged (same kernels); this only reorders when the encode happens.
 func TestEncodeAhead(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	path := os.ExpandEnv("$HOME/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf")
 	if _, err := os.Stat(path); err != nil {
 		t.Skipf("model not present: %v", path)
@@ -24,7 +26,7 @@ func TestEncodeAhead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("resident: %v", err)
 	}

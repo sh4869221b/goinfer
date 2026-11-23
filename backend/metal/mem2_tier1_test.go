@@ -10,14 +10,16 @@ import (
 	"time"
 
 	"github.com/townsendmerino/goinfer/internal/vision"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// TestMEM2_tier1Qwen3VL is MEM2-G4 (docs/tasks/task-memory-campaign-2026-10.md, MEM2 gates): the Qwen3-VL-2B tower on
+// TestMEM2_tier1Qwen3VL is MEM2-G4: the Qwen3-VL-2B tower on
 // Metal, float32. Tower A runs a 1080p grid and then a 4K grid; tower B runs the 4K grid alone. A's scratch after the 4K
 // forward (Metal's allocated size net of its reading after the build) is within 1% of B's, and after Close each is back
 // within 16 MiB of its reading before the build.
 func TestMEM2_tier1Qwen3VL(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	dir := os.ExpandEnv("$HOME/models/qwen3-vl-2b-instruct")
 	if _, err := os.Stat(dir); err != nil {
 		t.Skipf("no checkpoint at %s", dir)

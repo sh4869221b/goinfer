@@ -1,5 +1,4 @@
-// Package decidecmd is the goinfer-chat `decide` and `decisions-calibrate` subcommands (D1 of
-// docs/tasks/task-constrained-confidence.md): decisions by label-token scoring on a loaded model, one JSONL line
+// Package decidecmd is the goinfer-chat `decide` and `decisions-calibrate` subcommands: decisions by label-token scoring on a loaded model, one JSONL line
 // in and one out, and the per-kind temperature fit that makes their distributions calibrated in the fit's sense.
 //
 // A line in is a decision in the shape of SargeDev/jev-distill-corpus-v3's rows —
@@ -95,7 +94,7 @@ func newCommon(name, usage string) *common {
 	c.head = fs.String("head", "", "a trained decision head (Route B): a dir with judge_config.json, head.safetensors and calibration.json, "+
 		"such as autotrust's JEV-9B. --model must be its backbone; an unmerged head's adapter is merged at load. "+
 		"Without it, decisions are label-token scoring (Route A). With it, the model loads at "+decoder.DecisionHeadQuant+
-		" unless --quant is given (the default for decision models, D6b)")
+		" unless --quant is given (the default for decision models)")
 	c.out = fs.String("o", "", "output file (default stdout)")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), usage, filepath.Base(os.Args[0]))

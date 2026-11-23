@@ -20,7 +20,7 @@ import (
 	"github.com/townsendmerino/goinfer/internal/runtime/checkpoint"
 )
 
-// A safetensors checkpoint as a pull target (docs/tasks/task-checkpoint-fetch-2026-09.md). GGUF is one
+// A safetensors checkpoint as a pull target. GGUF is one
 // file; a safetensors checkpoint is a SET: config.json, the tokenizer files, and either
 // model.safetensors or an index plus the shards it names. decoder.Load already opens such a directory,
 // so this only gets the set onto disk, with the guarantees a single file has: every file

@@ -517,7 +517,7 @@ func Argmax(logits []float32) int {
 	return bi
 }
 
-// softmaxStable converts logits to probabilities (numerically stable). It always allocates; softmaxStableInto is the
+// SoftmaxStable converts logits to probabilities (numerically stable). It always allocates; softmaxStableInto is the
 // scratch-reusing sibling for per-token hot paths.
 func SoftmaxStable(logits []float32, temperature float64) []float64 {
 	return softmaxStableInto(logits, temperature, nil)
@@ -623,13 +623,7 @@ func topFilterLogits(logits []float32, temperature float64, topK int, topP, minP
 		cand = topKByLogit(logits, topK)
 	case minP > 0:
 		// e_i ≥ minP·e_max ⟺ logit_i ≥ maxL + T·ln(minP)  (e_max = 1 at the argmax).
-		thr := maxL + texp*math.Log(minP)
-		cand = candScratch[:0]
-		for i, v := range logits {
-			if float64(v) >= thr {
-				cand = append(cand, i)
-			}
-		}
+		cand = minPCandidates(logits, maxL+texp*math.Log(minP), candScratch)
 	case topPActive:
 		cand = topPCandidates(logits, texp, maxL, Z, topP)
 	default:

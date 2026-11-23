@@ -4,13 +4,14 @@ package metal
 
 import (
 	"fmt"
-	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 	"math"
-	"os"
 	"runtime"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/logs"
+	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 )
 
-// The greedy chain (docs/audit-metal-2026-09-30.md, C-B01; docs/tasks/task-metal-audit-2026-10.md, Phase 3 item 5).
+// The greedy chain (docs/audit-metal-2026-09-30.md).
 //
 // The pipelined executor (execLoop) pre-encodes token t+1 while t runs, but cannot commit it until t finishes: t+1's input is
 // the embedding of the token t's logits pick, and the host picks it, so between t's last kernel and t+1's first the GPU waits
@@ -58,7 +59,7 @@ var greedyChainOff = false
 
 // greedyChainWhyNot is why this resident cannot run the greedy chain ("" if it can). It covers what the GPU side needs
 // apart from the gather table, which chainEmbedTable prices and makes; the decoder adds what only it knows (its
-// embedding lookup has no multiplier, no adapter, no MC3).
+// embedding lookup has no multiplier, no adapter, no batched step).
 func (r *resident) greedyChainWhyNot() string {
 	switch {
 	case greedyChainOff:
@@ -100,7 +101,7 @@ func (r *resident) chainEmbedTable() (Buffer, Buffer, string) {
 		r.chainEmbTried = true
 		r.chainEmbW, r.chainEmbS, r.chainEmbWhy = r.buildChainEmbed()
 		if r.chainEmbWhy != "" {
-			fmt.Fprintf(os.Stderr, "metal: greedy chain off for this model: %s\n", r.chainEmbWhy)
+			logs.Warnf("metal: greedy chain off for this model: %s", r.chainEmbWhy)
 		}
 	}
 	return r.chainEmbW, r.chainEmbS, r.chainEmbWhy
@@ -131,6 +132,7 @@ func (r *resident) buildChainEmbed() (w, s Buffer, why string) {
 	defer pool.Drain()
 	defer func() {
 		if p := recover(); p != nil { // mustBuf panics on a failed allocation, as buildResident's callers recover
+			mem.RepanicBug(p)
 			w, s, why = Buffer{}, Buffer{}, fmt.Sprintf("allocating the untied head's device embedding table failed: %v", p)
 		}
 	}()
@@ -146,7 +148,7 @@ func (r *resident) chainStart(id, pos int) error {
 	return r.chainOpen(chainReq{op: chainOpStart, id: id, pos: pos})
 }
 
-// chainStartSampled opens a temperature-only chain (C-P02): each buffer ends with ForwardSample's draw (the full
+// chainStartSampled opens a temperature-only chain: each buffer ends with ForwardSample's draw (the full
 // LM-head row, then gumbel_stage1 and gumbel_stage2) instead of the argmax head. The forward at position pos draws with
 // (seed, draw), and each later one with the next draw, which is how decoder.Sampler.NextDraw advances (the seed fixed,
 // the draw counting up). chainNextSampled checks that against the decoder's own draw for every token.
@@ -173,21 +175,14 @@ func (r *resident) chainOpen(q chainReq) error {
 	}
 	r.stopExec() // the encode-ahead executor and any earlier chain
 	r.chainGW, r.chainGS = gw, gs
-	if r.chainTok[0] == (Buffer{}) {
-		for k := range r.chainSets {
-			r.chainTok[k] = NewBufferU32On(mem.LineScratch, r.d, 0)
-			r.chainSets[k] = posUniforms{NewBufferU32On(mem.LineScratch, r.d, 0), NewBufferU32On(mem.LineScratch, r.d, 1), NewBufferU32On(mem.LineScratch, r.d, 0),
-				NewBufferFloatsOn(mem.LineScratch, r.d, []float32{1}), NewBufferU32On(mem.LineScratch, r.d, 0)}
-		}
-	}
-	if q.sampled && r.chainLogits[0] == (Buffer{}) {
-		r.chainInvT, r.chainK0, r.chainK1 = NewBufferFloatsOn(mem.LineScratch, r.d, []float32{1}), NewBufferU32On(mem.LineScratch, r.d, 0), NewBufferU32On(mem.LineScratch, r.d, 0)
-		for k := range r.chainLogits {
-			r.chainLogits[k] = r.d.NewBufferLenOn(mem.LineScratch, r.V)
-			r.chainD0[k], r.chainD1[k] = NewBufferU32On(mem.LineScratch, r.d, 0), NewBufferU32On(mem.LineScratch, r.d, 0)
-		}
+	for _, sb := range r.chainBuffers(r.chainTok[0] == (Buffer{}), q.sampled && r.chainLogits[0] == (Buffer{})) {
+		sb.set(sb.alloc(r.d))
 	}
 	r.chainReq, r.chainResp, r.chainDone = make(chan chainReq), make(chan chainResp), make(chan struct{})
+	r.chainSlot, r.chainEnd = r.kvSlot, q.pos
+	if r.kvSlot < len(r.kvSlotSt) {
+		r.chainEnd = r.kvSlotSt[r.kvSlot].valid // until the first write maps (chainLoop's commit)
+	}
 	go r.chainLoop()
 	r.chainReq <- q
 	return (<-r.chainResp).err
@@ -214,7 +209,8 @@ func (r *resident) chainAsk(q chainReq) (int, error) {
 	return a.id, a.err
 }
 
-// stopChain closes the chain, if one is open, and blocks until no buffer of it is in flight.
+// stopChain closes the chain, if one is open, and blocks until no buffer of it is in flight. The slot's sequence then ends where its
+// caller's does (chainEnd): the look-ahead queued past the last token taken goes back, with any block it opened.
 func (r *resident) stopChain() {
 	if r.chainReq == nil {
 		return
@@ -222,6 +218,7 @@ func (r *resident) stopChain() {
 	close(r.chainReq)
 	r.chainReq = nil
 	<-r.chainDone
+	r.kvEndAt(r.chainSlot, r.chainEnd)
 }
 
 // chainFallbackAtForTest, when >= 0, makes the sampled chain's draw at that position read a row of -inf instead of the
@@ -300,10 +297,19 @@ func (r *resident) chainLoop() {
 	}
 	var fifo []inflight
 	next, sinceDrain := 0, 0
-	sampled, pos0, draw0 := false, 0, uint64(0)
+	sampled, pos0, draw0, started := false, 0, uint64(0), false
+	var kvErr error // a block the next forward needed could not be had: speculation stops, and the request that reaches it says why
 	commit := func() {
-		if next >= r.ctxCap { // nothing to speculate into: the next position is past the resident KV
+		if next >= r.ctxCap || kvErr != nil { // nothing to speculate into: the next position is past the resident KV, or its block
 			return
+		}
+		// The chain maps a block as its forward enters it. The forwards in flight read only this slot's blocks below next, and a take
+		// for a position past the prompt is a fresh block, never a copy into one they read.
+		if kvErr = r.kvWrite(r.kvSlot, next, next+1); kvErr != nil {
+			return
+		}
+		if next == pos0 {
+			r.chainEnd = pos0
 		}
 		k := next & 1
 		r.writePosUniforms(r.chainSets[k], next, next)
@@ -364,7 +370,11 @@ func (r *resident) chainLoop() {
 	for q := range r.chainReq {
 		switch q.op {
 		case chainOpStart:
-			drain()
+			if started { // a loop starts once: chainOpen opens a fresh one, after stopChain has ended the old one's slot
+				r.chainResp <- chainResp{err: fmt.Errorf("metal: greedy chain: already started")}
+				continue
+			}
+			started = true
 			next, sampled, pos0, draw0 = q.pos, q.sampled, q.pos, q.draw
 			if sampled {
 				r.chainInvT.Floats()[0] = q.invT
@@ -378,8 +388,16 @@ func (r *resident) chainLoop() {
 			commit()
 			r.chainResp <- chainResp{}
 		case chainOpNext:
+			if len(fifo) == 0 && kvErr != nil {
+				kvErr = nil // the look-ahead found no block; one may be had now
+				commit()
+			}
 			if len(fifo) == 0 {
-				r.chainResp <- chainResp{err: fmt.Errorf("metal: greedy chain: no forward in flight")}
+				err := kvErr
+				if err == nil {
+					err = fmt.Errorf("metal: greedy chain: no forward in flight")
+				}
+				r.chainResp <- chainResp{err: err}
 				continue
 			}
 			if q.sampled != sampled {
@@ -396,7 +414,7 @@ func (r *resident) chainLoop() {
 				drain()
 				id := 0
 				if err == nil {
-					id = pick(f)
+					id, r.chainEnd = pick(f), f.pos+1
 					if len(fifo) == 0 {
 						commit()
 					}
@@ -408,7 +426,7 @@ func (r *resident) chainLoop() {
 			f, err := oldest()
 			id := 0
 			if err == nil {
-				id = pick(f)
+				id, r.chainEnd = pick(f), f.pos+1
 			}
 			r.chainResp <- chainResp{id: id, err: err}
 		case chainOpStop:

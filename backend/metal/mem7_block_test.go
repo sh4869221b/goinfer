@@ -17,7 +17,7 @@ import (
 	"github.com/townsendmerino/goinfer/tokenizer"
 )
 
-// TestMEM7_blockFitsTheBudget is BLK-G2 (docs/tasks/task-memory-campaign-2026-10.md, MEM7 gates): the block is the rows
+// TestMEM7_blockFitsTheBudget is BLK-G2: the block is the rows
 // that fit what the memory guard's budget leaves after the need, capped at prefillBlockScratch and floored at
 // prefillBlockRowsMin; the cases that report no block still report none.
 func TestMEM7_blockFitsTheBudget(t *testing.T) {
@@ -54,19 +54,20 @@ func TestMEM7_blockFitsTheBudget(t *testing.T) {
 		t.Errorf("PrefillBlockRows = %d with --exact-prefill, want 0", got)
 	}
 	// An int8 cache takes the pass (P3b-2): it gets a block, and a row costs what it does at f16 plus the fixed dequantize
-	// scratch (kvI8ScratchRows positions of K and V at f16).
+	// scratch (kvI8ScratchRows positions of K and V at f16) and the identity table its readers take over it (kvIdentityTab).
 	f16Price := a.PrefillScratchBytes(256)
 	r.kvI8 = true
 	if got := a.PrefillBlockRows(); got <= 0 {
 		t.Errorf("PrefillBlockRows = %d with an int8 KV cache, want a block", got)
 	}
-	if got, want := a.PrefillScratchBytes(256)-f16Price, 4*int64(r.kvI8ScratchRows())*int64(r.prefillGeom().kvDim); got != want {
-		t.Errorf("an int8 cache adds %d bytes of prefill scratch, want %d (the dequantize scratch)", got, want)
+	want := 4*int64(r.kvI8ScratchRows())*int64(r.prefillGeom().kvDim) + 4*int64(kvBlocksFor(r.kvI8ScratchRows()))
+	if got := a.PrefillScratchBytes(256) - f16Price; got != want {
+		t.Errorf("an int8 cache adds %d bytes of prefill scratch, want %d (the dequantize scratch and its identity table)", got, want)
 	}
 	r.kvI8 = false
 }
 
-// TestMEM7_speedSmallBlock is BLK-G3 (docs/tasks/task-memory-campaign-2026-10.md, MEM7 gates): on Qwen2.5-Coder-1.5B from
+// TestMEM7_speedSmallBlock is BLK-G3: on Qwen2.5-Coder-1.5B from
 // ~/models, a 12,288-token prose prompt's resident prefill with today's block (the rows prefillBlockScratch holds) against the
 // rows a 128 MiB budget gives, five alternating pairs after a warm-up pair, in one process. A timed run: hold the timing lock.
 //

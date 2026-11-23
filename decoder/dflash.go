@@ -13,6 +13,7 @@ import (
 
 	"github.com/townsendmerino/aikit/embed"
 	"github.com/townsendmerino/aikit/linalg"
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
 // DFlashDrafter is an imported z-lab DFlash block drafter (docs/spec/08): a small non-causal transformer trunk that
@@ -65,7 +66,7 @@ func (d *DFlashDrafter) DraftTokenID(be Backend, h []float32) int {
 	d.mustHoldWeights()
 	logits := make([]float32, d.draftVocab)
 	matmul(be, &d.lmHead, h, logits, 1)
-	i := argmax(logits)
+	i := sampling.Argmax(logits)
 	return i + int(d.d2t[i])
 }
 
@@ -104,7 +105,7 @@ func (d *DFlashDrafter) DraftIDs(m *Model, rows [][]float32) []int {
 		if d.HasOwnHead() {
 			out[i] = d.DraftTokenID(m.be, h)
 		} else {
-			out[i] = argmax(m.DrafterHeadLogits(h))
+			out[i] = sampling.Argmax(m.DrafterHeadLogits(h))
 		}
 	}
 	return out
@@ -441,9 +442,9 @@ func loadDFlashDrafter(dir string, streamed bool) (*DFlashDrafter, error) {
 	if c.DFlash.ConvKernelSize > 0 || c.DFlash.SelectorRank > 0 {
 		return nil, fmt.Errorf("dflash: %s is a DFlash 2 checkpoint (conv_kernel_size=%d, "+
 			"selector_rank=%d) and this loader implements v1 — it would load and silently ignore "+
-			"the dynamic-conv and candidate-selector weights (23.8%% of the file on the released "+
-			"Qwen3.8-27B pair), giving a drafter that verifies losslessly but drafts worse than v1. "+
-			"DFlash 2 support is queued as P15", dir, c.DFlash.ConvKernelSize, c.DFlash.SelectorRank)
+			"the dynamic-conv and candidate-selector weights, giving a drafter that verifies losslessly "+
+			"but drafts worse than v1. DFlash 2 is not supported yet (docs/spec/08-dspark-dflash.md, "+
+			"section \"DFlash 2\")", dir, c.DFlash.ConvKernelSize, c.DFlash.SelectorRank)
 	}
 	// speculators dialect: the layer geometry lives one level down. Decode it into
 	// the SAME struct so every field below is read once, from one place, whichever
@@ -533,7 +534,7 @@ func loadDFlashDrafter(dir string, streamed bool) (*DFlashDrafter, error) {
 			d.rows[dst] = r
 			return nil
 		}
-		m, err := stIsland(st, name, rows, cols) // unquantized: a bf16 checkpoint's bits stay bf16, mapped (MEM11-bf16)
+		m, err := stIsland(st, name, rows, cols) // unquantized: a bf16 checkpoint's bits stay bf16, mapped
 		if err != nil {
 			return fmt.Errorf("dflash: %w", err)
 		}

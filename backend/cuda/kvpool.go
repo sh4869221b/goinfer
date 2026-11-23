@@ -3,22 +3,23 @@
 package cuda
 
 import (
+	"errors"
 	"fmt"
-	"os"
-	"strings"
 
 	gpu "github.com/townsendmerino/goinfer/backend/cuda/internal/gpudev"
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/internal/runtime/logs"
 	"github.com/townsendmerino/goinfer/internal/runtime/mem"
+	"github.com/townsendmerino/goinfer/internal/runtime/program"
 )
 
-// Paged KV storage (docs/tasks/task-kv-architecture-2026-10.md §5.3, KV4). Every layer that keeps K/V holds them in a pool of
+// Paged KV storage. Every layer that keeps K/V holds them in a pool of
 // kvBlock-row blocks, [blocks][kvBlock][kvDim], one allocation per layer for K and one for V. A layer belongs to one group: the full
 // group keeps every position (full attention, MLA latent rows), the window group keeps what a sliding window and the rollback need
 // (kvwindow.go). A block id names the same block in every layer of its group. Block 0 of every pool is zero-filled and never handed
 // out: an entry a sequence has not mapped, or has released, points at it.
 //
-// A resident KV slot (MC1) is a sequence's tables, one per group: the block id of each kvBlock positions of the sequence. They live on
+// A resident KV slot is a sequence's tables, one per group: the block id of each kvBlock positions of the sequence. They live on
 // the host and are mirrored to one device buffer, which every KV kernel reads through kvpage.cuh's KV_ROW. A block counts the tables
 // that name it: a full-group block another slot's prefix shares (CopyKV, kvShare) has more than one, and a slot that is about to write
 // into such a block first takes a block of its own and copies the rows it keeps (kvMap), so a slot only ever writes blocks no other
@@ -42,8 +43,8 @@ type kvPool struct {
 	refs   []int32 // the tables that name each block
 }
 
-// kvPoolOrderForTest, when set, gives the order a pool of n blocks hands its blocks out in (ids 1..n-1, each once). G1a's scrambled
-// tables (docs/measurements/kv4-cuda-2026-10-21.md) use it; nil hands out ascending ids.
+// kvPoolOrderForTest, when set, gives the order a pool of n blocks hands its blocks out in (ids 1..n-1, each once).
+// TestKV4_scrambledTables uses it; nil hands out ascending ids.
 var kvPoolOrderForTest func(n int) []int32
 
 func newKVPool(blocks int) kvPool {
@@ -147,9 +148,9 @@ func (r *cudaResident) kvWithinShare(s int, cow bool) bool {
 	return held < r.kvShareBlocks || (cow && held <= r.kvShareBlocks)
 }
 
-// kvTake hands slot s a block of group g. When none is free it releases idle slots' blocks, least recently used first (D5's step 1); a
+// kvTake hands slot s a block of group g. When none is free it releases idle slots' blocks, least recently used first; a
 // slot within its share then takes back what a running borrower holds past its share, which stops that borrower (kvReclaim). A slot past
-// its share that still finds no block gets decoder.ErrKVPoolFull: only a borrower is ever stopped (D-KV4-2), and it ends as at the context
+// its share that still finds no block gets decoder.ErrKVPoolFull: only a borrower is ever stopped, and it ends as at the context
 // cap. The window group's pool holds every slot's most, so it never runs short.
 func (r *cudaResident) kvTake(s, g int, cow bool) (int32, error) {
 	if kvTakeFailForTest != nil && kvTakeFailForTest(s) {
@@ -196,17 +197,18 @@ func (r *cudaResident) kvReclaim(s int) bool {
 	r.kvTabs[best].dirty[kvGroupFull] = true
 	r.kvStopped[best], r.kvStepAbort = true, true
 	r.kvValid[best] = min(r.kvValid[best], r.kvShareBlocks*kvBlock)
-	fmt.Fprintf(os.Stderr, "cuda: KV pool: stopped slot %d, %d blocks past its share of %d, for slot %d within its share\n", best, most, r.kvShareBlocks, s)
+	logs.Warnf("cuda: KV pool: stopped slot %d, %d blocks past its share of %d, for slot %d within its share", best, most, r.kvShareBlocks, s)
 	return true
 }
 
-// kvEvictIdle releases every block of the least recently written slot that is not s, not bound, not held by a running generation
+// kvEvictIdle releases every block of the least recently written slot that is not s (the slot being written: a batched step writes through
+// each row's slot and leaves the binding where it was, so the bound slot is no shield), not held by a running generation
 // (kvSlotBusy) and holds any, and marks it released, so it answers 0 to every reuse question until it starts a new sequence. False
 // when there is none.
 func (r *cudaResident) kvEvictIdle(s int) bool {
 	best := -1
 	for t := range r.kvTabs {
-		if t == s || t == r.kvSlot || r.kvSlotBusy[t] || (r.kvHeld(t) == 0 && !r.kvHoldsWindow(t)) {
+		if t == s || r.kvSlotBusy[t] || (r.kvHeld(t) == 0 && !r.kvHoldsWindow(t)) {
 			continue
 		}
 		if best < 0 || r.kvSlotUse[t] < r.kvSlotUse[best] {
@@ -224,7 +226,7 @@ func (r *cudaResident) kvEvictIdle(s int) bool {
 	if r.kvDemoted[best] == nil {
 		r.kvValid[best] = 0
 	}
-	fmt.Fprintf(os.Stderr, "cuda: KV pool: released slot %d's %d blocks (idle, the least recently used) for slot %d, which is past its share of %d\n",
+	logs.Debugf("cuda: KV pool: released slot %d's %d blocks (idle, the least recently used) for slot %d, which is past its share of %d",
 		best, n, s, r.kvShareBlocks)
 	return true
 }
@@ -239,7 +241,7 @@ func (r *cudaResident) kvHoldsWindow(s int) bool {
 	return false
 }
 
-// SetKVSlotBusy implements decoder.ResidentKVSlotActivity.
+// SetKVSlotBusy implements decoder.ResidentKVSubsystem.
 func (r *cudaResident) SetKVSlotBusy(slot int, busy bool) {
 	_ = r.do(func() error {
 		if slot >= 0 && slot < len(r.kvSlotBusy) {
@@ -267,7 +269,7 @@ func kvWindowBlocks(ctxCap, held int) int {
 // kvPoolBlocks is group g's pool: every slot's largest need, plus the null block.
 func (r *cudaResident) kvPoolBlocks(g, slots int) int { return slots*r.kvSlotBlocks(g) + 1 }
 
-// kvT is layer l's table in the slot whose K/V the kernels are addressing (kvTabSlot: the bound slot, or an MC3 row's).
+// kvT is layer l's table in the slot whose K/V the kernels are addressing (kvTabSlot: the bound slot, or a batched step row's).
 func (r *cudaResident) kvT(l int) Buffer { return r.kvTabBuf(r.kvTabSlot, r.kvGroupOf(l)) }
 
 // kvTabBuf is slot s's group-g table on the device.
@@ -275,8 +277,8 @@ func (r *cudaResident) kvTabBuf(s, g int) Buffer {
 	return r.kvTabDev.At((s*kvGroups + g) * r.kvMaxBlocks() * 4)
 }
 
-// kvAllocPools allocates every owning layer's pools and every slot's tables for slots slots, and zeroes the null blocks. It replaces the
-// per-slot buffers MC1 used to allocate; the caller has run checkKVFits and kvWindowSetup.
+// kvAllocPools allocates every owning layer's pools and every slot's tables for slots slots, and zeroes the null blocks. The
+// caller has run checkKVFits and kvWindowSetup.
 func (r *cudaResident) kvAllocPools(slots int) error {
 	defer r.onLine(mem.LineKV)()
 	r.kvPools = [kvGroups]kvPool{newKVPool(r.kvPoolBlocks(kvGroupFull, slots)), newKVPool(r.kvPoolBlocks(kvGroupWin, slots))}
@@ -291,6 +293,9 @@ func (r *cudaResident) kvAllocPools(slots int) error {
 			continue
 		}
 		r.kc[l], r.vc[l] = r.akv(l, rows*Ly.kvDim), r.akv(l, rows*Ly.kvDim)
+		if Ly.kvI8 {
+			r.ksc[l], r.vsc[l] = r.akvScales(rows*Ly.nKV), r.akvScales(rows*Ly.nKV)
+		}
 	}
 	for l := range r.layers {
 		if r.layers[l].kvShared {
@@ -305,7 +310,7 @@ func (r *cudaResident) kvAllocPools(slots int) error {
 	}
 	r.kvTabDev = r.ai(slots * kvGroups * r.kvMaxBlocks())
 	if r.kvTabStage == nil {
-		stage, e := gpu.NewHostBufferOn[uint8](r.dev, mem.LineKV, kvTabRing*r.kvMaxBlocks()*4)
+		stage, e := gpu.NewHostBufferOn[uint8](r.dev, mem.LineStaging, kvTabRing*r.kvMaxBlocks()*4)
 		if e != nil {
 			return e
 		}
@@ -342,16 +347,86 @@ func (r *cudaResident) kvZeroNullBlocks() error {
 				return e
 			}
 		}
+		if Ly.kvI8 { // a null row reads 0 x its scale: zero the scales too, so it reads 0 as the f32 null block does
+			for _, b := range []Buffer{r.ksc[l], r.vsc[l]} {
+				if e := r.stream.ZeroAsync(b, kvBlock*Ly.nKV*4); e != nil {
+					return e
+				}
+			}
+		}
 	}
 	return nil
 }
 
-// kvElem is the bytes of one cached element of layer l: 4, or 2 for an f16 layer. An MLA latent row is f32.
+// kvElem is the bytes of one cached element of layer l: 4, 2 for an f16 layer, or 1 for an int8 one (whose scales are in ksc/vsc). An MLA
+// latent row is f32.
 func (r *cudaResident) kvElem(l int) int {
-	if r.layers[l].kvHalf {
+	switch {
+	case r.layers[l].kvI8:
+		return 1
+	case r.layers[l].kvHalf:
 		return 2
 	}
 	return 4
+}
+
+// kvCheckDeclared holds layer l's declared per-position rows (decoder.Model.LayerBuffers) to what its kernels address, before its pools
+// are sized from its geometry: K and V of kvDim elements in nKV heads at the KV precision, with the layer's window; on an MLA layer one
+// latent of kvDim elements declared f32, which CUDA holds at the cache's precision but never int8; none on a layer that reads another's
+// KV or keeps none. A row missing, extra, declared twice, or of another width, head count, precision or window is refused: the plan
+// prices the declaration, so pools sized otherwise would not be what fit priced.
+func kvCheckDeclared(l int, bufs []program.Buf, Ly *cudaLayer) error {
+	rows := map[string]program.Buf{}
+	for _, b := range bufs {
+		if b.Unit != program.PerPosition {
+			continue
+		}
+		if _, again := rows[b.Name]; again {
+			return fmt.Errorf("cuda: layer %d: the program declares %s rows twice", l, b.Name)
+		}
+		rows[b.Name] = b
+	}
+	need := map[string]program.Buf{}
+	switch {
+	case Ly.kvShared || Ly.noKV() || Ly.kvDim == 0:
+	case Ly.isMLA():
+		if Ly.kvI8 {
+			return fmt.Errorf("cuda: layer %d: the program declares an f32 latent, which CUDA holds at f16 or f32, on an int8 cache", l)
+		}
+		need["latent"] = program.Buf{Prec: program.PrecF32, Elems: Ly.kvDim}
+	default:
+		kv := program.Buf{Prec: program.PrecKV, Elems: Ly.kvDim, Heads: Ly.nKV, Window: int(Ly.window)}
+		need["k"], need["v"] = kv, kv
+	}
+	for name, b := range rows {
+		w, ok := need[name]
+		switch {
+		case !ok:
+			return fmt.Errorf("cuda: layer %d: the program declares %s rows, which its kernels have no pool for", l, name)
+		case b.Elems != w.Elems || b.Prec != w.Prec || b.Window != w.Window || (w.Heads > 0 && b.Heads != w.Heads):
+			return fmt.Errorf("cuda: layer %d: the program declares %s rows of %d elements in %d heads at precision %d, window %d; the kernels address %d in %d at %d, window %d",
+				l, name, b.Elems, b.Heads, b.Prec, b.Window, w.Elems, w.Heads, w.Prec, w.Window)
+		}
+	}
+	for name := range need {
+		if _, ok := rows[name]; !ok {
+			return fmt.Errorf("cuda: layer %d: the program declares no %s rows", l, name)
+		}
+	}
+	return nil
+}
+
+// kvRowBytes is the device bytes of one position's K (or V, or MLA latent) row of a layer: kvDim elements, and on an int8 layer one f32
+// scale per KV head in its scale pool. decoder.cudaKVRowBytes prices the same from the declared row, which kvCheckDeclared holds to
+// this layer.
+func kvRowBytes(Ly *cudaLayer) int64 {
+	switch {
+	case Ly.kvI8:
+		return int64(Ly.kvDim) + 4*int64(Ly.nKV)
+	case Ly.kvHalf:
+		return 2 * int64(Ly.kvDim)
+	}
+	return 4 * int64(Ly.kvDim)
 }
 
 // kvMap gives slot s's group-g table a block of its own for every kvBlock positions overlapping [lo, hi), which the caller is about to
@@ -416,6 +491,14 @@ func (r *cudaResident) kvCopyBlockRows(g int, from, to int32, rows int) error {
 			}
 			if e := r.copyF32(b.At(int(from)*kvBlock*row), b.At(int(to)*kvBlock*row), rows*row/4); e != nil {
 				return e
+			}
+		}
+		if Ly.kvI8 { // the rows' scales go with them
+			srow := Ly.nKV * 4
+			for _, b := range []Buffer{r.ksc[l], r.vsc[l]} {
+				if e := r.copyF32(b.At(int(from)*kvBlock*srow), b.At(int(to)*kvBlock*srow), rows*Ly.nKV); e != nil {
+					return e
+				}
 			}
 		}
 	}
@@ -542,15 +625,11 @@ func kvPoolNullBytes(layers []cudaLayer) int64 {
 		if Ly.kvShared || Ly.kvDim == 0 || Ly.noKV() {
 			continue
 		}
-		elem := int64(4)
-		if Ly.kvHalf {
-			elem = 2
-		}
 		if Ly.isMLA() {
-			n += kvBlock * int64(Ly.kvDim) * elem
+			n += kvBlock * kvRowBytes(Ly)
 			continue
 		}
-		n += 2 * kvBlock * int64(Ly.kvDim) * elem
+		n += 2 * kvBlock * kvRowBytes(Ly)
 	}
 	return n
 }
@@ -567,7 +646,7 @@ func (r *cudaResident) kvAllocPoolsFit() error {
 		}
 		if ok {
 			if n < want {
-				fmt.Fprintf(os.Stderr, "cuda: %d of %d resident KV slots granted: the device ran out of memory allocating the KV pools beside the build's own scratch\n", n, want)
+				logs.Warnf("cuda: %d of %d resident KV slots granted: the device ran out of memory allocating the KV pools beside the build's own scratch", n, want)
 			}
 			r.kvSlotsN = n
 			return r.kvAfterRaise()
@@ -576,11 +655,16 @@ func (r *cudaResident) kvAllocPoolsFit() error {
 	return fmt.Errorf("cuda: the device ran out of memory allocating one KV slot's pools")
 }
 
+// allocFailureForTest is what a test seam that stands in an out-of-memory device panics with: the allocator's own failure value.
+func allocFailureForTest() *gpu.AllocFailure {
+	return gpu.AllocFailedPanic("test seam", 0, errors.New("cuMemAlloc_v2: CUDA_ERROR_OUT_OF_MEMORY"))
+}
+
 // kvTryAllocPools is one kvAllocPools attempt; ok=false, with everything it allocated released, on a device allocation failure.
 func (r *cudaResident) kvTryAllocPools(slots int) (ok bool, err error) {
 	defer func() {
 		if v := recover(); v != nil {
-			if !strings.Contains(fmt.Sprint(v), "device allocation failed") {
+			if !mem.DeviceAllocFailed(v) {
 				panic(v)
 			}
 			r.kvReleasePools()
@@ -588,7 +672,7 @@ func (r *cudaResident) kvTryAllocPools(slots int) (ok bool, err error) {
 		}
 	}()
 	if kvSlotAllocFailAtForTest > 0 && slots > kvSlotAllocFailAtForTest {
-		panic("cuda: device allocation failed (test seam): cuMemAlloc_v2: CUDA_ERROR_OUT_OF_MEMORY")
+		panic(allocFailureForTest())
 	}
 	if r.kvWin {
 		r.kvBases = make([]int, slots)
@@ -618,7 +702,7 @@ func (r *cudaResident) kvReleasePools() {
 			r.kc[l], r.vc[l] = Buffer{}, Buffer{}
 		}
 	}
-	for _, set := range [][]Buffer{r.kc, r.vc} {
+	for _, set := range [][]Buffer{r.kc, r.vc, r.ksc, r.vsc} {
 		for l := range set {
 			if set[l].Len() > 0 {
 				r.dev.ReleaseBuf(set[l])
@@ -644,7 +728,7 @@ func (r *cudaResident) kvAfterRaise() error {
 		r.dev.ReleaseBuf(r.skScoreBuf)
 		r.skScoreBuf = r.af(r.nH * r.ctxCap)
 	}
-	fmt.Fprint(os.Stderr, r.kvPoolLine())
+	logs.InfoText(r.kvPoolLine())
 	return nil
 }
 
@@ -654,13 +738,13 @@ func (r *cudaResident) kvPoolLine() string {
 		r.kvSlotsN*r.kvShareBlocks*kvBlock, r.kvSlotsN*r.kvShareBlocks, kvBlock, r.kvSlotsN, r.ctxCap, r.kvShareCtx)
 }
 
-// KVPool implements decoder.ResidentKVPoolInfo: the context positions across every slot (the figure kvPoolLine and the plan name, a
+// KVPool implements decoder.ResidentKVSubsystem: the context positions across every slot (the figure kvPoolLine and the plan name, a
 // windowed layer serving them from fewer rows), each slot's guaranteed share, the groups the owning layers use, the rows a window
 // group keeps per conversation, the pools' precision and their device bytes (each owning layer's K and V pools and the block tables,
 // at the driver's charge).
 func (r *cudaResident) KVPool() decoder.KVPoolDetail {
 	d := decoder.KVPoolDetail{Positions: r.KVSlots() * r.kvShareBlocks * kvBlock, Guaranteed: r.kvShareCtx, BlockRows: kvBlock}
-	half, single := false, false
+	half, single, i8 := false, false, false
 	var inGroup [kvGroups]bool
 	for l := range r.layers {
 		Ly := &r.layers[l]
@@ -669,9 +753,13 @@ func (r *cudaResident) KVPool() decoder.KVPoolDetail {
 		}
 		inGroup[r.kvGroupOf(l)] = true
 		elem := int64(4)
-		if Ly.kvHalf {
+		switch {
+		case Ly.kvI8:
+			elem, i8 = 1, true
+			d.Bytes += chargedBytes(int64(r.ksc[l].Len())*4) + chargedBytes(int64(r.vsc[l].Len())*4)
+		case Ly.kvHalf:
 			elem, half = 2, true
-		} else {
+		default:
 			single = true
 		}
 		d.Bytes += chargedBytes(int64(r.kc[l].Len()) * elem)
@@ -688,6 +776,8 @@ func (r *cudaResident) KVPool() decoder.KVPoolDetail {
 		d.WindowRows = r.kvSlotBlocks(kvGroupWin) * kvBlock
 	}
 	switch {
+	case i8:
+		d.Precision = "i8"
 	case half && single:
 		d.Precision = "f16 and f32"
 	case half:

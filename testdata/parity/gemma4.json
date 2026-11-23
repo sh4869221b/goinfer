@@ -8,13 +8,14 @@
     "decoder/forward_gemma4.go",
     "decoder/arch_gemma4.go",
     "decoder/forward_gemma4_moe.go",
-    "decoder/program_cpu_n_gemma4.go"
+    "decoder/program_cpu_n_gemma4.go",
+    "decoder/gguf_build_gemma4.go"
   ],
   "programs": [
     "testdata/gemma4-moe-kv-tiny",
     "testdata/gemma4-moe-kv-tiny32"
   ],
-  "deps_hash": "sha256:dd23fe946a50311536230b6de4389c23f514cc5caf60f885f2f15b3532049f24",
+  "deps_hash": "sha256:ed1c3731c764774870e109494d165ec73e44a3553a7f520cb9ea652c157766a6",
   "status": "validated",
   "validated_at": "310a2e44",
   "date": "2026-09-28",

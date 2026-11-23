@@ -42,9 +42,11 @@ func TestWebGPU_ForwardNoLogits_byteIdenticalKV(t *testing.T) {
 				t.Fatalf("model not resident: %s", m.ResidentDecline())
 			}
 
-			kvOnly, ok := rf.(decoder.ResidentPrefillKV)
+			kvOnly := decoder.SubsystemsOf(rf).Decode
+
+			ok := kvOnly.NoLogitsAvailable()
 			if !ok {
-				t.Fatalf("residentDecoder does not implement decoder.ResidentPrefillKV")
+				t.Fatalf("residentDecoder does not implement decoder.ResidentDecodeSubsystem")
 			}
 
 			prompt := []int{2, 7, 13, 5, 19, 11, 23, 17, 3, 29}
@@ -189,8 +191,8 @@ func TestWebGPU_Generate_KVOnlyMatchesFull(t *testing.T) {
 				}
 				defer m.Close()
 
-				if _, ok := m.ResidentForwardForTest().(decoder.ResidentPrefillKV); !ok {
-					t.Fatal("residentDecoder does not implement decoder.ResidentPrefillKV")
+				if ok := decoder.SubsystemsOf(m.ResidentForwardForTest()).Decode.NoLogitsAvailable(); !ok {
+					t.Fatal("residentDecoder does not implement decoder.ResidentDecodeSubsystem")
 				}
 
 				ch, _ := m.Generate(context.Background(), prompt, genCount, greedy)
@@ -237,9 +239,10 @@ func BenchmarkWebGPU_Prefill_KVOnlyVsFull(b *testing.B) {
 	defer m.Close()
 
 	rf := m.ResidentForwardForTest()
-	kvOnly, ok := rf.(decoder.ResidentPrefillKV)
+	kvOnly := decoder.SubsystemsOf(rf).Decode
+	ok := kvOnly.NoLogitsAvailable()
 	if !ok {
-		b.Fatal("not ResidentPrefillKV")
+		b.Fatal("not ResidentDecodeSubsystem")
 	}
 
 	const promptLen = 16

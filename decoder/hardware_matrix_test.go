@@ -1,6 +1,6 @@
 package decoder
 
-// Generated model × hardware matrix (docs/completed/task-hardware-matrix.md).
+// Generated model × hardware matrix.
 //
 // Mirrors capability_matrix_test.go's registry walk, but the columns are one thing: does each
 // backend run each family on its RESIDENT (GPU) decode path? The cells are 100% derived from
@@ -161,8 +161,8 @@ func renderHardwareMD(rows []hwRow, verified string) []byte {
 	b.WriteString("  (Metal's builder still declines Granite-4.0-H, backend/metal/mamba.go:buildMamba, until its own resident gate).\n")
 	b.WriteString("- **Nemotron-H's row is generated from a DENSE representative config.** Real, downloadable\n")
 	b.WriteString("  Nemotron 3 Nano and 3.5 Lightning checkpoints add a fourth per-layer block kind (MoE\n")
-	b.WriteString("  FFN) this representative config never exercises — WebGPU implements it (G7 part 2,\n")
-	b.WriteString("  docs/tasks/task-gpu-paths-2026-09.md); CUDA and Metal still decline it, CPU-only. `DecodePath()`\n")
+	b.WriteString("  FFN) this representative config never exercises — WebGPU implements it (G7 part 2);\n")
+	b.WriteString("  CUDA and Metal still decline it, CPU-only. `DecodePath()`\n")
 	b.WriteString("  names this specific per-checkpoint gap for a loaded model; this table cannot, since its\n")
 	b.WriteString("  rows are one per architecture, not per checkpoint.\n")
 	b.WriteString("- **Gemma 4's row is generated from a representative that is not an E-model.** The small E-models\n")
@@ -177,7 +177,7 @@ func renderHardwareMD(rows []hwRow, verified string) []byte {
 	b.WriteString("  kernels is exact at position 0 and wrong from position 1 with no error (measured 2026-10-01 on the\n")
 	b.WriteString("  CUDA resident before its pairwise kernels existed: real Command-R7B and Aya-expanse-8B at int4, worst\n")
 	b.WriteString("  per-position cosine -0.075 / -0.041 against the CPU). CUDA has `backend/cuda/rope_pairwise.cu` and Metal its\n")
-	b.WriteString("  twins since 2026-10-09 (docs/tasks/task-metal-pairwise-rope-2026-10.md); a WebGPU row returns once it\n")
+	b.WriteString("  twins since 2026-10-09; a WebGPU row returns once it\n")
 	b.WriteString("  has pairwise rope kernels and a resident-vs-CPU gate on peaked attention.\n")
 	b.WriteString(renderHardwareWhy(rows))
 	b.WriteString(verified)
@@ -230,8 +230,9 @@ func renderHardwareWhy(rows []hwRow) string {
 		b.WriteString("(`internal/runtime/modelload/modelload.go:activationSafeQuant`):\n\n")
 		b.WriteString("- **CUDA:** a GGUF loads at `--quant q4k` by default and runs resident. Any other source loads at int8int8 with\n")
 		b.WriteString("  per-32 activation scales, which CUDA's residency also implements.\n")
-		b.WriteString("- **Metal:** resident only with an explicit `--quant q4k`. The default load is int8int8 with per-32 activation\n")
-		b.WriteString("  scales, which Metal's resident projections do not implement, so it runs on the CPU.\n")
+		b.WriteString("- **Metal:** a GGUF loads at `--quant q4k` by default and runs resident on the q4k lane, which quantizes no\n")
+		b.WriteString("  activation. Any other source loads at int8int8 with per-32 activation scales, which Metal's resident projections do\n")
+		b.WriteString("  not implement, so it runs on the CPU.\n")
 		b.WriteString("- **WebGPU:** neither; the CPU.\n")
 	}
 	return b.String()
@@ -360,7 +361,7 @@ func TestHardwareMatrix_declineReasonsNotHidden(t *testing.T) {
 	}
 }
 
-// Verified on (hardware-coverage H6, docs/tasks/task-hardware-coverage-2026-10.md): the table above is CAPABILITY. This section is what has actually RUN, generated from the H0 census
+// Verified on: the table above is CAPABILITY. This section is what has actually RUN, generated from the H0 census
 // (docs/hardware-coverage.json), so it cannot say more than the census records and goes stale, and red here, the moment a record is added. The census is per hardware-selected code path, not
 // per model family, so the section is a machine table and a never-executed list, not a per-family column; a per-family cell would have to be invented.
 type censusFile struct {

@@ -2,8 +2,7 @@ package sampling
 
 import "math"
 
-// TopKRow is one decode step's logits row reduced on-device to its K best entries (R7,
-// docs/tasks/red-october.md). IDs/Logits are ordered (logit DESCENDING, token id ASCENDING) — the tie
+// TopKRow is one decode step's logits row reduced on-device to its K best entries. IDs/Logits are ordered (logit DESCENDING, token id ASCENDING) — the tie
 // order topKByLogit defines, which feeds the sampler's cumulative draw — so Logits[0] is the
 // row's exact maximum and IDs[0] its argmax. Z is the full-vocabulary softmax denominator
 // Σ exp((l−max)/T) at the temperature the row was requested with; 0 unless it was asked for. Full
@@ -15,7 +14,7 @@ type TopKRow struct {
 	Full   func() ([]float32, error)
 }
 
-// Sampling from a device-side top-K (R7, docs/tasks/red-october.md).
+// Sampling from a device-side top-K.
 //
 // A resident backend that implements ResidentTopK hands the sampler the K best logits of the row
 // instead of all V. For a FILTERED sampler that is enough to reproduce the host path exactly: the
@@ -63,7 +62,7 @@ func (s *Sampler) TopKEligible() bool {
 	return p.TopK > 0 || p.MinP > 0 || (p.TopP > 0 && p.TopP < 1)
 }
 
-// topPActive mirrors topFilterLogits' own predicate.
+// TopPActive mirrors topFilterLogits' own predicate.
 func (s *Sampler) TopPActive() bool { return s.p.TopP > 0 && s.p.TopP < 1 }
 
 // TopKWidth returns how many candidates to request for a vocab of the given size, and false when the

@@ -4,14 +4,13 @@ package cuda
 
 import (
 	"fmt"
-	"os"
-	"strings"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/internal/runtime/logs"
 	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 )
 
-// Windowed KV (docs/tasks/task-cuda-windowed-kv-2026-10.md). A sliding-window layer reads only the last `window` positions, so with
+// Windowed KV. A sliding-window layer reads only the last `window` positions, so with
 // Options.ResidentWindowedKV its K and V live in the window group's pool (kvpool.go), and a slot maps only the blocks that cover the
 // positions it still holds, [base, end): window+slack positions at most, against the context's worth a full layer maps. Every kernel
 // addresses K and V by absolute position through the slot's table, so nothing moves: when the next write would pass base+window+slack,
@@ -38,13 +37,13 @@ var kvWindowRollbackMax = 1024
 // kvWindowSetup decides, once the layers are built and before the caches are sized, whether windowed KV engages, and marks the layers
 // that use it. It engages only when the option is on, some layer is a windowed attention layer, and the context is longer than a
 // window plus its slack (below that a layer would hold the whole context anyway). Every windowed layer shares one window
-// (SlidingWindowResident), so one base per slot serves them all.
+// (SlidingWindow), so one base per slot serves them all.
 func (r *cudaResident) kvWindowSetup(m *decoder.Model) {
 	r.kvWin, r.kvWindow = false, 0
 	if !m.ResidentWindowedKV() {
 		return
 	}
-	window := m.SlidingWindowResident()
+	window := m.BackendView().SlidingWindow()
 	if window <= 0 || r.ctxCap <= window+kvWindowSlack {
 		return
 	}
@@ -63,7 +62,7 @@ func (r *cudaResident) kvWindowSetup(m *decoder.Model) {
 		}
 	}
 	if r.kvWin {
-		fmt.Fprintf(os.Stderr, "cuda: windowed KV: sliding-window layers hold %d positions (window %d + %d slack; a follow-up may diverge %d before the newest and reuse its prefix) instead of the context's %d\n",
+		logs.Infof("cuda: windowed KV: sliding-window layers hold %d positions (window %d + %d slack; a follow-up may diverge %d before the newest and reuse its prefix) instead of the context's %d",
 			r.kvWindow+r.kvSlack, r.kvWindow, r.kvSlack, r.kvRollback(), r.ctxCap)
 	}
 }
@@ -85,7 +84,7 @@ func kvWindowGrant(free, reserve, perPos int64, step, maxExtra int) int {
 // are fixed, so it never costs either. A load without an expert cache calls it last. An expert-cache load calls it just before the cache is
 // sized, with holdBack the cache's minimum (expertCacheFloorBytes), so the grant comes out of the elastic cache and never makes the load
 // decline: an expert-cache load of a windowed model would otherwise keep the floor rollback, which refuses a follow-up that rewrites more
-// than about 448 tokens of the end (docs/queue-performance.md, P34, cause 2). Also held back: the companion and vision-tower reserve
+// than about 448 tokens of the end. Also held back: the companion and vision-tower reserve
 // (extraBytes), the decode margin, and two default prefill passes' scratch, which prefillCore allocates per request. The windowed buffers are
 // reallocated (nothing is written yet); a failed allocation keeps the planned ones.
 func (r *cudaResident) kvGrantRollback(holdBack int64) {
@@ -108,7 +107,7 @@ func (r *cudaResident) kvGrantRollback(holdBack int64) {
 		return
 	}
 	r.kvSlack += extra
-	fmt.Fprint(os.Stderr, r.kvGrantLine(extra, perPos, free))
+	logs.DebugText(r.kvGrantLine(extra, perPos, free))
 }
 
 // kvGrantFor is kvGrantRollback's decision over the free VRAM it read: the positions to add to the windowed slack (kvWindowGrant over
@@ -184,7 +183,7 @@ func (r *cudaResident) kvReallocWindowed(slack int) (ok bool) {
 	var made []swap
 	defer func() {
 		if v := recover(); v != nil {
-			if !strings.Contains(fmt.Sprint(v), "device allocation failed") {
+			if !mem.DeviceAllocFailed(v) {
 				panic(v)
 			}
 			for _, m := range made {
@@ -239,7 +238,7 @@ func (r *cudaResident) kvV(l int) Buffer { return r.vc[l] }
 // symptom. Executor thread only.
 func (r *cudaResident) kvEnsure(p0, n int) error { return r.kvEnsureSlot(r.kvSlot, p0, n) }
 
-// kvEnsureSlot is kvEnsure for slot s, whether or not it is the bound one (an MC3 step prepares every row's slot before its layer loops).
+// kvEnsureSlot is kvEnsure for slot s, whether or not it is the bound one (a batched decode step prepares every row's slot before its layer loops).
 func (r *cudaResident) kvEnsureSlot(s, p0, n int) error {
 	if e := r.kvWriteRefused(s, p0); e != nil {
 		return e
@@ -274,25 +273,15 @@ func (r *cudaResident) kvEnsureSlot(s, p0, n int) error {
 // that diverges up to rollback positions before the furthest position written can still reuse its prefix (ReusableKV), at whatever point of the
 // cycle the last decode stopped. capN must exceed window+rollback; the positions beyond that are how far a slot writes between compactions.
 func kvWindowNextBase(base, p0, n, window, capN, rollback int) (from, to int, err error) {
-	if p0 == 0 {
-		base = 0 // a fresh sequence: nothing before it is read
+	from, newBase, low, st := decoder.KVWindowNextBase(base, p0, n, window, capN, rollback)
+	switch st {
+	case decoder.KVWindowStepBelowBase:
+		return from, from, fmt.Errorf("cuda: windowed KV: position %d needs history from position %d but this slot holds only from %d (a reuse or rollback past the window slack; the caller must prefill from the reusable prefix, ReusableKV)", p0, low, from)
+	case decoder.KVWindowStepOverCap:
+		return from, from, fmt.Errorf("cuda: windowed KV: %d rows at position %d need %d positions, past the %d the layers hold (window %d + slack %d): write fewer rows per pass", n, p0, p0+n-newBase, capN, window, capN-window)
 	}
-	low := max(0, p0-(window-1)) // the oldest position the first row's attention reads
-	if low < base {
-		return base, base, fmt.Errorf("cuda: windowed KV: position %d needs history from position %d but this slot holds only from %d (a reuse or rollback past the window slack; the caller must prefill from the reusable prefix, ReusableKV)", p0, low, base)
-	}
-	if p0+n-base <= capN {
-		return base, base, nil
-	}
-	newBase := max(base, min(low, p0+n-(window-1)-rollback))
-	if p0+n-newBase > capN {
-		return base, base, fmt.Errorf("cuda: windowed KV: %d rows at position %d need %d positions, past the %d the layers hold (window %d + slack %d): write fewer rows per pass", n, p0, p0+n-newBase, capN, window, capN-window)
-	}
-	return base, newBase, nil
+	return from, newBase, nil
 }
-
-// kvWindowReusable reports whether a forward continuing at position prefix finds its window held by a slot whose base is base.
-func kvWindowReusable(base, prefix, window int) bool { return base == 0 || prefix-(window-1) >= base }
 
 // kvRoomFor reports whether n rows at position p0 can ever be written: the window floor of the first row, then the rows themselves, must fit the
 // positions a windowed layer holds. False only for a pass wider than the slack allows (a long image block, a wide verify); no state is read, so
@@ -304,7 +293,7 @@ func (r *cudaResident) kvRoomFor(p0, n int) bool {
 	return p0+n-max(0, p0-(r.kvWindow-1)) <= min(r.ctxCap, r.kvWindow+r.kvSlack)
 }
 
-// ReusableKV implements decoder.ResidentReusableKV: of the first prefix positions of a sequence this resident's bound slot holds, how many
+// ReusableKV implements decoder.ResidentKVSubsystem: of the first prefix positions of a sequence this resident's bound slot holds, how many
 // it can serve to a forward that continues at position prefix. A slot whose blocks were released to make room holds nothing: 0. A
 // windowed layer has dropped everything before its base, so a prefix shorter than base+window-1 has lost the history the next row attends
 // to: 0 (prefill cold). Everything else is valid: the full layers hold every position, and a windowed layer holds [base, end).
@@ -315,7 +304,7 @@ func (r *cudaResident) ReusableKV(prefix int) int {
 	out := prefix
 	// the base and the released marks are executor state: read them where they are written
 	if err := r.do(func() error {
-		if r.kvReleasedLost(r.kvSlot, prefix) || (r.kvWin && !kvWindowReusable(r.kvBases[r.kvSlot], prefix, r.kvWindow)) {
+		if r.kvReleasedLost(r.kvSlot, prefix) || (r.kvWin && !decoder.KVWindowReusable(r.kvBases[r.kvSlot], prefix, r.kvWindow)) {
 			out = 0
 		}
 		return nil

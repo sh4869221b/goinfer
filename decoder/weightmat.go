@@ -32,7 +32,7 @@ const (
 	quantInt4Mix
 	// quantQ4K keeps every tensor the GGUF stores as Q4_K in its own super-block layout
 	// (linalg.WrapQ4K, exact, 4.5 bpw) and puts every other layer matmul at int8 W8A8, with per-32
-	// activations throughout (docs/tasks/task-int4-weight-quality-2026-09.md: the re-quantization
+	// activations throughout (the re-quantization
 	// of Q4_K into symmetric int4 is the int4 quality loss). Like quantInt4Mix it is a LOAD-TIME
 	// policy resolved per tensor at the GGUF load sites. GGUF only; its .giw form is kind 8 (serialize.go).
 	quantQ4K
@@ -95,7 +95,7 @@ func (q quantMode) embeddingWith(embedInt4 bool) quantMode {
 
 // gatherTable is the precision of a table that is only gathered by row on the host, never multiplied (Gemma 4's per-layer
 // token table): int4 at int4, whatever the head pin (EmbedInt4) says, since the pin exists for the logit GEMV and the Metal
-// head kernel, neither of which reads it (D10, docs/tasks/task-memory-campaign-2026-10.md §7).
+// head kernel, neither of which reads it.
 func (q quantMode) gatherTable() quantMode { return q.embeddingWith(true) }
 
 // int4GroupSize is the number of consecutive input features that share one f32
@@ -104,16 +104,16 @@ func (q quantMode) gatherTable() quantMode { return q.embeddingWith(true) }
 // stays ~0.125 byte/element.
 const int4GroupSize = 32
 
-// int4ParThreshold sets the fan-out threshold for the int4 (W4A8) matmul below aikit's default (parThreshold = 1<<24 MACs)
-// so the small int4 decode matmuls parallelize. At M=1 every Gemma-4 int4 matmul (expert gate||up 3.96M, down 1.98M,
-// dense ~5.9M, attention ~11.5M MACs) falls under the aikit default and would run serial. 1<<20 sits below the smallest
-// decode matmul (1.98M), so all of them fan out, while tiny ops (<1M) stay serial; threshold 0, which fans out everything,
-// over-parallelizes on the 8-core Ryzen.
+// int4ParThreshold sets the fan-out threshold for the int4 (W4A8 and Q4_K) matmul below aikit's default (parThreshold =
+// 1<<24 MACs) so the small decode matmuls parallelize. aikit runs a call serial when M*N*K (M*totalN*K for a batch) is
+// under it. 1<<19 lets the smallest projections of the sub-1B models fan out (qwen2.5 0.5B's q/k/v batch, 1,032,192 MACs,
+// and its o projection, 802,816), while ops under 512K MACs stay serial; threshold 0, which fans out everything,
+// over-parallelizes on the 8-core Ryzen. TestInt4ParThreshold_qwen05bShapesFanOut pins the 0.5B shapes.
 //
 // Output is byte-identical (aikit partitions output columns in 8-wide groups, the width-invariant contract), and it only
 // widens fan-out, so prefill's already-parallel large-M matmuls are unaffected. Re-run BenchmarkInt4ParThresholdSweep if
 // the core topology or aikit's kernel changes. Measurements on both rigs: docs/code-notes/decoder.md#int4ParThreshold.
-const int4ParThreshold = 1 << 20
+const int4ParThreshold = 1 << 19
 
 // streamQuantized builds a [rows, cols] linalg.WeightMat in the target precision
 // by dequantizing each row through rowInto (into a reused cols-wide scratch) and
@@ -444,8 +444,8 @@ var w4a8Row4RepackEnabled = true
 // AVX2-without-VNNI hosts only.
 //
 // Wired into the same two call sites as the row4 repack and for the same reason (see that function for why the .giw
-// loader is excluded). The repack allocates a second buffer and never writes through the canonical bytes, which for a
-// .giw kind=3 tensor are a zero-copy mmap alias of the file; rewriting them in place would silently misdecode every
+// loader is excluded). The repack allocates a second buffer and never writes through the canonical bytes, which for a.
+// giw kind=3 tensor are a zero-copy mmap alias of the file; rewriting them in place would silently misdecode every
 // existing bundle (aikit's TestWeightMatSplitHalf_canonicalUntouched pins that it does not).
 //
 // Memory: a second copy of every eligible tensor's nibbles, with canonical kept. The cost and why it is default-off live
@@ -614,8 +614,9 @@ func quantizeEmbedWM(w linalg.WeightMat, mode quantMode, needCanonical bool) lin
 // linalg.Int4Row4Usable's rows%4 check, applied per tensor by repackedOnlyOrCanonical, so a violating shape is never
 // built repacked-only.
 //
-// Down-proj, the router and MoE expert weights are not this class: they never reach the batched dispatch, and take the
-// same policy through quantizeLayerWM under their own safety argument. Expert weights read through a read-only mmap span
+// Down-proj, the router and MoE expert weights are not this class and take the same policy through quantizeLayerWM. The
+// one batched dispatch an expert reaches, gpt-oss's gate and up (Model.gptOssExpertBatch), is decode-only at M=1 and
+// per-tensor rows%4 as above, so the same argument covers it. Expert weights read through a read-only mmap span
 // (paged .giw loading) have no load-time repack, so a .giw keeps them canonical.
 func quantizeBatchedProjWM(w linalg.WeightMat, mode quantMode, needCanonical, skipRow4 bool) linalg.WeightMat {
 	if mode != quantInt4 || fakeQuantScheme != "" {
@@ -687,7 +688,7 @@ type GIWTarget string
 const (
 	GIWTargetNone     GIWTarget = ""
 	GIWTargetCPUArm64 GIWTarget = "cpu-arm64"
-	GIWTargetCPUAmd64 GIWTarget = "cpu-amd64" // defined for L5; does not yet change what's written
+	GIWTargetCPUAmd64 GIWTarget = "cpu-amd64" // defined, but does not yet change what's written
 	GIWTargetMetal    GIWTarget = "metal"
 	GIWTargetCUDA     GIWTarget = "cuda"
 	GIWTargetWebGPU   GIWTarget = "webgpu"
@@ -957,9 +958,9 @@ func matmulWS(be Backend, own *linalg.Workspace, w *linalg.WeightMat, a, dst []f
 		linalg.MatmulBTQ8Into(ws, a, q8, scales, dst, M, w.Cols(), w.Rows())
 		return
 	}
-	if w.Kind() == "q4k" {
-		// Native Q4_K (quantQ4K) runs on the CPU here: there is no staged-backend consult for it. Per-32 activations are built
-		// into the kind.
+	if k := w.Kind(); k == "q4k" || k == "q5k" || k == "q6k" {
+		// Native K-quants (quantQ4K) run on the CPU here: there is no staged-backend consult for them. Per-32 activations are
+		// built into the kinds.
 		ws, pooled := matmulWorkspace(own)
 		if pooled {
 			defer matmulWSPool.Put(ws)

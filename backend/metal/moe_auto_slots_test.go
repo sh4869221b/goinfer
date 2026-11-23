@@ -65,12 +65,13 @@ func TestMoeTopK_realFixtures(t *testing.T) {
 		t.Fatalf("load mixtral-tiny: %v", err)
 	}
 	defer m.Close()
-	_, wantK, _, _, _, _, _, _, _, _, ok := m.MoEResidentParams()
+	mo, ok := m.BackendView().MoE()
+	wantK := mo.TopK
 	if !ok {
 		t.Fatal("mixtral-tiny did not report MoE resident params")
 	}
 	if got := moeTopK(m); got != wantK {
-		t.Errorf("moeTopK(mixtral-tiny) = %d, want %d (from MoEResidentParams)", got, wantK)
+		t.Errorf("moeTopK(mixtral-tiny) = %d, want %d (from MoE)", got, wantK)
 	}
 
 	const g4 = "../../testdata/gemma4-moe-tiny"
@@ -83,7 +84,7 @@ func TestMoeTopK_realFixtures(t *testing.T) {
 		t.Fatalf("load gemma4-moe-tiny: %v", err)
 	}
 	defer mg.Close()
-	if !mg.HasGemma4MoEResident() {
+	if !mg.BackendView().HasGemma4MoE() {
 		t.Fatal("gemma4-moe-tiny did not resolve to a Gemma-4 MoE resident")
 	}
 	if want := mg.Config().TopKExperts; want > 0 {
@@ -105,7 +106,7 @@ func TestMetalMoESlotsRequest_autoOnlyWithCacheExperts(t *testing.T) {
 	if m.MoECacheExperts() {
 		t.Fatal("test setup: MoECacheExperts should be false without the option")
 	}
-	if got := metalMoESlotsRequest(m); got != "" {
+	if got := metalMoESlotsRequest(m, metalCtxPlan{}); got != "" {
 		t.Errorf("metalMoESlotsRequest with MoECacheExperts unset = %q, want \"\" (unchanged default)", got)
 	}
 
@@ -120,7 +121,7 @@ func TestMetalMoESlotsRequest_autoOnlyWithCacheExperts(t *testing.T) {
 	if mAuto.MoECacheSlotsRequest() != 0 {
 		t.Fatal("test setup: no explicit --moe-cache-slots should have been set")
 	}
-	got := metalMoESlotsRequest(mAuto)
+	got := metalMoESlotsRequest(mAuto, metalCtxPlan{})
 	if got == "" {
 		t.Fatal("metalMoESlotsRequest with MoECacheExperts set returned \"\" — auto-sizing did not engage (M-13 regressed)")
 	}

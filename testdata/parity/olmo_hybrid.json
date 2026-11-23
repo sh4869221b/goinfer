@@ -11,12 +11,13 @@
     "decoder/olmo_hybrid_test.go",
     "scripts/pin_olmo_hybrid_real.py",
     "scripts/pin_olmo_hybrid_tiny.py",
-    "decoder/arch_olmo_hybrid.go"
+    "decoder/arch_olmo_hybrid.go",
+    "decoder/gguf_build_qwen35.go"
   ],
   "programs": [
     "testdata/olmo_hybrid-tiny"
   ],
-  "deps_hash": "sha256:5ea305d90144f56c8351feb8165f9d409d46889e5cedf3797c9b26f324754b77",
+  "deps_hash": "sha256:0eccc2b0d742a67e9b038b1c1a76bbae6612c7fdd79ada7702603e787171ec66",
   "status": "validated",
   "validated_at": "7b50947a",
   "date": "2026-10-05",

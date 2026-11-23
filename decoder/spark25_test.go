@@ -7,9 +7,11 @@ import (
 	"math"
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
-// TestSpark25Tiny_textParity is Gate 1 (docs/tasks/task-spark-x2-5.md): "loads and matches the
+// TestSpark25Tiny_textParity is Gate 1: "loads and matches the
 // tiny golden." Pins the new spark2_5 forward — fused QKV split, sigmoid head-wise attention-
 // output gate, 1:3 sliding:full interleave with per-layer-type partial RoPE, and a GATED MLP
 // using exact-erf GELU (gegluExact) — against a tiny-random HF oracle (the real
@@ -78,7 +80,7 @@ func TestSpark25Tiny_textParity(t *testing.T) {
 	if len(logits) != len(g.LastLogits) {
 		t.Fatalf("got %d logits, want %d", len(logits), len(g.LastLogits))
 	}
-	got := argmax(logits)
+	got := sampling.Argmax(logits)
 	if got != g.Argmax {
 		t.Errorf("argmax = %d, want %d", got, g.Argmax)
 	}
@@ -115,7 +117,7 @@ func TestSpark25Tiny_textParity(t *testing.T) {
 		}
 	}
 	for range g.NNew {
-		id := argmax(lg)
+		id := sampling.Argmax(lg)
 		cont = append(cont, id)
 		if lg, err = m.forward(id, c2); err != nil {
 			t.Fatalf("continuation forward: %v", err)

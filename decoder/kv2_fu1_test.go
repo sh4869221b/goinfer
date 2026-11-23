@@ -6,6 +6,8 @@ import (
 	"math/rand"
 	"slices"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/kvmgr"
 )
 
 // twoClassFake is copyFake with a second kernel class, as Metal's and CUDA's residents have: a batched pass
@@ -15,11 +17,17 @@ import (
 // one class, a reply re-prefilled from a copy equals the reply that continued in place.
 type twoClassFake struct{ *copyFake }
 
+func (f *twoClassFake) ResidentSubsystems() ResidentSubsystems { return selfSubsystems(f) }
+
 // batchedTag is mixed into every row a batched pass writes.
 const batchedTag = 0x9E3779B97F4A7C15
 
-func (f *twoClassFake) PrefillKernelFloor() int { return 1 }
-func (f *twoClassFake) PrefillTailExact() bool  { return true }
+func (f *twoClassFake) ResidentCaps() ResidentCaps {
+	c := f.copyFake.ResidentCaps()
+	c.HasKernelFloor, c.KernelFloor = true, 1
+	return c
+}
+func (f *twoClassFake) PrefillTailExact() bool { return true }
 
 func (f *twoClassFake) PrefillLast(ctx context.Context, embs [][]float32, startPos int) ([]float32, error) {
 	if _, err := f.copyFake.PrefillLast(ctx, embs, startPos); err != nil {
@@ -117,8 +125,7 @@ func fu1Gen(t *testing.T, m *Model, prompt []int) ([]int, *Generation) {
 	return ids, g
 }
 
-// TestKV2FU1_ownRollbackScheduleIndependence is FU1-G3 (docs/tasks/task-kv-architecture-2026-10.md §6, KV2 follow-up
-// 1): three conversations sharing KV2's preamble, each rolling back twice to its first prompt and first reply after a
+// TestKV2FU1_ownRollbackScheduleIndependence is FU1-G3: three conversations sharing KV2's preamble, each rolling back twice to its first prompt and first reply after a
 // long turn (giving up more than it keeps), in every registered schedule at 1, 2 and 4 slots. A turn whose slot still
 // holds its conversation, and that keeps the first prompt of that slot's lineage, continues it in place, copies nothing
 // and reuses what it kept. Every turn emits and holds exactly what its reference does: its conversation's lineage
@@ -193,7 +200,7 @@ func TestKV2FU1_ownRollbackScheduleIndependence(t *testing.T) {
 						}
 						prev := got[c][tn-1]
 						full := append(slices.Clone(prev.prompt), prev.ids...)
-						keep := min(len(x.prompt)-1, commonPrefixLen(full, x.prompt))
+						keep := min(len(x.prompt)-1, kvmgr.CommonPrefixLen(full, x.prompt))
 						if keep < lineFirst-1 {
 							continue // it diverges inside the lineage's first prompt: main's rule, not this item's
 						}

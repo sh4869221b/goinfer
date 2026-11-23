@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-// G-W4 of docs/tasks/task-cuda-windowed-kv-2026-10.md, the decoder half: with Options.ResidentWindowedKV the CUDA price of a sliding-window
+// G-W4, the decoder half: with Options.ResidentWindowedKV the CUDA price of a sliding-window
 // layer's KV is the blocks of min(ctx, window+WindowedKVSlack) positions (plus one past window+slack, for a range that starts mid-block),
 // beside the null blocks and the tables, and Plan chooses a context against that price. The allocation it must equal is
 // cuda's TestWindowedKV_allocation (needs a GPU).
@@ -13,7 +13,7 @@ func loadWindowFixture(t *testing.T, on bool) *Model {
 	t.Helper()
 	m, err := Load("../testdata/mistral-tiny-window", Options{Quant: "f32", ResidentWindowedKV: on})
 	if err != nil {
-		t.Skipf("no fixture: %v", err)
+		t.Fatalf("load ../testdata/mistral-tiny-window: %v", err)
 	}
 	t.Cleanup(func() { m.Close() })
 	return m
@@ -21,7 +21,7 @@ func loadWindowFixture(t *testing.T, on bool) *Model {
 
 func TestWindowedKV_planPrices(t *testing.T) {
 	off, on := loadWindowFixture(t, false), loadWindowFixture(t, true)
-	window := on.SlidingWindowResident()
+	window := on.BackendView().SlidingWindow()
 	if window <= 0 {
 		t.Fatalf("fixture has no sliding window")
 	}
@@ -88,7 +88,7 @@ func TestWindowedKV_planChoosesLongerContext(t *testing.T) {
 func TestWindowedKV_gatesOnLayer(t *testing.T) {
 	m, err := Load("../testdata/llama-tiny", Options{Quant: "f32", ResidentWindowedKV: true})
 	if err != nil {
-		t.Skipf("no fixture: %v", err)
+		t.Fatalf("load ../testdata/llama-tiny: %v", err)
 	}
 	defer m.Close()
 	_, nLayers, _, _, _, _, _ := m.Dims()

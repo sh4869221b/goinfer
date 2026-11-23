@@ -12,14 +12,21 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 _tmp = tempfile.mkdtemp(prefix="night-test-")
 os.environ["NIGHT_DIR"] = os.path.join(_tmp, "night")  # read when night.py is imported
 os.environ["GOINFER_TIMING_LOCK_FILE"] = os.path.join(_tmp, "timing.lock")
 os.environ["NIGHT_HOOKS"] = os.path.join(_tmp, "night-hooks.toml")  # read when night.py is imported; absent unless a test writes it
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+SCRIPTS = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPTS)
 import night  # noqa: E402
+
+if Path(_tmp) not in night.ROOT.parents:  # night was loaded before NIGHT_DIR was set above: every test would write the box's queue
+    sys.exit(f"test_night: night.py was loaded with NIGHT_DIR={night.ROOT}, not this run's temporary directory; nothing was run")
+
+GO_DIRS = ["/usr/local/go/bin", str(Path("~/go/bin").expanduser())]
 
 # A floor far above any reading: the tests of the percentile itself pass it, so nothing is floored there (MM6 option C).
 UNBOUNDED = ("unbounded", 1 << 62)
@@ -58,11 +65,13 @@ class Runner(night.Runner):
 
 class FreeMemoryReading(unittest.TestCase):
     def test_reads_goinfers_number(self):
-        # The runner's fit-need gate reads cmd/hostmem's reclaimable figure (scripts/hostmem.py), not the fit guard's available one.
+        # The runner's fit-need gate reads the fit guard's own available figure (scripts/hostmem.py), not the reclaimable one.
         import hostmem
-        saved = hostmem.reclaimable_mb
-        self.addCleanup(setattr, hostmem, "reclaimable_mb", saved)
-        hostmem.reclaimable_mb = lambda *a, **k: 6789
+        saved, saved_r = hostmem.available_mb, hostmem.reclaimable_mb
+        self.addCleanup(setattr, hostmem, "available_mb", saved)
+        self.addCleanup(setattr, hostmem, "reclaimable_mb", saved_r)
+        hostmem.available_mb = lambda *a, **k: 6789
+        hostmem.reclaimable_mb = lambda *a, **k: 1
         self.assertEqual(night.free_mem_mb(), 6789)
 
 
@@ -337,6 +346,30 @@ class QueueEnvironment(unittest.TestCase):
         self.assertTrue(seen.startswith(str(bindir) + os.pathsep), seen)
         self.assertIn(os.environ["PATH"], seen)
 
+    def test_a_bare_starter_path_still_gives_the_job_go(self):
+        """A launchd agent or systemd service starts the runner with a bare PATH; the job still gets go's directories, in front."""
+        out = self.dir / "path-seen"
+        self.job(script=f'printf %s "$PATH" > {out}')
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+            self.run_queue()
+        seen = out.read_text().split(os.pathsep)
+        self.assertEqual(seen, [*GO_DIRS, "/usr/bin", "/bin"])
+
+    def test_go_dirs_already_on_the_path_keep_their_place(self):
+        p = os.pathsep.join(["/opt/x/bin", GO_DIRS[0], "/usr/bin", GO_DIRS[1]])
+        with mock.patch.dict(os.environ, {"PATH": p}):
+            self.assertEqual(night.queue_path(), p)
+
+    def test_the_runner_process_itself_gets_go(self):
+        """The runner's own readings (cmd/hostmem, a `go run`) inherit its process PATH: main() widens it before any subcommand."""
+        code = ("import os, sys; sys.path.insert(0, %r); sys.argv = ['night.py', 'list']; import night; night.main(); "
+                "print('PATH=' + os.environ['PATH'])") % SCRIPTS
+        r = subprocess.run([sys.executable, "-c", code], env=dict(os.environ, PATH="/usr/bin:/bin"), capture_output=True, text=True,
+                           timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        line = [x for x in r.stdout.splitlines() if x.startswith("PATH=")][-1]
+        self.assertEqual(line[len("PATH="):].split(os.pathsep), [*GO_DIRS, "/usr/bin", "/bin"])
+
     def test_a_missing_required_tool_refuses_the_start_and_leaves_the_queue_intact(self):
         self.toml('require_on_path = ["no-such-tool-for-night-test"]\n')
         f = self.job()
@@ -406,6 +439,83 @@ class QueueEnvironment(unittest.TestCase):
         finally:
             night.missing_required = real
         self.assertIsNone(code, out)
+
+
+_FLAT = {"t": "x", "load1": 1.0, "ncores": 8, "available_mb": 9000, "reclaimable_mb": 8000, "swap_mb": 500.0}
+
+
+def setUpModule():
+    # Every job reads the box at its start and end (void_rule.snapshot, two cmd/hostmem runs) and samples swap (sysctl): a cheap flat
+    # stand-in for the tests that do not look at them, so no test spawns either.
+    import void_rule
+    night.readings = lambda: dict(_FLAT)
+    void_rule.swap_used_mb = lambda: _FLAT["swap_mb"]
+
+
+class SwapReadingsInAJob(unittest.TestCase):
+    """A job's four readings at its start and end are recorded, with the swap growth between them as information. They never void the job:
+    the cell is the unit of the void rule (scripts/void_rule.py), so a multi-cell job that voided a cell and re-ran it in place, which ends
+    above its start baseline, is not failed here; the runner's own per-cell void is the verdict."""
+
+    def run_job(self, swaps):
+        night.QUEUE.mkdir(parents=True, exist_ok=True)
+        for f in night.QUEUE.glob("*"):
+            f.unlink()
+        _seq[0] += 1
+        seq = 2_000_000 + _seq[0]
+        job = {"name": f"swap-{seq}", "cmd": ["/bin/sh", "-c", "echo measured; exit 0"], "cwd": _tmp, "est_min": 1.0, "timeout_min": 2.0,
+               "priority": 50, "seq": seq}
+        (night.QUEUE / f"{seq}-swap.json").write_text(json.dumps(job))
+        seen = iter(swaps)
+        saved = night.readings
+        night.readings = lambda: dict(_FLAT, swap_mb=next(seen))
+        self.addCleanup(setattr, night, "readings", saved)
+        r = Runner(night.now() + dt.timedelta(hours=1), Path(tempfile.mkdtemp(dir=_tmp)))
+        with contextlib.redirect_stdout(io.StringIO()):
+            r.run()
+        return [x for x in r.results if x["name"] == job["name"]][0]
+
+    def test_swap_growth_between_the_readings_is_recorded_and_does_not_fail_the_job(self):
+        got = self.run_job([500.0, 650.5])
+        self.assertEqual(got["outcome"], "ok", got["outcome"])
+        self.assertEqual((got["readings"]["start"]["swap_mb"], got["readings"]["end"]["swap_mb"], got["readings"]["swap_growth_mb"]),
+                         (500.0, 650.5, 150.5))
+
+    def test_the_end_reading_is_folded_into_the_peak(self):
+        # the job's swap grew 150.5 MB by its end reading; the peak is never smaller than that growth, whatever the polls saw
+        got = self.run_job([500.0, 650.5])
+        self.assertGreaterEqual(got["readings"]["swap_peak_growth_mb"], got["readings"]["swap_growth_mb"])
+        self.assertEqual(got["readings"]["swap_peak_growth_mb"], 150.5)
+
+    def test_polls_and_an_end_reading_that_all_fail_leave_no_numeric_peak_or_growth(self):
+        import void_rule
+        saved = void_rule.swap_used_mb
+        self.addCleanup(setattr, void_rule, "swap_used_mb", saved)
+        void_rule.swap_used_mb = lambda: None
+        got = self.run_job([500.0, None])
+        self.assertIsNone(got["readings"]["swap_peak_growth_mb"])
+        self.assertIsNone(got["readings"]["swap_growth_mb"])
+
+    def test_an_unreadable_start_swap_leaves_the_peak_unknown_not_rebased(self):
+        got = self.run_job([None, 650.5])
+        self.assertIsNone(got["readings"]["swap_peak_growth_mb"])
+
+    def test_the_sampled_peak_and_the_growth_share_one_baseline(self):
+        # readings: swap 500 at the start, 520 at the end; the sampler reads 530 once: both are growth over the SAME 500 (the start reading),
+        # not the peak over the sampler's own first reading
+        import void_rule
+        saved = void_rule.swap_used_mb
+        self.addCleanup(setattr, void_rule, "swap_used_mb", saved)
+        void_rule.swap_used_mb = lambda: 530.0
+        got = self.run_job([500.0, 520.0])
+        self.assertEqual((got["readings"]["swap_growth_mb"], got["readings"]["swap_peak_growth_mb"]), (20.0, 30.0))
+
+    def test_the_readings_are_recorded(self):
+        got = self.run_job([500.0, 500.0])
+        for k in ("load1", "available_mb", "reclaimable_mb", "swap_mb"):
+            self.assertIn(k, got["readings"]["start"])
+            self.assertIn(k, got["readings"]["end"])
+        self.assertEqual(got["readings"]["swap_growth_mb"], 0.0)
 
 
 class LogFailureMarkers(unittest.TestCase):
@@ -566,11 +676,25 @@ class Serve(unittest.TestCase):
     def test_low_free_memory_holds_the_start(self):
         sv = FakeServer()
         self.job(fit_need_gb=4)
-        sv.free = 4 * 1024 + 2048 - 1
+        sv.free = 4 * 1024 - 1
         self.assertEqual(self.tick(sv), "idle")
-        self.assertIn("free memory", sv.waits[0])
-        sv.free = 4 * 1024 + 2048
+        self.assertIn("available memory", sv.waits[0])
+        sv.free = 4 * 1024  # exactly the need starts: there is no 2 GB margin any more
         self.assertEqual(self.tick(sv), "ran")
+
+    def test_the_real_runner_does_not_coerce_an_unreadable_core_count(self):
+        with mock.patch.object(night.os, "cpu_count", lambda: None):
+            self.assertIsNone(night.Server.ncores(object()))
+
+    def test_an_unreadable_core_count_skips_the_load_term_and_logs_it_once(self):
+        sv = FakeServer()
+        sv.ncores = lambda: None
+        logged = []
+        sv.log = logged.append
+        sv.la = 99.0
+        self.assertIsNone(sv.heavy({"fit_need_gb": 0}), "no cap of 0.5 from an unknown core count")
+        self.assertIsNone(sv.heavy({"fit_need_gb": 0}))
+        self.assertEqual(sum("core count unreadable" in m for m in logged), 1)
 
     def test_plant_without_the_heavy_gate_it_runs_under_load(self):
         sv = FakeServer()
@@ -1275,7 +1399,7 @@ class NightProfile(unittest.TestCase):
         self.assertEqual(prof["name"], "box-night")
         self.assertEqual(night.percentile([2900, 3900, 4600, 6400, 6400, 6600, 6900, 7000, 7400, 7500, 7700], 25), 5500)
 
-    def test_too_few_readings_fall_back_to_the_day_profile_with_a_warning(self):
+    def too_few_readings_scenario(self):
         """G-NP-2: under 5 readings or 3 nights, a night job is priced on the apps-open profile, and add says why."""
         for d in range(2):
             for mb in (5000, 6000, 7000):
@@ -1291,11 +1415,37 @@ class NightProfile(unittest.TestCase):
         for d in range(2):
             for mb in (5000, 6000, 7000):
                 night.record_reading(self.at(d, 23), "j", True, mb, path=self.readings, host="macbookpro.lan")
-        checks, refusals, warnings = night.fit_check(["m.gguf"], [""], True, "macbookpro.lan", self.dir, run=fake,
-                                                     readings_path=self.readings, night_profile_path=self.dir / "p.json")
+        # fit_check prices on night.now(): pin it to the test's own clock (night of 2026-10-26), or the window slides with the day the
+        # test runs on and the readings, dated 24 to 26 October, fall out of it
+        saved_now = night.now
+        night.now = lambda: self.t
+        try:
+            checks, refusals, warnings = night.fit_check(["m.gguf"], [""], True, "macbookpro.lan", self.dir, run=fake,
+                                                         readings_path=self.readings, night_profile_path=self.dir / "p.json")
+        finally:
+            night.now = saved_now
         self.assertEqual(checks[0]["profile"], "m1pro-apps-open")
-        self.assertTrue(any("6 night readings over 2 nights" in w and "m1pro-apps-open" in w for w in warnings), warnings)
+        want = ("only 6 night readings over 2 nights in the last 14 (the night profile needs 5 over 3): "
+                "this night job is priced on the m1pro-apps-open profile")
+        self.assertIn(want, warnings)
         self.assertTrue(calls[0][calls[0].index("-profile") + 1].endswith("m1pro-apps-open.json"))
+
+    def test_too_few_readings_fall_back_to_the_day_profile_with_a_warning(self):
+        self.too_few_readings_scenario()
+
+    def test_the_scenario_does_not_read_the_wall_clock(self):
+        """The readings are dated 2026-10-24 to 26; fit_check prices on night.now(). Run under any later wall clock the scenario must
+        say the same thing: it is the test's clock that is fixed, not the day it runs on."""
+        for i, when in enumerate(("2026-11-08T22:30:00", "2026-11-09T12:00:00", "2027-03-01T12:00:00")):
+            with self.subTest(wall_clock=when):
+                saved = night.now
+                self.addCleanup(setattr, night, "now", saved)
+                self.readings = self.dir / f"memory-{i}.jsonl"  # a fresh log each time: the scenario writes its own readings
+                night.now = lambda w=dt.datetime.fromisoformat(when).astimezone(): w
+                try:
+                    self.too_few_readings_scenario()
+                finally:
+                    night.now = saved
 
     def run_at(self, hour, name, avail=4321):
         """Runs one queued job through the real runner with the clock at hour today; returns its log text and new readings."""
@@ -1413,6 +1563,16 @@ class NightProfile(unittest.TestCase):
         r = night.memory_readings(mem)
         self.assertEqual([(x["job"], x["available_mb"], x["night"], x["source"]) for x in r], [("nightjob", int(6.6 * 1024), True, "backfill")])
 
+    def test_backfill_reads_the_gib_line(self):
+        """The fit guard prints GiB; a log in that unit backfills the same reading the older GB line did."""
+        runs = self.dir / "runs3" / "2026-10-20"
+        runs.mkdir(parents=True)
+        (runs / "gib.log").write_text("=== night job gib\n=== START    2026-10-20 23:05:00 PDT  loadavg 0.50  available ? MB\n"
+                                      "decoder: m needs ~5.10 GiB; this machine currently has 6.60 GiB of memory available\n")
+        mem = self.dir / "bf3.jsonl"
+        self.assertEqual(night.backfill_readings(runs=self.dir / "runs3", path=mem), 1)
+        self.assertEqual([x["available_mb"] for x in night.memory_readings(mem)], [int(6.6 * 1024)])
+
     def test_the_real_reading_never_raises(self):
         """night.Runner.avail_mb (not the test Runner's stand-in) returns MiB or None, and None when hostmem fails."""
         r = night.Runner.__new__(night.Runner)
@@ -1427,6 +1587,155 @@ class NightProfile(unittest.TestCase):
         finally:
             hostmem.available_mb = real
 
+
+class Morning(unittest.TestCase):
+    """`morning` and `status` read the newest night under runs/: a YYYY-MM-DD directory no later than today. A test's scratch
+    directory (wait-test_*) or a date ahead of the clock (a pinned-clock test's night) is not a night."""
+
+    def setUp(self):
+        self.today = night.RUNS / night.now().strftime("%Y-%m-%d")
+        self.today.mkdir(parents=True, exist_ok=True)
+        s = self.today / "SUMMARY.md"
+        before = s.read_text() if s.exists() else None
+        self.addCleanup(lambda: s.write_text(before) if before is not None else s.unlink(missing_ok=True))
+        s.write_text("# the real night\n")
+        for name in ("wait-test_scratch", (night.now() + dt.timedelta(days=400)).strftime("%Y-%m-%d")):
+            d = night.RUNS / name
+            d.mkdir()
+            self.addCleanup(lambda d=d: (d / "SUMMARY.md").unlink() or d.rmdir())
+            (d / "SUMMARY.md").write_text(f"# not a night: {name}\n")
+
+    def test_morning_prints_the_real_night(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            night.cmd_morning(None)
+        self.assertEqual(out.getvalue().splitlines()[0], "# the real night")
+
+    def test_latest_run_dir_is_todays(self):
+        self.assertEqual(night.latest_run_dir(), self.today)
+
+
+class Isolation(unittest.TestCase):
+    def test_loaded_against_another_night_dir_the_tests_refuse_to_run(self):
+        """night.py reads NIGHT_DIR once, at import: a process that loaded it first (with the box's real directory) and then ran
+        these tests would write their queue files and runs into it. This file refuses to run instead, and writes nothing there."""
+        real = Path(tempfile.mkdtemp(dir=_tmp)) / "the-box-night-dir"
+        code = ("import runpy, sys; sys.path.insert(0, %r); import night; sys.argv = [%r, 'WaitForAJob']; "
+                "runpy.run_path(%r, run_name='__main__')" % (SCRIPTS, __file__, os.path.abspath(__file__)))
+        r = subprocess.run([sys.executable, "-c", code], env=dict(os.environ, NIGHT_DIR=str(real)), capture_output=True, text=True,
+                           timeout=300)
+        self.assertFalse((real / "runs").exists() or (real / "queue").exists(), "the tests wrote into the directory night was loaded with")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not this run's temporary directory", r.stderr)
+
+
+
+def _fake_server(d, name="goinfer-serve-cuda-test"):
+    """A stand-in server: a shell script named like goinfer's server that prints one line to each stream, holds a little memory and
+    sleeps until killed."""
+    p = Path(d) / name
+    p.write_text("#!/bin/bash\necho \"pid $$ out\"\necho \"pid $$ err\" >&2\nexec -a %s sleep 30\n" % name)
+    p.chmod(0o755)
+    return p
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "the sampler reads /proc and the cgroup tree")
+class JobMemorySampler(unittest.TestCase):
+    """A job's memory is sampled once a second into <rundir>/<job>.mem.tsv: the goinfer servers in its process tree (VmSwap, VmRSS,
+    RssAnon, RssShmem, RssFile over each server and its descendants), system swap, MemAvailable, and the user slice's memory.current and
+    memory.events, so a swap-guard trip names its source and what the slice held."""
+
+    def test_a_sample_finds_the_server_in_the_job_tree_and_reads_the_slice(self):
+        import job_mem
+        d = tempfile.mkdtemp(dir=_tmp)
+        srv = _fake_server(d)
+        job = subprocess.Popen(["/bin/bash", "-c", f"{srv} >/dev/null 2>&1 & wait"], start_new_session=True)
+        self.addCleanup(lambda: (os.killpg(job.pid, 9), job.wait()))
+        cg = Path(tempfile.mkdtemp(dir=_tmp))  # a stand-in cgroup tree: the job's slice with its two files
+        sl = cg / "user.slice" / "user-1000.slice"
+        sl.mkdir(parents=True)
+        (sl / "memory.current").write_text("123456\n")
+        (sl / "memory.events").write_text("low 0\nhigh 7\nmax 1\noom 0\noom_kill 0\n")
+        cgpath = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/goinfer-night.service\n"
+        row = None
+        for _ in range(50):
+            row = job_mem.sample(job.pid, cgroup_root=str(cg), cgroup_line=cgpath)
+            if row["servers"]:
+                break
+            time.sleep(0.1)
+        self.assertEqual(len(row["servers"].split(",")), 1, row)
+        self.assertGreater(row["VmRSS"], 0)
+        for k in ("VmSwap", "RssAnon", "RssShmem", "RssFile", "sys_swap_used", "MemAvailable"):
+            self.assertIn(k, row)
+        self.assertEqual((row["slice"], row["slice_current"], row["slice_high"], row["slice_max"]),
+                         ("/user.slice/user-1000.slice", 123456, 7, 1))
+
+    def test_a_job_writes_its_mem_tsv_while_it_runs(self):
+        d = tempfile.mkdtemp(dir=_tmp)
+        srv = _fake_server(d)
+        night.QUEUE.mkdir(parents=True, exist_ok=True)
+        for f in night.QUEUE.glob("*"):
+            f.unlink()
+        _seq[0] += 1
+        seq = 3_000_000 + _seq[0]
+        name = f"mem-{seq}"
+        job = {"name": name, "cmd": ["/bin/bash", "-c", f"{srv} >/dev/null 2>&1 & sleep 2.5; kill %1"], "cwd": _tmp, "est_min": 1.0,
+               "timeout_min": 2.0, "priority": 50, "seq": seq}
+        (night.QUEUE / f"{seq}-mem.json").write_text(json.dumps(job))
+        rundir = Path(tempfile.mkdtemp(dir=_tmp))
+        r = Runner(night.now() + dt.timedelta(hours=1), rundir)
+        with mock.patch.dict(os.environ, {"NIGHT_MEM_SAMPLE_S": "0.2"}), contextlib.redirect_stdout(io.StringIO()):
+            r.run()
+        tsv = rundir / f"{name}.mem.tsv"
+        self.assertTrue(tsv.exists(), "no memory samples were written for the job")
+        lines = tsv.read_text().splitlines()
+        head = lines[0].split("\t")
+        for k in ("t", "servers", "VmSwap", "VmRSS", "RssAnon", "sys_swap_used", "MemAvailable", "slice_current", "slice_high"):
+            self.assertIn(k, head)
+        served = [l for l in lines[1:] if l.split("\t")[head.index("servers")]]
+        self.assertGreater(len(served), 2, "the server was never seen in the job's samples")
+        self.assertIn(f"=== MEMORY   {tsv}", (rundir / f"{name}.log").read_text())
+
+
+class ServeLogged(unittest.TestCase):
+    """scripts/serve_logged.sh, reached as <binary>.logged, runs <binary> as the same process with the same arguments, keeps stdout and
+    stderr apart, and appends both to $NIGHT_RUNDIR/$NIGHT_JOB.serve.log: a night job's server keeps its log whoever starts it."""
+
+    def test_the_server_keeps_its_pid_its_streams_and_a_log(self):
+        d = Path(tempfile.mkdtemp(dir=_tmp))
+        b = d / "goinfer-serve-x"
+        b.write_text("#!/bin/bash\necho \"pid $$ args $*\"\necho \"to stderr\" >&2\n")
+        b.chmod(0o755)
+        (d / "goinfer-serve-x.logged").symlink_to(Path(SCRIPTS) / "serve_logged.sh")
+        env = dict(os.environ, NIGHT_RUNDIR=str(d), NIGHT_JOB="j1")
+        p = subprocess.Popen([str(d / "goinfer-serve-x.logged"), "-a", "1"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             env=env)
+        out, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 0, err)
+        self.assertEqual(out.strip(), f"pid {p.pid} args -a 1")
+        self.assertEqual(err.strip(), "to stderr")
+        for _ in range(50):  # the tees finish writing after the server exits
+            log = (d / "j1.serve.log").read_text() if (d / "j1.serve.log").exists() else ""
+            if "to stderr" in log and "args -a 1" in log:
+                break
+            time.sleep(0.1)
+        self.assertIn(f"pid {p.pid} args -a 1", log)
+        self.assertIn("to stderr", log)
+
+    def test_outside_a_night_job_the_log_goes_beside_the_binary(self):
+        d = Path(tempfile.mkdtemp(dir=_tmp))
+        b = d / "goinfer-serve-y"
+        b.write_text("#!/bin/bash\necho hi\n")
+        b.chmod(0o755)
+        (d / "goinfer-serve-y.logged").symlink_to(Path(SCRIPTS) / "serve_logged.sh")
+        env = {k: v for k, v in os.environ.items() if k not in ("NIGHT_RUNDIR", "NIGHT_JOB", "SERVE_LOG")}
+        r = subprocess.run([str(d / "goinfer-serve-y.logged")], capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for _ in range(50):
+            if (d / "goinfer-serve-y.serve.log").exists() and "hi" in (d / "goinfer-serve-y.serve.log").read_text():
+                break
+            time.sleep(0.1)
+        self.assertIn("hi", (d / "goinfer-serve-y.serve.log").read_text())
 
 if __name__ == "__main__":
     unittest.main()

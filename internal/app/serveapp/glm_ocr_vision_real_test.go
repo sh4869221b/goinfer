@@ -18,6 +18,9 @@ import (
 
 	"github.com/townsendmerino/goinfer/chat"
 	"github.com/townsendmerino/goinfer/internal/app/loadflags"
+	"github.com/townsendmerino/goinfer/internal/testpath"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TestServe_glmOcrImage_O3 is gate O3's serve half, on the real GLM-OCR checkpoint at f32 on the CPU backend, through the
@@ -34,7 +37,7 @@ import (
 //
 //	GOINFER_HEAVY_TESTS=1 go test -tags realckpt ./internal/app/serveapp/ -run 'TestServe_glmOcrImage_O3/invoice' -v -timeout 20m 2>&1 | tee /tmp/glm-ocr-serve-invoice.log
 func TestServe_glmOcrImage_O3(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ckpt := filepath.Join(os.Getenv("HOME"), "models", "glm-ocr")
 	if _, err := os.Stat(filepath.Join(ckpt, "config.json")); err != nil {
 		t.Skipf("asset missing: %s", ckpt)
@@ -44,13 +47,13 @@ func TestServe_glmOcrImage_O3(t *testing.T) {
 		t.Fatalf("newServer: %v", err)
 	}
 	lm := srv.models["glm"]
-	if lm == nil || lm.glm == nil || !lm.visionCapable() {
+	if lm == nil || lm.glmOcr() == nil || !lm.visionCapable() {
 		t.Fatal("auto-discovery did not attach the GLM-OCR tower to the served model")
 	}
 	if lm.tmpl == nil || lm.tmpl.Name() != "glm_ocr" {
 		t.Fatalf("chat template %v, want glm_ocr", lm.tmpl)
 	}
-	if lm.glm.enc != nil {
+	if lm.glmOcr().enc != nil {
 		t.Error("the tower loaded at startup; it must load on the first image")
 	}
 	mux := http.NewServeMux()
@@ -71,7 +74,7 @@ func TestServe_glmOcrImage_O3(t *testing.T) {
 				Grid     [][3]int `json:"grid_thw"`
 			}
 			var g gold
-			f, err := os.Open(filepath.Join("..", "..", "testdata", "glm_ocr", "golden_"+name+".json.gz"))
+			f, err := os.Open(testpath.Testdata(t, "glm_ocr", "golden_"+name+".json.gz"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -92,7 +95,7 @@ func TestServe_glmOcrImage_O3(t *testing.T) {
 			}
 
 			// (a) the prompt ids, built by serve's own code path.
-			towerBefore := lm.glm.enc // nil on the first image; a later subtest starts with the tower already loaded
+			towerBefore := lm.glmOcr().enc // nil on the first image; a later subtest starts with the tower already loaded
 			vi, err := lm.visionPrompt(lm.tmpl, "", []chat.Turn{{Role: "user", Content: g.Prompt}}, imageRef{mediaType: "image/png", data: png})
 			if err != nil {
 				t.Fatalf("visionPrompt: %v", err)
@@ -113,7 +116,7 @@ func TestServe_glmOcrImage_O3(t *testing.T) {
 				t.Fatalf("serve's grid %v, HF's processor %v", vi.grid, g.Grid[0])
 			}
 			t.Logf("prompt ids identical to HF's: %d ids (%d image tokens), grid %v, prompt %q", len(vi.ids), vi.imgLen, vi.grid, g.Prompt)
-			if lm.glm.enc != towerBefore {
+			if lm.glmOcr().enc != towerBefore {
 				t.Error("visionPrompt ran the tower: features must stay lazy")
 			}
 
@@ -146,7 +149,7 @@ func TestServe_glmOcrImage_O3(t *testing.T) {
 			if out.Usage.PromptTokens != len(g.InputIDs) || out.Usage.CompletionTokens != len(g.HFTokens) {
 				t.Errorf("usage prompt/completion = %d/%d, want %d/%d", out.Usage.PromptTokens, out.Usage.CompletionTokens, len(g.InputIDs), len(g.HFTokens))
 			}
-			if lm.glm.enc == nil {
+			if lm.glmOcr().enc == nil {
 				t.Error("the tower never loaded: the image path did not run through it")
 			}
 		})

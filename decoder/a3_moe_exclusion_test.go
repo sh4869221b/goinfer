@@ -8,6 +8,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // What was the MoE exclusion in A3/G24 worth? Measures both halves of the trade on a MoE checkpoint:
@@ -21,7 +23,7 @@ import (
 //	go test -tags goinfer_testhooks ./decoder/ -run TestA3MoEExclusionIsMeasured -v
 func TestA3MoEExclusionIsMeasured(t *testing.T) {
 	path := assetPath(t, "GOINFER_MELLUM_CKPT")
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	K := 2048
 	if v := os.Getenv("GOINFER_MELLUM_K"); v != "" {
 		if _, err := fmt.Sscanf(v, "%d", &K); err != nil {
@@ -30,7 +32,7 @@ func TestA3MoEExclusionIsMeasured(t *testing.T) {
 	}
 	// Quant is an axis: the attention swap is quant-independent, but its share of prefill is not (int4's faster
 	// weight matmul raises attention's fraction and so the speedup). Label which quant you quote: int4 is the
-	// operator-facing number (docs/completed/mellum2-resident.md), int8int8 is the one comparable to earlier runs.
+	// operator-facing number, int8int8 is the one comparable to earlier runs.
 	quant := os.Getenv("GOINFER_BENCH_QUANT")
 	if quant == "" {
 		quant = "int8int8"

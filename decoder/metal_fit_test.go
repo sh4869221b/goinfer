@@ -2,6 +2,7 @@ package decoder
 
 import (
 	"fmt"
+	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 	"strings"
 	"testing"
 )
@@ -36,7 +37,7 @@ func TestPlan_metalPlansWhatMetalAllocates(t *testing.T) {
 // TestGuardGIWFit_onMetalStillPricesTheCPUWorstCase: the load-time guard runs before the backend decides whether it can
 // host the model, and a model Metal declines runs on the CPU, whose KV grows to the request (R13). So the guard keeps
 // pricing the window at the CPU cache's precision on a Metal load too; resolveMetalCtxCap then treats its auto-pin as
-// a ceiling (metal/ctxcap_autopin_test.go). The cost, recorded in docs/tasks/task-metal-audit-2026-10.md: a machine too
+// a ceiling (metal/ctxcap_autopin_test.go). The cost: a machine too
 // tight for the 2048-position floor at f32 is refused a load Metal could have run at f16.
 func TestGuardGIWFit_onMetalStillPricesTheCPUWorstCase(t *testing.T) {
 	cfg := &Config{NumLayers: 32, NumKVHeads: 8, HeadDim: 128, MaxPositions: 131072}
@@ -57,7 +58,7 @@ func TestGuardGIWFit_floorRefusalNamesTheFloorsNeed(t *testing.T) {
 	if err == nil {
 		t.Fatal("no refusal below the floor; the test proves nothing")
 	}
-	floor := fmt.Sprintf("~%.2f GB", float64(estimateKVBytes(cfg, ctxFloor, false, false)+prefillAttnScratchBudget)/fitGB)
+	floor := "~" + mem.GiB(estimateKVBytes(cfg, ctxFloor, false, false)+prefillAttnScratchBudget)
 	if !strings.Contains(err.Error(), floor) {
 		t.Errorf("refusal %q does not give the floor's need %s", err, floor)
 	}

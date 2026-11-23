@@ -11,17 +11,19 @@ import (
 
 	"github.com/townsendmerino/goinfer/decoder"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// TestNemotronResidentQuality measures resident int4 Nemotron-H (int8 doesn't fit 8 GB, see
-// docs/completed/nemotron-resident.md; granite showed the gap is precision-invariant, so
+// TestNemotronResidentQuality measures resident int4 Nemotron-H (int8 doesn't fit 8 GB, see;
+// granite showed the gap is precision-invariant, so
 // int4≈int8) against the f32 CPU reference: teacher-forced agreement/KL/top-5/perplexity, plus
 // free-running coherence and decode speed. Nemotron-H is the same deep hybrid + recurrent-mamba
 // architecture whose int8 resident gap granite proved fundamental, but it has no MoE router, so
 // whether the gap carries over is the question. The agreement number drives the default-vs-opt-in
 // decision; there is no pre-set bar.
 func TestNemotronResidentQuality(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	if os.Getenv("GOINFER_SSM_QUALITY") == "" {
 		t.Skip("nemotron resident quality (slow: 9B f32 + int4 loads); set GOINFER_SSM_QUALITY=1")
 	}

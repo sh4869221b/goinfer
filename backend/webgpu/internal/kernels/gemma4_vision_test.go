@@ -16,6 +16,8 @@ import (
 	"github.com/townsendmerino/goinfer/internal/vision"
 
 	"github.com/townsendmerino/goinfer/multimodal"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // g4vTinyTower loads the committed tiny Gemma 4 tower (finite ClippableLinear bounds) with random position tables and
@@ -99,7 +101,7 @@ func g4vLowest(t *testing.T, enc *vision.Gemma4Encoder, a *g4vTower, p []float32
 	return minTokenCos(got, want, enc.TextHiddenSize)
 }
 
-// TestG4VWebGPU_matchesCPU is G-S12.3d-1 (docs/tasks/task-multimodal-support-2026-10.md, S12.3d): on the tiny tower,
+// TestG4VWebGPU_matchesCPU is G-S12.3d-1: on the tiny tower,
 // with its finite clip bounds and random position tables and norm weights, the WebGPU tower followed by aikit's tail
 // matches aikit's CPU Forward to cosine 0.9999 on every soft token: grids of 18, 54 and 135 patches, raster and
 // shuffled, at the attention block the tower picks and at blocks of 6 (divides 18 and 54) and 5 (divides neither).
@@ -202,7 +204,7 @@ func g4vBudgetOverride(t *testing.T) int {
 //
 //	GOINFER_HEAVY_TESTS=1 go test -count=1 -timeout 30m -tags 'gpu goinfer_testhooks' -run '^TestG4VWebGPU_realE2B$' -v ./gpu/
 func TestG4VWebGPU_realE2B(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	enc, budget := g4vRealTower(t, t.Skipf)
 	t0 := time.Now()
 	logf := func(format string, a ...any) {

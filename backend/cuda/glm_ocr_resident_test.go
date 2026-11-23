@@ -67,13 +67,15 @@ func TestGlmOcrResidentParityCUDA(t *testing.T) {
 	if !cr.pairwiseRoPE || !cr.mropePrefillReady {
 		t.Fatalf("pairwiseRoPE=%v mropePrefillReady=%v: the pairwise kernels (decode, batched, m-RoPE) are not all bound", cr.pairwiseRoPE, cr.mropePrefillReady)
 	}
-	mrope, ok := rf.(decoder.ResidentMRoPE)
+	mrope := decoder.SubsystemsOf(rf).Decode
+	ok = mrope.MRoPEDecodeAvailable()
 	if !ok {
-		t.Fatal("cudaResident does not satisfy decoder.ResidentMRoPE")
+		t.Fatal("cudaResident does not satisfy decoder.ResidentDecodeSubsystem")
 	}
-	rmp, ok := rf.(decoder.ResidentMRoPEPrefill)
+	rmp := decoder.SubsystemsOf(rf).Prefill
+	ok = rmp.MRoPEPrefillAvailable()
 	if !ok {
-		t.Fatal("cudaResident does not satisfy decoder.ResidentMRoPEPrefill")
+		t.Fatal("cudaResident does not satisfy decoder.ResidentPrefillSubsystem")
 	}
 	mCPU, err := decoder.Load(ckpt, decoder.Options{Backend: "cpu", Quant: "int8int8"})
 	if err != nil {
@@ -142,7 +144,7 @@ func TestGlmOcrResidentParityCUDA(t *testing.T) {
 			t.Fatalf("cpu image prefill: %v", err)
 		}
 		cr.Reset()
-		gotImg, gpuPos, err := mRes.ResidentMRoPEPrefillForTest(context.Background(), rmp, g.PromptIDs, feats, g.ImageStart, g.NImage, mropePos)
+		gotImg, gpuPos, err := mRes.ResidentMRoPEPrefillForTest(context.Background(), rf, g.PromptIDs, feats, g.ImageStart, g.NImage, mropePos)
 		if err != nil {
 			t.Fatalf("resident m-RoPE prefill: %v", err)
 		}

@@ -12,10 +12,11 @@ import (
 	"testing"
 
 	gpu "github.com/townsendmerino/goinfer/backend/cuda/internal/gpudev"
+	"github.com/townsendmerino/goinfer/backend/cuda/internal/wpack"
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// The exact-input identity of docs/tasks/task-cuda-f16-kv-2026-10.md: on K and V that are already f16-representable, a _kv16 attention reader
+// The exact-input identity: on K and V that are already f16-representable, a _kv16 attention reader
 // widens each value exactly and folds in the f32 original's order, so its output must equal the f32 original's BIT FOR BIT. A bar of cosine 0.99
 // could not tell a reader that is right from one that is slightly wrong; this can.
 
@@ -49,7 +50,7 @@ func kv16Representable(n int, seed uint32) []float32 {
 		if i%97 == 0 {
 			v *= 40 // an outlier channel
 		}
-		out[i] = f16BitsToF32(f32ToF16RNE(v))
+		out[i] = f16BitsToF32(wpack.F32ToF16RNE(v))
 	}
 	return out
 }

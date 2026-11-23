@@ -111,7 +111,7 @@ experts and the shared expert.
   routed scaling factor.
 - **The top k experts** run as gated MLPs.
 - **An optional always-on shared expert** is added on top. It is sigmoid-gated (Qwen-MoE) or
-  ungated (GLM, DeepSeek).
+  ungated (GLM, DeepSeek, Laguna, Flint).
 
 Granite's fused expert tensors are split per expert at load, so `moeMLP` never sees them. Four
 families bring their own MoE FFN inside their own layer loop: gpt-oss, Llama 4, Nemotron 3 Nano and
@@ -127,8 +127,8 @@ primitive is chosen per layer (`isLinearLayer`, `isMambaLayer`, `isConvLayer`, N
 kind). Its state lives in the same `KVCache` (`decoder/kvcache.go`) beside ordinary K/V. The
 capability matrix files each family under one class (its `coverage_axis`).
 
-**softmax-GQA** — 27 families, among them Llama, Qwen 2/2.5/3 and their MoE and VL variants, Mistral,
-Mixtral, Gemma 3 and 4, Phi, GPT-2, gpt-oss and GLM-4.5/4.6.
+**softmax-GQA** — 28 families, among them Llama, Qwen 2/2.5/3 and their MoE and VL variants, Mistral,
+Mixtral, Gemma 3 and 4, Phi, GPT-2, gpt-oss, GLM-4.5/4.6, Laguna and Flint.
 - Cached per layer: K and V.
 - Code: the generic loop (`decoder/model.go`), or an own loop (below).
 
@@ -174,11 +174,27 @@ own list:
 not name. The list used to be restated per consumer. One copy fell a family behind, and a two-token
 LFM2 prompt panicked (audit 2026-09-02, C-01).
 
-**Recurrent state cannot be rewound.** DeltaNet, KDA, Mamba-2 and short-conv state is overwritten
-in place at every token, and no backend can checkpoint and restore it. Two consequences follow:
-- These families refuse rollback-based speculative decoding (`specRollbackSafe`).
-- They reuse a cached prefix only when the new prompt extends the cached one exactly. An edited
-  conversation is prefilled again.
+**Recurrent state cannot be truncated, so a resident keeps copies of it.** DeltaNet, KDA, Mamba-2 and
+short-conv state is overwritten in place at every token: there is no earlier position to cut back to.
+A sequence can leave its own history only at a position where a copy of the state was kept. The
+residents keep three kinds:
+- **State slots.** CUDA and Metal hold one conv window and one state per recurrent layer *for each KV
+  slot*, as attention KV is held per slot, so two conversations on a hybrid do not share a state.
+- **The checkpoint (KV8a).** One device copy of every recurrent layer's window and state, saved where a
+  prompt ends, before the reply (CUDA keeps one per slot where they fit; Metal keeps one). A request
+  whose prompt matches the sequence only through the checkpoint restarts from it instead of from zero.
+  A load whose memory plan cannot hold the copy keeps none.
+- **Host snapshots (CUDA, KV7's store, below).** A snapshot carries the state with its KV rows, for
+  Gated-DeltaNet and Mamba-2, so a snapshot restores to exactly the row it was taken at and no other.
+  A recurrent model's prefill is cut at each snapshot point, rounded down to a 64-row block: the end
+  of the prompt less its generation tail (`KVScope.Keep`), the start of its last message
+  (`KVScope.MsgBoundary`) and the end of its system-and-tools preamble (`KVScope.Boundary`).
+
+With no copy to restore, a recurrent family reuses a cached prefix only when the new prompt extends
+the cached one exactly, and an edited conversation is prefilled again. The same property keeps these
+families off rollback-based speculative decoding (`specRollbackSafe`); a CUDA Gated-DeltaNet resident
+verifies drafts without rewinding at all, folding only the rows a verify commits
+(`backend/cuda/recurrent_spec.go`).
 
 `specRollbackSafe` refuses a sliding-window ring for the same reason: a wrapped ring cannot rewind
 exactly.
@@ -227,7 +243,7 @@ To get the exact path back, use `--cpu-exact-prefill` (CPU only) or `--exact-pre
 backend). Speculative verify always uses the exact path.
 
 **On a resident backend.** `residentPrefillSeed` hands a suffix of 8 or more tokens to the backend's
-batched prefill (`Prefiller.PrefillLast`) when no adapter is bound. A shorter suffix runs token by
+batched prefill (`ResidentPrefillSubsystem.PrefillLast`) when no adapter is bound. A shorter suffix runs token by
 token. Each backend's floor for its fast prefill kernels is in §3.
 
 `Model.PrefillPath()` states at load which path this model will take, and why. serve prints it in
@@ -294,9 +310,10 @@ Vision in, text out, and on serve only (`--vision`).
 - **Splicing.** The image's embeddings go into the prompt at its placeholder tokens (`GenerateVL`,
   `GenerateQwenVL` with m-RoPE positions, `GenerateGemma4VL`). The text decoder is unchanged.
 - **Qwen3-VL** loads as a text-only decoder, and a `mistral3` checkpoint's tower is ignored.
-- **Where towers run.** Resident vision towers live in `backend/cuda/internal/{qwencuda,visioncuda}` and
-  `backend/metal/internal/{qwenmetal,visionmetal}` (plus SigLIP on WebGPU via `vision.RegisterResident`); the other towers run
-  on the CPU.
+- **Where towers run.** Each backend's resident towers are its own, registered through `vision.RegisterResident` and
+  `vision.RegisterQwenResident`: on CUDA, `backend/cuda/tower_base.go` with `vision_register.go`, `siglip_vision.go`,
+  `qwen25_vision.go`, `grid_vision.go` and `gemma4_vision.go`; on Metal, `backend/metal/vl_towers.go`, `grid_vision.go` and
+  `gemma4_vision.go`; SigLIP on WebGPU. aikit's own GPU towers are not imported. The other towers run on the CPU.
 - **Where the decode runs after the image.** Resident for Gemma 3, Qwen2.5-VL and Gemma 4 26B/31B (the CPU's
   image-block prefill is uploaded with `UploadKV`; CUDA also prefills the image resident), and for GLM-OCR on CUDA.
   **Not resident:** Qwen3.5+ (a recurrent family refuses every resident branch), Gemma 4 E2B/E4B, and GLM-OCR off CUDA.
@@ -452,8 +469,9 @@ This page used to promise an automatic fallback to the GGUF path; that fallback 
 ### Quantization and the CPU kernels
 
 **The default is `int4`.** `--quant` defaults to `int4` in chat, serve and `fit`. That is W4A8: int4
-weights, int8 activations. The embedding and LM head are relaxed to int4 too by default
-(`--embed-int4`, default ON since 2026-09-28 — pass `--embed-int4=false` for the W8A8 pin). The
+weights, int8 activations. The embedding and LM head are relaxed to int4 too by default on a model under 1B parameters
+(`--embed-int4`; from 1B up the default keeps them at int8, `decoder.EmbedInt4For` — pass `--embed-int4=false` for the W8A8
+pin at any size). The
 alternatives:
 - `int8int8` (W8A8), where accuracy matters more than RAM;
 - `int8` (weight-only);
@@ -485,8 +503,9 @@ kernels are bit-identical, so a matmul gives the same answer in decode and in pr
   only for generic-loop, non-MoE families.
 - A sliding-window layer keeps a ring the size of its window.
 
-A resident backend keeps its own cache on the device, one fixed reservation per KV slot
-(`--kv-sessions`), laid out its own way:
+A resident backend keeps its own cache on the device, laid out its own way: CUDA and Metal as a pool of
+64-row blocks behind a table per KV slot (below), WebGPU as one fixed reservation per KV slot
+(`--kv-sessions`):
 
 | | K/V precision | MLA | sliding-window layers | context when not pinned |
 |---|---|---|---|---|
@@ -532,9 +551,27 @@ backends").
   turns sharing off (`decoder.Options.KVShareOff`) under `--kv-share off` and when it answers the network without
   an API key; a request then reuses only its own conversation's rows. `docs/server.md` states the timing limit that
   remains.
-- **Not yet.** Paged storage and the geometry's use (`decoder.Architecture.KVGeometry`: the layer groups by row width
-  and retention, and the recurrent state) are later steps of
-  [tasks/task-kv-architecture-2026-10.md](tasks/task-kv-architecture-2026-10.md).
+- **Storage.** On CUDA and Metal a slot is its block table: KV lives in per-group pools of 64-row blocks
+  (`backend/cuda/kvpool.go`, `backend/metal/kvpool.go`; the groups are `decoder.Architecture.KVGeometry`'s layer
+  groups by row width and retention). Preamble blocks are shared by reference and copied on write, and one
+  conversation can use the whole pool, so a single request's context is bounded by the pool, not by a slot. WebGPU keeps
+  fixed slots.
+- **Host memory (KV7), CUDA only.** One budget, `--kv-host-bytes` (`decoder.Options.KVHostBytes`; by default a tenth of the
+  machine's RAM, at most 8 GiB; the fit guard counts it), holds two things in host memory, each only while it is held:
+  - *Prefix snapshots* (`decoder.kvSnapStore`): after a cold first prefill of 2,048 ids or more, the KV rows of the
+    prompt's full blocks (and, for a recurrent model, its state at each snapshot point) are copied out, keyed like the
+    index (namespace, model, adapter, KV precision). A later request that starts with the same ids restores them by device
+    copy and prefills only the rest. They are prefill-class rows copied before any decode step, so the reply is the cold
+    one. The least recently restored snapshot goes first, and a longer prompt of a held prefix replaces the shorter.
+  - *Host demotion* (`backend/cuda/kvdemote.go`, off unless `--kv-host-bytes` names a budget, experimental): when the pool
+    takes the blocks of an idle conversation, its rows are copied to host memory first and brought back when it returns,
+    bit-identical. It is per slot, not a block-granular host pool, and it is not done for windowed KV or a recurrent model.
+- **The sequence contract.** `kvmgr.SequenceState` is the live KV state of one sequence, in a CPU session or a resident slot:
+  its tokens, root, image spans, kernel classes, whether it is recurrent and where its checkpoint is (`Checkpoint`), its
+  floor, how much of a prefix is still physically servable (`ReusablePrefix`) and whether a cut-back is exact (`Truncate`).
+  Prefix scoring, sharing and turn rewinding run on it, so CPU and resident KV share one set of rules.
+- **Not yet.** A disk tier and a block-granular host pool (the rest of KV7), and Metal's host memory: snapshots and
+  demotion are CUDA's. See [tasks/task-kv-architecture-2026-10.md](tasks/task-kv-architecture-2026-10.md).
 
 ### Fitting to the machine
 
@@ -565,7 +602,7 @@ it priced. The **`fit` subcommand** (`goinfer-chat fit <model>`) loads the model
 placement for every backend compiled into the binary. `-measure` also times decode on the best one.
 
 **Each memory quantity is computed in one place**, so the planner and the guards cannot disagree
-([tasks/task-memory-accounting-2026-09.md](tasks/task-memory-accounting-2026-09.md)):
+([tasks/task-memory-accounting-2026-09.md](completed/task-memory-accounting-2026-09.md)):
 
 - `Model.ResidentKVBytes(backend, ctx, f16, i8)`: the KV cache as that backend allocates it (the
   table above). Pinned against the real allocations on CUDA and Metal.
@@ -635,7 +672,7 @@ silicon only, and keeps a non-int4 model on the CPU rather than re-quantize it
 **Two seams.** `decoder.Backend` (`decoder/backend.go`) is per matmul. The CPU implements it, and
 WebGPU implements it on the device for its staged path (below).
 
-`decoder.ResidentForward` (`decoder/residency.go`) is the whole token, built by the backend's
+`decoder.ResidentForward` (declared in `decoder/resident` as `resident.Forward`, with the four subsystem contracts and the data their signatures carry, and aliased in `decoder/residentalias.go`) is the whole token, built by the backend's
 `BuildResident`:
 
 - `Forward(embedding, pos)` returns one token's logits and appends its K/V on the device.
@@ -644,17 +681,43 @@ WebGPU implements it on the device for its staged path (below).
 - `UploadKV` writes K/V computed on the CPU (an image prefill, say) into the device cache.
 - `TruncateTo`, `Reset`, `Close`.
 
-34 optional interfaces sit around it, found by type assertion on a resident (28 of them are declared in
-`decoder/residency.go`). Among them:
-- batched prefill (`Prefiller`);
-- device sampling;
-- prefill without logits;
-- hidden-state readout;
-- compute-time LoRA (`ResidentAdapter`);
-- image and m-RoPE prefill;
-- a context cap (`ResidentCapped`);
-- the load-time reporters (`PrefillPathReporter`, `VerifyPathReporter`), which say which path a
-  model will take.
+Everything optional is reached through four subsystem contracts, not by asking a resident which methods it has.
+
+### The resident's contracts
+
+The four contracts are in `decoder/resident_subsystems.go`:
+
+- `ResidentDecodeSubsystem`: the single-token fast paths (argmax, top-K, device sampling, m-RoPE, KV-only), the
+  device-chained greedy and sampled decode, and multi-sequence batched and ragged steps.
+- `ResidentPrefillSubsystem`: batched, row-chunked and boundary-marked prefill, block and chunk scratch pricing,
+  hidden-state and residual readout, and image, m-RoPE and span prefill.
+- `ResidentKVSubsystem`: slot binding, the shared block pool, cross-slot copy, reuse queries, host snapshots and
+  demotion, and recurrent checkpoints.
+- `ResidentRuntimeSubsystem`: `ResidentCaps` (the context cap among them), cost spans, compute-time LoRA, the MoE
+  expert cache, the speculative verify path and its guards, and the block drafter host.
+
+A resident gets them to the decoder by implementing `decoder/residentalias.go:ResidentSubsystemProvider`, whose
+`ResidentSubsystems()` returns four pre-built wrappers. Each backend pins that at compile time in its
+`subsystems.go`, and each wrapper embeds `NoopResidentDecode`, `NoopResidentPrefill`, `NoopResidentKV` or
+`NoopResidentRuntime`, so a capability the backend lacks answers false. The decoder asks `GreedyAvailable()` and the
+like, then calls the method; it makes no type assertion on a resident. `SubsystemsOf` returns a provider's subsystems and
+the no-op subsystems for anything else, so a resident that implements only `ResidentForward` runs on the plain path. The
+exported capability types outside the four, each kept for a stated reason, and the inventory are in
+[sub1-resident-interfaces.md](sub1-resident-interfaces.md).
+
+### The model view and the layer walk
+
+`decoder/backend_view.go:BackendModelView` is the read-only seam a resident builder and the placement code use to inspect
+a loaded model, in place of the 200-odd methods on `*Model`; `Model.BackendView()` returns it. It carries the dimensions,
+the per-family geometry (`MoE`, `MLA`, `Qwen35`, and so on), the norm, RoPE and softcap scalars, and the
+`Weights`. Its per-layer half is `decoder/backend_view.go:ResidentLayerView` (head geometry, RoPE schedule, and the
+family-specific weights). All three backends' resident builders read it, as do the fit and placement code in `decoder`.
+
+The layer walk is `internal/runtime/program/walk.go:DecodeLayerWalk`. A layer's operation list (`Model.Program()`) goes in,
+with the backend's name; the sublayers are partitioned, the backend's claim on each is checked, and a `LayerWalk` comes out:
+the mixer kind, the attention walk and an `FFNWalk` carrying how each sublayer takes its input and joins the residual
+stream. A backend that walks it follows the model's topology (pre-norm, sandwich, parallel, post-only) instead of
+re-deriving it per family. Metal's decode FFN steps and CUDA's decode and prefill read it; WebGPU does not yet.
 
 ### Admission: which models run resident
 
@@ -665,7 +728,7 @@ load's facts, `Admit` (`decoder/admit.go`), which applies them in this order:
 1. **The load's backend and precision.**
    - The backend can build residents at all.
    - Native Q4_K has a resident kernel (CUDA and Metal).
-   - `-backend auto` on Metal keeps a non-int4 model on the CPU.
+   - `-backend auto` on Metal keeps a model on the CPU unless it is int4, q4k, or int8int8 that runs natively.
    - Nemotron-H's MoE block is named as a gap on CUDA and Metal.
 2. **Runner shape and precision policy** (`admitRunner`). The architecture must be one the
    uniform-layer runners can express.
@@ -779,13 +842,14 @@ The `backend/webgpu/` module (`package webgpu`), built with `-tags gpu`, and cgo
   - The match is on token ids, never text, and the last token is always recomputed.
   - A slot is forgotten on any generation that does not complete.
   - It is adapter-aware, and it survives image turns through the image hash.
-  - On the recurrent families it covers only an exact extension of what the slot holds.
+  - On the recurrent families it covers an exact extension of what the slot holds, or the position of a
+    state copy that was kept (the checkpoint, a CUDA snapshot).
   - A continuation keeps its slot. A prompt that shares only a short lead with a slot (a chat
     template's preamble) takes an empty slot, or the least recently used one.
   - Where a backend's long prompts run kernels that are not bit-identical to its short ones (CUDA
     from 512 tokens, in passes of 16 rows or more), a reused lead shorter than 64 tokens is dropped
     and the prompt is prefilled whole, so that one class of kernel writes it.
-- **Context caps** differ per backend (the KV table in §2). `ResidentCapped` lets generation refuse
+- **Context caps** differ per backend (the KV table in §2). `ResidentCaps.ContextCap` lets generation refuse
   or clamp a request before it starts, instead of failing after N tokens.
 - **Performance numbers** (kernels, time to first token, decode) are in
   [benchmarks.md](benchmarks.md). CUDA rows are anchored to one NVIDIA driver version.
@@ -1086,31 +1150,30 @@ Every import from one goinfer package to another, by repository-relative directo
 | `apps/examples/structured` | `chat`, `constrain`, `decoder`, `tokenizer` |  |
 | `apps/sdktest` |  | `server` |
 | `apps/site/cmd/build` | `site/internal/site` |  |
-| `backend/cuda` | `backend/cuda/internal/gpudev`, `backend/cuda/internal/launchgeom`, `backend/cuda/internal/wpack`, `decoder`, `internal/audio`, `internal/cost`, `internal/runtime/mem`, `internal/runtime/program`, `internal/runtime/sampling`, `internal/vision`, `multimodal` | `chat`, `embeddinggemma2`, `internal/app/loadflags`, `internal/clef`, `internal/diag/sb2census`, `internal/diag/towerid`, `internal/guard/memgate`, `internal/runtime/giw`, `internal/runtime/mem/probe`, `internal/runtime/modelload`, `internal/runtime/whisper`, `internal/wrappedupload`, `tokenizer` |
+| `backend/cuda` | `backend/cuda/internal/fitdecide`, `backend/cuda/internal/gpudev`, `backend/cuda/internal/launchgeom`, `backend/cuda/internal/wpack`, `decoder`, `decoder/fit`, `internal/audio`, `internal/cost`, `internal/runtime/logs`, `internal/runtime/mem`, `internal/runtime/program`, `internal/runtime/sampling`, `internal/vision`, `multimodal` | `chat`, `embeddinggemma2`, `internal/app/fitcmd`, `internal/app/loadflags`, `internal/clef`, `internal/diag/sb2census`, `internal/diag/towerid`, `internal/fidelity`, `internal/guard/memgate`, `internal/runtime/giw`, `internal/runtime/mem/probe`, `internal/runtime/modelload`, `internal/runtime/whisper`, `internal/testgate`, `internal/wrappedupload`, `tokenizer` |
 | `backend/cuda/cmd/chat` | `backend/cuda`, `internal/app/chatapp` |  |
 | `backend/cuda/cmd/serve` | `backend/cuda`, `internal/app/serveapp` |  |
-| `backend/cuda/internal/qwencuda` | `backend/cuda/internal/gpudev`, `internal/runtime/mem`, `internal/vision` |  |
-| `backend/cuda/internal/visioncuda` | `backend/cuda/internal/gpudev`, `internal/runtime/mem`, `internal/vision` |  |
-| `backend/cuda/kernels` |  | `backend/cuda/internal/gpudev`, `backend/cuda/internal/launchgeom`, `backend/cuda/internal/wpack`, `internal/runtime/hybridattn`, `internal/runtime/mamba2`, `internal/runtime/sampling` |
-| `backend/cuda/s4siglip` |  | `backend/cuda/internal/visioncuda`, `internal/vision` |
-| `backend/metal` | `backend/metal/internal/gpudev`, `backend/metal/kernels`, `decoder`, `embeddinggemma2`, `internal/audio`, `internal/cost`, `internal/runtime/f16`, `internal/runtime/mem`, `internal/runtime/mem/probe`, `internal/runtime/program`, `internal/vision`, `multimodal` | `chat`, `constrain`, `internal/app/loadflags`, `internal/confidence`, `internal/diag/sb2census`, `internal/diag/towerid`, `internal/fidelity`, `internal/guard/memgate`, `internal/runtime/giw`, `internal/runtime/modelload`, `internal/runtime/prequant`, `internal/wrappedupload`, `tokenizer` |
+| `backend/cuda/internal/fitdecide` | `internal/runtime/mem` |  |
+| `backend/cuda/kernels` |  | `backend/cuda/internal/gpudev`, `backend/cuda/internal/launchgeom`, `backend/cuda/internal/wpack`, `internal/runtime/hybridattn`, `internal/runtime/mamba2`, `internal/runtime/mem`, `internal/runtime/sampling` |
+| `backend/metal` | `backend/metal/internal/gpudev`, `backend/metal/kernels`, `decoder`, `embeddinggemma2`, `internal/audio`, `internal/cost`, `internal/runtime/f16`, `internal/runtime/logs`, `internal/runtime/mem`, `internal/runtime/mem/probe`, `internal/runtime/program`, `internal/vision`, `multimodal` | `chat`, `constrain`, `decoder/fit`, `internal/app/loadflags`, `internal/confidence`, `internal/diag/sb2census`, `internal/diag/towerid`, `internal/fidelity`, `internal/guard/memgate`, `internal/runtime/giw`, `internal/runtime/modelload`, `internal/runtime/prequant`, `internal/testgate`, `internal/wrappedupload`, `tokenizer` |
 | `backend/metal/cmd/chat` | `backend/metal`, `internal/app/chatapp` |  |
 | `backend/metal/cmd/serve` | `backend/metal`, `internal/app/serveapp` |  |
-| `backend/metal/internal/qwenmetal` | `backend/metal/internal/gpudev`, `internal/runtime/mem`, `internal/vision` |  |
-| `backend/metal/internal/visionmetal` | `backend/metal/internal/gpudev`, `internal/runtime/mem`, `internal/vision` |  |
 | `backend/metal/kernels` | `internal/runtime/f16` | `backend/metal/internal/gpudev`, `internal/runtime/hybridattn`, `internal/runtime/mamba2`, `internal/runtime/sampling` |
-| `backend/webgpu` | `backend/webgpu/internal/kernels`, `decoder`, `internal/cost`, `internal/runtime/mem`, `internal/runtime/program` | `chat`, `internal/diag/sb2census`, `internal/diag/towerid`, `internal/fidelity`, `internal/guard/memgate`, `internal/runtime/giw`, `internal/runtime/mem/probe`, `internal/vision`, `internal/wrappedupload`, `multimodal`, `tokenizer` |
+| `backend/webgpu` | `backend/webgpu/internal/kernels`, `backend/webgpu/internal/kvdecl`, `decoder`, `internal/cost`, `internal/runtime/logs`, `internal/runtime/mem`, `internal/runtime/program` | `chat`, `decoder/fit`, `internal/diag/sb2census`, `internal/diag/towerid`, `internal/fidelity`, `internal/guard/memgate`, `internal/runtime/giw`, `internal/runtime/mem/probe`, `internal/testgate`, `internal/vision`, `internal/wrappedupload`, `multimodal`, `tokenizer` |
 | `backend/webgpu/cmd/chat` | `backend/webgpu`, `internal/app/chatapp` |  |
 | `backend/webgpu/cmd/serve` | `backend/webgpu`, `internal/app/serveapp` |  |
-| `backend/webgpu/internal/kernels` | `internal/cost`, `internal/runtime/adapter`, `internal/runtime/mem`, `internal/vision`, `multimodal` | `internal/runtime/hybridattn`, `internal/runtime/sampling` |
-| `chat` | `tokenizer` | `internal/codec`, `multimodal` |
-| `cmd/gate` | `internal/guard/paritykey`, `internal/runtime/mem/probe`, `tokenizer` |  |
+| `backend/webgpu/internal/kernels` | `internal/cost`, `internal/runtime/adapter`, `internal/runtime/mem`, `internal/vision`, `multimodal` | `internal/runtime/hybridattn`, `internal/runtime/sampling`, `internal/testgate` |
+| `backend/webgpu/internal/kvdecl` | `internal/runtime/program` |  |
+| `chat` | `constrain`, `tokenizer` | `internal/codec`, `multimodal` |
+| `cmd/gate` | `internal/guard/paritykey`, `internal/runtime/mem/probe`, `tokenizer` | `internal/testgate` |
 | `cmd/hostmem` | `internal/runtime/mem/probe` |  |
 | `cmd/prequant` | `decoder`, `internal/runtime/prequant` |  |
 | `cmd/serve` | `internal/app/serveapp` |  |
+| `cmd/testcmdtags` | `internal/guard/testcmdtags` |  |
 | `constrain` |  | `tokenizer` |
-| `decoder` | `chat`, `constrain`, `decoder/fit`, `internal/cost`, `internal/runtime/adapter`, `internal/runtime/checkpoint`, `internal/runtime/diskfree`, `internal/runtime/f16`, `internal/runtime/giw`, `internal/runtime/hybridattn`, `internal/runtime/kvmgr`, `internal/runtime/mamba2`, `internal/runtime/mem`, `internal/runtime/mem/probe`, `internal/runtime/program`, `internal/runtime/sampling`, `tokenizer` | `internal/audio`, `internal/fidelity`, `internal/guard/paritykey`, `internal/vision`, `multimodal` |
+| `decoder` | `chat`, `constrain`, `decoder/config`, `decoder/fit`, `decoder/quant`, `decoder/resident`, `internal/cost`, `internal/runtime/adapter`, `internal/runtime/checkpoint`, `internal/runtime/diskfree`, `internal/runtime/f16`, `internal/runtime/giw`, `internal/runtime/hybridattn`, `internal/runtime/kvmgr`, `internal/runtime/logs`, `internal/runtime/mamba2`, `internal/runtime/mem`, `internal/runtime/mem/probe`, `internal/runtime/program`, `internal/runtime/sampling`, `tokenizer` | `internal/audio`, `internal/diag/sb2census`, `internal/fidelity`, `internal/guard/paritykey`, `internal/testgate`, `internal/vision`, `multimodal` |
 | `decoder/fit` | `internal/runtime/mem` |  |
+| `decoder/resident` | `internal/cost`, `internal/runtime/adapter` |  |
 | `demo/agent/agent` | `chat`, `constrain`, `decoder`, `multimodal`, `tokenizer` |  |
 | `demo/agent/cmd/agent-web` | `backend/webgpu`, `demo/agent/agent`, `demo/agent/internal/embedmodel` |  |
 | `demo/agent/cmd/stdlib-agent` | `demo/agent/agent`, `demo/agent/internal/embedmodel` |  |
@@ -1121,10 +1184,11 @@ Every import from one goinfer package to another, by repository-relative directo
 | `engine/enginetest` | `engine` |  |
 | `internal/app/chatapp` | `chat`, `constrain`, `decoder`, `internal/app/cliutil`, `internal/app/decidecmd`, `internal/app/fitcmd`, `internal/app/loadflags`, `internal/app/pullcmd`, `internal/batchio`, `internal/codec`, `internal/diag/hwreport`, `internal/runtime/giw`, `internal/runtime/modelload`, `internal/runtime/prequant`, `internal/vision`, `multimodal`, `pull`, `tokenizer` |  |
 | `internal/app/decidecmd` | `decoder`, `internal/app/loadflags`, `internal/decide`, `internal/runtime/modelload`, `internal/runtime/prequant` |  |
-| `internal/app/fitcmd` | `decoder`, `internal/runtime/modelload`, `internal/runtime/prequant` | `internal/runtime/giw` |
+| `internal/app/fitcmd` | `decoder`, `decoder/fit`, `internal/config`, `internal/runtime/mem`, `internal/runtime/modelload`, `internal/runtime/prequant` | `internal/runtime/giw` |
 | `internal/app/loadflags` | `decoder`, `internal/app/cliutil`, `internal/config` |  |
 | `internal/app/pullcmd` | `pull` |  |
-| `internal/app/serveapp` | `chat`, `constrain`, `decoder`, `embeddinggemma2`, `engine`, `engine/enginetest`, `internal/app/cliutil`, `internal/app/connect`, `internal/app/loadflags`, `internal/app/pullcmd`, `internal/audio`, `internal/batchio`, `internal/clef`, `internal/codec`, `internal/cost`, `internal/decide`, `internal/guard/servecheck`, `internal/guard/swapguard`, `internal/runtime/modelload`, `internal/runtime/prequant`, `internal/runtime/sampling`, `internal/runtime/scheduler`, `internal/runtime/whisper`, `internal/vision`, `multimodal`, `pull`, `tokenizer` | `internal/app/chatapp`, `internal/app/inproc`, `internal/config`, `internal/runtime/giw`, `internal/runtime/kvmgr` |
+| `internal/app/serveapp` | `chat`, `constrain`, `decoder`, `decoder/fit`, `embeddinggemma2`, `engine`, `internal/app/cliutil`, `internal/app/connect`, `internal/app/loadflags`, `internal/app/pullcmd`, `internal/app/serveapp/jobs`, `internal/audio`, `internal/batchio`, `internal/clef`, `internal/codec`, `internal/cost`, `internal/decide`, `internal/guard/servecheck`, `internal/guard/swapguard`, `internal/runtime/mem`, `internal/runtime/modelload`, `internal/runtime/prequant`, `internal/runtime/sampling`, `internal/runtime/scheduler`, `internal/runtime/whisper`, `internal/vision`, `multimodal`, `pull`, `tokenizer` | `engine/enginetest`, `internal/app/chatapp`, `internal/app/inproc`, `internal/config`, `internal/runtime/giw`, `internal/runtime/kvmgr`, `internal/testgate`, `internal/testpath` |
+| `internal/app/serveapp/jobs` | `internal/cost` |  |
 | `internal/audio` | `internal/vision` |  |
 | `internal/clef` | `decoder`, `tokenizer` | `internal/runtime/modelload` |
 | `internal/codec` | `chat`, `multimodal`, `tokenizer` |  |
@@ -1132,11 +1196,11 @@ Every import from one goinfer package to another, by repository-relative directo
 | `internal/decide` | `chat`, `decoder`, `internal/codec`, `internal/confidence`, `tokenizer` |  |
 | `internal/diag/hwreport` | `decoder`, `internal/app/fitcmd` |  |
 | `internal/diag/towerid` | `embeddinggemma2`, `internal/audio`, `internal/diag/kernelprint`, `internal/vision`, `multimodal` |  |
-| `internal/guard/memgate` | `decoder`, `internal/runtime/mem` | `internal/diag/sb2census` |
+| `internal/guard/memgate` | `decoder`, `decoder/fit`, `internal/runtime/mem` | `internal/diag/sb2census` |
 | `internal/guard/servecheck` | `decoder`, `internal/diag/hwreport` |  |
-| `internal/guard/swapguard` | `decoder`, `internal/runtime/mem/probe` |  |
+| `internal/guard/swapguard` | `decoder`, `internal/runtime/logs`, `internal/runtime/mem/probe` |  |
 | `internal/runtime/mamba2` | `internal/runtime/hybridattn` |  |
-| `internal/runtime/modelload` | `decoder`, `internal/guard/swapguard`, `internal/runtime/giw`, `internal/runtime/mem`, `internal/runtime/prequant`, `pull`, `tokenizer` |  |
+| `internal/runtime/modelload` | `decoder`, `decoder/fit`, `internal/guard/swapguard`, `internal/runtime/giw`, `internal/runtime/logs`, `internal/runtime/mem`, `internal/runtime/prequant`, `pull`, `tokenizer` | `internal/testpath` |
 | `internal/runtime/prequant` | `decoder` |  |
 | `internal/runtime/whisper` | `internal/audio`, `tokenizer` | `multimodal` |
 | `internal/wrappedupload` | `decoder` |  |
@@ -1151,6 +1215,9 @@ No import, made or recorded, may break one; they are edited by hand in `imports.
 | rule | packages | may not import | why |
 |---|---|---|---|
 | fit-leaf | `decoder/fit`, tests included | any goinfer package; (`decoder/fit` may import `internal/runtime/mem`) | decoder/fit (Tier 3, docs/layout.md) holds the fit guard's and the planner's exchange types so a caller can name them without importing the loader. It sits below decoder, which re-exports them: it imports internal/runtime/mem and no other goinfer package, decoder included. |
+| resident-leaf | `decoder/resident`, tests included | any goinfer package; (`decoder/resident` may import `internal/cost`, `internal/runtime/adapter`) | decoder/resident holds the contract a resident backend implements (the four subsystem interfaces, the provider, ResidentForward, the drafter host and the small data their signatures carry) so a reader can hold it without the loader (MZ5 option B, docs/sub1-resident-interfaces.md). It sits below decoder, which aliases every name in decoder/residentalias.go: it imports internal/cost and internal/runtime/adapter and no other goinfer package, decoder included. |
+| config-leaf | `decoder/config`, tests included | any goinfer package | decoder/config holds a checkpoint's Config, its validators and its loader, so they test in seconds without compiling decoder. It sits below decoder, which aliases Config: it imports no goinfer package, decoder included. |
+| quant-leaf | `decoder/quant`, tests included | any goinfer package | decoder/quant (Tier 3, docs/layout.md) parses safetensors checkpoint quantization configs and reconstructs FP8, GPTQ, AWQ, NVFP4 and MLX quantized weights behind Reconstructor/RowStreamReconstructor. It sits below decoder and imports no goinfer package, decoder included. |
 | towers-standalone | `internal/vision`, `internal/audio`, tests included | any goinfer package; (`internal/audio` may import `internal/vision`); anything outside the standard library but `github.com/townsendmerino/aikit/linalg`, `github.com/townsendmerino/aikit/embed` | The towers moved from aikit (AX) as model semantics over aikit's kernels: no goinfer package, and from outside the standard library only aikit's linalg and embed. One exception: internal/audio may import internal/vision, whose tower program type the audio towers walk (Francis, 2026-10-29). |
 | gpudev-standalone | `backend/cuda/internal/gpudev`, `backend/metal/internal/gpudev`, tests included | any goinfer package | The device substrate (AX) sits under every backend package and imports none of them, nor anything else of goinfer's. |
 | kernels-free-of-decoder | `backend/cuda/kernels`, `backend/metal/kernels`, `backend/webgpu/internal/kernels`, tests included | `decoder` | Backend kernel tests left the packages that import decoder (SB1 step 1) so a decoder edit stops re-running them. |
@@ -1158,5 +1225,6 @@ No import, made or recorded, may break one; they are edited by hand in `imports.
 | root-free-of-backends | `module:root`, tests included | `backend/cuda`; `backend/metal`; `backend/webgpu`; `github.com/townsendmerino/aikit/gpu`; `github.com/ebitengine/purego`; `github.com/eitamring/gocudrv`; (the root go.mod requires none of them) | The root module builds without a GPU toolchain or binding: the backends are their own modules, which import the root, never the reverse. |
 | scheduler-standard-library | `internal/runtime/scheduler`, tests included | any goinfer package | The scheduling policy (SB6) is decisions over plain values: no goinfer package and nothing outside the standard library, so it can be tested on a virtual clock with nothing loaded. |
 | engine-below-the-shell | `engine`, `engine/enginetest`, tests included | `internal/app/serveapp`; `internal/app/chatapp`; `cmd` | The engine package (SB7) is what the serving shell asks of a model; the shell imports it and its fakes, never the reverse, so a fake engine needs no server. |
+| serveapp-fakes-test-only | `internal/app/serveapp` | `engine/enginetest` | The engine fakes are test code: the serving shell's production files do not link them. A test supplies its engine through loadedModel.fakeEngine. |
 
 <!-- imports:end -->

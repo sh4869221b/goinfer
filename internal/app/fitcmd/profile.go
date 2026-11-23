@@ -3,11 +3,13 @@ package fitcmd
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 	"io"
 	"os"
 	"strings"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/decoder/fit"
 )
 
 // ExitRefused is fit -profile's exit code for a load the recorded machine would refuse; 0 is a load that proceeds (it fits,
@@ -22,14 +24,14 @@ type machineProfile struct {
 
 // profileVerdict is fit -profile -json's output.
 type profileVerdict struct {
-	Profile        string            `json:"profile"`
-	AvailableBytes int64             `json:"available_bytes"`
-	Verdict        string            `json:"verdict"` // fits, capped, refused, unpriced
-	Answer         decoder.FitAnswer `json:"answer"`
+	Profile        string        `json:"profile"`
+	AvailableBytes int64         `json:"available_bytes"`
+	Verdict        string        `json:"verdict"` // fits, capped, refused, unpriced
+	Answer         fit.FitAnswer `json:"answer"`
 }
 
 // verdictOf names a FitAnswer's outcome.
-func verdictOf(a decoder.FitAnswer) string {
+func verdictOf(a fit.FitAnswer) string {
 	switch {
 	case !a.Fits:
 		return "refused"
@@ -73,16 +75,15 @@ func runProfile(w io.Writer, path, profilePath string, opts decoder.Options, asJ
 		out, _ := json.Marshal(v)
 		fmt.Fprintln(w, string(out))
 	} else {
-		gib := func(n int64) float64 { return float64(n) / (1 << 30) }
 		switch v.Verdict {
 		case "refused":
-			fmt.Fprintf(w, "fit: REFUSED on %s (%.1f GB available):\n%s\n", p.Name, gib(p.AvailableBytes), a.Decline)
+			fmt.Fprintf(w, "fit: REFUSED on %s (%s available):\n%s\n", p.Name, mem.GiB(p.AvailableBytes), a.Decline)
 		case "unpriced":
 			fmt.Fprintf(w, "fit: UNPRICED on %s: %s\n", p.Name, a.Unpriced)
 		case "capped":
-			fmt.Fprintf(w, "fit: CAPPED on %s: context %d (model allows %d), needs %.1f GB of a %.1f GB budget\n", p.Name, a.Ctx, a.MaxCtx, gib(a.NeedBytes), gib(a.BudgetBytes))
+			fmt.Fprintf(w, "fit: CAPPED on %s: context %d (model allows %d), needs %s of a %s budget\n", p.Name, a.Ctx, a.MaxCtx, mem.GiB(a.NeedBytes), mem.GiB(a.BudgetBytes))
 		default:
-			fmt.Fprintf(w, "fit: FITS on %s: needs %.1f GB of a %.1f GB budget\n", p.Name, gib(a.NeedBytes), gib(a.BudgetBytes))
+			fmt.Fprintf(w, "fit: FITS on %s: needs %s of a %s budget\n", p.Name, mem.GiB(a.NeedBytes), mem.GiB(a.BudgetBytes))
 		}
 	}
 	if v.Verdict == "refused" {

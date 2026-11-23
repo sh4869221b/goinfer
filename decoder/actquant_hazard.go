@@ -13,7 +13,7 @@ import (
 // row by one max/127. A family whose projection inputs carry massive outliers loses nearly all of
 // each row to rounding.
 //
-// Phi-3-mini is the measured case (docs/queue-engineering.md, H2): the down_proj input's max/rms is about 80-90 in most
+// Phi-3-mini is the measured case: the down_proj input's max/rms is about 80-90 in most
 // layers, so a per-row scale rounds nearly the whole row to zero, and int4 and int8int8 lose the logits while weight-only
 // int8 holds. Keyed on model type, so Phi-4 (also "phi3") is covered without having been measured. This is a guard until
 // per-group activation scales land in the kernels; it is not the fix.
@@ -62,4 +62,4 @@ func PeekModelType(path string) string {
 
 // ActQuantGroup is the activation quantization group this model was loaded with
 // (Options.ActQuantGroup): 0 = one scale per activation vector, 32 = one per 32 inputs.
-func (m *Model) ActQuantGroup() int { return m.actGroup }
+func (m *Model) ActQuantGroup() int { return m.opts.ActQuantGroup }

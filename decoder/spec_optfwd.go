@@ -1,5 +1,7 @@
 package decoder
 
+import "github.com/townsendmerino/goinfer/internal/runtime/sampling"
+
 import ()
 
 // optFwdMaxTemp is the temperature at or below which the optimistic-forward overlap may run; above it the overlap is a
@@ -47,7 +49,7 @@ func (s *OptFwdStats) HitRate() float64 {
 // optFwdGate is a binary (speculate / don't) trailing-hit-rate switch, the same EMA shape as AdaptiveDepth
 // (spec_adaptive.go) but for an on/off decision rather than a continuous depth.
 //
-// Its thresholds are fitted on one model and are wrong for small-vocab ones (docs/QUEUE.md G27). Break-even hit rate
+// Its thresholds are fitted on one model and are wrong for small-vocab ones. Break-even hit rate
 // rises as the sampler's share of a step falls, because the overlap can only pay back the sampler it hides. EnableAt
 // is pinned to the worst break-even measured on a large-vocab model at a shallow context; on a small-vocab model the
 // true break-even sits above it, the whole 0.90/0.75 dead band lies below it, and the gate cannot turn off where the
@@ -98,7 +100,7 @@ func (g *optFwdGate) ensure() {
 // called only from optFwdStep, which the caller in model.go invokes only when Should() is true, so once alpha falls
 // below DisableAt nothing is observed again and the re-enable branch in Observe cannot run for the rest of that
 // Generate. TestOptFwdGate_hysteresis drives Observe unconditionally, a calling convention production never uses, so
-// it does not pin this. Left as is deliberately: fix it together with the thresholds (docs/QUEUE.md G27).
+// it does not pin this. Left as is deliberately: fix it together with the thresholds.
 func (g *optFwdGate) Should() bool {
 	g.ensure()
 	return g.on
@@ -146,7 +148,7 @@ type optFwdResult struct {
 // metal/backend.go). The emitted tokens and logprobs are bit-identical to the non-speculative path either way; only
 // which goroutine computed which logits differs.
 func (m *Model) optFwdStep(sampler *Sampler, logits []float32, gpuPos int, gate *optFwdGate, stats *OptFwdStats) (optFwdResult, error) {
-	guess := argmax(logits)
+	guess := sampling.Argmax(logits)
 
 	// Copy the logits before starting the overlap. Without it the feature is silently wrong on CUDA: a resident backend
 	// may return a slice that aliases its own reusable host buffer, valid only until the next Forward (cuda/resident.go

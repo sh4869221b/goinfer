@@ -1,7 +1,6 @@
 package decoder
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 )
@@ -21,13 +20,13 @@ import (
 // key parseRopeScaling reads. Left unhandled, its default (0.1·ln(16)+1 ≈ 1.277) would silently override the correct 1.0, so it is
 // overridden the way deepseekArchitecture does.
 func ministral3Architecture(cfg *Config) (*Architecture, *tensorSchema, error) {
-	// backfillFlatRope BEFORE validateLlama: the released checkpoints carry ONLY a nested
-	// rope_parameters (no flat rope_theta), and validateLlama itself requires RoPEGlobalBase > 0
+	// backfillFlatRope BEFORE ValidateLlama: the released checkpoints carry ONLY a nested
+	// rope_parameters (no flat rope_theta), and ValidateLlama itself requires RoPEGlobalBase > 0
 	// — the same ordering mistralArchitecture uses, for the same reason.
 	if err := backfillFlatRope(cfg, "mistral3"); err != nil {
 		return nil, nil, err
 	}
-	if err := cfg.validateLlama(); err != nil {
+	if err := cfg.ValidateLlama(); err != nil {
 		return nil, nil, err
 	}
 	base, scaling, err := ropeBaseFlatOrNested(cfg, "mistral3")
@@ -43,7 +42,9 @@ func ministral3Architecture(cfg *Config) (*Architecture, *tensorSchema, error) {
 			Mscale       *float64 `json:"mscale"`
 			MscaleAllDim *float64 `json:"mscale_all_dim"`
 		}
-		_ = json.Unmarshal(cfg.RopeParameters, &y)
+		if err := rereadRope("mistral3", cfg.RopeParameters, &y); err != nil {
+			return nil, nil, err
+		}
 		if y.Mscale != nil || y.MscaleAllDim != nil {
 			m, mAll := 1.0, 1.0
 			if y.Mscale != nil {
@@ -59,9 +60,11 @@ func ministral3Architecture(cfg *Config) (*Architecture, *tensorSchema, error) {
 		Beta       float64 `json:"llama_4_scaling_beta"`
 		OrigMaxPos float64 `json:"original_max_position_embeddings"`
 	}
-	_ = json.Unmarshal(cfg.RopeParameters, &attnTemp)
+	if err := rereadRope("mistral3", cfg.RopeParameters, &attnTemp); err != nil {
+		return nil, nil, err
+	}
 
-	hd := cfg.headDim()
+	hd := cfg.EffectiveHeadDim()
 	var layerIsGlobal func(int) bool
 	if cfg.SlidingWindow > 0 {
 		layerIsGlobal = func(int) bool { return false }
@@ -88,7 +91,7 @@ func ministral3Architecture(cfg *Config) (*Architecture, *tensorSchema, error) {
 		layerIsGlobal:      layerIsGlobal,
 		RoPELocalBase:      base,
 		RoPEGlobalBase:     base,
-		RotaryDim:          cfg.rotaryDim(),
+		RotaryDim:          cfg.RotaryDim(),
 		ropeScaling:        scaling,
 		EmbedScale:         0,
 		TiedLMHead:         false, // finalized from lm_head.weight presence at load

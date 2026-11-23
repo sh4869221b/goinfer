@@ -13,7 +13,7 @@ import (
 	"github.com/townsendmerino/goinfer/tokenizer"
 )
 
-// TestPrefillGate is docs/completed/task-prefill-gap.md §3's gate: may Metal's batched (f16-MMA) PrefillLast
+// TestPrefillGate is the L1 gate: may Metal's batched (f16-MMA) PrefillLast
 // become the DEFAULT prompt-ingestion path, in place of today's shipped sequential Forward-per-
 // token prefill? It runs both paths on the SAME model, SAME prompts, and scores the batched path
 // against the sequential one as the oracle — sequential decode is what every other gate in this
@@ -98,7 +98,7 @@ func TestPrefillGate(t *testing.T) {
 			}
 			if runPrefillGateModel(t, mc.name, path, depths, continuationN) {
 				t.Fatalf("§3 GATE FAILED for model %s — see log above for which (model, K) cell; "+
-					"the default stays exact there (docs/completed/task-prefill-gap.md §3, §7)", mc.name)
+					"the default stays exact there", mc.name)
 			}
 		})
 	}
@@ -122,8 +122,10 @@ func runPrefillGateModel(t *testing.T, modelName, path string, depths []int, con
 		t.Fatalf("model %s: load tokenizer: %v", modelName, err)
 	}
 
-	prompts := make([][]int, 0, len(decoder.PrefillGateProseFiles))
-	for _, f := range decoder.PrefillGateProseFiles {
+	// The frozen set-A snapshots, which the CPU reference scores: the live documents change, and some have left the repository.
+	files := decoder.PrefillGatePromptSetFor("a")
+	prompts := make([][]int, 0, len(files))
+	for _, f := range files {
 		ids := decoder.PrefillGateProseIDsForTest(t, tk, f, depths[len(depths)-1])
 		prompts = append(prompts, ids)
 	}

@@ -12,8 +12,7 @@ import (
 	"github.com/townsendmerino/goinfer/tokenizer"
 )
 
-// TestW8Native_perLayerBisect is the Metal int8 doc's next step after F3 and F2 failed (docs/tasks/task-metal-int8-2026-10.md,
-// log 2026-10-02): name where Metal's native int8int8 leaves the CPU's int8int8, layer by layer, on the 0.5B. F1 holds
+// TestW8Native_perLayerBisect is the Metal int8 doc's next step after F3 and F2 failed: name where Metal's native int8int8 leaves the CPU's int8int8, layer by layer, on the 0.5B. F1 holds
 // every W8A8 GEMV bit-identical to the CPU given the same int8 inputs, so the gap enters elsewhere. The residual stream
 // after each layer at the probe position (the last of a 32-token prose prompt, so attention and RoPE run over real
 // history), against three references:
@@ -79,7 +78,7 @@ func TestW8Native_perLayerBisect(t *testing.T) {
 			t.Fatalf("load %s: %v", quant, err)
 		}
 		defer m.Close()
-		r, err := buildResident(m)
+		r, err := buildResident(m, metalCtxPlan{})
 		if err != nil {
 			t.Fatalf("resident %s: %v", quant, err)
 		}
@@ -192,7 +191,7 @@ func TestW8Native_hiddenVsLogits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatal(err)
 	}

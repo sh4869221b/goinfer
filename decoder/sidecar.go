@@ -16,8 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/townsendmerino/aikit/linalg"
 	"github.com/townsendmerino/goinfer/internal/runtime/diskfree"
 	"github.com/townsendmerino/goinfer/internal/runtime/giw"
+	"github.com/townsendmerino/goinfer/internal/runtime/logs"
 	"github.com/townsendmerino/goinfer/tokenizer"
 
 	"github.com/townsendmerino/goinfer/internal/runtime/checkpoint"
@@ -41,9 +43,9 @@ var freeDiskBytes = diskfree.Free
 // partial output. A cancelled ctx aborts a long streaming transcode at the next layer boundary and
 // removes the partial output.
 //
-// target names the ONE consumer this bundle is promised to (docs/tasks/task-int4-layout-2026-09.md):
+// target names the ONE consumer this bundle is promised to:
 // on a cpu-arm64 target, every eligible int4 tensor writes kind 5 (row4-only: the on-disk arm64
-// split-half, 4-row-interleaved layout, docs/completed/task-w4a8-neon-bandwidth.md) instead of kind 3
+// split-half, 4-row-interleaved layout) instead of kind 3
 // (decoder/serialize.go's weightMat vs weightMatKind3Only decides which tensors are eligible); every
 // other target, including GIWTargetNone, writes kind 3 for every int4 tensor.
 // GIWTargetForBackend derives a target from a backend name (EnsureCachedGIW);
@@ -161,11 +163,11 @@ func transcodeDir(ctx context.Context, dir, lora, out, quant string, embedInt4 b
 	var tokBytes []byte
 	if b, rerr := os.ReadFile(filepath.Join(dir, "tokenizer.json")); rerr == nil {
 		if _, lerr := tokenizer.LoadJSONBytes(b); lerr != nil {
-			fmt.Fprintf(os.Stderr, "prequant: note: %s/tokenizer.json present but not goinfer-loadable (%v); bundle carries it, but serve may need the original tokenizer\n", dir, lerr)
+			logs.Infof("prequant: note: %s/tokenizer.json present but not goinfer-loadable (%v); bundle carries it, but serve may need the original tokenizer", dir, lerr)
 		}
 		tokBytes = b
 	} else {
-		fmt.Fprintf(os.Stderr, "prequant: note: no tokenizer.json in %s — weights-only bundle (serve needs a separate tokenizer)\n", dir)
+		logs.Infof("prequant: note: no tokenizer.json in %s — weights-only bundle (serve needs a separate tokenizer)", dir)
 	}
 	id := filepath.Base(dir)
 	var side []byte
@@ -185,7 +187,7 @@ func transcodeDir(ctx context.Context, dir, lora, out, quant string, embedInt4 b
 	if err != nil {
 		return ph, fmt.Errorf("create %s: %w", tmp, err)
 	}
-	// Streamed one layer at a time (docs/tasks/task-prequant-dir-streaming-2026-10.md): peak memory about the globals plus
+	// Streamed one layer at a time: peak memory about the globals plus
 	// one layer, byte-identical to the resident transcode. A LoRA merge, and a family whose loader does not stream yet, take
 	// the resident transcode instead.
 	body := func(w io.Writer) (int64, error) { return residentDirBody(w, dir, lora, quant, embedInt4, target, id) }
@@ -193,7 +195,7 @@ func transcodeDir(ctx context.Context, dir, lora, out, quant string, embedInt4 b
 		body = func(w io.Writer) (int64, error) {
 			n, serr := StreamTranscodeDir(ctx, dir, w, quant, embedInt4, target, id)
 			if IsDirNoStream(serr) && n == 0 {
-				fmt.Fprintf(os.Stderr, "prequant: streams: no (%v); building it resident\n", serr)
+				logs.Infof("prequant: streams: no (%v); building it resident", serr)
 				return residentDirBody(w, dir, lora, quant, embedInt4, target, id)
 			}
 			return n, serr
@@ -236,7 +238,7 @@ func transcodeDir(ctx context.Context, dir, lora, out, quant string, embedInt4 b
 
 // residentDirBody is the resident directory transcode: Load the whole model at quant, then serialize it. A LoRA merge
 // needs it (the merge works on the f32 projections), and so does a family whose safetensors loader does not stream; it is
-// also G-DS1's reference for the streamed bytes.
+// also the byte-identity reference for the streamed bytes.
 func residentDirBody(w io.Writer, dir, lora, quant string, embedInt4 bool, target GIWTarget, id string) (int64, error) {
 	// ResidentContext 1: a transcode runs no request, so it allocates no KV (selfCheck does the same).
 	// Unpinned, the fit guard prices the model's full context and can refuse a model whose weights fit.
@@ -290,7 +292,7 @@ func EnsureCachedGIW(ctx context.Context, ggufPath, quant, backend string, embed
 				filepath.Base(ggufPath), float64(need)/1e9, float64(free)/1e9)
 		}
 	}
-	fmt.Fprintf(os.Stderr, "stream-weights: transcoding %s → %s (%s, one-time — minutes + ~model-size on disk)…\n",
+	logs.Infof("stream-weights: transcoding %s → %s (%s, one-time — minutes + ~model-size on disk)…",
 		filepath.Base(ggufPath), filepath.Base(cache), sidecarQuantLabel(quant))
 	t0 := time.Now()
 	ph, err := TranscodeGIWTimed(ctx, ggufPath, cache, quant, embedInt4, target)
@@ -298,11 +300,11 @@ func EnsureCachedGIW(ctx context.Context, ggufPath, quant, backend string, embed
 		return "", err
 	}
 	if fi, e := os.Stat(cache); e == nil {
-		fmt.Fprintf(os.Stderr, "stream-weights: cache ready (%.0f MB) in %s: %s\n",
+		logs.Infof("stream-weights: cache ready (%.0f MB) in %s: %s",
 			float64(fi.Size())/1048576, time.Since(t0).Round(time.Second), ph)
 	}
 	if lf, e := os.Stat(legacyCachePath(ggufPath, quant, embedInt4, target)); e == nil {
-		fmt.Fprintf(os.Stderr, "stream-weights: note: %s (%.0f MB) is from a build that wrote unversioned sidecar names; this build leaves it alone. Delete it once no such build is in use.\n",
+		logs.Infof("stream-weights: note: %s (%.0f MB) is from a build that wrote unversioned sidecar names; this build leaves it alone. Delete it once no such build is in use.",
 			filepath.Base(legacyCachePath(ggufPath, quant, embedInt4, target)), float64(lf.Size())/1048576)
 	}
 	return cache, nil
@@ -310,7 +312,7 @@ func EnsureCachedGIW(ctx context.Context, ggufPath, quant, backend string, embed
 
 // SidecarPathIfFresh returns the sidecar .giw for ggufPath at quant/backend's target and embedInt4
 // setting, and true, ONLY when a fresh one already exists: it never transcodes. For a caller like `fit`
-// (docs/tasks/task-never-swap-2026-09.md) where measuring is supposed to stay cheap: forcing a
+// where measuring is supposed to stay cheap: forcing a
 // transcode just to check fit would cost as much as the resident build it avoids.
 func SidecarPathIfFresh(ggufPath, quant, backend string, embedInt4 bool) (string, bool) {
 	target := GIWTargetForBackend(backend)
@@ -352,8 +354,8 @@ func SidecarPath(ggufPath, quant, backend string, embedInt4 bool) string {
 	return streamCachePath(ggufPath, quant, embedInt4, GIWTargetForBackend(backend))
 }
 
-// DefaultToSidecar reports whether a .gguf source should resolve to its sidecar .giw by default: the
-// .gguf direct heap load is the opt-out, not the default. True on darwin (where the swap incidents
+// DefaultToSidecar reports whether a .gguf source should resolve to its sidecar .giw by default: the.
+// gguf direct heap load is the opt-out, not the default. True on darwin (where the swap incidents
 // happened) and on linux (the sidecar showed no CPU decode cost and a load that maps instead of
 // re-quantizing; docs/measurements/cpu-giw-vs-direct-2026-09-24.md); other platforms keep the direct
 // load. directLoad is the caller's already-resolved -direct-load flag / GOINFER_GGUF_DIRECT env var;
@@ -398,7 +400,7 @@ func sidecarRoute(src string, opts Options) (string, error) {
 	case DirSidecarApplies(src, opts) && DefaultToSidecar(false):
 		p, err := ensure()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "decoder: loading %s directly: its sidecar .giw could not be built (%v)\n", src, err)
+			logs.Warnf("decoder: loading %s directly: its sidecar .giw could not be built (%v)", src, err)
 			return src, nil
 		}
 		return p, nil
@@ -447,8 +449,18 @@ func legacyCachePath(ggufPath, quant string, embedInt4 bool, target GIWTarget) s
 	if embedInt4 {
 		label += ".e4h"
 	}
-	label += gatherTableTag(ggufPath, quant, embedInt4)
+	label += gatherTableTag(ggufPath, quant, embedInt4) + kquantTag(quant, target)
 	return base + "." + label + "." + tgt + ".giw"
+}
+
+// kquantTag is the name segment of a q4k sidecar that keeps the GGUF's Q5_K and Q6_K tensors natively (kinds 11 and 12,
+// q4kNative56), ".k56"; "" otherwise. A q4k sidecar written before those kinds widened them under the name without the
+// segment, so the two are never mistaken for each other, and no legacy (unversioned) name carries it.
+func kquantTag(quant string, target GIWTarget) string {
+	if quant != "q4k" || target != GIWTargetCPUAmd64 || !linalg.KQuantNative() {
+		return ""
+	}
+	return ".k56"
 }
 
 // gatherTableTag is the name segment of a sidecar whose per-layer token table (Gemma 4's E-models) is int4 while the head
@@ -513,7 +525,7 @@ func adoptLegacy(cache, legacy, src string) bool {
 		return false
 	}
 	_ = os.Link(GIWVerifiedMarkerPath(legacy), GIWVerifiedMarkerPath(cache)) // best effort: the marker keeps the first load off a whole-file CRC
-	fmt.Fprintf(os.Stderr, "stream-weights: using %s as %s (the same file: already this build's format)\n", filepath.Base(legacy), filepath.Base(cache))
+	logs.Infof("stream-weights: using %s as %s (the same file: already this build's format)", filepath.Base(legacy), filepath.Base(cache))
 	return true
 }
 
@@ -535,8 +547,8 @@ func cacheFresh(cache, src string) bool {
 		return false
 	}
 	if err := selfCheck(cache); err != nil {
-		fmt.Fprintf(os.Stderr, "stream-weights: cache %s is newer than the source but does not "+
-			"load (%v) — rebuilding\n", filepath.Base(cache), err)
+		logs.Warnf("stream-weights: cache %s is newer than the source but does not "+
+			"load (%v) — rebuilding", filepath.Base(cache), err)
 		return false
 	}
 	return true
@@ -665,8 +677,7 @@ func sidecarQuantLabel(q string) string {
 // Backend:"cpu", not Options{}: an EMPTY Backend means "needs canonical" (wantsCanonicalInt4's
 // literal-"cpu"-is-a-promise rule), so Options{} would decline every kind-5 (row4-only) bundle this
 // function itself wrote for a cpu-arm64 target. "cpu" accepts both kind 3 and kind 5 and matches how a
-// cpu-arm64-target bundle is loaded in production
-// (docs/tasks/task-int4-layout-2026-09.md).
+// cpu-arm64-target bundle is loaded in production.
 //
 // ResidentContext 1: the check runs no request, so it allocates no KV. Unpinned, the host fit guard
 // prices the CPU's per-request ceiling over the model's whole window, prints a "context capped" line

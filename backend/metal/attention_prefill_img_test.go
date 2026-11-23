@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// G-IP1 (S17's Metal image prefill, docs/tasks/task-multimodal-support-2026-10.md), and G-S11c's kernel half (S11, several
+// G-IP1 (S17's Metal image prefill), and G-S11c's kernel half (S11, several
 // blocks): attention_prefill_img against a float64 reference of the CPU's rule (KVCache.attendHi, WindowStart): a query
 // inside an image block [start, end) sees keys up to that block's end-1, every other query is causal, and the sliding
 // window's lower bound stays at the causal position's. Max abs diff <= 4e-3 (f16 output). Control: attention_prefill
@@ -115,6 +115,7 @@ func TestAttentionPrefillImg_matchesReference(t *testing.T) {
 				}
 				args = append(args, NewBufferUint32s(d, flat), NewBufferU32(d, uint32(len(tc.blocks))))
 			}
+			args = append(args, kvIdentityTable(d))
 			q.Run1D(pipe(kernel), tc.M*nH*32, 32, args...)
 			o := make([]float32, tc.M*nH*hd)
 			recordAttnDigest(t, kernel, out.U16s()[:len(o)])

@@ -11,8 +11,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// The gates of Gemma 4's parallel dense and MoE feed-forward on WebGPU (docs/tasks/task-multimodal-support-2026-10.md,
-// S12.2), on the tiny enable_moe_block fixtures, int4 on both sides.
+// The gates of Gemma 4's parallel dense and MoE feed-forward on WebGPU, on the tiny enable_moe_block fixtures, int4 on both sides.
 
 // g4MoEFixtures are the tiny fixtures; the first is committed, the other two exist only where they were generated.
 var g4MoEFixtures = []string{"../../testdata/gemma4-moe-kv-tiny", "../../testdata/gemma4-moe-tiny", "../../testdata/gemma4-moe-unified-tiny"}
@@ -221,7 +220,8 @@ func TestGemma4MoE_webgpuPrefill(t *testing.T) {
 			rows[i] = append([]float32(nil), mb.EmbedResidentForTest(tok)...)
 		}
 	}
-	pf, isPF := rb.(decoder.Prefiller)
+	pf := decoder.SubsystemsOf(rb).Prefill
+	isPF := pf.PrefillAvailable()
 	if !isPF {
 		t.Fatalf("the resident (%T) is not a Prefiller", rb)
 	}

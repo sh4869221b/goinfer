@@ -9,12 +9,10 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-var _ decoder.ResidentKVCopier = (*metalResident)(nil)
-
-// CopyKV (decoder.ResidentKVCopier) copies rows [start, end) of every layer's K and V, and the int8 scales, from slot
-// src to slot dst. A slot's blocks are consecutive in its pool, position-major ([pos][kvDim]), and every layer holds the whole context,
-// so each buffer's rows are one byte range. On unified memory the copy is a memcpy of mapped pages (gpu.CopyDeviceBatch), so
-// nothing may be in flight on the GPU: the executor and any open chain are stopped first, as useKVSlot does.
+// CopyKV (decoder.ResidentKVSubsystem) makes rows [start, end) of slot dst those of slot src, by reference: each of dst's
+// table entries in the range names src's block for it, counted in kvRefs, and the block dst held there is released. No row moves; a
+// slot that later writes into a block another slot also names first takes its own (kvWrite). It declines a range src holds no block for (a slot
+// maps none past its sequence), a src whose blocks went to make room, and a start past dst's sequence. Tables are read when a command buffer runs, so nothing may be in flight: the executor and any open chain are stopped before either slot is read, as useKVSlot does.
 func (a *metalResident) CopyKV(src, dst, start, end int) error {
 	r := a.r
 	n := r.kvSlotCount()
@@ -35,41 +33,87 @@ func (a *metalResident) CopyKV(src, dst, start, end int) error {
 	if start == end {
 		return nil
 	}
-	elem := 2
-	if r.kvI8 {
-		elem = 1
-	} else if r.kvF32 {
-		elem = 4
+	r.stopExec() // first: stopping an open chain ends src's or dst's sequence where its caller's does (stopChain)
+	if st := &r.kvSlotSt[src]; st.released || st.stopped {
+		return &decoder.KVCopyDecline{Reason: fmt.Sprintf("slot %d's blocks were released or reclaimed to make room", src)}
 	}
+	if st := &r.kvSlotSt[dst]; start > 0 && (st.released || st.stopped || st.valid < start) {
+		return &decoder.KVCopyDecline{Reason: fmt.Sprintf("slot %d holds no rows up to %d, where the copy starts", dst, start)}
+	}
+	r.kvReap(true) // nothing is in flight: every block a window group retired is free now, and no record of one outlives the copy
+	for _, g := range r.kvGs {
+		low := start / decoder.KVBlockRows
+		if g.win > 0 && !kvRetainOffForTest { // a window group holds from its base: what it released is not offered
+			low = max(low, g.kvBase[src]/decoder.KVBlockRows)
+		}
+		for b := low; b < end/decoder.KVBlockRows; b++ {
+			if *g.kvRow(src, b) == 0 {
+				return &decoder.KVCopyDecline{Reason: fmt.Sprintf("slot %d holds no block for rows from %d", src, b*decoder.KVBlockRows)}
+			}
+		}
+	}
+	for _, g := range r.kvGs {
+		for b := start / decoder.KVBlockRows; b < end/decoder.KVBlockRows; b++ {
+			s, d := *g.kvRow(src, b), g.kvRow(dst, b)
+			if s == *d {
+				continue
+			}
+			if s != 0 {
+				g.kvRefs[s]++
+			}
+			g.kvUnref(*d)
+			*d = s
+		}
+		if g.win > 0 && !kvRetainOffForTest {
+			// dst holds [start, end) as src does, from src's base when that is past start; the rows below its new base are gone.
+			if base := g.kvBase[src]; start == 0 || base > start {
+				for b := 0; b < base/decoder.KVBlockRows && b < g.kvTabBlocks; b++ {
+					e := g.kvRow(dst, b)
+					g.kvUnref(*e)
+					*e = 0
+				}
+				g.kvBase[dst] = base
+			}
+		}
+	}
+	// dst now holds [start, end) as src does and below start what it held: its sequence ends where src's does, within the range, and the
+	// blocks of a longer one go back.
+	st := &r.kvSlotSt[dst]
+	if start == 0 {
+		st.released, st.stopped = false, false
+	}
+	st.valid = min(end, max(r.kvSlotSt[src].valid, start))
+	r.kvTrim(dst, st.valid)
+	r.kvUseTick++
+	st.use = r.kvUseTick
+	return nil
+}
+
+// kvOwnOffForTest leaves a shared entry shared when its slot writes, so the write lands in a block another slot reads: the plant
+// TestKVPages_shareByReference must catch.
+var kvOwnOffForTest bool
+
+// kvKeepShortForTest makes a copy on write keep one row too few: the plant TestKVPages_shareByReferenceLayerMajor must catch.
+var kvKeepShortForTest bool
+
+// kvBlockCopies is the copies of block from's first rows rows into block to, in every layer that owns K/V, its int8 scales with it.
+// Buffer.At sets an absolute offset, so each block is addressed from its pool's start, where the null block is.
+func (r *resident) kvBlockCopies(g *kvGroup, from, to uint32, rows int) []gpu.DeviceCopy {
 	var copies []gpu.DeviceCopy
 	for l := range r.layers {
 		L := &r.layers[l]
-		if L.kvShared || L.geom == nil || r.kvSlotBytes[l] == 0 {
-			continue // a shared layer aliases its source's cache, copied with it; a layer with no attention has none
+		if L.kvShared || r.kvSlotBytes[l] == 0 || r.kvGroupOf(l) != g {
+			continue // a shared layer reads its source's pool; a layer with no attention has none; a block id names a block of its own group's layers
 		}
-		row := L.geom.kvDim * elem
-		copies = append(copies,
-			gpu.DeviceCopy{Dst: r.kvRows(dst, l, false, start*row), Src: r.kvRows(src, l, false, start*row), Bytes: (end - start) * row},
-			gpu.DeviceCopy{Dst: r.kvRows(dst, l, true, start*row), Src: r.kvRows(src, l, true, start*row), Bytes: (end - start) * row})
-		if r.kvI8 {
-			sb := L.geom.nKV * 4                                                                // one float32 scale per KV head per position
-			at := func(b Buffer, s int) Buffer { return b.At(4*r.kvScaleOff(s, l) + start*sb) } // from the allocation: At is absolute
-			ks, vs := r.kvSlotBufs[0].ks[l], r.kvSlotBufs[0].vs[l]
-			copies = append(copies,
-				gpu.DeviceCopy{Dst: at(ks, dst), Src: at(ks, src), Bytes: (end - start) * sb},
-				gpu.DeviceCopy{Dst: at(vs, dst), Src: at(vs, src), Bytes: (end - start) * sb})
+		block, row := r.kvNullBytes[l], r.kvNullBytes[l]/decoder.KVBlockRows
+		pools, rowBytes, blockBytes := []Buffer{r.kc[l], r.vc[l]}, []int{row, row}, []int{block, block}
+		if r.kvI8 && L.geom != nil { // one float32 scale per KV head per position, block for block (an MLA latent has none)
+			sb := L.geom.nKV * 4
+			pools, rowBytes, blockBytes = append(pools, r.ks[l], r.vs[l]), append(rowBytes, sb, sb), append(blockBytes, decoder.KVBlockRows*sb, decoder.KVBlockRows*sb)
+		}
+		for i, b := range pools {
+			copies = append(copies, gpu.DeviceCopy{Dst: b.At(int(to) * blockBytes[i]), Src: b.At(int(from) * blockBytes[i]), Bytes: rows * rowBytes[i]})
 		}
 	}
-	r.stopExec()
-	return gpu.CopyDeviceBatch(copies)
-}
-
-// kvRows is slot s's K (v false) or V cache of layer l at byte off within the slot. Buffer.At sets an absolute offset, so the layer is
-// addressed from its pool's base, past the null block.
-func (r *resident) kvRows(s, l int, v bool, off int) Buffer {
-	b := r.kvSlotBufs[0].kc[l]
-	if v {
-		b = r.kvSlotBufs[0].vc[l]
-	}
-	return b.At(r.kvNullBytes[l] + s*r.kvSlotBytes[l] + off)
+	return copies
 }

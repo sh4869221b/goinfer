@@ -12,7 +12,7 @@
 // instruction-tuned checkpoint only measures "did the forward avoid total collapse").
 //
 // M.1 (~220B) has no gate of this kind and will not get one on this box; its code path is identical to
-// XS.2's apart from config, and this gates that path (docs/completed/task-laguna.md).
+// XS.2's apart from config, and this gates that path.
 //
 //	GOINFER_HEAVY_TESTS=1 GOINFER_LAGUNA_XS2=~/models/laguna-xs2 \
 //	  go test -tags realckpt ./decoder/ -run TestLagunaReal -v -timeout 180m
@@ -24,10 +24,12 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 func TestLagunaReal_gate(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ckpt := assetPath(t, "GOINFER_LAGUNA_XS2")
 
 	// int4 weights: 33B bf16 is ~63GB on disk and would not fit alongside f32 activations in 62GB of RAM.
@@ -186,7 +188,7 @@ func TestLagunaReal_gate(t *testing.T) {
 //
 //	GOINFER_HEAVY_TESTS=1 go test -tags realckpt ./decoder/ -run TestLagunaReal_oracle -v -timeout 60m
 func TestLagunaReal_oracle(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	ckpt := assetPath(t, "GOINFER_LAGUNA_XS2")
 	realLogitOracleQuant(t, ckpt, "../testdata/laguna_real_golden.json", "laguna", "laguna",
 		"HF bf16 (poolside Laguna-XS.2, 33B-A3B; full model via accelerate disk offload; int8 weights, f32 activations)", "int8")

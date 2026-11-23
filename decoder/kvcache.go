@@ -1,17 +1,18 @@
 package decoder
 
 import (
-	"github.com/townsendmerino/goinfer/internal/cost"
 	"slices"
 	"sync/atomic"
 
 	"github.com/townsendmerino/aikit/linalg"
+	"github.com/townsendmerino/goinfer/internal/cost"
+	"github.com/townsendmerino/goinfer/internal/runtime/kvmgr"
 )
 
 // kvQuant selects the CPU KV-cache storage precision. kvF32 (default) is
 // bit-exact; kvI8 stores K and V as per-(position,KV-head) symmetric int8 + a
 // f32 scale each — 4× smaller, and decode reads them with the SDOT integer dot
-// (DotI8) instead of scalar f64. Opt-in (lossy); see docs/completed/task-cpu-kv-quant.md.
+// (DotI8) instead of scalar f64. Opt-in (lossy);
 type kvQuant uint8
 
 const (
@@ -23,8 +24,8 @@ const (
 // widened reports whether stored rows are read by widening them into f32 scratch (int8, f16) rather than in place (f32).
 func (q kvQuant) widened() bool { return q != kvqF32 }
 
-// kvRoundF16ForTest rounds each K and V row to f16 and back where it reaches an f32 cache: gate F1's reference
-// (docs/tasks/task-cpu-kv-f16-2026-10.md). The planted defects F1 must see: kvF16NewRowsF32ForTest (a prefill's new ring rows
+// kvRoundF16ForTest rounds each K and V row to f16 and back where it reaches an f32 cache: the reference of the f16
+// cache's exactness gate (TestKVF16_F1Exactness). The planted defects it must see: kvF16NewRowsF32ForTest (a prefill's new ring rows
 // attended at f32) and kvF16RingOffsetForTest (the ring window read one slot late).
 var kvRoundF16ForTest, kvF16NewRowsF32ForTest, kvF16RingOffsetForTest bool
 
@@ -35,7 +36,7 @@ func roundF16InPlace(x []float32) {
 	}
 }
 
-// narrowF16Into stores src as f16 into dst; widenF16Into is its exact inverse. The f16 cache's one rounding (F1's rule).
+// narrowF16Into stores src as f16 into dst; widenF16Into is its exact inverse. The f16 cache's one rounding.
 func narrowF16Into(dst []uint16, src []float32) { linalg.F32ToF16Slice(dst, src) }
 func widenF16Into(dst []float32, src []uint16)  { linalg.F16ToF32Slice(dst, src) }
 
@@ -69,7 +70,7 @@ func dequantHeads(q []int8, scales []float32, nKV, headDim int, dst []float32) {
 //
 // Not goroutine-safe: one cache belongs to one in-flight sequence.
 type KVCache struct {
-	// cost, when set, counts this stream's operations into the phase costPhase (SB11, cost_cpu.go); nil is off.
+	// cost, when set, counts this stream's operations into the phase costPhase (cost_cpu.go); nil is off.
 	cost      *cost.Counter
 	costPhase cost.Phase
 
@@ -82,8 +83,8 @@ type KVCache struct {
 	kvDim                int      // NumKVHeads * HeadDim
 	window               int      // sliding-window cap for local layers; 0 = unbounded
 	imgBlocks            [][2]int // multimodal: position ranges [start,end) that attend bidirectionally (image blocks); nil = all-causal
-	mropePos             [][3]int // Qwen2.5-VL m-RoPE: per-sequence-position (t,h,w) rotary positions; nil = scalar RoPE. Indexed by absolute sequence position. (P5)
-	mropeDelta           int      // m-RoPE position delta: decode positions past the prefill are scalar seqPos+mropeDelta (the image compresses positions, so delta is usually negative). (P5)
+	mropePos             [][3]int // Qwen2.5-VL m-RoPE: per-sequence-position (t,h,w) rotary positions; nil = scalar RoPE. Indexed by absolute sequence position.
+	mropeDelta           int      // m-RoPE position delta: decode positions past the prefill are scalar seqPos+mropeDelta (the image compresses positions, so delta is usually negative).
 	// deepstack is Qwen3-VL's DeepStack for the prefill that carries it: after decoder layer l, for l < len(rows), rows[l]
 	// ([n*hidden], one row per image position) is added to the hidden state at the image positions [start, start+n), as HF's
 	// _deepstack_process does. nil for every other prefill; a decode step never touches it.
@@ -100,7 +101,7 @@ type KVCache struct {
 	// rings holds a fixed-W ring buffer for each sliding-window (local) layer; a nil entry is a global layer that append-forevers
 	// into keys/vals above. Set by enableRings (from NewCache) for the families on the attendQuery/attendBatchedHeads paths. A local
 	// layer stores only the W most recent positions (the only ones any future query can read), so its KV is O(W), not O(context).
-	// See docs/completed/task-kv-ring-eviction.md.
+	//
 	rings    []*ring
 	localAny bool // any ring layer present (gates prefill's assembly scratch)
 	// skipAppend reports the layers that reserve no append-forever capacity (NewKVCache's skipLayer; nil: none).
@@ -126,7 +127,7 @@ type KVCache struct {
 
 	// delta holds the Gated DeltaNet recurrent state for qwen3_5_moe's linear
 	// layers (nil entry on softmax layers, nil slice on every other family). This
-	// is the recurrent half of the hybrid cache — see docs/completed/qwen3_5_moe.md.
+	// is the recurrent half of the hybrid cache —
 	delta []*deltaState
 
 	// conv holds the LFM2 gated short-convolution rolling window for the conv layers
@@ -198,7 +199,7 @@ type KVCache struct {
 func NewKVCache(numLayers, numKVHeads, headDim, window, capHint int, skipLayer func(l int) bool) *KVCache {
 	if capHint < 0 { // defensive: a negative hint (e.g. from a negative max_tokens) would
 		capHint = 0 // panic makeslice with "cap out of range"; the HTTP surface rejects it
-	} // upstream (audit C-19), this guards every other caller too.
+	} // upstream; this guards every other caller too.
 	kvDim := numKVHeads * headDim
 	c := &KVCache{
 		numLayers:  numLayers,
@@ -337,7 +338,7 @@ func (r *ring) truncate(p int) bool {
 	if p >= r.count {
 		return true
 	}
-	exact := r.count <= r.w || p >= r.count-1
+	exact := kvmgr.RingTruncateExact(r.count, r.w, p)
 	r.count = p
 	return exact
 }
@@ -427,7 +428,7 @@ func (c *KVCache) Append(layer int, k, v []float32) int {
 		r.write(c.pos, k, v) // ring quantizes internally when kvI8
 	} else {
 		if c.stride[layer] == 0 {
-			c.stride[layer] = len(k) // per-layer KV width, learned on first append (M11)
+			c.stride[layer] = len(k) // per-layer KV width, learned on first append
 		}
 		if c.quant == kvqF16 {
 			if len(c.keysH[layer])+len(k) > cap(c.keysH[layer]) {
@@ -585,7 +586,7 @@ func (c *KVCache) Vals(layer int) []float32 { return c.vals[layer] }
 // prefill's K/V at the GPU cache's correct absolute positions (decoder/generate_vl_resident.go).
 func (c *KVCache) LayerKV(layer int) (k, v []float32, base int) {
 	if r := c.rings[layer]; r != nil {
-		lo := max(0, r.count-r.w)
+		lo := kvmgr.WindowHorizon(r.count, r.w, 0)
 		nLive, st := r.count-lo, r.stride
 		if st == 0 || nLive == 0 {
 			return nil, nil, lo
@@ -816,7 +817,7 @@ func (c *KVCache) TruncateTo(pos int) (exact bool) {
 		}
 		if r := c.rings[l]; r != nil {
 			if !r.truncate(pos) {
-				exact = false // wrapped ring rewound >1 position: window holds dropped K/V (C1)
+				exact = false // wrapped ring rewound >1 position: window holds dropped K/V
 			}
 			continue
 		}
@@ -864,7 +865,7 @@ func (c *KVCache) batchReadLocal(layer, startPos, K int, newK, newV, dstK, dstV 
 	if stride == 0 {
 		stride = len(newK) / K // first prefill: ring not yet sized
 	}
-	base = max(startPos-r.w+1, 0)
+	base = kvmgr.WindowNeedStart(startPos, r.w)
 	hist := startPos - base // resident history rows, ≤ W-1 and ≤ r.count
 	slot0 := base % r.w
 	seg1 := min(hist, r.w-slot0)
@@ -977,7 +978,7 @@ func (c *KVCache) dequantGlobalLayer(layer, kvDim int, dstK, dstV []float32) int
 	totalRows := n * nKV
 	totalFloats := n * kvDim
 	dequantKVRows(dstK[:totalFloats], dstV[:totalFloats], c.keysQ[layer][:totalFloats], c.valsQ[layer][:totalFloats],
-		c.keyScale[layer][:totalRows], c.valScale[layer][:totalRows], totalRows, c.headDim) // R-15: split by rows, bit-identical
+		c.keyScale[layer][:totalRows], c.valScale[layer][:totalRows], totalRows, c.headDim) // split by rows, bit-identical
 	return n
 }
 
@@ -1060,11 +1061,10 @@ func (c *KVCache) storedRows(layer, kvDim int) int {
 // only advances on the last layer's Append, so reading it post-Append would
 // shift the window by one on that layer alone. The query position is stable.
 func (c *KVCache) WindowStart(pos int, global bool) int {
-	if global || c.window <= 0 {
+	if global {
 		return 0
 	}
-	start := max(pos-c.window+1, 0)
-	return start
+	return kvmgr.WindowNeedStart(pos, c.window)
 }
 
 // SetImageBlocks marks position ranges [start,end) (e.g. an image's token block)
@@ -1086,7 +1086,7 @@ func (c *KVCache) attendHi(pos int) int {
 	return pos
 }
 
-// deepstackRows is KVCache.deepstack: the image runs (absolute, in prompt order; several for a multi-image turn, S11) and
+// deepstackRows is KVCache.deepstack: the image runs (absolute, in prompt order; several for a multi-image turn) and
 // one set per early layer, each holding every run's rows concatenated in run order.
 type deepstackRows struct {
 	spans []ImageSpan

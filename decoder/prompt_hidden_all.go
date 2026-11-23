@@ -7,13 +7,13 @@ import (
 )
 
 // PromptHiddenAll returns the final-norm hidden state at EVERY position of prompt: HF's last_hidden_state[0, :] (which
-// is output_hidden_states[-1]), K rows of HiddenDim. It is what a head that reads all positions consumes (Route C of
-// docs/tasks/task-constrained-confidence.md: Clef's joint schema head, docs/measurements/decisions-d10-clef-2026-10-02.md);
+// is output_hidden_states[-1]), K rows of HiddenDim. It is what a head that reads all positions consumes (Route C:
+// Clef's joint schema head, docs/measurements/decisions-d10-clef-2026-10-02.md);
 // PromptHidden returns only the last row.
 //
-// A resident backend that implements ResidentResidualAll answers first: the whole prompt runs on the device, the
+// A resident backend that implements ResidualAllAvailable answers first: the whole prompt runs on the device, the
 // residual stream of every row comes back, and the final norm is applied HERE on the host in f32, so the rows are not the
-// int8-requantized vectors ResidentHiddenLast returns. Its numerics are the device kernels', not the CPU reference's (the
+// int8-requantized vectors HiddenLastAvailable returns. Its numerics are the device kernels', not the CPU reference's (the
 // backend modules bound the difference); a decline falls through to the CPU exactly as if there were no resident, and a
 // cancellation returns. Otherwise it takes the same CPU paths PromptHidden takes, in the same order, so the last row is
 // the row PromptHidden returns on a model with no resident:
@@ -48,8 +48,8 @@ func (m *Model) promptHiddenAll(ctx context.Context, prompt []int) ([][]float32,
 		return nil, err
 	}
 	a := m.w.arch
-	if rr, ok := m.resident.(ResidentResidualAll); ok && m.tryClaimResident() {
-		rows, err := m.residualAllResident(ctx, rr, prompt)
+	if canStep(m.resident, stepBatch{Pass: passRows, Emb: stepProbe, Out: outEveryResidual}) && m.tryClaimResident() {
+		rows, err := m.residualAllResident(ctx, prompt)
 		atomic.StoreInt32(&m.resBusy, 0)
 		if err == nil {
 			return rows, nil
@@ -79,14 +79,15 @@ func (m *Model) promptHiddenAll(ctx context.Context, prompt []int) ([][]float32,
 
 // residualAllResident is PromptHiddenAll's resident path: embed on the host (the embedding the plain resident forward uses), hand the sequence to the backend, and apply the
 // final norm to each returned residual row in f32. The caller holds the resident claim.
-func (m *Model) residualAllResident(ctx context.Context, rr ResidentResidualAll, ids []int) ([][]float32, error) {
+func (m *Model) residualAllResident(ctx context.Context, ids []int) ([][]float32, error) {
 	a := m.w.arch
-	m.residentForgetIDs()
+	m.residentForgetScratch()
 	embs := make([][]float32, len(ids))
 	for i, id := range ids {
 		embs[i] = m.embedResident(id)
 	}
-	rows, err := rr.ResidualAll(ctx, embs, 0)
+	sr, err := m.step(stepBatch{Pass: passRows, Ctx: ctx, Emb: embs, Out: outEveryResidual})
+	rows := sr.Rows
 	if err != nil {
 		return nil, err
 	}

@@ -38,7 +38,7 @@ Reproduce the fixtures with `scripts/pin_plamo3_tiny.py` using the local officia
 
 ```sh
 python scripts/pin_plamo3_tiny.py ./models/plamo-3-translate-0.8b
-go test ./decoder -run '^TestPlamo3' -v
+go test -tags realckpt ./decoder -run '^TestPlamo3' -v
 PLAMO3_TOKENIZER_DIR=/absolute/path/to/plamo-3-translate-0.8b \
   go test ./tokenizer -run '^TestPlamo' -v
 ```

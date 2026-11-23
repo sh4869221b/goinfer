@@ -132,10 +132,9 @@ func (m *Model) FitBudgetSummary() (ctx int, kvBytes, weightBytes, budgetBytes i
 	budgetBytes = mem.HostBudget(mem.HostMachine(avail), mem.DefaultPolicy())
 	// A resident holds its own KV: its capacity, at the precision its backend allocates (Metal: f16 whatever -kv says), not the CPU's
 	// per-request ceiling over the model's whole window, which badly overstates it.
-	if capper, ok := m.resident.(ResidentCapped); ok && m.be != nil {
-		if c := capper.ContextCap(); c > 0 {
-			return c, m.ResidentKVBytes(m.be.Name(), c, m.kvF16, m.kvI8), weightBytes, budgetBytes, true
-		}
+	if c := m.ResidentContextCap(); c > 0 && m.be != nil {
+		f16, i8 := m.residentKVFlags(m.be.Name())
+		return c, m.ResidentKVBytes(m.be.Name(), c, f16, i8), weightBytes, budgetBytes, true
 	}
 	ctx = m.resCtxReq
 	if ctx <= 0 {
@@ -143,6 +142,9 @@ func (m *Model) FitBudgetSummary() (ctx int, kvBytes, weightBytes, budgetBytes i
 			return 0, 0, 0, 0, false
 		}
 		ctx = cfg.MaxPositions
+	}
+	if cfg != nil && cfg.MaxPositions > 0 && ctx > cfg.MaxPositions {
+		ctx = cfg.MaxPositions // a pin past the model's own window prices no higher than the window, as the load-time guard does
 	}
 	kvBytes = estimateKVBytes(cfg, ctx, m.hostKVF16(), m.kvI8)
 	return ctx, kvBytes, weightBytes, budgetBytes, true
@@ -170,7 +172,7 @@ func (m *Model) hostKVF16() bool { return m.kvH && m.w.arch.kvF16OK() }
 
 // CPUKVPrecision is the precision the CPU (host) KV cache is built at: "i8", "f16" or "f32".
 func (m *Model) CPUKVPrecision() string {
-	if got, _ := ResolveKV("cpu", m.w.arch, m.kvOpts); got != "" {
+	if got, _ := ResolveKV("cpu", m.w.arch, m.opts); got != "" {
 		return got
 	}
 	return "f32"
@@ -178,10 +180,10 @@ func (m *Model) CPUKVPrecision() string {
 
 // CPUKVF16DeclineReason is why an f16 request leaves the CPU cache at f32 ("" when f16 was not asked or is built).
 func (m *Model) CPUKVF16DeclineReason() string {
-	if cpuKVRequested(m.kvOpts) != kvPrecF16 {
+	if cpuKVRequested(m.opts) != kvPrecF16 {
 		return ""
 	}
-	if got, why := ResolveKV("cpu", m.w.arch, m.kvOpts); got != kvPrecF16 {
+	if got, why := ResolveKV("cpu", m.w.arch, m.opts); got != kvPrecF16 {
 		return why
 	}
 	return ""

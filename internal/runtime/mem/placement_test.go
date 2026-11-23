@@ -3,8 +3,11 @@ package mem
 import (
 	"fmt"
 	"math/rand/v2"
+	"regexp"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -119,65 +122,108 @@ func placementRank(p Placement) int {
 // steps over 16 MiB before each of a draw's first change points, where a KV step's sawtooth lives. searched counts the Metal
 // draws whose answer passed the floor.
 func monotoneBreak(n int, solve func(DeviceLoad, PlanRequest, Machine, Policy) DevicePlan) (brk string, searched int) {
+	type draw struct {
+		l   DeviceLoad
+		req PlanRequest
+		mc  MetalCtxLoad
+	}
 	r := rand.New(rand.NewPCG(13, 7))
-	p := DefaultPolicy()
-	const steps, step, fine, fineSteps = 4096, int64(16 << 20), int64(64 << 10), 256
-	for i := range n {
+	draws := make([]draw, n)
+	for i := range draws {
 		l, req := genDevice(r)
-		mc := genMetalCtx(r)
-		reached := false
-		walk := func(frees []int64) (string, []int64) {
-			var prev DevicePlan
-			var prevM MetalCtx
-			var changes []int64
-			for j, f := range frees {
-				m := Machine{Free: map[Tier]int64{HostAnon: f, VRAM: f, Unified: f}}
-				d, a := solve(l, req, m, p), SolveMetalCtx(mc, m, p)
-				reached = reached || a.Ctx > mc.Floor
-				if j == 0 {
-					prev, prevM = d, a
-					continue
+		draws[i] = draw{l, req, genMetalCtx(r)}
+	}
+	// The walks share nothing the generators did not fix above, so they take every core, and the answer is still the lowest break.
+	type result struct {
+		brk     string
+		reached bool
+	}
+	results := make([]result, n)
+	var next, lowest atomic.Int64
+	lowest.Store(int64(n))
+	var wg sync.WaitGroup
+	for range runtime.GOMAXPROCS(0) {
+		wg.Go(func() {
+			for {
+				i := next.Add(1) - 1
+				if i >= int64(n) || i > lowest.Load() {
+					return
 				}
-				if d != prev || a != prevM {
-					changes = append(changes, f)
+				d := draws[i]
+				results[i].brk, results[i].reached = walkLoad(int(i), d.l, d.req, d.mc, solve)
+				for results[i].brk != "" {
+					low := lowest.Load()
+					if i >= low || lowest.CompareAndSwap(low, i) {
+						break
+					}
 				}
-				was := frees[j-1]
-				switch {
-				case placementRank(d.Placement) < placementRank(prev.Placement):
-					return fmt.Sprintf("input %d: the plan got worse from %d to %d free: %s -> %s", i, was, f, planAnswer(prev), planAnswer(d)), nil
-				case d.Placement == prev.Placement && (d.Placement == Resident || d.Placement == ExpertCached) && d.Ctx < prev.Ctx:
-					return fmt.Sprintf("input %d: the context shrank within a placement from %d to %d free: %s -> %s", i, was, f, planAnswer(prev), planAnswer(d)), nil
-				case d.Placement == prev.Placement && d.Ctx == prev.Ctx && d.Slots < prev.Slots:
-					return fmt.Sprintf("input %d: slots fell at the same context from %d to %d free: %s -> %s", i, was, f, planAnswer(prev), planAnswer(d)), nil
-				case a.Ctx < prevM.Ctx:
-					return fmt.Sprintf("input %d: the Metal context fell from %d to %d free: %s -> %s", i, was, f, metalAnswer(prevM), metalAnswer(a)), nil
-				}
-				prev, prevM = d, a
 			}
-			return "", changes
+		})
+	}
+	wg.Wait()
+	for _, res := range results {
+		if res.brk != "" {
+			return res.brk, searched
 		}
-		coarse := make([]int64, steps)
-		for j := range coarse {
-			coarse[j] = int64(j) * step
-		}
-		b, changes := walk(coarse)
-		if b != "" {
-			return b, searched
-		}
-		for _, c := range changes[:min(len(changes), 6)] {
-			ladder := make([]int64, fineSteps+1)
-			for j := range ladder {
-				ladder[j] = c - step + int64(j)*fine
-			}
-			if b, _ := walk(ladder); b != "" {
-				return b, searched
-			}
-		}
-		if reached {
+		if res.reached {
 			searched++
 		}
 	}
 	return "", searched
+}
+
+// walkLoad is monotoneBreak on input i: its break, or "", and whether its Metal answer passed the floor.
+func walkLoad(i int, l DeviceLoad, req PlanRequest, mc MetalCtxLoad, solve func(DeviceLoad, PlanRequest, Machine, Policy) DevicePlan) (brk string, reached bool) {
+	p := DefaultPolicy()
+	const steps, step, fine, fineSteps = 4096, int64(16 << 20), int64(64 << 10), 256
+	walk := func(frees []int64) (string, []int64) {
+		var prev DevicePlan
+		var prevM MetalCtx
+		var changes []int64
+		for j, f := range frees {
+			m := Machine{Free: map[Tier]int64{HostAnon: f, VRAM: f, Unified: f}}
+			d, a := solve(l, req, m, p), SolveMetalCtx(mc, m, p)
+			reached = reached || a.Ctx > mc.Floor
+			if j == 0 {
+				prev, prevM = d, a
+				continue
+			}
+			if d != prev || a != prevM {
+				changes = append(changes, f)
+			}
+			was := frees[j-1]
+			switch {
+			case placementRank(d.Placement) < placementRank(prev.Placement):
+				return fmt.Sprintf("input %d: the plan got worse from %d to %d free: %s -> %s", i, was, f, planAnswer(prev), planAnswer(d)), nil
+			case d.Placement == prev.Placement && (d.Placement == Resident || d.Placement == ExpertCached) && d.Ctx < prev.Ctx:
+				return fmt.Sprintf("input %d: the context shrank within a placement from %d to %d free: %s -> %s", i, was, f, planAnswer(prev), planAnswer(d)), nil
+			case d.Placement == prev.Placement && d.Ctx == prev.Ctx && d.Slots < prev.Slots:
+				return fmt.Sprintf("input %d: slots fell at the same context from %d to %d free: %s -> %s", i, was, f, planAnswer(prev), planAnswer(d)), nil
+			case a.Ctx < prevM.Ctx:
+				return fmt.Sprintf("input %d: the Metal context fell from %d to %d free: %s -> %s", i, was, f, metalAnswer(prevM), metalAnswer(a)), nil
+			}
+			prev, prevM = d, a
+		}
+		return "", changes
+	}
+	coarse := make([]int64, steps)
+	for j := range coarse {
+		coarse[j] = int64(j) * step
+	}
+	b, changes := walk(coarse)
+	if b != "" {
+		return b, false
+	}
+	for _, c := range changes[:min(len(changes), 6)] {
+		ladder := make([]int64, fineSteps+1)
+		for j := range ladder {
+			ladder[j] = c - step + int64(j)*fine
+		}
+		if b, _ := walk(ladder); b != "" {
+			return b, false
+		}
+	}
+	return "", reached
 }
 
 // TestSolvePlacement_monotone (G-MA-2): monotoneBreak finds no break over 1,500 loads, at least a third of the Metal draws reach
@@ -283,5 +329,79 @@ func TestSolvePlacement_moeSawtooth(t *testing.T) {
 	}
 	if prev.Ctx <= mc.Floor {
 		t.Errorf("the Metal MoE load never got past the floor (%d): the walk tests nothing", prev.Ctx)
+	}
+}
+
+// TestSolvePlacement_declineReasonsQuoteEachTermOnce: a decline that quotes the dense weights quotes them alone (with the experts'
+// fixed bytes), and the scratch once in its own note, the paged slot indices included exactly where the plan charged them; a top-k
+// decline quotes as free what the experts had once those were taken. Each decline that prints a dense or free figure is reached:
+// the context floor on a dense Metal load and an MoE one, and, on the planner without the MoE reserve, no room left for an expert
+// cache and too little for its top k, each with and without a paged extra.
+func TestSolvePlacement_declineReasonsQuoteEachTermOnce(t *testing.T) {
+	const gib, mib = int64(1) << 30, int64(1) << 20
+	kv := func(c int) int64 { return int64(c) << 16 }
+	dense := DeviceLoad{Backend: "metal", Tier: Unified, DenseBytes: gib, ScratchBytes: 256 * mib, CtxStep: 8, CtxCeiling: 32768, KV: kv}
+	moe := dense
+	moe.NExperts, moe.TopK, moe.ExpertBytesFull, moe.ExpertBytesFixed, moe.ScratchPagedExtra = 8, 2, 8*gib, 512*mib, 64*mib
+	moe.HostAll = func() int64 { return 0 }
+	unpaged := moe // a cache that adds no paged extra
+	unpaged.ScratchPagedExtra = 0
+	quoted := func(re, reason string) string {
+		if m := regexp.MustCompile(re).FindStringSubmatch(reason); m != nil {
+			return m[1]
+		}
+		return "none"
+	}
+	weights := gib + 512*mib // the MoE load's dense and expert-fixed bytes
+	for _, c := range []struct {
+		name                  string
+		l                     DeviceLoad
+		free                  int64
+		reserve               bool
+		dense, scratch, avail string // "" where the reason quotes none
+	}{
+		{"dense, the context floor", dense, gib, true, "1.00", "256.00", ""},
+		{"moe, the context floor", moe, gib, true, "1.50", "320.00", ""},
+		{"moe without the reserve, no room for a paged cache", moe, weights + 320*mib + kv(4096), false, "1.50", "320.00", ""},
+		{"moe without the reserve, no room for an unpaged cache", unpaged, weights + 256*mib + kv(4096), false, "1.50", "256.00", ""},
+		{"moe without the reserve, under the top k, paged", moe, weights + 320*mib + kv(4096) + 3*gib/2, false, "", "", "1.50"},
+	} {
+		d := solvePlacement(c.l, PlanRequest{Ctx: 4096, CtxPinned: true}, Machine{Free: map[Tier]int64{Unified: c.free}}, DefaultPolicy(), c.reserve)
+		if d.Placement != Declined {
+			t.Fatalf("%s: %s, want a decline", c.name, planAnswer(d))
+		}
+		for _, q := range []struct{ what, re, want string }{
+			{"dense", `dense ([\d.]+) GiB`, c.dense}, {"scratch", `scratch ([\d.]+) MB`, c.scratch}, {"free", `only ([\d.]+) GiB is free`, c.avail},
+		} {
+			if q.want == "" {
+				continue
+			}
+			if got := quoted(q.re, d.Reason); got != q.want {
+				t.Errorf("%s: the reason quotes %s %s, want %s: %q", c.name, q.what, got, q.want, d.Reason)
+			}
+		}
+	}
+}
+
+// TestSolvePlacement_aCacheHoldingEveryExpertPaysNoPaging: an expert cache that fits every expert does not page, so it holds no
+// paged slot indices and its slot count is solved without them. Given exactly the room for all 8 experts beside the fixed terms,
+// the cache holds 8 at the resident build's scratch; one byte less, it holds 7 and pages, its scratch with the indices.
+func TestSolvePlacement_aCacheHoldingEveryExpertPaysNoPaging(t *testing.T) {
+	const mib = int64(1) << 20
+	kv := func(c int) int64 { return int64(c) << 10 }
+	l := DeviceLoad{Backend: "metal", Tier: Unified, DenseBytes: 1 << 30, ScratchBytes: mib, ScratchPagedExtra: 64, CtxStep: 8,
+		CtxCeiling: 32768, KV: kv, NExperts: 8, TopK: 2, ExpertBytesFull: 8 * mib,
+		HostAll: func() int64 { return 100 * mib }} // the experts' host copy keeps them from a resident placement
+	req := PlanRequest{Ctx: 4096, CtxPinned: true}
+	room := l.DenseBytes + l.ScratchBytes + kv(4096) + l.ExpertBytesFull
+	for _, c := range []struct {
+		free    int64
+		slots   int
+		scratch int64
+	}{{room, 8, l.ScratchBytes}, {room - 1, 7, l.ScratchBytes + 64}} {
+		d := SolvePlacement(l, req, Machine{Free: map[Tier]int64{Unified: c.free}}, DefaultPolicy())
+		if d.Placement != ExpertCached || d.Slots != c.slots || d.ScratchBytes != c.scratch {
+			t.Errorf("free %d: %s, scratch %d; want expert-cached at %d slots, scratch %d", c.free, planAnswer(d), d.ScratchBytes, c.slots, c.scratch)
+		}
 	}
 }

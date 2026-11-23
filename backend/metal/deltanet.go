@@ -132,7 +132,7 @@ var stateSpecsOf = (*decoder.Model).StateSpecs
 
 // metalRecurrentSlotBytes is one KV slot's recurrent state on m, from the list its layers allocate from.
 func metalRecurrentSlotBytes(m *decoder.Model) int64 {
-	_, nL, _, _, _, _, _ := m.Dims()
+	nL := m.Shape().Layers
 	var n int64
 	for l := range nL {
 		for _, s := range stateSpecsOf(m, l) {
@@ -155,13 +155,14 @@ func stateBuffersOn(d *Device, m *decoder.Model, l int) (win, state Buffer, err 
 // (nil, nil) for a dense model (no qwen35 family) — the same "ok=false -> not this family" shape
 // buildMoE uses, so buildResident's caller can no-op it uniformly.
 func buildDeltaNet(d *Device, m *decoder.Model, pipe func(string) Pipeline) (*dnetParams, error) {
-	convKernel, keyHeadDim, valueHeadDim, numKeyHeads, numValueHeads, _, ok := m.Qwen35ResidentParams()
+	q, ok := m.BackendView().Qwen35()
+	convKernel, keyHeadDim, valueHeadDim, numKeyHeads, numValueHeads := q.ConvKernel, q.KeyHeadDim, q.ValueHeadDim, q.NumKeyHeads, q.NumValueHeads
 	if !ok {
 		return nil, nil
 	}
 	if recurrentInt8Load(m) && !dnetInt8DeclineOffForTest {
 		// Metal's native int8 path covers no recurrent family (w8Eligible), so int8 projections would be re-quantized to
-		// int4 without notice: decline, and the CPU runs the model at the int8 it was loaded with (G44, as buildMamba).
+		// int4 without notice: decline, and the CPU runs the model at the int8 it was loaded with (as buildMamba).
 		return nil, fmt.Errorf("metal: a Gated-DeltaNet model runs resident at int4 only; its int8 projections would be re-quantized to int4 here, so it runs on the CPU")
 	}
 	keyDim, valueDim := numKeyHeads*keyHeadDim, numValueHeads*valueHeadDim
@@ -195,11 +196,11 @@ func recurrentInt8Load(m *decoder.Model) bool {
 	return false
 }
 
-// dnetInt8DeclineOffForTest removes buildDeltaNet's int8 decline: G44's planted defect.
+// dnetInt8DeclineOffForTest removes buildDeltaNet's int8 decline: a planted defect.
 var dnetInt8DeclineOffForTest = false
 
-// dnetNegEigvalOffForTest and dnetONormEpsOffForTest drop the DeltaNet's NegEigval and ONormEps at the build: OM-1's planted
-// defects (docs/tasks/task-olmo-hybrid-metal-webgpu-2026-11.md).
+// dnetNegEigvalOffForTest and dnetONormEpsOffForTest drop the DeltaNet's NegEigval and ONormEps at the build: planted
+// defects.
 var dnetNegEigvalOffForTest, dnetONormEpsOffForTest = false, false
 
 // buildDeltaNetLayer uploads one Gated-DeltaNet layer's weights and allocates its persistent
@@ -210,7 +211,7 @@ var dnetNegEigvalOffForTest, dnetONormEpsOffForTest = false, false
 // dozen rows), so this rides Metal's existing int8 GEMV path (pGemvW8) rather than adding a
 // dedicated f32 GEMV kernel for two small projections.
 func buildDeltaNetLayer(d *Device, m *decoder.Model, l int, dnet *dnetParams, mk func(*linalg.WeightMat) (Buffer, Buffer)) (*deltaNetLayer, error) {
-	inQKV, inZ, outProj, inB, inA, convW, dtBias, negExpA, normW := m.Qwen35DeltaWeights(l)
+	inQKV, inZ, outProj, inB, inA, convW, dtBias, negExpA, normW := m.BackendView().Layer(l).Qwen35DeltaWeights()
 	// Name the missing tensor (as cuda/backend.go's identical check does): an empty slice becomes a 0-byte device upload that
 	// fails as "invalid length" with no hint which of the four small tensors was missing.
 	// History: docs/code-notes/metal.md#buildDeltaNetLayer.
@@ -271,9 +272,15 @@ func (r *resident) encodeDeltaNetMixer(e *Encoder, L *residLayer) {
 // encodeDeltaNetMixerOn is encodeDeltaNetMixer on residual x, against the conv window win and state state: the multi-sequence
 // step passes each row's residual and its own slot's pair.
 func (r *resident) encodeDeltaNetMixerOn(e *Encoder, L *residLayer, x, win, state Buffer) {
+	r.encodeNorm(e, x, L.preNorm, L.preNormBias, r.aq, r.aSc)
+	r.encodeDeltaNetCoreOn(e, L, x, win, state)
+}
+
+// encodeDeltaNetCoreOn is the DeltaNet mixer from its normed input in aq and aSc through out_proj, which adds into the residual
+// x: the mixer operation and the residual add, which one dispatch serves.
+func (r *resident) encodeDeltaNetCoreOn(e *Encoder, L *residLayer, x, win, state Buffer) {
 	dp := r.dnet
 	D := L.delta
-	r.encodeNorm(e, x, L.preNorm, L.preNormBias, r.aq, r.aSc)
 	r.gemvExt(e, gemvExtKCoal, dp.convDim, r.H, D.qkvW, D.qkvS, r.aq, r.aSc, r.dnMixed, r.uH)
 	e.Dispatch(r.pGemvW8, dp.nv*32, 32, r.aq, r.aSc, D.bW, D.bS, r.dnBt, r.uH)
 	e.Dispatch(r.pGemvW8, dp.nv*32, 32, r.aq, r.aSc, D.aW, D.aS, r.dnAt, r.uH)

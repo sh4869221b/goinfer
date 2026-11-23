@@ -15,10 +15,11 @@ import (
 
 	gpu "github.com/townsendmerino/goinfer/backend/cuda/internal/gpudev"
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/decoder/fit"
 	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 )
 
-// OP2b on CUDA, step 2c (docs/tasks/task-forward-architecture-2026-10.md §4.7): the sites that tested r.dnet read "recurrent", so a Mamba-2 resident is
+// OP2b on CUDA, step 2c: the sites that tested r.dnet read "recurrent", so a Mamba-2 resident is
 // declined where a Gated-DeltaNet one is; and the KV plan prices attention layers only, plus the Mamba state.
 
 type guardCase struct {
@@ -54,7 +55,7 @@ func withTwoSlots(r *cudaResident) {
 
 // TestNemotronResidentCUDA_guards is OP2b's gate G on CUDA: a Nemotron-H resident is declined by each site that refuses recurrent state (the batched
 // step, the prefix snapshot, the KV copy, the verify pass, and the batched prefill by name), and a Gated-DeltaNet one is declined by the same sites as before
-// except the prefix snapshot, which carries its state (B35, ResidentRecurrentSnapshots) and admits it.
+// except the prefix snapshot, which carries its state (B35, ResidentKVSubsystem.KVSnapshotRecurrent) and admits it.
 // llama-tiny is the control, admitted where the recurrent check decides, so a guard that declines everything cannot pass. The batched-prefill decline is
 // switched off for the batched-step check (batchStepStaticDeclineOffForTest), because it also refuses a Mamba-2 model and would hide a guard left DeltaNet-only.
 // Not covered: the fast-lever switch in prefillCore (prefill.go), which a recurrent model never reaches because the prefill declines it first.
@@ -100,15 +101,8 @@ func TestNemotronResidentCUDA_guards(t *testing.T) {
 			if !strings.Contains(res.copyDecl, "recurrent") {
 				t.Errorf("CopyKV on %s: decline %q (err %v), want the recurrent-state decline", c.fixture, res.copyDecl, res.copyErr)
 			}
-			switch c.fixture {
-			case "qwen35-tiny": // B35: a Gated-DeltaNet snapshot carries the recurrent state, so it is admitted
-				if res.snapDecl != "" {
-					t.Errorf("the prefix snapshot of %s: decline %q, want it admitted (B35)", c.fixture, res.snapDecl)
-				}
-			default:
-				if !strings.Contains(res.snapDecl, "Mamba-2") {
-					t.Errorf("the prefix snapshot of %s: decline %q, want the Mamba-2 state decline", c.fixture, res.snapDecl)
-				}
+			if res.snapDecl != "" { // a recurrent snapshot carries the state, Gated-DeltaNet's (B35) and Mamba-2's (KV8) alike
+				t.Errorf("the prefix snapshot of %s: decline %q, want it admitted", c.fixture, res.snapDecl)
 			}
 			if res.verifyBatched {
 				t.Errorf("ForwardN's verify pass on %s reports a batched path", c.fixture)
@@ -144,19 +138,19 @@ func TestNemotronResidentCUDA_pricing(t *testing.T) {
 	var nMamba int
 	var stateBytes int64
 	for l := range r.layers {
-		switch m.NemotronBlockKind(l) { // the family's own kinds, not the resident's
+		switch m.BackendView().Layer(l).NemotronBlockKind() { // the family's own kinds, not the resident's
 		case 1:
 			attn++
-			want += 2 * int64(m.KVHeadsAtResident(l)*m.HeadDimAtResident(l)) * elem * ctx
+			want += 2 * int64(m.BackendView().Layer(l).KVHeads()*m.BackendView().Layer(l).HeadDim()) * elem * ctx
 			if r.kc[l].Len() == 0 || r.vc[l].Len() == 0 {
 				t.Errorf("attention layer %d has no KV buffer", l)
 			}
 		default:
 			if r.kc[l].Len() != 0 || r.vc[l].Len() != 0 {
-				t.Errorf("layer %d (block kind %d) holds a KV buffer of %d elements", l, m.NemotronBlockKind(l), r.kc[l].Len())
+				t.Errorf("layer %d (block kind %d) holds a KV buffer of %d elements", l, m.BackendView().Layer(l).NemotronBlockKind(), r.kc[l].Len())
 			}
 		}
-		if m.NemotronBlockKind(l) == 0 {
+		if m.BackendView().Layer(l).NemotronBlockKind() == 0 {
 			nMamba++
 			stateBytes += int64(r.layers[l].mbWin.Len()+r.layers[l].mbSSM.Len()) * 4
 		}
@@ -172,13 +166,13 @@ func TestNemotronResidentCUDA_pricing(t *testing.T) {
 	if got, w := m.ResidentKVBytes("cuda", ctx, r.kvF16, false), want+tabs+kvPoolNullBytes(r.layers); got != w {
 		t.Errorf("the decoder's ResidentKVBytes(cuda, %d) = %d, want %d", ctx, got, w)
 	}
-	if got := m.Plan("cuda", 1<<40, decoder.PlanRequest{Ctx: ctx}).StateBytes; got != stateBytes {
+	if got := m.Plan("cuda", 1<<40, fit.PlanRequest{Ctx: ctx}).StateBytes; got != stateBytes {
 		t.Errorf("the plan's state line is %d, the %d Mamba layers' state buffers are %d bytes", got, nMamba, stateBytes)
 	}
 	t.Logf("nemotron-tiny: %d attention layers of %d price %d KV bytes at %d positions; %d Mamba layers' state is %d bytes", attn, len(r.layers), want, ctx, nMamba, stateBytes)
 }
 
-// TestRecurrentStatePlanned_matchesTheBuild is MM8's CUDA gate (docs/tasks/task-subsystems-2026-10.md, MM8): the recurrent state the
+// TestRecurrentStatePlanned_matchesTheBuild is MM8's CUDA gate: the recurrent state the
 // pre-build context plan prices (each layer's conv window and state, at the driver's allocation quantum) equals what the build charges
 // for it, on Gated-DeltaNet, Mamba-2 and Olmo Hybrid fixtures; and it is all on the device, on the ledger's state line, before checkKVFits reads
 // free VRAM.
@@ -210,7 +204,7 @@ func TestRecurrentStatePlanned_matchesTheBuild(t *testing.T) {
 }
 
 // recurrentSlotFixtures are the recurrent models the state-slot gates run on: Gated-DeltaNet, Gated-DeltaNet with its own
-// settings, and Mamba-2 (docs/tasks/task-kv-architecture-2026-10.md, KV8's plan of 2026-11-03).
+// settings, and Mamba-2.
 var recurrentSlotFixtures = []string{"qwen35-tiny", "olmo_hybrid-tiny", "nemotron-tiny"}
 
 func recurrentSlotsLoad(t *testing.T, fixture string, o decoder.Options) (*decoder.Model, *cudaResident) {
@@ -507,7 +501,7 @@ func TestRecurrentSlots_stateLinePerSlot(t *testing.T) {
 			if n := r.KVSlots(); n != slots {
 				t.Fatalf("%s: %d slots, asked for %d", fixture, n, slots)
 			}
-			one := m.Plan("cuda", 1<<40, decoder.PlanRequest{Ctx: 1}).StateBytes
+			one := m.Plan("cuda", 1<<40, fit.PlanRequest{Ctx: 1}).StateBytes
 			if one <= 0 || one != r.recurrentStateCharged() {
 				t.Errorf("%s: the plan prices %d bytes of state for a slot, the build charges %d", fixture, one, r.recurrentStateCharged())
 			}
@@ -645,7 +639,7 @@ func TestRecurrentSlots_roomForOneCheckpoint(t *testing.T) {
 // that fit by their raw bytes do not.
 func TestCkptCopies_countTheCharge(t *testing.T) {
 	const reserve = int64(1 << 30)
-	r := &cudaResident{dnet: &dnetParams{convK: 2, convDim: 1, stateElems: 3 << 18}, layers: []cudaLayer{{mixer: decoder.MixerDeltaNet}}}
+	r := &cudaResident{layers: []cudaLayer{{mixer: decoder.MixerDeltaNet}}, recFloats: []recurrentFloats{{win: 1, state: 3 << 18}}}
 	live, charged := r.recurrentLiveBytes(), r.recurrentStateCharged()
 	if live >= charged {
 		t.Fatalf("raw %d, charged %d: the fixture has no rounding to read", live, charged)
@@ -756,12 +750,22 @@ func TestRecurrentSlots_decoderChoosesAmongSlots(t *testing.T) {
 // TestRecurrentSlots_snapshotHoldsTheSlotItNames is S-5, Gated-DeltaNet only: a snapshot taken and restored with another slot bound
 // holds and writes the slot it names, so that slot's sequence continues as if never moved.
 func TestRecurrentSlots_snapshotHoldsTheSlotItNames(t *testing.T) {
-	const mark, n = 64, 72
-	m, r := recurrentSlotsLoad(t, "qwen35-tiny", decoder.Options{ResidentKVSlots: 2})
-	if !r.KVSnapshotRecurrent() {
-		t.Fatal("a Gated-DeltaNet resident's snapshots do not carry its state")
+	for _, fixture := range recurrentSlotFixtures {
+		for _, plant := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/plant=%v", fixture, plant), func(t *testing.T) { recurrentSlotSnapshotOfUnbound(t, fixture, plant) })
+		}
 	}
-	_, one := recurrentSlotsLoad(t, "qwen35-tiny", decoder.Options{ResidentKVSlots: 1})
+}
+
+// recurrentSlotSnapshotOfUnbound takes a snapshot of slot 0 while slot 1 is bound and restores it after slot 0 moved on. With plant, the snapshot's
+// state is overwritten with slot 1's, which is what a snapshot that read the bound pair would hold: the sequence must then differ from its solo run.
+func recurrentSlotSnapshotOfUnbound(t *testing.T, fixture string, plant bool) {
+	const mark, n = 64, 72
+	m, r := recurrentSlotsLoad(t, fixture, decoder.Options{ResidentKVSlots: 2})
+	if !r.KVSnapshotRecurrent() {
+		t.Fatalf("%s: a recurrent resident's snapshots do not carry its state", fixture)
+	}
+	_, one := recurrentSlotsLoad(t, fixture, decoder.Options{ResidentKVSlots: 1})
 	A, B := recurrentSlotSeqs(m, n)
 	refA := recurrentSlotSolo(t, one, A)
 	recurrentSlotBind(t, r, 0)
@@ -783,6 +787,22 @@ func TestRecurrentSlots_snapshotHoldsTheSlotItNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer snap.Release()
+	if plant {
+		s := snap.(*cudaKVSnapshot)
+		if len(s.rec) == 0 {
+			t.Fatalf("%s: the snapshot holds no recurrent layer", fixture)
+		}
+		buf := s.hostRows()
+		for _, d := range s.rec {
+			p := r.layers[d.layer].recurrentOf(1)
+			if err := gpu.Download(p.win, buf[d.winOff:d.winOff+d.winWords]); err != nil {
+				t.Fatal(err)
+			}
+			if err := gpu.Download(p.state, buf[d.stOff:d.stOff+d.stW]); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	recurrentSlotBind(t, r, 0)
 	for i := mark; i < n; i++ { // moves slot 0's state past the snapshot
 		if _, err := r.Forward(B[i], i); err != nil {
@@ -794,14 +814,19 @@ func TestRecurrentSlots_snapshotHoldsTheSlotItNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	recurrentSlotBind(t, r, 0)
+	differ := 0
 	for i := mark; i < n; i++ {
 		l, err := r.Forward(A[i], i)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if d := logitsDiffer(l, refA[i]); d != 0 {
-			t.Fatalf("after the restore, position %d: %d logits differ from the sequence's solo run", i, d)
-		}
+		differ += logitsDiffer(l, refA[i])
+	}
+	switch {
+	case !plant && differ != 0:
+		t.Fatalf("after the restore, %d logits differ from the sequence's solo run", differ)
+	case plant && differ == 0:
+		t.Fatalf("the snapshot holding slot 1's state changed nothing: the comparison cannot see which slot's state the snapshot holds")
 	}
 }
 
@@ -1140,5 +1165,169 @@ func TestRecurrentSlots_resetFreesTheSlotsCheckpoint(t *testing.T) {
 	}
 	if !r.RecurrentCheckpointHeld(0) {
 		t.Error("a save took slot 0's checkpoint with a free copy available")
+	}
+}
+
+// TestRecurrentState_everyBufferReadsTheList: the live pair, every further slot's pair, the checkpoint's copy and the reset are all
+// sized from the one list (decoder.Model.StateSpecs). Moving both of its entries, unequally so a window sized as a state would show,
+// moves every buffer of each copy, makes a reset zero all of it, and the state line then holds exactly the slots' and checkpoints' copies of the moved list.
+func TestRecurrentState_everyBufferReadsTheList(t *testing.T) {
+	requireCUDADevice(t)
+	const extra = 8
+	stateSpecsOf = func(m *decoder.Model, l int) []decoder.StateSpec {
+		specs := slices.Clone(m.StateSpecs(l))
+		for i := range specs {
+			specs[i].Floats += extra * (i + 1)
+		}
+		return specs
+	}
+	t.Cleanup(func() { stateSpecsOf = (*decoder.Model).StateSpecs })
+	for _, fixture := range recurrentSlotFixtures {
+		t.Run(fixture, func(t *testing.T) {
+			m, r := recurrentSlotsLoad(t, fixture, decoder.Options{ResidentKVSlots: 2})
+			if r.KVSlots() != 2 || len(r.ckptCopies) == 0 {
+				t.Fatalf("%d slots and %d checkpoint copies (%s); this case needs a second slot and a checkpoint", r.KVSlots(), len(r.ckptCopies), r.ckptDeclined)
+			}
+			var want []int
+			var chargedOne int64
+			for l := range r.layers {
+				if !r.layers[l].isRecurrent() {
+					continue
+				}
+				for _, s := range stateSpecsOf(m, l) {
+					want = append(want, s.Floats)
+					chargedOne += chargedBytes(4 * int64(s.Floats))
+				}
+			}
+			if len(want) == 0 {
+				t.Fatal("no recurrent layer")
+			}
+			lens := func(bufs []Buffer) []int {
+				out := make([]int, len(bufs))
+				for i, b := range bufs {
+					out[i] = b.Len()
+				}
+				return out
+			}
+			var live, slot1 []Buffer
+			for l := range r.layers {
+				if L := &r.layers[l]; L.isRecurrent() {
+					p := L.recurrentLive()
+					live = append(live, p.win, p.state)
+					if len(L.recSlots) != 2 {
+						t.Fatalf("layer %d holds %d slot pairs, want 2", l, len(L.recSlots))
+					}
+					slot1 = append(slot1, L.recSlots[1].win, L.recSlots[1].state)
+				}
+			}
+			for name, bufs := range map[string][]Buffer{"the live pair": live, "slot 1": slot1, "the checkpoint": r.ckptCopies[0].bufs} {
+				if got := lens(bufs); !slices.Equal(got, want) {
+					t.Errorf("%s's buffers are %v floats; the moved list holds %v", name, got, want)
+				}
+			}
+			if got := r.recurrentStateCharged(); got != chargedOne {
+				t.Errorf("recurrentStateCharged is %d bytes; the moved list charges %d", got, chargedOne)
+			}
+			if got, want := r.recurrentLiveBytes(), func() int64 {
+				var n int64
+				for _, f := range want {
+					n += 4 * int64(f)
+				}
+				return n
+			}(); got != want {
+				t.Errorf("recurrentLiveBytes is %d; the moved list holds %d", got, want)
+			}
+			if l, ok := r.dev.Leaser().(*deviceLedger); !ok {
+				t.Fatal("the device has no ledger")
+			} else if copies := int64(r.KVSlots() + len(r.ckptCopies)); l.Usage().ByLine[mem.LineState] != copies*chargedOne {
+				t.Errorf("the state line holds %d bytes; %d copies (slots and checkpoints) of the moved list charge %d", l.Usage().ByLine[mem.LineState], copies, copies*chargedOne)
+			}
+			// A reset zeroes the whole of each live buffer, not the first floats of it.
+			for l := range r.layers {
+				if L := &r.layers[l]; L.isRecurrent() {
+					p := L.recurrentLive()
+					for _, b := range []Buffer{p.win, p.state} {
+						ones := make([]float32, b.Len())
+						for i := range ones {
+							ones[i] = 1
+						}
+						if err := r.do(func() error { return gpu.Upload(b, ones) }); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			}
+			if err := r.do(r.resetState); err != nil {
+				t.Fatal(err)
+			}
+			for l := range r.layers {
+				if L := &r.layers[l]; L.isRecurrent() {
+					p := L.recurrentLive()
+					for _, b := range []Buffer{p.win, p.state} {
+						got := make([]float32, b.Len())
+						if err := r.do(func() error { return gpu.Download(b, got) }); err != nil {
+							t.Fatal(err)
+						}
+						if i := slices.IndexFunc(got, func(v float32) bool { return v != 0 }); i >= 0 {
+							t.Errorf("layer %d: float %d of %d is %v after a reset; the reset left part of the buffer", l, i, len(got), got[i])
+							break
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestRecurrentState_listEqualsKernelGeometry: with the list unmoved, the sizes the build allocates from it are the sizes the kernels'
+// geometry (dnetParams, mambaParams) implies, layer by layer, so reading the list changed no buffer.
+func TestRecurrentState_listEqualsKernelGeometry(t *testing.T) {
+	for _, fixture := range recurrentSlotFixtures {
+		_, r := recurrentSlotsLoad(t, fixture, decoder.Options{})
+		seen := 0
+		for l := range r.layers {
+			var want recurrentFloats
+			switch L := &r.layers[l]; {
+			case L.isDeltaNet():
+				want = recurrentFloats{r.dnet.winFloats(), r.dnet.stateElems}
+			case L.mixer == decoder.MixerMamba:
+				want = recurrentFloats{r.mamba.winFloats(), r.mamba.ssmFloats()}
+			default:
+				continue
+			}
+			seen++
+			if r.recFloats[l] != want {
+				t.Errorf("%s layer %d: the list gives %+v, the kernels' geometry %+v", fixture, l, r.recFloats[l], want)
+			}
+		}
+		if seen == 0 {
+			t.Errorf("%s: no recurrent layer", fixture)
+		}
+	}
+}
+
+// TestRecurrentFloatsOf_refusesAListThatIsNotAWindowAndAState: a recurrent layer's list must be exactly a window then a state; any other
+// shape is an error the build declines on, not sizes guessed.
+func TestRecurrentFloatsOf_refusesAListThatIsNotAWindowAndAState(t *testing.T) {
+	t.Cleanup(func() { stateSpecsOf = (*decoder.Model).StateSpecs })
+	for name, specs := range map[string][]decoder.StateSpec{
+		"none":        nil,
+		"one":         {{Name: "window", Floats: 4}},
+		"three":       {{Name: "window", Floats: 4}, {Name: "state", Floats: 4}, {Name: "state", Floats: 4}},
+		"swapped":     {{Name: "state", Floats: 4}, {Name: "window", Floats: 4}},
+		"kda windows": {{Name: "window-q", Floats: 4}, {Name: "state", Floats: 4}},
+	} {
+		stateSpecsOf = func(*decoder.Model, int) []decoder.StateSpec { return specs }
+		if rf, err := recurrentFloatsOf(nil, 3); err == nil {
+			t.Errorf("%s: got %+v, want an error", name, rf)
+		} else if !strings.Contains(err.Error(), "layer 3") {
+			t.Errorf("%s: the error does not name the layer: %v", name, err)
+		}
+	}
+	stateSpecsOf = func(*decoder.Model, int) []decoder.StateSpec {
+		return []decoder.StateSpec{{Name: "window", Floats: 5}, {Name: "state", Floats: 7}}
+	}
+	if rf, err := recurrentFloatsOf(nil, 0); err != nil || rf != (recurrentFloats{5, 7}) {
+		t.Errorf("a window and a state: %+v, %v", rf, err)
 	}
 }

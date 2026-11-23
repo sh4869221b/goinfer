@@ -33,85 +33,10 @@ func ErrBlockSpecResidentBusy(err error) bool { return errors.Is(err, errBlockSp
 // Both are OPTIONAL capabilities: a ResidentForward that does not implement them simply cannot
 // host block drafting, and GenerateBlockSpec declines to plain generation rather than failing.
 
-// ResidentBlockDrafter is a block drafter's trunk living on a backend's device, attached to that
-// backend's resident target. Obtained from ResidentDrafterHost.AttachBlockDrafter.
-type ResidentBlockDrafter interface {
-	// FuseContext projects concatenated tap hidden states to the trunk's width and norms them.
-	FuseContext(rows [][]float32) ([][]float32, error)
-	// ExtendContext appends fused rows to the drafter's own K/V at the current context end. Incremental by contract: rebuilding the whole
-	// context per block costs more, and the gap widens with length (docs/spec/08).
-	ExtendContext(fused [][]float32) error
-	// ContextLen is how many positions the drafter's context currently holds.
-	ContextLen() int
-	// TruncateContext drops context positions >= n — the rollback after a partial accept.
-	TruncateContext(n int)
-	// DraftBlock runs the trunk over one block, returning its output rows.
-	DraftBlock(blockIn [][]float32) ([][]float32, error)
-	// DraftTokens turns trunk rows into token ids using the TARGET's LM head — a block drafter
-	// ships none of its own, which is why the pairing is fixed.
-	DraftTokens(trunk [][]float32) ([]int, error)
-}
-
-// ResidentDrafterHost is a resident target that can host a block drafter and hand back the
-// hidden states it needs. A backend implements this alongside ResidentForward.
-type ResidentDrafterHost interface {
-	// AttachBlockDrafter uploads a drafter's weights to this target's device. It must reject a
-	// geometry mismatch rather than resize: a drafter reads the target's residual stream, so a
-	// mismatch is the wrong PAIRING, and the failure mode is a drafter that runs and drafts noise.
-	AttachBlockDrafter(w BlockDrafterWeights) (ResidentBlockDrafter, error)
-	// PrefillLastNArgmax verifies M rows in one batched pass, returning each row's argmax token
-	// — all the accept decision reads. Only the ARGMAX must match a sequential Forward, not the
-	// logits bit-for-bit, which is what lets the LM head be batched (docs/spec/08).
-	PrefillLastNArgmax(embeddings [][]float32, startPos int) ([]int, error)
-	// SetBatchedCapture arms the hidden-state seam for the whole batch: the next PrefillLastNArgmax records the residual at each named layer
-	// for ALL its rows. The per-token seam costs a sync and a download per tap per token; this pays one per tap for the block.
-	SetBatchedCapture(taps []int) error
-	// BatchedCapture returns the last batched forward's rows as [tap][M*hidden].
-	BatchedCapture() [][]float32
-}
-
-// ResidentSeedArgmax is an OPTIONAL narrowing of PrefillLastNArgmax for the prompt seed, the one place the loop asks for M rows of argmax
-// and reads exactly one of them. Without it the seed materialises the batched logits (M x vocab: gigabytes on a large-vocab target at
-// prompt lengths over ~1k) and runs the head over every row to obtain one token id. The capture the seed needs comes from the layer loop,
-// not the head, so heading one row loses nothing.
-//
-// Optional rather than part of ResidentDrafterHost, following ResidentCapped and ResidentGreedy: a backend without it keeps working
-// through the wide path.
-type ResidentSeedArgmax interface {
-	// PrefillSeedArgmax runs the same batched forward and returns only the LAST row's argmax.
-	// The batched capture seam must be armed and filled exactly as PrefillLastNArgmax fills it.
-	PrefillSeedArgmax(embeddings [][]float32, startPos int) (int, error)
-}
-
-// ResidentRecurrentSpec is the OPTIONAL capability that lets a resident with recurrent state verify speculatively (SP2,
-// docs/tasks/task-forward-architecture-2026-10.md §6a, "SP2 on nobara"). Without it, BlockSpec refuses every recurrent model,
-// because PrefillLastNArgmax advances the state by every row it verifies, rejected or not.
-type ResidentRecurrentSpec interface {
-	// PrepareRecurrentSpec allocates what verifies of up to rows rows need, before a drafter attaches; a later call for no more
-	// rows is a no-op.
-	// It returns why when this load cannot take the path (a recurrent layer it does not serve, no room for the rows), and
-	// RecurrentSpecRows then stays 0.
-	PrepareRecurrentSpec(rows int) error
-	// RecurrentSpecRows is the widest verify the path holds: 0 when this load cannot take it (a recurrent layer it does not
-	// serve, or no room for its rows).
-	RecurrentSpecRows() int
-	// VerifyLastNArgmax is PrefillLastNArgmax that writes none of its own rows into any recurrent layer's committed state or conv
-	// window. It first folds the rows the previous verify had marked (FoldVerified). Each row starts from the row above it, so the
-	// rows are a chain.
-	VerifyLastNArgmax(embeddings [][]float32, startPos int) ([]int, error)
-	// FoldVerified marks the last verify's first n rows committed. They fold into the state, leaving it as a prefill of those
-	// rows would, at the next VerifyLastNArgmax or FlushFold, whichever comes first.
-	FoldVerified(n int) error
-	// FlushFold folds the marked rows now. Called before anything other than a verify reads or advances the state.
-	FlushFold() error
-	// DropFold forgets the marked rows without folding them: an exit that commits nothing leaves no rows for a later turn to fold.
-	DropFold()
-}
-
-// RecurrentSpecMaxRows is the widest verify a ResidentRecurrentSpec arena is sized for: a DFlash block.
+// RecurrentSpecMaxRows is the widest verify a RecurrentSpecAvailable arena is sized for: a DFlash block.
 const RecurrentSpecMaxRows = 16
 
-// RecurrentSpecArenaBytes is the device memory a ResidentRecurrentSpec resident keeps for verify passes of up to rows rows on a model of
+// RecurrentSpecArenaBytes is the device memory a RecurrentSpecAvailable resident keeps for verify passes of up to rows rows on a model of
 // arch a: two banks (a verify writes one while the previous verify's committed rows fold from the other) of, per Gated-DeltaNet layer and
 // row, the conv input and output, the normed q and k and two gates per value head, plus one fold output, f32, rounded up to the 2 MiB
 // cuMemAlloc gives a buffer that size. 0 for a model the path refuses: no recurrent
@@ -155,11 +80,7 @@ func recurrentSpecReserve(a *Architecture, drafter bool) int64 {
 // target that implements ResidentDrafterHost. Checked before a drafter is loaded, so a caller
 // can decline early rather than paying a load it cannot use.
 func (m *Model) BlockSpecCapable() bool {
-	if m.resident == nil {
-		return false
-	}
-	_, ok := m.resident.(ResidentDrafterHost)
-	return ok
+	return m.resident != nil && m.resRuntime().DrafterHostAvailable()
 }
 
 // BlockSpecOptions tunes block-drafting speculation.
@@ -202,7 +123,9 @@ const defaultVerifyWidth = 8
 // and doing it per request costs more than the speedup earns (a several-fold loss) while the loop stays lossless and acceptance looks
 // fine. Attach once per process, generate per request.
 type BlockSpec struct {
-	m     *Model
+	m *Model
+	// host is the resident itself, never one of its subsystems: step and SubsystemsOf resolve a resident, and a subsystem handed to
+	// either has no capability (blockSpecHost).
 	host  ResidentDrafterHost
 	rd    ResidentBlockDrafter
 	dw    BlockDrafterWeights
@@ -260,24 +183,34 @@ func (m *Model) newBlockSpec(dw BlockDrafterWeights, taps []int) (*BlockSpec, er
 	if err := m.SpecDecodeConflict(); err != nil {
 		return nil, err
 	}
-	host, ok := m.resident.(ResidentDrafterHost)
+	host, rt, ok := m.blockSpecHost()
 	if !ok {
 		return nil, errBlockSpecUnsupported
 	}
-	if sw, ok := dw.(StreamedDrafterWeights); ok && sw.Streamed() {
-		if _, ok := host.(StreamingDrafterHost); !ok {
-			return nil, fmt.Errorf("decoder: this resident cannot take a drafter opened to stream its matrices (OpenDFlashDrafter); load it with LoadDFlashDrafter")
-		}
+	if sw, ok := dw.(StreamedDrafterWeights); ok && sw.Streamed() && !rt.CanStreamDrafterRows() {
+		return nil, fmt.Errorf("decoder: this resident cannot take a drafter opened to stream its matrices (OpenDFlashDrafter); load it with LoadDFlashDrafter")
 	}
 	// Before the attach, so a refused model has no drafter uploaded to its device.
 	if err := m.prepareRecurrentSpec(host, dw); err != nil {
 		return nil, err
 	}
-	rd, err := host.AttachBlockDrafter(dw)
+	rd, err := rt.AttachBlockDrafter(dw)
 	if err != nil {
 		return nil, err
 	}
 	return &BlockSpec{m: m, host: host, rd: rd, dw: dw, taps: taps}, nil
+}
+
+// blockSpecHost is m's resident as a drafter host with its runtime subsystem; ok is false where the resident cannot host a block
+// drafter. The host is the resident, not rt: a backend's subsystems are not ResidentSubsystemProviders, so SubsystemsOf(rt) is the
+// no-op subsystems.
+func (m *Model) blockSpecHost() (host ResidentDrafterHost, rt ResidentRuntimeSubsystem, ok bool) {
+	rt = m.resRuntime()
+	if !rt.DrafterHostAvailable() {
+		return nil, nil, false
+	}
+	host, ok = drafterHostOf(m.resident)
+	return host, rt, ok
 }
 
 // prepareRecurrentSpec readies a recurrent target's fold path for dw's block, or says why block drafting would decode from
@@ -286,9 +219,9 @@ func (m *Model) prepareRecurrentSpec(host ResidentDrafterHost, dw BlockDrafterWe
 	if !m.hasRecurrentState() {
 		return nil
 	}
-	rs, ok := host.(ResidentRecurrentSpec)
-	if !ok {
-		return fmt.Errorf("decoder: this model has recurrent state and its resident cannot verify without writing it (no ResidentRecurrentSpec)")
+	rt := SubsystemsOf(host).Runtime
+	if !rt.RecurrentSpecAvailable() {
+		return fmt.Errorf("decoder: this model has recurrent state and its resident cannot verify without writing it (no RecurrentSpecAvailable)")
 	}
 	// The architecture first, so a model the path refuses has no arena allocated either; the arena's price is 0 exactly there.
 	if RecurrentSpecArenaBytes(m.w.arch, 1) == 0 {
@@ -298,26 +231,26 @@ func (m *Model) prepareRecurrentSpec(host ResidentDrafterHost, dw BlockDrafterWe
 	if rows < 2 {
 		return fmt.Errorf("decoder: a drafter block of %d positions verifies no draft", dw.BlockSize())
 	}
-	if err := rs.PrepareRecurrentSpec(rows); err != nil {
+	if err := rt.PrepareRecurrentSpec(rows); err != nil {
 		return fmt.Errorf("decoder: this model has recurrent state and its resident's fold path declined: %w", err)
 	}
-	if !m.specRollbackSafeVia(rs, rows) {
-		return fmt.Errorf("decoder: the resident's fold path holds %d rows, and this drafter verifies up to %d", rs.RecurrentSpecRows(), rows)
+	if !m.specRollbackSafeVia(rt, rows) {
+		return fmt.Errorf("decoder: the resident's fold path holds %d rows, and this drafter verifies up to %d", rt.RecurrentSpecRows(), rows)
 	}
 	return nil
 }
 
 // recurrentFold is the resident's fold path for verifies of width rows on a recurrent model, or nil: on a model with no
 // recurrent state (its verifies need none), and on one whose resident cannot take that width (specRollbackSafeVia).
-func (s *BlockSpec) recurrentFold(width int) ResidentRecurrentSpec {
+func (s *BlockSpec) recurrentFold(width int) ResidentRuntimeSubsystem {
 	if !s.m.hasRecurrentState() {
 		return nil
 	}
-	rs, _ := s.host.(ResidentRecurrentSpec)
-	if rs == nil || !s.m.specRollbackSafeVia(rs, width) {
+	rt := SubsystemsOf(s.host).Runtime
+	if !rt.RecurrentSpecAvailable() || !s.m.specRollbackSafeVia(rt, width) {
 		return nil
 	}
-	return rs
+	return rt
 }
 
 // verifyWidth is the verify width a generation with opt runs at: opt.VerifyWidth, else SetVerifyWidth's, else defaultVerifyWidth,
@@ -355,6 +288,20 @@ func (s *BlockSpec) Generate(prompt []int, opt BlockSpecOptions) ([]int, int, er
 	return s.generate(prompt, opt, nil)
 }
 
+// seedAnchor runs the prompt suffix embs from pos through the host and returns the seed's id, the argmax of its last row. It asks for
+// the id alone when the backend can (SeedArgmaxAvailable), which skips an M x vocab logits buffer, copy and host argmax.
+func (s *BlockSpec) seedAnchor(embs [][]float32, pos int) (int, error) {
+	if canStep(s.host, stepBatch{Pass: passRows, Emb: stepProbe, Out: outArgmax}) {
+		sr, err := stepOn(s.host, stepBatch{Pass: passRows, Emb: embs, Pos: pos, Out: outArgmax})
+		return sr.ID, err
+	}
+	ids, err := s.host.PrefillLastNArgmax(embs, pos)
+	if err != nil {
+		return 0, err
+	}
+	return ids[len(ids)-1], nil
+}
+
 // generate is the loop. emit, when non-nil, receives each round's committed tokens as they are
 // produced and returns false to stop (cancellation) — that is what lets GenerateStream forward
 // tokens per round instead of at the end.
@@ -383,7 +330,7 @@ func (s *BlockSpec) generate(prompt []int, opt BlockSpecOptions, emit func([]int
 	// advance the state by every row, rejected or not.
 	fold := s.recurrentFold(width)
 	if m.hasRecurrentState() && fold == nil {
-		return nil, 0, fmt.Errorf("decoder: block-spec verify width %d on a recurrent model needs the resident's fold path (ResidentRecurrentSpec)", width)
+		return nil, 0, fmt.Errorf("decoder: block-spec verify width %d on a recurrent model needs the resident's fold path (RecurrentSpecAvailable)", width)
 	}
 	if fold != nil {
 		// Every exit leaves nothing marked: the committing one flushes below, and an early one (a stopped stream, a device or
@@ -396,15 +343,15 @@ func (s *BlockSpec) generate(prompt []int, opt BlockSpecOptions, emit func([]int
 	// contend for resBusy or forget a resIDs commit it never wrote.
 	var reuseFrom int
 	if m.resident != nil {
-		// tryClaimResident, not a bare CAS: it also refuses while an MC3 generation holds a batch place, which never
-		// sets resBusy (docs/completed/task-audit-followups-2026-10-06.md, A1).
+		// tryClaimResident, not a bare CAS: it also refuses while a batched generation holds a batch place, which never
+		// sets resBusy.
 		if !m.tryClaimResident() {
 			return nil, 0, errBlockSpecResidentBusy
 		}
 		defer atomic.StoreInt32(&m.resBusy, 0)
 		// Compute reuse before forgetting: forgetting clears the very state residentReuseLen reads. BlockSpec never binds an adapter (nil lora,
 		// matching residentCommitIDs' own nil below).
-		// MC1: binds the KV slot (clearing resDrafterSynced on a switch). Off: the drafter keeps its own context, which a
+		// Binds the resident KV slot (clearing resDrafterSynced on a switch). Off: the drafter keeps its own context, which a
 		// copy of another sequence's rows would not bring with it.
 		sc := opt.scope
 		sc.Off = true
@@ -462,19 +409,9 @@ func (s *BlockSpec) generate(prompt []int, opt BlockSpecOptions, emit func([]int
 	for i, id := range suffix {
 		embs[i] = m.embedResident(id)
 	}
-	// The seed reads one id: ask for one when the backend can (ResidentSeedArgmax), which skips an M x vocab logits buffer, copy and host argmax.
-	var anchor int
-	if seeder, ok := host.(ResidentSeedArgmax); ok {
-		anchor, err = seeder.PrefillSeedArgmax(embs, reuseFrom)
-		if err != nil {
-			return nil, 0, err
-		}
-	} else {
-		ids, e := host.PrefillLastNArgmax(embs, reuseFrom)
-		if e != nil {
-			return nil, 0, e
-		}
-		anchor = ids[len(ids)-1]
+	anchor, err := s.seedAnchor(embs, reuseFrom)
+	if err != nil {
+		return nil, 0, err
 	}
 	if err := fuse(host.BatchedCapture(), len(suffix)); err != nil {
 		return nil, 0, err
@@ -491,6 +428,7 @@ func (s *BlockSpec) generate(prompt []int, opt BlockSpecOptions, emit func([]int
 	maskID := dw.MaskTokenID()
 	var guard acceptanceGuard
 	seamOff := false
+	var fallbackRow [1][]float32 // the plain-decode fallback's one-row batch, reused across its tokens
 	for opt.MaxTokens <= 0 || len(out) < opt.MaxTokens {
 		if eos[anchor] {
 			break
@@ -513,8 +451,11 @@ func (s *BlockSpec) generate(prompt []int, opt BlockSpecOptions, emit func([]int
 			// Falling back through PrefillLastNArgmax(M=1) downloads the full logit row per token, so the guard would turn a loss into the same
 			// loss instead of into plain-decode speed.
 			var e error
-			if g, ok := m.resident.(ResidentGreedy); ok {
-				anchor, e = g.ForwardArgmax(m.embedResident(anchor), pos)
+			if m.canDecode(outArgmax) {
+				var sr stepResult
+				fallbackRow[0] = m.embedResident(anchor)
+				sr, e = m.step(stepBatch{Pass: passToken, Emb: fallbackRow[:], Pos: pos, Out: outArgmax})
+				anchor = sr.ID
 			} else {
 				var one []int
 				one, e = host.PrefillLastNArgmax([][]float32{m.embedResident(anchor)}, pos)
@@ -656,8 +597,8 @@ func (s *BlockSpec) generate(prompt []int, opt BlockSpecOptions, emit func([]int
 					if _, e = host.PrefillLastNArgmax([][]float32{emb}, pos); e == nil {
 						e = fuse(host.BatchedCapture(), 1)
 					}
-				} else if g, ok := m.resident.(ResidentGreedy); ok {
-					_, e = g.ForwardArgmax(emb, pos)
+				} else if m.canDecode(outArgmax) {
+					_, e = m.step(stepBatch{Pass: passToken, Emb: [][]float32{emb}, Pos: pos, Out: outArgmax})
 				} else {
 					_, e = host.PrefillLastNArgmax([][]float32{emb}, pos)
 				}

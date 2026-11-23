@@ -15,10 +15,11 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/goinfer/internal/runtime/modelload"
+	"github.com/townsendmerino/goinfer/internal/testpath"
 )
 
 // TestSideRequests_snapshotPrefixes checks a run's restored prefixes against the ids the run itself wrote (KV7 step 2, the night rerun with bodies kept,
-// docs/tasks/task-kv7-step2-boundary-snapshot-2026-10.md §8). SIDE_OUT is a matrix.py output directory, SIDE_CONFIG the configuration (its serve log is
+// ). SIDE_OUT is a matrix.py output directory, SIDE_CONFIG the configuration (its serve log is
 // logs/serve-<name>.log and its request bodies bodies-<name>/NNNNN.req.json.gz, in the order of the log's request lines). For every request whose line
 // carries snap=<rows>, the first <rows> ids of its rendered prompt must be the first <rows> ids of an EARLIER request's rendered prompt: a restore puts
 // back rows a prefill wrote for those ids, and nothing else is a legitimate source. It also reports, per request, the rows reused, the time to first token
@@ -31,7 +32,7 @@ func TestSideRequests_snapshotPrefixes(t *testing.T) {
 	if name == "" {
 		t.Fatal("SIDE_CONFIG names the configuration")
 	}
-	tk, err := modelload.Tokenizer(filepath.Join("..", "..", "testdata", "mellum2-tokenizer"))
+	tk, err := modelload.Tokenizer(testpath.Testdata(t, "mellum2-tokenizer"))
 	if err != nil {
 		t.Skipf("needs the Mellum2 tokenizer: %v", err)
 	}
@@ -110,7 +111,7 @@ func TestSideRequests_sessionStartShare(t *testing.T) {
 			paths = append(paths, p)
 		}
 	}
-	tk, err := modelload.Tokenizer(filepath.Join("..", "..", "testdata", "mellum2-tokenizer"))
+	tk, err := modelload.Tokenizer(testpath.Testdata(t, "mellum2-tokenizer"))
 	if err != nil {
 		t.Skipf("needs the Mellum2 tokenizer: %v", err)
 	}

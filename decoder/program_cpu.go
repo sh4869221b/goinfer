@@ -19,7 +19,7 @@ const (
 	plantHiddenNoNorm              // HiddenLast's sequential path skips the head's norm (finalNorm)
 	plantCaptureEarly              // ForwardCapture copies the residual before the layer's last operation
 	plantSubPrePostNorm            // ForwardSubCapture records the attention contribution before its post-attention norm
-	plantCostDoubleCount           // the cost counters record each attention output projection twice (SB11's plant)
+	plantCostDoubleCount           // the cost counters record each attention output projection twice
 )
 
 // program returns m's program. A Model built without modelFromOptions (a test that assembles one) gets a fresh one per call.
@@ -145,7 +145,7 @@ func (m *Model) walkToken(prog *layerProgram, h []float32, pleID int, cache *KVC
 				out := m.reg(o.Out, h, scr)
 				if o.FFN.Form == ffnGemma4Dense {
 					// A model without Gemma 4's per-token state gets an error, never a nil dereference: a recovered access
-					// violation here corrupted the Go heap on some Windows hosts (docs/queue-correctness.md G50).
+					// violation here corrupted the Go heap on some Windows hosts.
 					if g4 == nil {
 						return nil, fmt.Errorf("decoder: layer %d: Gemma 4's dense FFN form on a model without Gemma 4 state", l)
 					}
@@ -383,7 +383,7 @@ func attendToken(p attentionParams, q, k, v, ctx []float32, cache *KVCache, scr 
 	}
 	nH, hd := arch.headsAt(l), arch.HeadDim
 	kvDim := arch.NumKVHeads * hd
-	if kvRoundF16ForTest { // F1's reference: the f32 path with each stored row rounded to f16 by hand
+	if kvRoundF16ForTest { // the f16 exactness gate's reference: the f32 path with each stored row rounded to f16 by hand
 		roundF16InPlace(k)
 		roundF16InPlace(v)
 	}
@@ -436,7 +436,7 @@ func (m *Model) ffnToken(p *ffnParams, x, out []float32, lw *LayerWeights, scr *
 		m.llama4MoEWith(x, out, lw, &p.MoE, arch.HiddenDim)
 		return nil
 	case ffnGptOss:
-		g, err := m.gptOssMoEWith(x, lw, p, arch.HiddenDim)
+		g, err := m.gptOssMoEWith(x, lw, p, arch.HiddenDim, scr)
 		if err != nil {
 			return err
 		}

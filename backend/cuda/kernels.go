@@ -46,8 +46,7 @@ var prefillBatchedPTX []byte
 
 // decodeSplitKVPTX: the high-occupancy, bit-identical decode attention (splitkv_scores, splitkv_softmax, splitkv_vsum).
 // attn_batched(M=1) is split along its independent axes (scores over keys, V-sum over dims), so every order-dependent
-// softmax fold stays whole and in order and the result is byte-identical, but fills the SMs. See
-// docs/tasks/task-decode-splitkv-attention.md.
+// softmax fold stays whole and in order and the result is byte-identical, but fills the SMs.
 //
 //go:embed testdata/decode_splitkv.ptx
 var decodeSplitKVPTX []byte
@@ -75,8 +74,7 @@ var deltaNetPTX []byte
 var gptOssActPTX []byte
 
 // actGroupPTX: per-32 activation quantization for the resident decode path: rmsnorm_quant_g32, quant_vec_g32,
-// glu_quant_g32 and the gemv_w4a8_g32 / gemv_w8a8_g32 GEMVs that read one activation scale per 32 elements (actgroup.cu;
-// docs/tasks/task-actquant-pergroup-2026-09.md). A per-row model never loads it.
+// glu_quant_g32 and the gemv_w4a8_g32 / gemv_w8a8_g32 GEMVs that read one activation scale per 32 elements (actgroup.cu). A per-row model never loads it.
 //
 //go:embed testdata/actgroup.ptx
 var actGroupPTX []byte
@@ -136,7 +134,7 @@ var gumbelPTX []byte
 //go:embed testdata/decode_fa.ptx
 var decodeFAPTX []byte
 
-// loraPTX: lora_delta_down/lora_delta_up, compute-time LoRA (docs/tasks/task-gpu-paths-2026-09.md). A new kernel pair is
+// loraPTX: lora_delta_down/lora_delta_up, compute-time LoRA. A new kernel pair is
 // its own module per cuda/testdata/REGEN.md's rule (new .cu, new .ptx, built at whatever NVRTC is present). See
 // cuda/lora.cu.
 //
@@ -151,7 +149,7 @@ var loraPTX []byte
 var attnBlockPTX []byte
 
 // attnImgPrefillPTX: attn_img_batched, Gemma 3's image-block bidirectional prefill attention
-// (decoder.ResidentImagePrefill / cuda.PrefillImageLast). A verbatim copy of attn_batched, except that a query row whose
+// (decoder.ResidentPrefillSubsystem / cuda.PrefillImageLast). A verbatim copy of attn_batched, except that a query row whose
 // own position lies inside a caller-supplied [imgStart,imgEnd) range sees the whole block; text before and after stays
 // exactly causal (unlike attn_block_full's uniform widening).
 //
@@ -171,7 +169,7 @@ var attnImgPrefillPTX []byte
 //go:embed testdata/attn_img_prefill_kv16.ptx
 var attnImgPrefillKV16PTX []byte
 
-// ropeMRopePrefillPTX: rope_kv_mrope_batched, Qwen2.5-VL's m-RoPE batched-prefill rotation (decoder.ResidentMRoPEPrefill
+// ropeMRopePrefillPTX: rope_kv_mrope_batched, Qwen2.5-VL's m-RoPE batched-prefill rotation (decoder.ResidentPrefillSubsystem
 // / cuda.PrefillMRoPELast). A copy of rope_kv_batched whose rotation angle is a per-row, per-frequency-section lookup:
 // frequency index d rotates by pos[comp(d)]*invFreq[d], where comp(d) picks temporal/height/width from the model's
 // MRopeSection cumulative boundaries.
@@ -191,7 +189,7 @@ var ropeMRopePrefillKV16PTX []byte
 
 // ropePairwisePTX: rope_kv_pw / rope_kv_batched_pw / rope_kv_mrope_batched_pw, the GPT-J pairwise (dims 2d, 2d+1) twins
 // of rope_kv / rope_kv_batched / rope_kv_mrope_batched, with the same argument lists and launch geometry, bound in their
-// place when decoder.Model.PairwiseRoPEResident() says so. The NeoX kernels rotate (d, d+half), so a pairwise family run
+// place when decoder.Model.BackendView().PairwiseRoPE() says so. The NeoX kernels rotate (d, d+half), so a pairwise family run
 // through them is exact at position 0 and wrong afterwards. Built at NVRTC 12.6.85, the pinned toolchain (the control is
 // in docs/measurements/cuda-pairwise-rope-2026-10-01.md). See cuda/rope_pairwise.cu.
 //
@@ -216,8 +214,8 @@ var layernormQuantPTX []byte
 //go:embed testdata/gelu_quant.ptx
 var geluQuantPTX []byte
 
-// attnFusedPTX: attn_fused_hd64 / attn_fused_hd128, the L2 FlashAttention-style fused prefill attention
-// (docs/completed/task-prefill-gap.md §4 L2). See cuda/attn_fused.cu.
+// attnFusedPTX: attn_fused_hd64 / attn_fused_hd128, the L2 FlashAttention-style fused prefill attention.
+// See cuda/attn_fused.cu.
 //
 //go:embed testdata/attn_fused.ptx
 var attnFusedPTX []byte
@@ -236,14 +234,13 @@ var attnFusedBMPTX []byte
 var attnFusedVitPTX []byte
 
 // towerBasePTX: tower_pos_add / tower_clamp / tower_clamp_copy / tower_rope_axial / tower_mul / tower_scale, the CUDA
-// vision-tower base's own kernels (docs/tasks/task-multimodal-support-2026-10.md), added to aikit's gpu.ViT module.
+// vision-tower base's own kernels, added to aikit's gpu.ViT module.
 // Built at NVRTC 12.9.86.
 //
 //go:embed testdata/tower_base.ptx
 var towerBasePTX []byte
 
-// gemmMMAPTX: gemm_w4a8_mma, the L3 tensor-core int4xint8 GEMM with group scales (docs/completed/task-prefill-gap.md §4
-// L3).
+// gemmMMAPTX: gemm_w4a8_mma, the L3 tensor-core int4xint8 GEMM with group scales.
 //
 //go:embed testdata/gemm_w4a8_mma.ptx
 var gemmMMAPTX []byte
@@ -266,7 +263,7 @@ var routerF32PTX []byte
 //go:embed testdata/gemv_w4f32.ptx
 var gemvW4F32PTX []byte
 
-// fusedQKVPTX: the K1 super-kernel: rmsnorm+quant folded into the Q/K/V GEMV by redundant per-block recompute, removing
+// fusedQKVPTX: the fused QKV super-kernel: rmsnorm+quant folded into the Q/K/V GEMV by redundant per-block recompute, removing
 // a GridX:1 glue kernel and 3 launches.
 //
 //go:embed testdata/fused_qkv.ptx
@@ -299,11 +296,10 @@ var mlaKV16PTX []byte
 // are documented in package wpack.
 func nibblePosFast(i int) int     { return wpack.NibblePos(i) }
 func permuteFast(w uint32) uint32 { return wpack.Permute(w) }
-func f32tof16(f float32) uint16   { return wpack.F32ToF16(f) }
 
 // The _kv16 twins: the same sources as the modules above, built with -DKV_F16 (kvtype.cuh), so their K/V cache pointers are __half. The resident
 // loads a twin in place of its module when the KV cache is f16 (cudaResident.kvPTX); the f32 modules above are byte-identical to what they were
-// before the twins existed. docs/tasks/task-cuda-f16-kv-2026-10.md.
+// before the twins existed.
 //
 //go:embed testdata/gemv_fwd_kv16.ptx
 var gemvFwdKV16PTX []byte
@@ -347,13 +343,68 @@ var decodeSplitKVCapPTX []byte
 //go:embed testdata/decode_splitkv_kv16_cap.ptx
 var decodeSplitKVKV16CapPTX []byte
 
+// glueKV8PTX: gluePTX built with the KV cache as int8 and per-(position, head) f32 scales (-DKV_I8, kvtype.cuh). Only `attention` reads the cache;
+// scoped in docs/measurements/cuda-kv-i8-2026-11/scope.md. Built at the pinned NVRTC 12.6.85 beside the audited glue modules, which stay byte-identical.
+//
+//go:embed testdata/glue_kv8.ptx
+var glueKV8PTX []byte
+
+// prefillBatchedKV8PTX and kv8StorePTX: the int8 cache's batched-prefill attention (prefill_batched.cu built with -DKV_I8) and its quantizing store
+// (kv8_store.cu), scoped in docs/measurements/cuda-kv-i8-2026-11/scope.md: built and tested, bound to nothing yet.
+//
+//go:embed testdata/prefill_batched_kv8.ptx
+var prefillBatchedKV8PTX []byte
+
+//go:embed testdata/kv8_store.ptx
+var kv8StorePTX []byte
+
+// prefillSplitKVKV8PTX: prefill_splitkv.cu built with -DKV_I8 (the row-batched long-context prefill attention), at the ambient NVRTC like prefill_splitkv.ptx.
+//
+//go:embed testdata/prefill_splitkv_kv8.ptx
+var prefillSplitKVKV8PTX []byte
+
+// decodeSplitKVKV8PTX: decode_splitkv.cu built with -DKV_I8 (the exact long-context decode path), at the ambient NVRTC like decode_splitkv.ptx.
+//
+//go:embed testdata/decode_splitkv_kv8.ptx
+var decodeSplitKVKV8PTX []byte
+
+// decodeFAKV8PTX: decode_fa.cu built with -DKV_I8 (the flash-decode lane's int8 readers), at the ambient NVRTC like decode_fa.ptx.
+//
+//go:embed testdata/decode_fa_kv8.ptx
+var decodeFAKV8PTX []byte
+
+// decodeFACapPTX and decodeFAKV16CapPTX: decode_fa.cu built with -DATTN_SOFTCAP (and -DKV_F16), the flash-decode lane for a model with an
+// attention softcap: every fa_partial* kernel takes the cap as its last parameter (withCap). At the ambient NVRTC like decode_fa.ptx.
+//
+//go:embed testdata/decode_fa_cap.ptx
+var decodeFACapPTX []byte
+
+//go:embed testdata/decode_fa_kv16_cap.ptx
+var decodeFAKV16CapPTX []byte
+
+// attnFusedKV8PTX and attnFusedBMKV8PTX: the tensor-core prefill tiles (attn_fused.cu, attn_fused_bm.cu) built with -DKV_I8, at the ambient
+// NVRTC like their f32 and f16 modules: K and V staged as f16 from the int8 cache and its scales (KV_LDHS), the rest of each tile the f16 build's.
+//
+//go:embed testdata/attn_fused_kv8.ptx
+var attnFusedKV8PTX []byte
+
+//go:embed testdata/attn_fused_bm_kv8.ptx
+var attnFusedBMKV8PTX []byte
+
+// gemvFwdKV8PTX: gemv_fwd.cu built with -DKV_I8, at the pinned NVRTC 12.6.85 beside the audited gemv_fwd modules, which stay byte-identical. Its
+// rope_kv rotates Q and K in place and stores nothing (KV_ST is a no-op in an int8 build); kv8_store then quantizes the rotated K and the V.
+//
+//go:embed testdata/gemv_fwd_kv8.ptx
+var gemvFwdKV8PTX []byte
+
 // attnPTX is kvPTX for the three modules that hold a kernel a capped layer takes (attention, attn_batched, splitkv_scores): a model with
-// an attention softcap loads the variant built with -DATTN_SOFTCAP (cuda/attnscore.cuh), every other model the plain module.
-func (r *cudaResident) attnPTX(f32, kv16, capF32, capKV16 []byte) []byte {
+// an attention softcap loads the variant built with -DATTN_SOFTCAP (cuda/attnscore.cuh), every other model the plain module. There is no
+// capped int8 build: on an int8 cache a capped model gets nil, which no load accepts (CUDAKVI8Decline refuses every capped family first).
+func (r *cudaResident) attnPTX(f32, kv16, kv8, capF32, capKV16 []byte) []byte {
 	if r.attnCap != 0 {
 		return r.kvPTX(capF32, capKV16)
 	}
-	return r.kvPTX(f32, kv16)
+	return r.kvPTX8(f32, kv16, kv8)
 }
 
 // withCap appends the cap to the argument list of a covered kernel when the model has one: the capped variants take it as their last
@@ -366,7 +417,7 @@ func (r *cudaResident) withCap(args ...gpu.KernelArg) []gpu.KernelArg {
 }
 
 // mambaPTX: the Mamba-2 decode mixer (mamba_conv, mamba_ssm, mamba_gnorm) for Nemotron-H and Granite-4.0-H, ported from metal/kernels/mamba_kernels_msl.go.
-// A module of its own: no existing PTX holds a Mamba kernel. Not bound by any pipeline until OP2b's resident builder (cuda/mamba.cu).
+// A module of its own: no existing PTX holds a Mamba kernel. Bound by the Mamba-2 resident builder (cuda/mamba.cu).
 //
 //go:embed testdata/mamba.ptx
 var mambaPTX []byte
@@ -376,9 +427,19 @@ var mambaPTX []byte
 //go:embed testdata/nongated_act.ptx
 var nongatedActPTX []byte
 
-// kvPTX is the module a KV-touching pipeline loads: the f16 twin when the resident's cache is f16, else the f32 module.
+// kvPTX is the module a KV-touching pipeline loads: the f16 twin when the resident's cache is f16, else the f32 module. A module with no
+// int8 twin is nil on an int8 cache, so it fails to load rather than reading int8 bytes as floats: an optional module (the tensor-core
+// prefill tiles) is then not bound and its fallback runs, a required one fails the build.
 func (r *cudaResident) kvPTX(f32, kv16 []byte) []byte {
-	if r.kvF16 {
+	return r.kvPTX8(f32, kv16, nil)
+}
+
+// kvPTX8 is kvPTX for a module that has an int8 twin (kv8, -DKV_I8): that twin on an int8 cache.
+func (r *cudaResident) kvPTX8(f32, kv16, kv8 []byte) []byte {
+	switch {
+	case r.kvI8:
+		return kv8
+	case r.kvF16:
 		return kv16
 	}
 	return f32

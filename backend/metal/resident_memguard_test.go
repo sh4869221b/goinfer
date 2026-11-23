@@ -111,7 +111,7 @@ func TestResidentFitsMemory_honorsLiveCeiling(t *testing.T) {
 		t.Skip("GOINFER_NO_RESIDENT_MEM_GUARD is set in the environment — the guard is disabled, nothing to exercise")
 	}
 	m := tinyDenseModelWithMoESlots(t, 0)
-	need := residentNeedBytes(m)
+	need := residentNeedBytes(m, metalCtxPlan{})
 	if need <= 0 {
 		t.Skip("tiny fixture reports zero resident bytes — nothing to price")
 	}
@@ -121,7 +121,7 @@ func TestResidentFitsMemory_honorsLiveCeiling(t *testing.T) {
 	// being consulted.
 	metalLiveAvailable = func() int64 { return 1 }
 	t.Cleanup(func() { metalLiveAvailable = orig })
-	if residentFitsMemory(m) {
+	if residentFitsMemory(m, metalCtxPlan{}) {
 		t.Fatalf("residentFitsMemory() = true with metalLiveAvailable() = 1 byte (need=%d bytes) — "+
 			"the guard is not reading the live-tightened ceiling", need)
 	}
@@ -135,7 +135,7 @@ func TestResidentFitsMemory_refusesExactlyBelowTheReading(t *testing.T) {
 		t.Skip("GOINFER_NO_RESIDENT_MEM_GUARD is set in the environment: the guard is disabled, nothing to exercise")
 	}
 	m := tinyDenseModelWithMoESlots(t, 0)
-	need := residentNeedBytes(m)
+	need := residentNeedBytes(m, metalCtxPlan{})
 	if need <= 0 {
 		t.Skip("tiny fixture reports zero resident bytes: nothing to price")
 	}
@@ -146,7 +146,7 @@ func TestResidentFitsMemory_refusesExactlyBelowTheReading(t *testing.T) {
 		fits  bool
 	}{{need - 1, false}, {need, true}, {2 * need, true}} {
 		metalLiveAvailable = func() int64 { return c.avail }
-		if got := residentFitsMemory(m); got != c.fits {
+		if got := residentFitsMemory(m, metalCtxPlan{}); got != c.fits {
 			t.Errorf("reading %d for a need of %d: fits %v, want %v", c.avail, need, got, c.fits)
 		}
 	}
@@ -160,20 +160,20 @@ func TestResidentMemoryDecline_workingSetCap(t *testing.T) {
 		t.Skip("GOINFER_NO_RESIDENT_MEM_GUARD is set in the environment: the guard is disabled, nothing to exercise")
 	}
 	m := tinyDenseModelWithMoESlots(t, 0)
-	need := residentNeedBytes(m)
+	need := residentNeedBytes(m, metalCtxPlan{})
 	if need <= 0 {
 		t.Skip("tiny fixture reports zero resident bytes: nothing to price")
 	}
-	alloc := need - m.ResidentHostCopyBytes(metalMoESlotsFromEnv(m))
+	alloc := need - m.ResidentHostCopyBytes(metalMoESlotsFromEnv(m, metalCtxPlan{}))
 	origCap, origLive := metalWorkingSetCap, metalLiveAvailable
 	t.Cleanup(func() { metalWorkingSetCap, metalLiveAvailable = origCap, origLive })
 	metalLiveAvailable = func() int64 { return 1 << 40 }
 	metalWorkingSetCap = func() int64 { return alloc - 1 }
-	if why := residentMemoryDecline(m); !strings.Contains(why, "recommendedMaxWorkingSetSize") {
+	if why := residentMemoryDecline(m, metalCtxPlan{}); !strings.Contains(why, "recommendedMaxWorkingSetSize") {
 		t.Errorf("an allocation of %d over a cap of %d: decline %q, want one naming recommendedMaxWorkingSetSize", alloc, alloc-1, why)
 	}
 	metalWorkingSetCap = func() int64 { return alloc }
-	if why := residentMemoryDecline(m); why != "" {
+	if why := residentMemoryDecline(m, metalCtxPlan{}); why != "" {
 		t.Errorf("an allocation of %d at a cap of %d: declined %q", alloc, alloc, why)
 	}
 }
@@ -236,7 +236,7 @@ func TestMetalMoESlotsFromEnv(t *testing.T) {
 				t.Setenv("GOINFER_METAL_MOE_SLOTS", tc.val)
 			}
 			m := tinyDenseModelWithMoESlots(t, tc.optSlots)
-			if got := metalMoESlotsFromEnv(m); got != tc.want {
+			if got := metalMoESlotsFromEnv(m, metalCtxPlan{}); got != tc.want {
 				t.Errorf("metalMoESlotsFromEnv() with env=%q Options.MoECacheSlots=%d = %d, want %d", tc.val, tc.optSlots, got, tc.want)
 			}
 		})
@@ -247,8 +247,8 @@ func TestMetalMoESlotsFromEnv(t *testing.T) {
 // reverted to always call ResidentWeightBytes() compiles clean and passes that parsing test. It loads a real (tiny) MoE checkpoint
 // and compares residentNeedBytes against ResidentWeightBytes, ResidentWeightBytesPaged, ResidentHostCopyBytes and residentKVBytes
 // directly, with no real RAM needed. The assertions add the host-copy and KV terms back in, computed independently through the public
-// accessors, so the test catches a regression in the paging wiring specifically without a rewrite each time another additive term
-// appears.
+// accessors, and at a paged request the experts' slot indices as arithmetic on the top k, so the test catches a regression in the
+// paging wiring specifically without a rewrite each time another additive term appears.
 func TestResidentNeedBytes_honorsPagingSlots(t *testing.T) {
 	// testdata/gemma4-moe-tiny is gitignored (a real, if small, checkpoint) — never present in CI,
 	// so skip rather than fail when it's absent, matching decoder's own convention for this fixture.
@@ -263,10 +263,15 @@ func TestResidentNeedBytes_honorsPagingSlots(t *testing.T) {
 	defer m.Close()
 
 	unpaged := m.ResidentWeightBytes()
-	kv := residentKVBytes(m)
+	kv := residentKVBytes(m, metalCtxPlan{})
+	// The buffers Metal's build derives beside the tensors: the excess of its dense figure over the tensors' sum, which on this f32
+	// load, with no q4k lane or Mamba layer to take anything off, is that term alone.
+	derived := m.ResidentDenseWeightBytesFor("metal") - m.ResidentDenseWeightBytes()
 
-	// The slot request is a per-model knob, read at Load (docs/tasks/task-env-config-2026-09.md, phase 4), so
+	// The slot request is a per-model knob, read at Load, so
 	// each arm prices its own model loaded with that request, not one model with the environment changed under it.
+	// needWith is the guard's figure at a slot request less decode's scratch with every expert resident, which the request does not
+	// move: the weights, the derived buffers, host copy and KV at that request, and the paged experts' slot indices where it pages.
 	needWith := func(t *testing.T, slots string) int64 {
 		t.Helper()
 		mk, err := decoder.Load(ckpt, decoder.Options{Quant: "f32", Knobs: &decoder.Knobs{"GOINFER_METAL_MOE_SLOTS": slots}})
@@ -274,13 +279,14 @@ func TestResidentNeedBytes_honorsPagingSlots(t *testing.T) {
 			t.Fatalf("Load (slots %q): %v", slots, err)
 		}
 		defer mk.Close()
-		return residentNeedBytes(mk)
+		return residentNeedBytes(mk, metalCtxPlan{}) - mk.MetalDecodeScratchBytes(0)
 	}
+	index := int64(4 * moeTopK(m)) // the paged experts' slot indices, 4 bytes for each of the top k
 
 	t.Run("unset env == unpaged", func(t *testing.T) {
-		want := unpaged + m.ResidentHostCopyBytes(0) + kv
+		want := unpaged + derived + m.ResidentHostCopyBytes(0) + kv
 		if got := needWith(t, ""); got != want {
-			t.Errorf("residentNeedBytes() with no slots env = %d, want unpaged+hostcopy+kv %d", got, want)
+			t.Errorf("residentNeedBytes() with no slots env = %d, want unpaged+derived+hostcopy+kv %d", got, want)
 		}
 	})
 
@@ -289,9 +295,9 @@ func TestResidentNeedBytes_honorsPagingSlots(t *testing.T) {
 		if wantWeights >= unpaged {
 			t.Fatalf("test fixture has too few experts to make this case meaningful (paged(1)=%d, unpaged=%d)", wantWeights, unpaged)
 		}
-		want := wantWeights + m.ResidentHostCopyBytes(1) + kv
+		want := wantWeights + derived + m.ResidentHostCopyBytes(1) + kv + index
 		if got := needWith(t, "1"); got != want {
-			t.Errorf("residentNeedBytes() with GOINFER_METAL_MOE_SLOTS=1 = %d, want %d (paged weights+hostcopy+kv) — "+
+			t.Errorf("residentNeedBytes() with GOINFER_METAL_MOE_SLOTS=1 = %d, want %d (paged weights+derived+hostcopy+kv+slot indices) — "+
 				"the guard is not asking for the paged estimate", got, want)
 		}
 		// The host-copy addend must itself shrink under paging: paged experts stream, so ResidentHostCopyBytes(1) must be strictly smaller
@@ -378,7 +384,7 @@ func TestBuildDemand_matchesDecoderDefault(t *testing.T) {
 	t.Logf("%d configs, %d queries", len(cfgs), len(queries))
 }
 
-// TestResident_holdsTheModelsProgram (OP4m-a's A4, docs/tasks/task-forward-architecture-2026-10.md §4.9): the resident a Metal
+// TestResident_holdsTheModelsProgram: the resident a Metal
 // build returns holds the model's own program, the one copy decoder walks, for a synthetic dense model and the tracked qwen3.5
 // fixture.
 func TestResident_holdsTheModelsProgram(t *testing.T) {
@@ -402,7 +408,7 @@ func TestResident_holdsTheModelsProgram(t *testing.T) {
 				t.Fatalf("load: %v", err)
 			}
 			defer m.Close()
-			r, err := buildResident(m)
+			r, err := buildResident(m, metalCtxPlan{})
 			if err != nil {
 				t.Fatalf("build resident: %v", err)
 			}
@@ -455,15 +461,15 @@ func shapeDiffs(m *decoder.Model) ([]string, error) {
 		name      string
 		got, want bool
 	}{
-		{"sandwich", s.Sandwich, m.SandwichNormResident()},
-		{"postOnly", s.PostOnly, m.PostOnlyNormResident()},
-		{"parallel", s.Parallel, m.ParallelBlockResident()},
-		{"nonGated", s.NonGated, m.NonGatedMLPResident()},
-		{"layerNorm", s.LayerNorm, m.LayerNormResident()},
-		{"qkNorm", s.QKNorm, m.HasQKNorm()},
-		{"qkNormWhole", s.QKNormWhole, m.QKNormWholeResident()},
-		{"outBias", s.OutBias, m.OutBiasResident()},
-		{"learnedPos", s.LearnedPos, m.LearnedPosResident()},
+		{"sandwich", s.Sandwich, m.BackendView().SandwichNorm()},
+		{"postOnly", s.PostOnly, m.BackendView().PostOnlyNorm()},
+		{"parallel", s.Parallel, m.BackendView().ParallelBlock()},
+		{"nonGated", s.NonGated, m.BackendView().NonGatedMLP()},
+		{"layerNorm", s.LayerNorm, m.BackendView().LayerNorm()},
+		{"qkNorm", s.QKNorm, m.BackendView().HasQKNorm()},
+		{"qkNormWhole", s.QKNormWhole, m.BackendView().QKNormWhole()},
+		{"outBias", s.OutBias, m.BackendView().OutBias()},
+		{"learnedPos", s.LearnedPos, m.BackendView().LearnedPos()},
 	} {
 		if c.got != c.want {
 			d = append(d, fmt.Sprintf("%s: program %v, accessor %v", c.name, c.got, c.want))
@@ -523,7 +529,7 @@ func eachShapeFixture(t *testing.T, f func(name string, m *decoder.Model)) int {
 	return compared
 }
 
-// TestDenseShape_matchesTheAccessors is OP4m-b1's B1-1 and B1-2 (docs/tasks/task-forward-architecture-2026-10.md §4.9): on every
+// TestDenseShape_matchesTheAccessors is OP4m-b1's B1-1 and B1-2: on every
 // tracked tiny checkpoint the decoder loads on the CPU, the layer shape Metal derives from the program equals the nine
 // Architecture accessors it replaces, and the derivation returns no error. The derivation is internal/program's ShapeOf; its
 // plants are decoder's TestProgramShape_matchesTheAccessors, which runs on every box.
@@ -629,10 +635,12 @@ func TestBuildLayerSteps_matchesTheLoadedBlocks(t *testing.T) {
 	scaled := append(slices.Clone(dense), program.Op{Kind: program.OpLayerScale})
 	parallel := append(slices.Clone(dense[:4]), dense[6], program.Op{Kind: program.OpResidual, Res: program.ResidualParams{Two: true}})
 	build := func(ops []program.Op, L residLayer, q4k bool) error {
-		r := &resident{layers: []residLayer{L}, q4kLane: q4k}
+		parallel := slices.ContainsFunc(ops, func(o program.Op) bool { return o.Kind == program.OpResidual && o.Res.Two })
+		r := &resident{layers: []residLayer{L}, q4kLane: q4k, parallelBlock: parallel, decode: decodeShape{act: uint32(program.ActSiLU)}}
 		return r.buildLayerSteps(&program.Program{Layers: [][]program.Op{ops}})
 	}
-	loaded := residLayer{geom: &attnGeom{}, ffn: true}
+	nonEmpty := (Buffer{}).At(1)
+	loaded := residLayer{geom: &attnGeom{}, ffn: true, preNorm: nonEmpty, postNorm: nonEmpty}
 	read := loaded
 	read.layerScaleRead = true
 	for _, c := range []struct {
@@ -645,8 +653,8 @@ func TestBuildLayerSteps_matchesTheLoadedBlocks(t *testing.T) {
 		{"a dense layer as loaded", dense, loaded, false, true},
 		{"a dense layer on the q4k lane", dense, loaded, true, true},
 		{"a layer scale whose scalar was read", scaled, read, false, true},
-		{"the build loaded no FFN", dense, residLayer{geom: &attnGeom{}}, false, false},
-		{"the build loaded no attention", dense, residLayer{ffn: true}, false, false},
+		{"the build loaded no FFN", dense, residLayer{geom: &attnGeom{}, preNorm: nonEmpty}, false, false},
+		{"the build loaded no attention", dense, residLayer{ffn: true, postNorm: nonEmpty}, false, false},
 		{"a layer scale the build did not read", scaled, loaded, false, false},
 		{"a read layer scale the program lacks", dense, read, false, false},
 		{"the q4k lane with a layer scale", scaled, read, true, false},
@@ -670,6 +678,7 @@ var (
 // TestMain (G-MM3c-2): a test's own buffers lease on the test line, and every device the run releases must have had nothing
 // unplanned and must close to zero.
 func TestMain(m *testing.M) {
+	switchesBefore := readSwitches(testSwitches())
 	gpu.UnlinedLine = mem.LineTest
 	gpu.ReleasedForTest = func(d *Device) {
 		b := metalLedgerBreak(metalLedgerOf(d))
@@ -691,7 +700,231 @@ func TestMain(m *testing.M) {
 		code = 1
 	}
 	releasedMu.Unlock()
+	if leaks := switchLeaks(testSwitches(), switchesBefore); len(leaks) > 0 {
+		fmt.Fprintf(os.Stderr, "FAIL: %d package-level switch(es) were left changed by a test; each test restores the value it found:\n", len(leaks))
+		for _, l := range leaks {
+			fmt.Fprintln(os.Stderr, "  "+l)
+		}
+		code = 1
+	}
 	os.Exit(code)
+}
+
+// leakSwitch reads one package-level variable a test may assign.
+type leakSwitch struct {
+	name string
+	read func() any
+}
+
+func sw[T comparable](name string, p *T) leakSwitch {
+	return leakSwitch{name, func() any { return *p }}
+}
+
+// testSwitches lists every package-level scalar a test in this package assigns; TestMain fails the run when a test leaves one
+// changed. A new switch is one line here, and TestSwitchGuard_coversEveryAssignedSwitch fails until it has one. A test that
+// changes a switch restores what it found (`defer func(v bool) { x = v }(x)`), never a constant.
+func testSwitches() []leakSwitch {
+	return []leakSwitch{
+		sw("attnFABlk64On", &attnFABlk64On),
+		sw("attnFABlkAnyG", &attnFABlkAnyG),
+		sw("attnSoftcapDropForTest", &attnSoftcapDropForTest),
+		sw("chainFallbackAtForTest", &chainFallbackAtForTest),
+		sw("chainNaNAtForTest", &chainNaNAtForTest),
+		sw("costPlantForTest", &costPlantForTest),
+		sw("dg01Mutation", &dg01Mutation),
+		sw("dnSeqOldForTest", &dnSeqOldForTest),
+		sw("dnetInt8DeclineOffForTest", &dnetInt8DeclineOffForTest),
+		sw("dnetPrefillOn", &dnetPrefillOn),
+		sw("eg2Block", &eg2Block),
+		sw("emodelBatchDefect", &emodelBatchDefect),
+		sw("emodelBatchedOn", &emodelBatchedOn),
+		sw("exactAttnTileForTest", &exactAttnTileForTest),
+		sw("expertPoolDefect", &expertPoolDefect),
+		sw("ffnWalkPlantForTest", &ffnWalkPlantForTest),
+		sw("g4DropLayerScalarForTest", &g4DropLayerScalarForTest),
+		sw("g4DropVNormForTest", &g4DropVNormForTest),
+		sw("g4ExpertBatchOn", &g4ExpertBatchOn),
+		sw("g4KVSrcOffForTest", &g4KVSrcOffForTest),
+		sw("g4KeepSharedKVStoreForTest", &g4KeepSharedKVStoreForTest),
+		sw("g4LayerMajorOn", &g4LayerMajorOn),
+		sw("g4OneFFNWidthForTest", &g4OneFFNWidthForTest),
+		sw("g4PrefetchOn", &g4PrefetchOn),
+		sw("g4SkipPLEForTest", &g4SkipPLEForTest),
+		sw("gemmTilePolicy", &gemmTilePolicy),
+		sw("gemma4FFNSplitOffForTest", &gemma4FFNSplitOffForTest),
+		sw("gemvExtOn", &gemvExtOn),
+		sw("greedyChainOff", &greedyChainOff),
+		sw("gridIdleRelease", &gridIdleRelease),
+		sw("gridReleaseCeiling", &gridReleaseCeiling),
+		sw("gridReleaseOffForTest", &gridReleaseOffForTest),
+		sw("gridScratchAllForTest", &gridScratchAllForTest),
+		sw("gvKeepF32ForAB", &gvKeepF32ForAB),
+		sw("ksc2OldDownForTest", &ksc2OldDownForTest),
+		sw("ksd7OldDequantForTest", &ksd7OldDequantForTest),
+		sw("kvCopyFailAfterForTest", &kvCopyFailAfterForTest),
+		sw("kvCopyFailForTest", &kvCopyFailForTest),
+		sw("kvEvictOrderPlantForTest", &kvEvictOrderPlantForTest),
+		sw("kvKeepShortForTest", &kvKeepShortForTest),
+		sw("kvOwnOffForTest", &kvOwnOffForTest),
+		sw("kvScrambleForTest", &kvScrambleForTest),
+		sw("kvTakeFailAfterForTest", &kvTakeFailAfterForTest),
+		sw("kvTakeFailForTest", &kvTakeFailForTest),
+		sw("kvWindowReadPlantForTest", &kvWindowReadPlantForTest),
+		sw("kvRetainOffForTest", &kvRetainOffForTest),
+		sw("kvWindowPoolOffForTest", &kvWindowPoolOffForTest),
+		sw("kvWindowPoolForceForTest", &kvWindowPoolForceForTest),
+		sw("kvWindowIgnoreForTest", &kvWindowIgnoreForTest),
+		sw("kvRetainEarlyPlantForTest", &kvRetainEarlyPlantForTest),
+		sw("kvReapEarlyPlantForTest", &kvReapEarlyPlantForTest),
+		sw("kvNoRepointPlantForTest", &kvNoRepointPlantForTest),
+		sw("kvReusableBasePlantForTest", &kvReusableBasePlantForTest),
+		sw("ledgerChargeDeltaForTest", &ledgerChargeDeltaForTest),
+		sw("ledgerChargeLineForTest", &ledgerChargeLineForTest),
+		sw("mambaPrefillOn", &mambaPrefillOn),
+		sw("mambaResetSkipForTest", &mambaResetSkipForTest),
+		sw("mc3AdjRowsOn", &mc3AdjRowsOn),
+		sw("mc3DeviceArgmaxOn", &mc3DeviceArgmaxOn),
+		sw("mc3FARowsOn", &mc3FARowsOn),
+		sw("mc3W8RowsOn", &mc3W8RowsOn),
+		sw("metalDeepstackPrefillOn", &metalDeepstackPrefillOn),
+		sw("metalFitFreeUnknownForTest", &metalFitFreeUnknownForTest),
+		sw("metalMRoPEPrefillOn", &metalMRoPEPrefillOn),
+		sw("metalMemoryCeilingForTest", &metalMemoryCeilingForTest),
+		sw("mixerWalkPlantForTest", &mixerWalkPlantForTest),
+		sw("mlaKVCopyDeclineOffForTest", &mlaKVCopyDeclineOffForTest),
+		sw("moeExpertBatchOn", &moeExpertBatchOn),
+		sw("moeExpertRowsOn", &moeExpertRowsOn),
+		sw("moeKSlotsOn", &moeKSlotsOn),
+		sw("moeLayerMajorOn", &moeLayerMajorOn),
+		sw("nativeInt4Mix", &nativeInt4Mix),
+		sw("nativeInt8", &nativeInt8),
+		sw("nativeInt8MoE", &nativeInt8MoE),
+		sw("pagedAsyncPhase2On", &pagedAsyncPhase2On),
+		sw("pagedFenceCheckForTest", &pagedFenceCheckForTest),
+		sw("pagedFenceOn", &pagedFenceOn),
+		sw("preciseMathCompile", &preciseMathCompile),
+		sw("prefillAttnSkipForTest", &prefillAttnSkipForTest),
+		sw("prefillBlockRowsForTest", &prefillBlockRowsForTest),
+		sw("prefillParallelDefectForTest", &prefillParallelDefectForTest),
+		sw("prefillR20Copy", &prefillR20Copy),
+		sw("prefillResidScaleForTest", &prefillResidScaleForTest),
+		sw("prefillScratchCopy", &prefillScratchCopy),
+		sw("prefillScratchPoison", &prefillScratchPoison),
+		sw("prefillSteelAttnOff", &prefillSteelAttnOff),
+		sw("promptStepAboveFloor", &promptStepAboveFloor),
+		sw("q4kNativeOffForTest", &q4kNativeOffForTest),
+		sw("siglipForceInt8", &siglipForceInt8),
+		sw("skipPagedInt4CheckForTest", &skipPagedInt4CheckForTest),
+		sw("stepNonGatedRow0PlantForTest", &stepNonGatedRow0PlantForTest),
+		sw("stepPrefillAllHeads", &stepPrefillAllHeads),
+		sw("stepSlotOffsetPlantForTest", &stepSlotOffsetPlantForTest),
+		sw("swigluFusedOffForTest", &swigluFusedOffForTest),
+		sw("w8FastMath", &w8FastMath),
+	}
+}
+
+func readSwitches(ss []leakSwitch) map[string]any {
+	v := make(map[string]any, len(ss))
+	for _, s := range ss {
+		v[s.name] = s.read()
+	}
+	return v
+}
+
+// switchLeaks names each switch whose value differs from before, sorted.
+func switchLeaks(ss []leakSwitch, before map[string]any) []string {
+	var out []string
+	for _, s := range ss {
+		if now := s.read(); now != before[s.name] {
+			out = append(out, fmt.Sprintf("%s: %v at start, %v now", s.name, before[s.name], now))
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// TestSwitchGuard_namesALeak: the guard reports a switch a test left changed, and nothing when it is restored.
+func TestSwitchGuard_namesALeak(t *testing.T) {
+	ss := testSwitches()
+	before := readSwitches(ss)
+	if l := switchLeaks(ss, before); len(l) != 0 {
+		t.Fatalf("no switch changed, yet the guard reports %v", l)
+	}
+	prev := gemvExtOn
+	defer func() { gemvExtOn = prev }()
+	gemvExtOn = !prev
+	l := switchLeaks(ss, before)
+	if len(l) != 1 || !strings.HasPrefix(l[0], "gemvExtOn: ") {
+		t.Fatalf("gemvExtOn flipped: the guard reports %v, want one line naming gemvExtOn", l)
+	}
+}
+
+// TestSwitchGuard_coversEveryAssignedSwitch: every package-level scalar (bool, int, string or a literal-initialised one) that a
+// _test.go file in this directory assigns is in testSwitches, so a new switch cannot be left out of the guard.
+func TestSwitchGuard_coversEveryAssignedSwitch(t *testing.T) {
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scalar := map[string]bool{"bool": true, "int": true, "int64": true, "float32": true, "string": true}
+	vars := map[string]bool{}
+	for _, p := range pkgs {
+		for fn, f := range p.Files {
+			if strings.HasSuffix(fn, "_test.go") {
+				continue
+			}
+			for _, d := range f.Decls {
+				g, ok := d.(*ast.GenDecl)
+				if !ok || g.Tok != token.VAR {
+					continue
+				}
+				for _, sp := range g.Specs {
+					vs := sp.(*ast.ValueSpec)
+					for i, n := range vs.Names {
+						if id, ok := vs.Type.(*ast.Ident); ok && scalar[id.Name] {
+							vars[n.Name] = true
+						} else if vs.Type == nil && i < len(vs.Values) {
+							if lit, ok := vs.Values[i].(*ast.BasicLit); ok && lit.Kind != token.IMAG {
+								vars[n.Name] = true
+							} else if id, ok := vs.Values[i].(*ast.Ident); ok && (id.Name == "true" || id.Name == "false") {
+								vars[n.Name] = true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	listed := map[string]bool{}
+	for _, s := range testSwitches() {
+		listed[s.name] = true
+	}
+	var missing []string
+	for _, p := range pkgs {
+		for fn, f := range p.Files {
+			if !strings.HasSuffix(fn, "_test.go") {
+				continue
+			}
+			ast.Inspect(f, func(n ast.Node) bool {
+				if a, ok := n.(*ast.AssignStmt); ok {
+					for _, l := range a.Lhs {
+						if id, ok := l.(*ast.Ident); ok && vars[id.Name] && !listed[id.Name] && !slices.Contains(missing, id.Name) {
+							missing = append(missing, id.Name)
+						}
+					}
+				}
+				return true
+			})
+		}
+	}
+	slices.Sort(missing)
+	if len(missing) > 0 {
+		t.Errorf("a test assigns these package-level switches, which testSwitches does not list (add one sw line each): %v", missing)
+	}
+	if len(listed) < 40 {
+		t.Errorf("only %d switches listed: the scan or the table is broken", len(listed))
+	}
 }
 
 // metalLedgerOf is the ledger the metal package attached to d, or nil.

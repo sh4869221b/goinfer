@@ -1,6 +1,6 @@
 //go:build realckpt
 
-// Step (b') of docs/tasks/task-multimodal-support-2026-10.md ("Gemma 4 31B, step (b')", registered before this code): goinfer's half. For each arm (int8int8, int4; CPU) it teacher-forces the 12 prompts of
+// Step (b'): goinfer's half. For each arm (int8int8, int4; CPU) it teacher-forces the 12 prompts of
 // quant_consistency_real_test.go (qcPrompts, through the checkpoint's own chat template) along the continuation recorded by G-31a (GOINFER_G31B_PATHS, the Paths of qc-31b.json or qc-e4b.json: goinfer's own
 // int8int8 greedy path, stop token included) and writes the float32 logits at every continuation position, [positions, vocab], beside the id sequences the Hugging Face side must use
 // (scripts/g31b_hf_stream.py reads <out>.seqs.json, so both sides run the same ids). Nothing is graded here (scripts/g31b_grade.py).
@@ -23,10 +23,12 @@ import (
 
 	"github.com/townsendmerino/goinfer/chat"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 func TestG31b_goinferLogits(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	dir, pathsFile, out := os.Getenv("GOINFER_G31B_DIR"), os.Getenv("GOINFER_G31B_PATHS"), os.Getenv("GOINFER_G31B_OUT")
 	if dir == "" || out == "" {
 		t.Skip("set GOINFER_G31B_DIR, GOINFER_G31B_PATHS (not needed for a tiny fixture) and GOINFER_G31B_OUT")

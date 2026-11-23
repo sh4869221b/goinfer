@@ -85,7 +85,7 @@ fn dot4(a: u32, b: u32) -> i32 {
 // when Context.hasDP4A (probed live in New()) — on a backend that lowers it to real
 // hardware DP4A (e.g. Vulkan's VK_KHR_shader_integer_dot_product on a DP4A-capable
 // NVIDIA part), this is what clears the compute/bandwidth wall the tiled GEMM was
-// gated on (docs/completed/task-gpu-batched-prefill.md). Same math as the unpacked fallback —
+// gated on. Same math as the unpacked fallback —
 // dot4I8Packed treats the u32 as four little-endian sign-extended int8 lanes,
 // verified against the unpacked path's parity gate (TestMatmulW8A8Tiled_dp4aParity).
 const dot4PackedWGSL = `
@@ -247,7 +247,11 @@ func (c *Context) BatchTiled(aq []int8, aScales []float32, M int, rms []*Residen
 			}
 		}
 	}
-	enc, _ := c.device.TryCreateCommandEncoder(nil)
+	enc, err := c.device.TryCreateCommandEncoder(nil)
+	if err != nil {
+		release()
+		return nil, fmt.Errorf("gpu: BatchTiled: command encoder: %w", err)
+	}
 	defer enc.Release()
 	pass := enc.BeginComputePass(nil)
 	pass.SetPipeline(c.tiledPipeline)
@@ -260,7 +264,7 @@ func (c *Context) BatchTiled(aq []int8, aScales []float32, M int, rms []*Residen
 			return nil, fmt.Errorf("gpu: BatchTiled dst: %w", err)
 		}
 		dims, err := c.tryCreateBufferInit(mem.LineScratch, &wgpu.BufferInitDescriptor{Label: "btiled-dims", Contents: wgpu.ToBytes([]uint32{uint32(M), uint32(rm.kp), uint32(N), 0}), Usage: wgpu.BufferUsageUniform})
-		if err != nil { // nil dims → nil-panic in CreateBindGroup / the cleanup Release below (audit R-06)
+		if err != nil { // nil dims → nil-panic in CreateBindGroup / the cleanup Release below
 			releaseBuf(dst)
 			pass.Release()
 			release()
@@ -296,9 +300,16 @@ func (c *Context) BatchTiled(aq []int8, aScales []float32, M int, rms []*Residen
 			return nil, fmt.Errorf("gpu: BatchTiled stage: %w", err)
 		}
 		pops[i].stag = stag
-		enc.TryCopyBufferToBuffer(pops[i].dst, 0, stag, 0, uint64(M*pops[i].n*4))
+		if err := enc.TryCopyBufferToBuffer(pops[i].dst, 0, stag, 0, uint64(M*pops[i].n*4)); err != nil {
+			release()
+			return nil, fmt.Errorf("gpu: BatchTiled copy[%d]: %w", i, err)
+		}
 	}
-	cmd, _ := enc.TryFinish(nil)
+	cmd, err := enc.TryFinish(nil)
+	if err != nil {
+		release()
+		return nil, fmt.Errorf("gpu: BatchTiled: finish: %w", err)
+	}
 	defer cmd.Release()
 	c.queue.Submit(cmd)
 	statuses := make([]wgpu.MapAsyncStatus, len(pops))
@@ -388,7 +399,10 @@ func (c *Context) MatmulW8A8Tiled(aq []int8, aScales []float32, rm *ResidentW8A8
 		return nil, fmt.Errorf("gpu: tiled bind: %w", err)
 	}
 	defer bg.Release()
-	enc, _ := c.device.TryCreateCommandEncoder(nil)
+	enc, err := c.device.TryCreateCommandEncoder(nil)
+	if err != nil {
+		return nil, fmt.Errorf("gpu: MatmulW8A8Tiled: command encoder: %w", err)
+	}
 	defer enc.Release()
 	pass := enc.BeginComputePass(nil)
 	pass.SetPipeline(c.tiledPipeline)
@@ -403,7 +417,10 @@ func (c *Context) MatmulW8A8Tiled(aq []int8, aScales []float32, rm *ResidentW8A8
 	if err := enc.TryCopyBufferToBuffer(dstBuf, 0, stage, 0, dstSize); err != nil {
 		return nil, fmt.Errorf("gpu: tiled copy: %w", err)
 	}
-	cmd, _ := enc.TryFinish(nil)
+	cmd, err := enc.TryFinish(nil)
+	if err != nil {
+		return nil, fmt.Errorf("gpu: MatmulW8A8Tiled: finish: %w", err)
+	}
 	defer cmd.Release()
 	c.queue.Submit(cmd)
 	status := wgpu.MapAsyncStatus(0)

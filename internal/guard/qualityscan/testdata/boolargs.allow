@@ -1,0 +1,1 @@
+# Calls passing three or more adjacent bool literals (TestQualityScan_noRunsOfBoolLiteralArguments): `<file>:<func> -- <reason>`.

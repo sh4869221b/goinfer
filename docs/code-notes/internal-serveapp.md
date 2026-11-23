@@ -50,7 +50,7 @@ first being granted the lock. Zero value ready to use, same as the mutex it repl
 sessMu guards the sessionLRU, which is not goroutine-safe (sessions.go): drive's acquire and checkin, and the
 background goroutines (admin.go's load-time restore, liveness.go's idle-close save, main.go's graceful-shutdown
 save and idle-demote ticker). It is held around those operations only, NOT across a generation (MC3c,
-docs/tasks/task-concurrency-2026-09.md): the session a generation is using is CHECKED OUT instead
+docs/tasks/parked/task-concurrency-2026-09.md): the session a generation is using is CHECKED OUT instead
 (sessionLRU.busy), and the LRU never hands out, evicts, demotes, saves or even reads a busy session. That is
 what lets several generations of one CPU model run at once (-max-concurrent), and it keeps the old safety
 property — nothing frees or moves memory out from under a running generation — for one generation too.
@@ -408,7 +408,7 @@ applied only through the session binding (sessionLRU.bindAdapter → Session.Use
 cache's lora), and the stateless Generate/GenerateNgram… run on a fresh cache with lora == nil,
 so they'd silently return BASE-model output. Route adapter requests down the session path below
 instead; base models keep the resident fast path here (audit R-01). Since G3
-(docs/tasks/task-gpu-paths-2026-09.md), the session path itself is NOT always staged/CPU for
+(docs/completed/task-gpu-paths-2026-09.md), the session path itself is NOT always staged/CPU for
 an adapter: generateInto's useGPU (decoder/model.go) admits prefillFrom==0 with a bound
 resident adapter onto the resident GPU path — a session's FIRST turn. A later turn on the
 same session (prefillFrom>0, continuing off the reused warm prefix) still drops to CPU;
@@ -495,7 +495,7 @@ specialized case would be the wrong trade for a three-method primitive this repo
 test directly (task-work-queue-2026-09.md's own ground rule 4: "no new root module dependency").
 
 Zero value is ready to use — no constructor needed — and admits ONE holder. setCap widens it (MC3c,
-docs/tasks/task-concurrency-2026-09.md: -max-concurrent on a CPU model): up to cap holders at once, still strict FIFO
+docs/tasks/parked/task-concurrency-2026-09.md: -max-concurrent on a CPU model): up to cap holders at once, still strict FIFO
 for everyone waiting.
 ```
 
@@ -738,7 +738,7 @@ never the thing truncation drops — it must stay last, because it is the pooled
 Moved from `internal/app/serveapp/embeddings.go` (the comment above `embedTask`) on 2026-10-09.
 
 ```text
-embedTask picks the prompt a taskEmbedder applies (docs/tasks/task-embeddinggemma2.md, Gate 3, owner decision
+embedTask picks the prompt a taskEmbedder applies (docs/completed/task-embeddinggemma2.md, Gate 3, owner decision
 2026-10-06): an explicit task names one of the model's prompts ("none" for none); else input_type maps onto the
 model's own "query" and "document" prompts; else no prompt, which is what sentence-transformers applies by default,
 so a client that knows nothing about prompts gets the reference's own output.
@@ -1157,7 +1157,7 @@ pickSession is acquire's choice: bestExtend's candidate, unless the LRU has room
 reusing the candidate would throw away more of it than it keeps. bestExtend's floor learns the shared preamble only
 from OTHER resident sessions, so with a single one it cannot tell a chat-template preamble from a continuation: two
 interleaved conversations then took each other's session on every turn, each truncating the other to the preamble,
-and the LRU never grew past one session (MC0, docs/tasks/task-concurrency-2026-09.md, 2026-09-26: 7 tokens reused per
+and the LRU never grew past one session (MC0, docs/tasks/parked/task-concurrency-2026-09.md, 2026-09-26: 7 tokens reused per
 turn at 2 clients, 0.69x the 1-client aggregate on CPU). A fresh session costs only re-prefilling the shared lead;
 the truncation costs the other conversation its history. P-18's partial matches (a stop-string tail, an edited last
 message) keep most of their session and still reuse. With no room, reusing the candidate IS the eviction, so it
@@ -1169,7 +1169,7 @@ stands. -1 means take a fresh session.
 Moved from `internal/app/serveapp/systemone.go` (the comment above `handleSystemOne`) on 2026-10-09.
 
 ```text
-POST /v1/systemone — TypeSafe's decisions wire shape (D5 of docs/tasks/task-constrained-confidence.md; the request
+POST /v1/systemone — TypeSafe's decisions wire shape (D5 of docs/tasks/parked/task-constrained-confidence.md; the request
 and response JSON are recorded verbatim in docs/measurements/decisions-d0-prior-art-2026-09-27.md §3), answered by
 label scoring on the served model (Route A, internal/decide). It exists so jevx and TypeSafe's SDKs (JS, Python,
 Vercel, LangChain), which all take a base-URL override, work against goinfer unchanged.
@@ -1560,7 +1560,7 @@ mu guards Status/Results/OutputFileID/ErrorFileID/CompletedAt: many line gorouti
 Results[i] concurrently (disjoint indices, so the writes themselves never race each other) but
 Status and the two file-id fields are read by every GET and written by exactly one finalizer,
 so they need the same discipline job.go's own mu gained in J3 after -race caught a real bug
-there (internal/app/serveapp/job.go:jobStore's doc comment) — written locked from the start here instead of finding the
+there (internal/app/serveapp/jobs/job.go:Store's doc comment) — written locked from the start here instead of finding the
 same class of defect twice.
 ```
 
@@ -1577,7 +1577,7 @@ has no Results entry yet either way).
 JobIDs is copied under b.mu before ranging over it — found by -race, not by inspection: each
 line's goroutine writes its own slot via setJobID (batches_run.go) under the same lock, and a
 plain read of the slice here raced those writes even though every write lands at a disjoint
-index (internal/app/serveapp/job.go:jobStore's doc comment names the same class of bug in J3's job store).
+index (internal/app/serveapp/jobs/job.go:Store's doc comment names the same class of bug in J3's job store).
 ```
 
 ## setJobID
@@ -1586,7 +1586,7 @@ Moved from `internal/app/serveapp/batches_run.go` (the comment above `setJobID`)
 
 ```text
 setJobID records line i's job id under the batch's own lock. Found by -race, not by
-inspection, the same way job.go's own mu gained coverage in J3 (internal/app/serveapp/job.go:jobStore's doc comment):
+inspection, the same way job.go's own mu gained coverage in J3 (internal/app/serveapp/jobs/job.go:Store's doc comment):
 requestCancel (batches.go) reads the whole JobIDs slice from a different goroutine while lines
 are still writing their own slot — disjoint indices don't save a plain slice write from racing a
 concurrent read of the slice's backing array with no synchronization between them.
@@ -1658,7 +1658,7 @@ is far worse than the int8 tower.
 Moved from `internal/app/serveapp/glm_ocr_vision.go` (the comment at the top of the file) on 2026-10-09.
 
 ```text
-GLM-OCR image serving (O3, docs/tasks/task-glm-ocr-2026-10.md). The route is the Qwen2.5-VL / Qwen3.5+ one —
+GLM-OCR image serving (O3, docs/completed/task-glm-ocr-2026-10.md). The route is the Qwen2.5-VL / Qwen3.5+ one —
 preprocess -> tower -> GenerateQwenVL with m-RoPE, the merged tower rows replacing the <|image|> run — with these
 differences, all of which live here or in the loadedModel.glm branches of vision_serve.go:
   - the tower is aikit's GlmOcrVisionEncoder, loaded on first use (like qwen3Tower);
@@ -1750,7 +1750,7 @@ numbers for the same env var.
 Moved from `internal/app/serveapp/systemone_clef.go` (the comment at the top of the file) on 2026-10-09.
 
 ```text
-Route C of POST /v1/systemone (D13 of docs/tasks/task-constrained-confidence.md): a model directory that carries joint_head.safetensors is Cloudflare's Clef
+Route C of POST /v1/systemone (D13 of docs/tasks/parked/task-constrained-confidence.md): a model directory that carries joint_head.safetensors is Cloudflare's Clef
 decision model, and one backbone pass over the whole record answers every question (internal/clef). The request is the same TypeSafe shape; what differs is
 that it is read as the reference's encoder reads it, from the raw body, and answered in the reference's own shape (systemone_answer in the checkpoint's
 joint_schema_model.py, read in full for docs/measurements/decisions-d10-clef-2026-10-02.md):
@@ -1936,7 +1936,7 @@ Gemma 4's image and audio towers included) at withFeatureCache.
 Moved from `internal/app/serveapp/webui.go` (the comment above `webUIFS`) on 2026-10-09.
 
 ```text
-ONE DIRECTORY, NOT ONE FILE (docs/tasks/task-web-ui-2026-09.md §6.1). The page was a single
+ONE DIRECTORY, NOT ONE FILE. The page was a single
 1,828-line HTML file; the web-UI plan roughly doubles it, so it is split into index.html plus
 webui/ui/app.css and webui/ui/app.js. What is deliberately NOT given up: still no build step, no
 bundler, no toolchain — plain files, embedded verbatim, one binary, fully offline. The assets
@@ -2642,7 +2642,7 @@ the audit scoped to /v1/completions. The generated ids must never go through Dec
 ids continue the prompt, and Decode applies SentencePiece's sequence-level dummy-prefix strip
 to them — eating the response's leading space on Llama-2/Mistral.
 
-R-08 (audit-2026-09-02 / docs/tasks/task-recompute-audit.md) replaced the per-token DecodeContinuation(ids)
+R-08 (audit-2026-09-02 / docs/completed/task-recompute-audit.md) replaced the per-token DecodeContinuation(ids)
 re-decode of the WHOLE generated sequence (O(n^2) in output length) with DecodePiece(id)
 appended incrementally. DecodePiece is the same non-stripping contract DecodeContinuation was
 relied on for here — its own doc comment states it explicitly ("does NOT apply the
@@ -2708,7 +2708,7 @@ invisible tail).
 Moved from `internal/app/serveapp/sessions_test.go` (the comment above `TestPickSession_sparePreambleGoesFresh`) on 2026-10-09.
 
 ```text
-TestPickSession_sparePreambleGoesFresh is the bug MC0 found (docs/tasks/task-concurrency-2026-09.md, 2026-09-26):
+TestPickSession_sparePreambleGoesFresh is the bug MC0 found (docs/tasks/parked/task-concurrency-2026-09.md, 2026-09-26):
 with one resident session, bestExtend's floor (what a candidate shares with every OTHER session) is 0, so the shared
 chat-template preamble alone qualified. Two interleaved conversations then took each other's single session, each
 truncating the other to the 7-token preamble, and the LRU never grew past one session despite -kv-sessions 4. On the
@@ -2994,7 +2994,7 @@ Moved from `internal/app/serveapp/exactprefill_test.go` (the comment above `Test
 
 ```text
 The prompt-ingestion flags reach each model through its decoder.Options, never the process environment
-(phase 5, docs/tasks/task-env-config-2026-09.md — they used to be applied by applyExactPrefillEnv's
+(phase 5, docs/completed/task-env-config-2026-09.md — they used to be applied by applyExactPrefillEnv's
 os.Setenv, process-wide). M-48 still holds: --exact-prefill covers all three backends, now because
 Options.ExactPrefill is consulted by each (CPU, CUDA resident build, Metal resident) per model.
 ```
@@ -3032,7 +3032,7 @@ CPU tower even when the user had asked never to leave the backend).
 Moved from `internal/app/serveapp/lone_tool_livelock_test.go` (the comment above `TestForcedTool_loneToolConvenienceEndsAtTheToolResult`) on 2026-10-09.
 
 ```text
-PRE-REGISTERED (docs/queue-correctness.md G39). `serve check`'s `tools, OpenAI` row failed with "turn two asked for the tool
+PRE-REGISTERED. `serve check`'s `tools, OpenAI` row failed with "turn two asked for the tool
 again instead of answering — the agent-livelock shape" on BOTH Qwen2.5-Coder-7B and Qwen2.5-7B-Instruct, and the same turn
 with a second tool in the request, or with the identical prompt sent as a raw completion, got a normal answer. Cause: with
 exactly ONE tool and tool_choice auto, forcedTool constrained the reply to that tool's call from its first token on EVERY turn,
@@ -3269,7 +3269,7 @@ Moved from `internal/app/serveapp/webui_test.go` (the comment at the start of th
 
 ```text
 EVERY EMBEDDED FILE, not just index.html. The page is split across webui/ (§6.1 of
-docs/tasks/task-web-ui-2026-09.md); a check that still read only index.html would pass while
+a private task doc); a check that still read only index.html would pass while
 a CDN import sat in ui/app.js — narrowing silently exactly when the page grew.
 ```
 
@@ -3341,7 +3341,7 @@ options() path serve uses for every --model entry (D6b, owner decision 2026-10-0
 Moved from `internal/app/serveapp/embeddinggemma2_embedder_test.go` (the comment at the start of this block, before the diet) on 2026-10-09.
 
 ```text
-TestEmbeddings_taskPromptChoice is Gate 3's prompt rule (docs/tasks/task-embeddinggemma2.md, owner decision
+TestEmbeddings_taskPromptChoice is Gate 3's prompt rule (docs/completed/task-embeddinggemma2.md, owner decision
 2026-10-06): with no task and no input_type the model gets no prompt (sentence-transformers' own default); input_type
 maps onto the model's query and document prompts; task names any of its prompts, and "none" means none. The prompt
 applied is echoed in goinfer_task and the X-Goinfer-Embedding-Task header.

@@ -12,9 +12,6 @@ import (
 // attn_score takes the score as the kernel has it (the dot product times the scale, in whichever order that kernel
 // multiplies). attn_score_log2 is the same for the steel prefill kernel, whose score carries log2(e) because its
 // softmax runs in base 2.
-//
-// attention_fa_blk does not call it: that kernel's text is pinned to the source that was graded
-// (TestAttnFABlkIsTheGradedKernel), and an edit to it needs that grading re-run.
 const AttnScoreMSL = `
 inline float attn_score(float x) { return x; }
 inline float attn_score_log2(float x) { return x; }
@@ -34,8 +31,7 @@ inline float attn_score_log2(float x) { const float c = %[1]s * 1.44269504088896
 // cap replaces the one occurrence of AttnScoreMSL with the capped functions.
 //
 // The softcap is a variant of the source and not a kernel argument so that a model without one runs no branch per
-// score, and so that its kernels are the same text as before the softcap existed
-// (docs/tasks/task-forward-architecture-2026-10.md §4.6).
+// score, and so that its kernels are the same text as before the softcap existed.
 func WithAttnSoftcap(src string, cap float32) (string, error) {
 	if cap == 0 {
 		return src, nil
@@ -49,8 +45,8 @@ func WithAttnSoftcap(src string, cap float32) (string, error) {
 	return strings.Replace(src, AttnScoreMSL, fmt.Sprintf(attnScoreSoftcapMSL, fmt.Sprintf("%.9ef", cap)), 1), nil
 }
 
-// KVRowMSL is the row of a key in a paged KV pool: the block its 64-row block of the sequence maps to, through the sequence's table
-// (docs/tasks/task-kv-architecture-2026-10.md §5.3). Every reader computes it per key, in absolute key units, so no reader's
+// KVRowMSL is the row of a key in a paged KV pool: the block its 64-row block of the sequence maps to, through the sequence's table.
+// Every reader computes it per key, in absolute key units, so no reader's
 // arithmetic changes its grouping. It must agree with decoder.KVBlockRows.
 const KVRowMSL = `
 inline uint kv_row(device const uint* kt, uint k) { return kt[k >> 6u] * 64u + (k & 63u); }

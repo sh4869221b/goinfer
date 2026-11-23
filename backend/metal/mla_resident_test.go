@@ -13,7 +13,7 @@ import (
 )
 
 // TestMLAResident_tinyAgainstControl is OP2a's gate M as first registered, kept as a diagnostic that logs and asserts
-// nothing (docs/tasks/task-forward-architecture-2026-10.md §4.7, gate M's amendments): unforced, kimi-tiny dips at a routing
+// nothing ( gate M's amendments): unforced, kimi-tiny dips at a routing
 // near-tie, so gate M is graded with routing forced (TestMLAResident_routingForced); and the tiny fixtures cannot see the
 // rope/nope plant, which the kernel gate TestMLAKernels_rope carries.
 func TestMLAResident_tinyAgainstControl(t *testing.T) {
@@ -38,7 +38,7 @@ func TestMLAResident_guards(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -74,14 +74,14 @@ func TestMLAResident_guards(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer mi.Close()
-	if r, err := buildResident(mi); err != nil || r.kvI8 || r.mla == nil {
+	if r, err := buildResident(mi, metalCtxPlan{}); err != nil || r.kvI8 || r.mla == nil {
 		t.Errorf("an MLA model's build with int8 KV asked: err %v; want it built with its f32 latent and no int8 cache", err)
 	} else {
 		r.Close()
 	}
 }
 
-// TestMLAResident_tier1V2LiteSlice is OP2a's tier 1 (docs/tasks/task-forward-architecture-2026-10.md §4.7): the first two
+// TestMLAResident_tier1V2LiteSlice is OP2a's tier 1: the first two
 // layers of DeepSeek-V2-Lite-Chat's Q4_K_M GGUF (layer 0 dense, layer 1 MoE; scripts/slice_gguf_layers.py), resident on
 // Metal against the CPU at int4, by G2-R's bars with the dense 1.5B control (residentTier1).
 //

@@ -20,6 +20,9 @@ type HostLoad struct {
 	// PackBytes is what a CUDA-resident build adds beside the weights when there is no source term (one packed layer and staging).
 	PackBytes int64
 	DeviceKV  bool // the KV is allocated on a device, which a context plan sizes
+	// SnapshotBytes is the prefix-snapshot store's budget (-kv-host-bytes), 0 where the load keeps no store. The store fills after the build, beside what
+	// stays on the host once the server is up: the weights and KV of a load that is not device-resident, the pinned expert copy of one that is.
+	SnapshotBytes int64
 
 	Ctx    int     // the context KV was priced at
 	MaxCtx int     // the model's own window, 0 when it declares none
@@ -45,11 +48,65 @@ func NewHostCheck(l HostLoad, m Machine, p Policy) HostCheck {
 	return HostCheck{HostLoad: l, Available: m.Available(HostAnon), Policy: p}
 }
 
-// Need is the host memory the load takes at its peak.
-func (c HostCheck) Need() int64 {
-	n := max(c.CUDABuildBytes, c.WeightBytes+c.KVBytes+c.SourceBytes)
+// heapSlackDen prices the process's own heap beside the weights it builds, while a load maps its source: 1/heapSlackDen of the weights.
+// A margin, on Francis's word; the reading behind it is docs/measurements/memfix-e6-2026-11/README.md (the anonymous peak 2.2-2.8% over
+// the weights on two direct .gguf loads).
+const heapSlackDen = 100
+
+// HeapSlackBytes is the heap slack the guard prices beside weights bytes of weights for a load mapping source bytes of its source: 0 with
+// no source term.
+func HeapSlackBytes(weights, source int64) int64 {
+	if source <= 0 {
+		return 0
+	}
+	return weights / heapSlackDen
+}
+
+// loadTerm is the load's own peak: the weights, the KV, the mapped source and the heap slack beside them (HeapSlackBytes).
+func (c HostCheck) loadTerm() int64 {
+	return c.WeightBytes + c.KVBytes + c.SourceBytes + HeapSlackBytes(c.WeightBytes, c.SourceBytes)
+}
+
+// Need is the host memory the load takes at its peak: the build's, or the serving state's with the snapshot store full, whichever is larger.
+func (c HostCheck) Need() int64 { return max(c.buildPeak(), c.servingNeed()) }
+
+// buildPeak is the host memory the build takes at its peak.
+func (c HostCheck) buildPeak() int64 {
+	n := max(c.CUDABuildBytes, c.loadTerm())
 	if c.PackBytes > 0 {
 		n = max(n, c.WeightBytes+c.PackBytes)
+	}
+	return n
+}
+
+// servingNeed is the host memory a server holds once it is up with the snapshot store at its budget: that budget beside what stays on the host
+// (the weights and KV of a load that is not device-resident, the pinned expert copy of one that is). 0 without a store: the build's peak is then
+// the whole need.
+func (c HostCheck) servingNeed() int64 {
+	if c.SnapshotBytes <= 0 {
+		return 0
+	}
+	if c.DeviceKV {
+		return c.ExpertBytes + c.SnapshotBytes
+	}
+	return c.WeightBytes + c.KVBytes + c.SnapshotBytes
+}
+
+// snapshotBinds reports whether the snapshot store, not the build, sets Need: the case whose refusal names -kv-host-bytes.
+func (c HostCheck) snapshotBinds() bool { return c.servingNeed() > c.buildPeak() }
+
+// needUnpinned is Need with the CUDA expert cache's pinned copy out of the build peak, as --moe-experts-unpinned prices it: every other
+// term Need takes stays.
+func (c HostCheck) needUnpinned() int64 {
+	n := max(c.CUDABuildBytes-c.ExpertBytes, c.loadTerm())
+	if c.PackBytes > 0 {
+		n = max(n, c.WeightBytes+c.PackBytes)
+	}
+	switch {
+	case c.SnapshotBytes > 0 && c.DeviceKV:
+		n = max(n, c.SnapshotBytes) // the pinned experts are gone from the serving state too
+	default:
+		n = max(n, c.servingNeed())
 	}
 	return n
 }
@@ -74,31 +131,52 @@ func (c HostCheck) Ratio() float64 {
 // Arithmetic is the one line the warning and the refusal share, so the two never quote different numbers for one load.
 func (c HostCheck) Arithmetic() string {
 	var b strings.Builder
-	if c.CUDABuildBytes > c.WeightBytes+c.KVBytes+c.SourceBytes {
-		fmt.Fprintf(&b, "%s needs ~%.1f GB of host memory while building the CUDA expert cache (%.1f GB weights + %.1f GB packed copy + %.1f GB pinned copy of the experts)",
-			c.Name, float64(c.CUDABuildBytes)/gb, float64(c.WeightBytes)/gb, float64(c.WeightBytes)/gb, float64(c.ExpertBytes)/gb)
-		fmt.Fprintf(&b, "; this machine currently has %.1f GB of memory available (budget %.1f GB = %.0f%% of that)",
-			float64(c.Available)/gb, float64(c.Budget())/gb, c.Policy.WeightsFraction*100)
+	if c.snapshotBinds() {
+		fmt.Fprintf(&b, "%s needs ~%s of host memory once it is serving with its prefix-snapshot store full (%s + %s of snapshots, -kv-host-bytes)",
+			c.Name, GiB(c.Need()), c.stays(), GiB(c.SnapshotBytes))
+		fmt.Fprintf(&b, "; this machine currently has %s of memory available (budget %s = %.0f%% of that)",
+			GiB(c.Available), GiB(c.Budget()), c.Policy.WeightsFraction*100)
 		return b.String()
 	}
-	fmt.Fprintf(&b, "%s needs ~%.1f GB resident at quant %s", c.Name, float64(c.WeightBytes)/gb, c.Quant)
+	if c.CUDABuildBytes > c.loadTerm() {
+		fmt.Fprintf(&b, "%s needs ~%s of host memory while building the CUDA expert cache (%s weights + %s pinned copy of the experts and packing)",
+			c.Name, GiB(c.CUDABuildBytes), GiB(c.WeightBytes), GiB(c.CUDABuildBytes-c.WeightBytes))
+		fmt.Fprintf(&b, "; this machine currently has %s of memory available (budget %s = %.0f%% of that)",
+			GiB(c.Available), GiB(c.Budget()), c.Policy.WeightsFraction*100)
+		return b.String()
+	}
+	fmt.Fprintf(&b, "%s needs ~%s resident at quant %s", c.Name, GiB(c.WeightBytes), c.Quant)
 	if c.DeviceKV {
 		b.WriteString(" (its KV is in VRAM, which the context plan sizes)")
 	}
 	if c.KVBytes > 0 {
-		fmt.Fprintf(&b, " + %.1f GB KV", float64(c.KVBytes)/gb)
+		fmt.Fprintf(&b, " + %s KV", GiB(c.KVBytes))
 	}
 	if c.SourceBytes > 0 {
 		// The source stays mapped resident for the whole load beside the weights built from it, named so this does not read as
 		// a doubled weight estimate.
-		fmt.Fprintf(&b, " + %.1f GB reading the checkpoint (the .gguf stays mapped resident for the whole load)", float64(c.SourceBytes)/gb)
+		fmt.Fprintf(&b, " + %s reading the checkpoint (the .gguf stays mapped resident for the whole load) + %s heap beside it",
+			GiB(c.SourceBytes), GiB(HeapSlackBytes(c.WeightBytes, c.SourceBytes)))
 	}
 	if c.KVBytes > 0 || c.SourceBytes > 0 {
-		fmt.Fprintf(&b, " = %.1f GB", float64(c.Need())/gb)
+		fmt.Fprintf(&b, " = %s", GiB(c.Need()))
 	}
-	fmt.Fprintf(&b, "; this machine currently has %.1f GB of memory available (budget %.1f GB = %.0f%% of that)",
-		float64(c.Available)/gb, float64(c.Budget())/gb, c.Policy.WeightsFraction*100)
+	fmt.Fprintf(&b, "; this machine currently has %s of memory available (budget %s = %.0f%% of that)",
+		GiB(c.Available), GiB(c.Budget()), c.Policy.WeightsFraction*100)
 	return b.String()
+}
+
+// stays names what the serving state holds beside the snapshot store.
+func (c HostCheck) stays() string {
+	switch {
+	case c.DeviceKV && c.ExpertBytes > 0:
+		return fmt.Sprintf("%s pinned expert copy", GiB(c.ExpertBytes))
+	case c.DeviceKV:
+		return "nothing else, its weights and KV are on the device"
+	case c.KVBytes > 0:
+		return fmt.Sprintf("%s weights + %s KV", GiB(c.WeightBytes), GiB(c.KVBytes))
+	}
+	return fmt.Sprintf("%s weights", GiB(c.WeightBytes))
 }
 
 // Warning is what the banner prints when the load fits but only just.
@@ -123,6 +201,9 @@ func QuantPages(quant string) bool {
 // Remedy names the way out. -stream-weights helps only a .gguf source; a safetensors directory's way out is a one-time .giw
 // build with cmd/prequant, which streams one layer at a time.
 func (c HostCheck) Remedy() string {
+	if c.snapshotBinds() {
+		return "Lower -kv-host-bytes (the prefix-snapshot store's budget; 0 turns snapshots off)."
+	}
 	if c.GGUF && !QuantPages(c.Quant) {
 		return fmt.Sprintf("-stream-weights will not help at --quant %s: weight paging reads only int8 and int4 weights.", c.Quant)
 	}
@@ -155,6 +236,9 @@ type Decline struct {
 // Decline is the refusal of this load.
 func (c HostCheck) Decline() *Decline {
 	alt := "  " + c.smallerLoad() + ".\n"
+	if c.CUDABuildBytes > c.loadTerm() && c.ExpertBytes > 0 && c.needUnpinned() <= c.Budget() {
+		alt = "  Or " + UnpinnedExpertsHint(c.ExpertBytes) + ".\n" + alt
+	}
 	msg := fmt.Sprintf("decoder: %s.\n"+
 		"  Loading it would page to swap rather than run, so it was NOT loaded.\n"+
 		"  %s\n"+
@@ -175,8 +259,17 @@ func (c HostCheck) SmallerFittingContext() (int, bool) {
 	if c.CUDABuildBytes > c.Budget() {
 		return 0, false
 	}
-	// The source is a fixed term like the weights: it comes out of the budget too.
-	room := c.Budget() - c.WeightBytes - c.SourceBytes
+	// The snapshot store and the pinned expert copy do not depend on the context: if they alone exceed the budget no smaller context helps.
+	if c.DeviceKV && c.servingNeed() > c.Budget() {
+		return 0, false
+	}
+	// The source is a fixed term like the weights: it comes out of the budget too, and so does the snapshot store beside a host-resident
+	// load's weights and KV (the two do not coexist, so the larger counts).
+	fixed := c.SourceBytes + HeapSlackBytes(c.WeightBytes, c.SourceBytes)
+	if !c.DeviceKV {
+		fixed = max(fixed, c.SnapshotBytes)
+	}
+	room := c.Budget() - c.WeightBytes - fixed
 	if room <= 0 {
 		return 0, false
 	}
@@ -222,8 +315,8 @@ func (c HostCheck) CapNote(ctx int) string {
 		lift = ""
 	}
 	return fmt.Sprintf(
-		"decoder: context capped at %d (model allows %d) so that KV fits: weights %.1f GB + KV %.1f GB of budget %.1f GB — pass -ctx to choose%s",
-		ctx, c.MaxCtx, float64(c.WeightBytes)/gb, float64(kv)/gb, float64(c.Budget())/gb, lift)
+		"decoder: context capped at %d (model allows %d) so that KV fits: weights %s + KV %s of budget %s — pass -ctx to choose%s",
+		ctx, c.MaxCtx, GiB(c.WeightBytes), GiB(kv), GiB(c.Budget()), lift)
 }
 
 // HostFit is SolveHost's answer: the decision, and the line the guard prints (a cap note or a warning; "" for none).

@@ -1,10 +1,8 @@
 // Package modelload is the one path serve, chat and fit take from a --model value to a loaded
-// decoder.Model and its tokenizer. Each app used to do this its own way, and the copies drifted:
-// serve's .giw tokenizer fallback still swallowed the GGUF error chat had fixed as N-25, fit did not
-// resolve hf:/demo: references at all, and serve alone retried a fit decline with weight streaming.
-// The steps, in order: resolve a reference, pick the path to load (sidecar .giw or streaming
-// transcode for a .gguf), load the tokenizer, load the model under the swap guard, retry once with
-// streaming on a dense fit decline, and refuse an explicit --quant a prequant .giw cannot honour.
+// decoder.Model and its tokenizer, so the apps cannot drift apart on it. The steps, in order:
+// resolve a reference, pick the path to load (sidecar .giw or streaming transcode for a .gguf),
+// load the tokenizer, load the model under the swap guard, retry once with streaming on a dense
+// fit decline, and refuse an explicit --quant a prequant .giw cannot honour.
 package modelload
 
 import (
@@ -18,8 +16,10 @@ import (
 	"time"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/decoder/fit"
 	"github.com/townsendmerino/goinfer/internal/guard/swapguard"
 	"github.com/townsendmerino/goinfer/internal/runtime/giw"
+	"github.com/townsendmerino/goinfer/internal/runtime/logs"
 	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 	"github.com/townsendmerino/goinfer/internal/runtime/prequant"
 	"github.com/townsendmerino/goinfer/pull"
@@ -40,8 +40,8 @@ func Resolve(ctx context.Context, spec string) (string, error) {
 	return path, nil
 }
 
-// Tokenizer loads the tokenizer for a model path, by extension: a .giw carries it in its tok half, a
-// .gguf in its own metadata, and anything else is an HF / SentencePiece directory.
+// Tokenizer loads the tokenizer for a model path, by extension: a .giw carries it in its tok half, a.
+// gguf in its own metadata, and anything else is an HF / SentencePiece directory.
 func Tokenizer(path string) (*tokenizer.Tokenizer, error) {
 	switch {
 	case strings.HasSuffix(path, ".giw"):
@@ -59,7 +59,7 @@ func Tokenizer(path string) (*tokenizer.Tokenizer, error) {
 
 // TokenizerFromTok parses a .giw bundle's tok half, which is GGUF metadata for a GGUF-sourced bundle
 // and the raw tokenizer.json for a safetensors-sourced one. When neither parses, BOTH errors are
-// reported (N-25): with only the JSON one, a corrupt GGUF-sourced bundle reads as "invalid JSON" and
+// reported: with only the JSON one, a corrupt GGUF-sourced bundle reads as "invalid JSON" and
 // sends the reader to the wrong half of the file.
 func TokenizerFromTok(raw []byte) (*tokenizer.Tokenizer, error) {
 	tk, gerr := tokenizer.LoadGGUFBytes(raw)
@@ -68,7 +68,7 @@ func TokenizerFromTok(raw []byte) (*tokenizer.Tokenizer, error) {
 	}
 	tk, jerr := tokenizer.LoadJSONBytes(raw)
 	if jerr != nil {
-		return nil, fmt.Errorf("not a GGUF (%v) and not tokenizer.json (%v)", gerr, jerr)
+		return nil, fmt.Errorf("not a GGUF (%w) and not tokenizer.json (%w)", gerr, jerr)
 	}
 	return tk, nil
 }
@@ -131,15 +131,16 @@ func Load(ctx context.Context, req Request) (*Result, error) {
 	// Before a sidecar is chosen: a .giw bakes its quant, so this cannot be fixed after the transcode.
 	var msg string
 	if opts.Quant, opts.ActQuantGroup, msg = activationSafeQuant(src, opts.Quant, opts.ActQuantGroup, req.ExplicitQuant, opts.Backend); msg != "" {
-		fmt.Fprintln(os.Stderr, msg)
+		logs.Warnf("%s", msg)
 	}
+	opts.EmbedInt4, opts.EmbedInt4Default = decoder.EmbedInt4For(src, opts), false // the sidecar's cache key carries the head
 	ensureGIW := func() (string, error) {
 		return prequant.EnsureCachedGIW(ctx, src, opts.Quant, opts.Backend, opts.EmbedInt4)
 	}
 
 	// Weight streaming needs the read-only mmap only a .giw provides, so a .gguf is transcoded to a
-	// sidecar once. Without streaming, a .gguf still resolves to its sidecar by default (S1,
-	// task-never-swap-2026-09.md) so resident weights are zero-copy mmap aliases rather than heap
+	// sidecar once. Without streaming, a .gguf still resolves to its sidecar by default
+	// (task-never-swap-2026-09.md) so resident weights are zero-copy mmap aliases rather than heap
 	// copies. -embed-int4 bakes its int4 head into the sidecar too (streamCachePath's "e4h" cache
 	// key keeps it distinct from a plain-head sidecar of the same source and quant) — it no longer
 	// forces a direct load.
@@ -161,14 +162,14 @@ func Load(ctx context.Context, req Request) (*Result, error) {
 		if p, gerr := ensureGIW(); gerr == nil {
 			loadPath = p
 		} else {
-			fmt.Fprintf(os.Stderr, "note: loading %s directly: its sidecar .giw could not be built (%v)\n", src, gerr)
+			logs.Warnf("note: loading %s directly: its sidecar .giw could not be built (%v)", src, gerr)
 		}
 	default:
 		if opts.StreamWeights && isDir(src) {
-			// M-30: -stream-weights is a no-op for a safetensors directory; say so rather than leave a
+			// -stream-weights is a no-op for a safetensors directory; say so rather than leave a
 			// later fit refusal reading as "should have worked".
-			fmt.Fprintf(os.Stderr, "note: -stream-weights only applies to a .gguf source; %q is a "+
-				"safetensors directory — see cmd/prequant to build a streamable .giw from it\n", src)
+			logs.Warnf("note: -stream-weights only applies to a .gguf source; %q is a "+
+				"safetensors directory — see cmd/prequant to build a streamable .giw from it", src)
 		}
 	}
 
@@ -189,12 +190,12 @@ func Load(ctx context.Context, req Request) (*Result, error) {
 		// (tasks/task-fit-to-hardware.md's CPU placement piece) — unless the model is MoE or an
 		// own-forward family (FitDeclineError.DenseStreamable: CPU expert paging is a measured
 		// failure), streaming was already on, or --fit=off asked for today's refusal instead.
-		var fde *decoder.FitDeclineError
+		var fde *fit.FitDeclineError
 		if opts.StreamWeights || opts.DisableFit || !strings.HasSuffix(src, ".gguf") ||
 			!errors.As(err, &fde) || !fde.DenseStreamable {
 			return nil, fmt.Errorf("load model (%s): %w", loadPath, err)
 		}
-		fmt.Fprintf(os.Stderr, "note: %q does not fit resident RAM; automatically retrying with weight streaming (pass --fit=off to keep today's refusal instead)\n", src)
+		logs.Warnf("note: %q does not fit resident RAM; automatically retrying with weight streaming (pass --fit=off to keep today's refusal instead)", src)
 		declineErr := err
 		opts.StreamWeights = true
 		if loadPath, err = ensureGIW(); err != nil {
@@ -222,15 +223,15 @@ type sourceRoute int
 const (
 	routeDirect        sourceRoute = iota
 	routeStreamSidecar             // -stream-weights on a .gguf: the sidecar is required
-	routeSidecar                   // a .gguf's default sidecar (S1): a failed build is the load's error
-	routeDirSidecar                // a safetensors directory's sidecar (S18): a failed build falls back to the direct load
+	routeSidecar                   // a .gguf's default sidecar: a failed build is the load's error
+	routeDirSidecar                // a safetensors directory's sidecar: a failed build falls back to the direct load
 )
 
 // routeFor is the one place Load and Plan choose how a source is opened. A q4k .gguf takes its sidecar like any other
 // (its Q4_K tensors are the .giw's kind 8). -stream-weights is refused at a quant weight paging cannot read (mem.QuantPages),
 // where it would bound nothing. A directory's sidecar keeps its
 // weights as mmap aliases rather than a heap copy, which on Metal's unified memory is the difference between the weights
-// counted once and counted twice (docs/tasks/task-multimodal-support-2026-10.md, S18).
+// counted once and counted twice.
 func routeFor(src string, opts decoder.Options, directLoad bool) (sourceRoute, error) {
 	gguf := strings.HasSuffix(src, ".gguf")
 	if opts.StreamWeights && strings.HasSuffix(src, ".giw") {
@@ -287,6 +288,7 @@ func Plan(req Request) (Planned, error) {
 	if opts.Quant, opts.ActQuantGroup, msg = activationSafeQuant(src, opts.Quant, opts.ActQuantGroup, req.ExplicitQuant, opts.Backend); msg != "" {
 		p.Notes = append(p.Notes, msg)
 	}
+	opts.EmbedInt4, opts.EmbedInt4Default = decoder.EmbedInt4For(src, opts), false
 	p.Opts = opts
 	route, err := routeFor(src, opts, req.DirectLoad)
 	if err != nil {
@@ -315,15 +317,15 @@ func isDir(p string) bool {
 }
 
 // activationSafeQuant is the precision and activation group a load should use for src. For a family
-// that per-vector int8 activations break (decoder.ActivationQuantHazard), the default becomes:
-//   - q4k for a .gguf on the CPU or CUDA backend: the file's Q4_K tensors exact, the rest int8,
-//     per-32 (docs/tasks/task-int4-weight-quality-2026-09.md: on phi3-mini, CPU decode 1.31× and
-//     CUDA resident decode 1.26× / 1.17× (depth 128 / 2048) the int8int8 default's, and CUDA fits the
-//     default context resident where int8int8 does not);
-//   - int8int8 with per-32 activation scales anywhere else (Metal, WebGPU: no Q4_K kernel yet). Only CUDA
-//     residency implements per-group activation scales, so on Metal and WebGPU such a load declines to the
-//     CPU (decoder's actGroupResidentDecline; docs/completed/task-option-path-admission-2026-10.md §4.3), which
-//     honours the group (docs/tasks/task-actquant-pergroup-2026-09.md).
+// that per-vector int8 activations break (decoder.ActivationQuantHazard: Phi-3, and Phi-4, which shares its type), the default becomes:
+//   - q4k for a .gguf on the CPU, CUDA or Metal backend: the file's Q4_K tensors exact, the rest int8,
+//     per-32, which decodes faster than the int8int8 default on CPU and CUDA, and on CUDA fits the
+//     default context resident where int8int8 does not. On Metal it runs resident on the q4k lane, which quantizes no
+//     activation (the Metal q4k default: docs/measurements/peer-vetted-2026-10-07-macbook.md, "M1 on main after #775: read");
+//   - int8int8 with per-32 activation scales anywhere else (WebGPU: no Q4_K kernel). Only CUDA
+//     residency implements per-group activation scales, so on WebGPU such a load declines to the
+//     CPU (decoder's actGroupResidentDecline), which
+//     honours the group.
 //
 // An explicit int8int8 gets per-32 too. An explicit int4/int4mix is honoured with a warning, because
 // per-32 does not clear int4's weight error. msg is "" when nothing applies.
@@ -334,8 +336,12 @@ func activationSafeQuant(src, quant string, group int, explicitQuant, backend st
 		return quant, group, ""
 	}
 	switch {
-	case explicitQuant == "" && strings.HasSuffix(src, ".gguf") && (backend == "" || backend == "cpu" || backend == "cuda"):
-		return "q4k", 0, fmt.Sprintf("note: loading at --quant q4k (the file's Q4_K tensors kept exact, the rest int8, per-32 activations) instead of the default %s: %s.", quant, why)
+	case explicitQuant == "" && strings.HasSuffix(src, ".gguf") && (backend == "" || backend == "cpu" || backend == "cuda" || backend == "metal"):
+		acts := "per-32 activations"
+		if backend == "metal" {
+			acts = "no activation quantized on Metal"
+		}
+		return "q4k", 0, fmt.Sprintf("note: loading at --quant q4k (the file's Q4_K tensors kept exact, the rest int8, %s) instead of the default %s: %s.", acts, quant, why)
 	case explicitQuant == "":
 		return "int8int8", 32, fmt.Sprintf("note: loading at --quant int8int8 with per-32 activation scales instead of the default %s: %s.", quant, why)
 	case quant == "int8int8":
@@ -344,7 +350,7 @@ func activationSafeQuant(src, quant string, group int, explicitQuant, backend st
 	return quant, group, fmt.Sprintf("warning: --quant %s quantizes activations to int8, and %s; expect degraded output (--quant int8int8 runs it with per-32 activation scales).", quant, why)
 }
 
-// loadGuarded is decoder.Load under S3's load-time swap tripwire (docs/tasks/task-never-swap-2026-09.md).
+// loadGuarded is decoder.Load under the load-time swap tripwire (internal/guard/swapguard).
 // A .gguf direct build and a .giw load observe Options.LoadAbort (the .giw loader's CRC pass and layer walk, and the resident build through
 // Model.LoadAbort), so both arm the watch; an HF-dir or streamed load arms nothing.
 func loadGuarded(path string, opts decoder.Options, advice string) (*decoder.Model, error) {

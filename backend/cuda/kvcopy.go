@@ -5,24 +5,21 @@ package cuda
 import (
 	"errors"
 	"fmt"
-	"os"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/internal/runtime/logs"
 )
 
-var (
-	_ decoder.ResidentKVCopier       = (*cudaResident)(nil)
-	_ decoder.ResidentReusableKVSlot = (*cudaResident)(nil)
-)
+var ()
 
 // kvCopyF16 is whether CopyKV serves a load whose KV cache is f16. False declines every such copy, so an f16 load shares
 // nothing across conversations and an f32 load is unaffected: the one switch for holding cross-conversation sharing to
 // f32 (docs/measurements/kv2-cuda-2026-10-15.md, G0-C).
 var kvCopyF16 = true
 
-// CopyKV implements decoder.ResidentKVCopier: rows [start, end) of every layer's KV, from slot src to slot dst, so dst
+// CopyKV implements decoder.ResidentKVSubsystem: rows [start, end) of every layer's KV, from slot src to slot dst, so dst
 // continues at position end. It is one executor job, so it is ordered on the one stream after everything posted before
-// it (a busy source's prefill included) and runs between MC3 steps, never inside one. A busy source's decode writes only
+// it (a busy source's prefill included) and runs between batched decode steps, never inside one. A busy source's decode writes only
 // rows past its prompt, which the decoder never asks for. The job synchronises the stream before it returns, so the
 // caller's timing covers the copy.
 //
@@ -70,7 +67,7 @@ func (r *cudaResident) copyKVSlots(src, dst, start, end int) (err error) {
 	}
 	lo := 0 // the first row a windowed layer of dst holds afterwards
 	if r.kvWin {
-		if !kvWindowReusable(r.kvBases[src], end, r.kvWindow) {
+		if !decoder.KVWindowReusable(r.kvBases[src], end, r.kvWindow) {
 			return &decoder.KVCopyDecline{Reason: fmt.Sprintf("slot %d's windowed layers hold rows from %d; continuing at %d needs them from %d; %s",
 				src, r.kvBases[src], end, end-(r.kvWindow-1), r.kvBudgetText())}
 		}
@@ -140,10 +137,10 @@ func (r *cudaResident) copyKVSlots(src, dst, start, end int) (err error) {
 		return err
 	}
 	if r.kvWin {
-		fmt.Fprintf(os.Stderr, "cuda: kv copy: slot %d -> %d, rows [%d, %d); windowed layers: slot %d's base %d, slot %d's base %d after the copy; %s\n",
+		logs.Debugf("cuda: kv copy: slot %d -> %d, rows [%d, %d); windowed layers: slot %d's base %d, slot %d's base %d after the copy; %s",
 			src, dst, start, end, src, r.kvBases[src], dst, lo, r.kvBudgetText())
 	}
-	fmt.Fprintf(os.Stderr, "cuda: kv copy: slot %d -> %d shares rows [%d, %d), %d blocks; %d of %d full-pool blocks in use\n",
+	logs.Debugf("cuda: kv copy: slot %d -> %d shares rows [%d, %d), %d blocks; %d of %d full-pool blocks in use",
 		src, dst, start, end, (end-start)/kvBlock, r.kvPools[kvGroupFull].inUse(), r.kvPools[kvGroupFull].blocks-1)
 	return nil
 }
@@ -155,7 +152,7 @@ func (r *cudaResident) kvBudgetText() string {
 	return fmt.Sprintf("rollback budget %d = %d planned + %d from free VRAM", r.kvRollback(), planned, r.kvRollback()-planned)
 }
 
-// ReusableKVSlot implements decoder.ResidentReusableKVSlot: ReusableKV's answer for any slot, bound or not.
+// ReusableKVSlot implements decoder.ResidentKVSubsystem: ReusableKV's answer for any slot, bound or not.
 func (r *cudaResident) ReusableKVSlot(slot, prefix int) int {
 	if prefix <= 0 {
 		return prefix
@@ -170,9 +167,9 @@ func (r *cudaResident) ReusableKVSlot(slot, prefix int) int {
 			out = 0
 			return nil
 		}
-		if r.kvWin && !kvWindowReusable(r.kvBases[slot], prefix, r.kvWindow) {
+		if r.kvWin && !decoder.KVWindowReusable(r.kvBases[slot], prefix, r.kvWindow) {
 			out = 0
-			fmt.Fprintf(os.Stderr, "cuda: kv copy: slot %d's windowed layers hold rows from %d; continuing at %d needs them from %d; %s\n",
+			logs.Debugf("cuda: kv copy: slot %d's windowed layers hold rows from %d; continuing at %d needs them from %d; %s",
 				slot, r.kvBases[slot], prefix, prefix-(r.kvWindow-1), r.kvBudgetText())
 		}
 		return nil

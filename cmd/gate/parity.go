@@ -57,6 +57,8 @@ var parityGates = []gateCheck{
 	{"gemma+gemma2", "TestGemma12_forwardParity"}, // Gemma 1 / CodeGemma and Gemma 2, safetensors and GGUF
 	{"olmo_hybrid", "TestOlmoHybrid_forwardParity"},
 	{"bailing_hybrid", "TestBailingHybrid_forwardParity"},
+	{"flint-tiny", "TestFlint_tinyForwardParity"},
+	{"flint-window", "TestFlint_windowBoundaryParity"},
 	{"mistral3-batched", "TestMinistral3_batchedMatchesSequential"},
 	{"llama", "TestLlama_forwardParity"},
 	{"llama3.2", "TestLlama32_forwardParity"},
@@ -192,7 +194,7 @@ func parseGateRun(raw string) (*regexp.Regexp, error) {
 	}
 	re, err := regexp.Compile(raw)
 	if err != nil {
-		return nil, fmt.Errorf("GATE_RUN=%q does not compile as a regexp: %v — refusing rather than silently running the full sweep", raw, err)
+		return nil, fmt.Errorf("GATE_RUN=%q does not compile as a regexp: %w — refusing rather than silently running the full sweep", raw, err)
 	}
 	return re, nil
 }

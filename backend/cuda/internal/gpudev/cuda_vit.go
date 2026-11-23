@@ -14,8 +14,8 @@ import (
 // vision-specific: a quantized GEMM, a LayerNorm, a GELU, a bidirectional attention
 // and a per-row int8 quantizer are the same ops a text encoder needs (Phase 4). The
 // vision-specific part — how a SigLIP tower is wired out of these — lives in
-// gpu/visioncuda, which is also where the aikit/vision import lives, so this package
-// stays aikit-import-free like the rest of the device layer.
+// backend/cuda (tower_base.go), which is also where the vision import lives, so this package
+// stays vision-import-free like the rest of the device layer.
 //
 // Every kernel mirrors vision/encoder.go's arithmetic exactly (double-accumulated
 // reductions, tanh-GELU, max-subtract softmax); see vit.cu for why that matters and
@@ -114,7 +114,7 @@ const (
 
 	// KernelGEMMW8A8Reg is the register-blocked int8 GEMM: a 64x64 output tile per
 	// block, 4x4 outputs per thread, packed-word shared staging and __dp4a. The
-	// int8 twin of gemm_f32_reg (audit M-12) — gemm_w8a8_tiled computes ONE output
+	// int8 twin of gemm_f32_reg — gemm_w8a8_tiled computes ONE output
 	// per thread from byte-granular shared memory, which is 32 ld.shared.u8 per 4
 	// dp4a and LSU-bound, the shape the roofline campaign measured at 7% of roof
 	// and retired from the ANN path. ALIGNED ONLY — M%64==0, N%64==0, K%16==0.
@@ -168,7 +168,7 @@ const GEMMTile = 16
 // host code, where no kernel-level rule reaches.
 //
 // Do not sweep it for a speed win without re-baselining the ViT parity gate. That
-// gate (gpu/visioncuda/encoder_test.go) is a cosine bound, deliberately — the CPU
+// gate (backend/cuda's tower parity tests) is a cosine bound, deliberately — the CPU
 // tower accumulates in float64 while these kernels work in f32/int32, so bit
 // equality is impossible by construction — and a small consistent shift passes a
 // tolerance while the numbers have moved. Change ViTBlock and LNBLOCK together; the
@@ -413,7 +413,7 @@ const (
 )
 
 // GEMMW8A8Plan picks the int8 GEMM kernel and its launch geometry for M×N×K —
-// the int8 analogue of GEMMF32Plan (audit M-12).
+// the int8 analogue of GEMMF32Plan.
 //
 // It needs only K%16==0: M and N edge tiles stage zeros and skip their stores,
 // so the inner loop stays unguarded while any M and N are accepted. That

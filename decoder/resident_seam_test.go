@@ -25,14 +25,18 @@ import (
 // It returns a deterministic non-nil logit row so callers proceed normally; the point is the
 // call count, not the values.
 type fakeResident struct {
+	fakeSubsystems
 	vocab       int
 	capPos      int // resident KV cap in positions (0 = unbounded); ContextCap exposes it
 	forwards    int
 	closed      bool
 	uploadKVs   []fakeUploadKVCall // records every UploadKV call, in order — gap-0 resident tests
 	resetCalls  int
-	lastRopePos int // last ForwardMRoPE ropePos argument (ResidentMRoPE gap-0 tests)
+	lastRopePos int // last ForwardMRoPE ropePos argument (MRoPEDecodeAvailable gap-0 tests)
 }
+
+func (f *fakeResident) ResidentSubsystems() ResidentSubsystems { return selfSubsystems(f) }
+func (f *fakeResident) MRoPEDecodeAvailable() bool             { return true }
 
 // fakeUploadKVCall is one recorded UploadKV(layer, base, keys, vals) invocation.
 type fakeUploadKVCall struct {
@@ -40,7 +44,7 @@ type fakeUploadKVCall struct {
 	keys, vals  []float32
 }
 
-// ForwardMRoPE makes fakeResident satisfy decoder.ResidentMRoPE too — ropePos is recorded but
+// ForwardMRoPE makes fakeResident serve MRoPEDecodeAvailable too — ropePos is recorded but
 // otherwise ignored (the fake's output only needs to be deterministic and distinct per pos, the
 // numeric RoPE correctness itself is gated for real against the CUDA/WebGPU kernels, not here).
 func (f *fakeResident) ForwardMRoPE(embedding []float32, pos, ropePos int) ([]float32, error) {
@@ -61,9 +65,14 @@ func (f *fakeResident) Forward(embedding []float32, pos int) ([]float32, error) 
 	return out, nil
 }
 
-// ContextCap makes fakeResident a ResidentCapped so generateInto clamps decode length
+// ResidentCaps reports capPos as fakeResident's ContextCap so generateInto clamps decode length
 // to it up front (0 ⇒ unbounded, the default for the other seam tests).
-func (f *fakeResident) ContextCap() int { return f.capPos }
+func (f *fakeResident) ResidentCaps() ResidentCaps {
+	if f == nil { // a fake that embeds a nil *fakeResident reports nothing
+		return ResidentCaps{}
+	}
+	return ResidentCaps{ContextCap: f.capPos}
+}
 
 func (f *fakeResident) ForwardN(embeddings [][]float32, startPos int) ([][]float32, error) {
 	rows := make([][]float32, 0, len(embeddings))
@@ -191,19 +200,14 @@ func TestSeam_SessionsDoNotSilentlyDisableResidency(t *testing.T) {
 	for range stream { //nolint:revive
 	}
 	usedResident := be.rf.forwards > before
-	// This documents CURRENT, DELIBERATE behaviour: sessions and residency are mutually
-	// exclusive (model.go: commit != nil ⇒ !useGPU). The assertion is not "sessions must use the
-	// GPU" — it is that the incompatibility is REAL and known, so cmd/serve must keep bypassing
-	// sessions for resident models. If this ever starts passing, sessions learned to preserve
-	// residency and cmd/serve's bypass can be revisited.
+	// This asserts CURRENT, DELIBERATE behaviour: sessions and residency are mutually exclusive
+	// (model.go: commit != nil ⇒ !useGPU), which is why cmd/serve bypasses sessions for resident
+	// models (openai.go). If this goes red, sessions learned to preserve residency: revisit that
+	// bypass and turn this into the opposite assertion.
 	if usedResident {
-		t.Logf("NOTE: Session.Generate now uses the resident runner (%d forwards). The "+
-			"session/residency incompatibility is gone — revisit cmd/serve's resident bypass "+
-			"(openai.go), which exists only to work around it.", be.rf.forwards-before)
-	} else {
-		t.Logf("confirmed: Session.Generate does NOT use the resident runner — this is why " +
-			"cmd/serve bypasses sessions for resident models. Do not route resident requests " +
-			"back through the session cache without re-checking this.")
+		t.Fatalf("Session.Generate now uses the resident runner (%d forwards): the session/residency "+
+			"incompatibility is gone; revisit cmd/serve's resident bypass (openai.go), which exists only to work "+
+			"around it, and update this test", be.rf.forwards-before)
 	}
 }
 

@@ -3,17 +3,24 @@
 package metal
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/internal/app/loadflags"
+	"github.com/townsendmerino/goinfer/internal/runtime/modelload"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// TestQ4KLaneResidentQwen is the q4k lane's by-day wiring smoke (docs/tasks/task-metal-q4k-2026-10.md), not G-Q2: a
+// TestQ4KLaneResidentQwen is the q4k lane's by-day wiring smoke, not G-Q2: a
 // Qwen2.5-Coder q4_k_m at --quant q4k, resident on Metal, against the CPU at q4k on the same file, teacher-forced over
 // 32 positions. The two files cover the lane's shapes between them:
 //   - 0.5B: ffn_down Q4_K in half the layers and Q6_K (int8) in the rest, as Phi-3's; everything else int8 (Q5_0/Q8_0);
@@ -37,7 +44,7 @@ func TestQ4KLaneResidentQwen(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if c.heavy {
-				requireHeavyModel(t)
+				testgate.RequireHeavy(t)
 			}
 			path := os.Getenv(c.env)
 			if path == "" {
@@ -75,6 +82,19 @@ func testQ4KLaneResident(t *testing.T, path string) {
 		decline := mm.ResidentDecline()
 		mm.Close()
 		t.Fatalf("decode path %q, want metal-resident (q4k); decline: %s", dp, decline)
+	}
+	// The decoder's price for the lane's decode scratch is the build's own list, with the chain's buffers, which the build holds once
+	// a chain opens (none has yet).
+	if a, ok := mm.ResidentForwardForTest().(*metalResident); !ok {
+		t.Errorf("the resident is %T, not Metal's: its decode list is not read", mm.ResidentForwardForTest())
+	} else {
+		chain := int64(0)
+		for _, sb := range a.r.chainBuffers(true, true) {
+			chain += int64(sb.bytes())
+		}
+		if got, want := mm.MetalDecodeScratchBytes(metalMoESlotsFromEnv(mm, metalCtxPlan{})), a.r.decode.listBytes(a.r)+chain; got != want {
+			t.Errorf("q4k lane: the decoder prices decode's scratch at %d bytes, the build's list with the chain's at %d (%+d)", got, want, got-want)
+		}
 	}
 	rf := mm.ResidentForwardForTest()
 	rf.Reset()
@@ -122,5 +142,254 @@ func testQ4KLaneResident(t *testing.T, path string) {
 		filepath.Base(path), positions, worst, agree, positions, dp)
 	if worst < 0.99 {
 		t.Errorf("worst per-position cosine %.6f, bar 0.99", worst)
+	}
+}
+
+// phi3DefaultLoad loads decoder.WritePhi3Q4KTinyGGUFForTest's Phi-3 as a serve with its defaults does on this Mac: -backend auto and no --quant,
+// through loadflags.Resolve and modelload.Plan (the per-family default), opening the sidecar Plan names, built here first as the
+// load builds it. It returns the model and the copied source.
+func phi3DefaultLoad(t *testing.T) (*decoder.Model, string) {
+	t.Helper()
+	src := filepath.Join(t.TempDir(), "phi3.gguf")
+	if err := decoder.WritePhi3Q4KTinyGGUFForTest(src); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(src, old, old); err != nil {
+		t.Fatal(err)
+	}
+	auto := decoder.AutoBackend()
+	if auto.Backend != "metal" {
+		t.Fatalf("-backend auto picks %q on this machine (%s), not metal", auto.Backend, auto.Reason)
+	}
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	f := loadflags.Register(fs, loadflags.Serve)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	opts := loadflags.Resolve(*f, loadflags.Machine{Auto: auto}, loadflags.Overrides{Serve: &loadflags.ServeLoad{KVSessions: 4}})
+	pl, err := modelload.Plan(modelload.Request{Spec: src, Opts: opts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl.Build != "" {
+		if err := decoder.TranscodeGIW(context.Background(), src, pl.Build, pl.Opts.Quant, pl.Opts.EmbedInt4, decoder.GIWTargetForBackend(pl.Opts.Backend)); err != nil {
+			t.Fatal(err)
+		}
+		pl.LoadPath = pl.Build
+	}
+	m, err := decoder.Load(pl.LoadPath, pl.Opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m, src
+}
+
+// TestPhi3Default_autoRunsResidentOnTheQ4KLane: a Phi-3 .gguf served with the defaults (-backend auto, no --quant) on Apple
+// silicon loads at q4k and runs resident on Metal's q4k lane, which keeps the file's Q4_K blocks and quantizes no activation.
+func TestPhi3Default_autoRunsResidentOnTheQ4KLane(t *testing.T) {
+	m, _ := phi3DefaultLoad(t)
+	defer m.Close()
+	if q, dp := m.Quant(), m.DecodePath(); q != "q4k" || !strings.HasPrefix(dp, "metal-resident (q4k") {
+		t.Errorf("the default load is %s, decode path %q; want q4k, metal-resident (q4k)", q, dp)
+	}
+}
+
+// TestPhi3Default_tracksTheCPUReferenceAtLeastAsCloselyAsTheOldDefault is the default's fidelity gate, tier 0, on
+// decoder.WritePhi3Q4KTinyGGUFForTest's Phi-3, teacher-forced over 32 positions. The reference is the CPU at f32 on the same file (every Q4_K
+// block dequantized exactly). The default (phi3DefaultLoad: q4k, resident on Metal) is held to three bars:
+//   - against the CPU at q4k on the same file, worst per-position logits cosine at least 0.99: the q4k lane's bar
+//     (testQ4KLaneResident), which compares the same quant on both sides;
+//   - against the f32 reference, worst cosine at least that of the old default (int8int8 with per-32 activation scales, which
+//     Metal declines to the CPU) and of the CPU's own q4k;
+//   - against the f32 reference, argmax agreement at least the old default's.
+//
+// No absolute bar is set against f32: the q4k quant's int8 parts move every path that takes it away from the reference, the CPU's
+// own q4k included, by an amount the fixture's random weights set, so the bars compare paths. Random blocks carry none of Phi-3's
+// activation outliers, so this gates the default's arithmetic, not the outlier hazard; that is G-Q2's, on the real file
+// (TestQ4KLane_realPhi3NonInferiority).
+func TestPhi3Default_tracksTheCPUReferenceAtLeastAsCloselyAsTheOldDefault(t *testing.T) {
+	const positions = 32
+	tok := func(p int) int { return (7 + 11*p) % 64 }
+	def, src := phi3DefaultLoad(t)
+	if dp := def.DecodePath(); !strings.HasPrefix(dp, "metal-resident (q4k") {
+		def.Close()
+		t.Fatalf("the default load's decode path is %q, want metal-resident (q4k)", dp)
+	}
+	rf := def.ResidentForwardForTest()
+	rf.Reset()
+	var got [][]float32
+	for p := range positions {
+		lg, err := rf.Forward(def.EmbedResidentForTest(tok(p)), p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, append([]float32(nil), lg...))
+	}
+	def.Close()
+
+	cpuLogits := func(name string, o decoder.Options, wantPath string) [][]float32 {
+		m, err := decoder.Load(src, o)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		defer m.Close()
+		if dp := m.DecodePath(); !strings.HasPrefix(dp, wantPath) {
+			t.Fatalf("%s: decode path %q, want %s", name, dp, wantPath)
+		}
+		cache := m.NewCache(positions)
+		var out [][]float32
+		for p := range positions {
+			lg, err := m.ForwardForTest(tok(p), cache)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, append([]float32(nil), lg...))
+		}
+		return out
+	}
+	ref := cpuLogits("the f32 reference", decoder.Options{Backend: "cpu", Quant: "", DirectLoad: true}, "cpu")
+	cpuQ4K := cpuLogits("the CPU at q4k", decoder.Options{Backend: "cpu", Quant: "q4k", DirectLoad: true}, "cpu")
+	oldDef := cpuLogits("the old default", decoder.Options{Backend: "metal", BackendAuto: true, Quant: "int8int8", ActQuantGroup: 32, DirectLoad: true}, "cpu")
+
+	score := func(arm, against [][]float32) (worst float64, agree int) {
+		worst = 1
+		for p := range positions {
+			var dot, na, nb float64
+			ga, wa := 0, 0
+			for i, w := range against[p] {
+				g := float64(arm[p][i])
+				if math.IsNaN(g) || math.IsInf(g, 0) {
+					t.Fatalf("position %d logit %d is %v", p, i, g)
+				}
+				dot, na, nb = dot+g*float64(w), na+g*g, nb+float64(w)*float64(w)
+				if arm[p][i] > arm[p][ga] {
+					ga = i
+				}
+				if w > against[p][wa] {
+					wa = i
+				}
+			}
+			worst = math.Min(worst, dot/math.Sqrt(na*nb))
+			if ga == wa {
+				agree++
+			}
+		}
+		return worst, agree
+	}
+	lane, _ := score(got, cpuQ4K)
+	dw, da := score(got, ref)
+	cw, _ := score(cpuQ4K, ref)
+	ow, oa := score(oldDef, ref)
+	t.Logf("over %d positions: the default (q4k, Metal) against the CPU at q4k, worst cosine %.6f; against the f32 reference: the default %.6f, argmax %d; the CPU at q4k %.6f; the old default (int8int8 per-32, CPU) %.6f, argmax %d",
+		positions, lane, dw, da, cw, ow, oa)
+	if lane < 0.99 {
+		t.Errorf("the default against the CPU at q4k: worst cosine %.6f, bar 0.99", lane)
+	}
+	if dw < ow || dw < cw || da < oa {
+		t.Errorf("against the f32 reference the default reads worst cosine %.6f, argmax %d; bars: the old default's %.6f and %d, the CPU q4k's %.6f",
+			dw, da, ow, oa, cw)
+	}
+}
+
+// tinyPhi3Q4K loads decoder.WritePhi3Q4KTinyGGUFForTest's Phi-3 at --quant q4k, resident on Metal's q4k lane, with every layer's
+// norm weights divided by 128 on the device. The fixture's random blocks carry its residual past half's range in one layer (the
+// batched pass then declines on its overflow check); scaled, it peaks in the thousands, and the sequential path and the pass read
+// the same buffers, so they still run one model.
+func tinyPhi3Q4K(t *testing.T) (*decoder.Model, *metalResident) {
+	t.Helper()
+	src := filepath.Join(t.TempDir(), "phi3.gguf")
+	if err := decoder.WritePhi3Q4KTinyGGUFForTest(src); err != nil {
+		t.Fatal(err)
+	}
+	m, err := decoder.Load(src, decoder.Options{Backend: "metal", Quant: "q4k", ResidentContext: 256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, ok := m.ResidentForwardForTest().(*metalResident)
+	if !ok || !a.r.q4kLane {
+		m.Close()
+		t.Fatalf("resident %T (%s), want metal on the q4k lane", m.ResidentForwardForTest(), m.DecodePath())
+	}
+	for l := range a.r.layers {
+		for _, b := range []Buffer{a.r.layers[l].preNorm, a.r.layers[l].postNorm} {
+			f := b.Floats()
+			for i := range f {
+				f[i] /= 128
+			}
+		}
+	}
+	return m, a
+}
+
+// TestQ4KLane_prefillTakesTheMMAPass: the q4k lane is admitted to the batched f16 MMA pass (prefillOK), PrefillPath names that
+// route, and a prompt above the step's bound runs it: the pass's attention launches, which the step never makes, are counted.
+func TestQ4KLane_prefillTakesTheMMAPass(t *testing.T) {
+	m, a := tinyPhi3Q4K(t)
+	defer m.Close()
+	ok, path := a.PrefillPath()
+	if !a.r.prefillOK || !ok || !strings.HasPrefix(path, "batched f16-MMA") {
+		t.Errorf("q4k lane: pass %v, PrefillPath (%v, %q); want the pass and a batched f16-MMA route", a.r.prefillOK, ok, path)
+	}
+	_, _, _, _, _, _, vocab := m.Dims()
+	embs := make([][]float32, 40)
+	for i := range embs {
+		embs[i] = m.EmbedResidentForTest((i*7 + 3) % vocab)
+	}
+	prefillAttnRanForTest = map[string]int{}
+	defer func() { prefillAttnRanForTest = nil }()
+	if _, err := a.PrefillLast(context.Background(), embs, 0); err != nil {
+		t.Fatalf("PrefillLast: %v", err)
+	}
+	launches := 0
+	for _, n := range prefillAttnRanForTest {
+		launches += n
+	}
+	if launches != a.r.nL {
+		t.Errorf("a 40-token prompt made %d batched-pass attention launches (%v), want one a layer (%d)", launches, prefillAttnRanForTest, a.r.nL)
+	}
+}
+
+// TestQ4KLane_mmaPrefillTracksTheSequentialPath is the pass's tier-0 fidelity check on the tiny Phi-3: its prompt-final logits
+// against the lane's own sequential Forward loop, at 40 and 100 tokens. The pass rounds weights and activations to half where the
+// lane's decode keeps f32, so it is not bit-identical. Bar, set before the first run: worst 1 - cosine at most 1e-3 and no NaN; a
+// wrong segment, offset or kind is far outside it. (Phi-3 at int4 is not resident on Metal, so no int4 arm compares here.)
+func TestQ4KLane_mmaPrefillTracksTheSequentialPath(t *testing.T) {
+	m, a := tinyPhi3Q4K(t)
+	defer m.Close()
+	worst := 0.0
+	_, _, _, _, _, _, vocab := m.Dims()
+	for _, n := range []int{40, 100} {
+		embs := make([][]float32, n)
+		for i := range embs {
+			embs[i] = m.EmbedResidentForTest((i*7 + 3) % vocab)
+		}
+		var seq []float32
+		for i := range n {
+			lg, err := a.Forward(embs[i], i)
+			if err != nil {
+				t.Fatalf("Forward %d: %v", i, err)
+			}
+			seq = append(seq[:0], lg...)
+		}
+		got, err := a.PrefillLast(context.Background(), embs, 0)
+		if err != nil {
+			t.Fatalf("PrefillLast: %v", err)
+		}
+		var dot, na, nb float64
+		for i := range seq {
+			if math.IsNaN(float64(got[i])) {
+				t.Fatalf("%d tokens: NaN logit at %d", n, i)
+			}
+			dot += float64(got[i]) * float64(seq[i])
+			na += float64(got[i]) * float64(got[i])
+			nb += float64(seq[i]) * float64(seq[i])
+		}
+		d := 1 - dot/math.Sqrt(na*nb)
+		fmt.Fprintf(os.Stderr, "[q4k MMA prefill] %d tokens: pass vs sequential 1-cosine %.3g\n", n, d)
+		worst = math.Max(worst, d)
+	}
+	if worst > 1e-3 {
+		t.Errorf("q4k pass vs sequential: worst 1-cosine %.3g; bar at most 1e-3", worst)
 	}
 }

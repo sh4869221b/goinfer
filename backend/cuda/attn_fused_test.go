@@ -10,6 +10,8 @@ import (
 
 	gpu "github.com/townsendmerino/goinfer/backend/cuda/internal/gpudev"
 	"github.com/townsendmerino/goinfer/decoder"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TOLERANCE. The bars are scaled by max |V| over the head, not by each row's own |ctx|: with synthetic V of
@@ -49,7 +51,7 @@ const (
 //
 //	GOINFER_HEAVY_TESTS=1 go test -tags 'cuda goinfer_testhooks' ./cuda/ -run TestAttnFused_vsExact -v
 func TestAttnFused_vsExact(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	path := os.Getenv("GOINFER_CUDA_MODEL")
 	if path == "" {
 		path = modelPath("qwen2.5-coder-1.5b-instruct-q4_k_m.gguf")
@@ -249,7 +251,7 @@ func TestAttnFused_vsExact(t *testing.T) {
 // The proof does not compare against attn_batched (which could share the same bug). It changes
 // ONLY the cache contents BEFORE startPos and requires the output to move.
 func TestAttnFused_attendsKeysBeforeStartPos(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	path := os.Getenv("GOINFER_CUDA_MODEL")
 	if path == "" {
 		path = modelPath("qwen2.5-coder-1.5b-instruct-q4_k_m.gguf")
@@ -385,7 +387,7 @@ func f16rne(x float32) float32 {
 // of input conditioning can distort.
 //
 // TestAttnFused_vsExact compares two GPU kernels that use different operand precision, so a disagreement
-// there cannot say which one is wrong (the trap docs/completed/task-prefill-gap.md §3.1 describes at the
+// there cannot say which one is wrong (the trap the prefill gate describes at the
 // model level: a fast path scored against an exact path that is itself a quantisation). This test scores
 // attn_fused against EXACT f64 arithmetic on ITS OWN INPUTS, rounded to f16 as the kernel rounds them, so
 // any error left is the kernel's logic (a mismapped mma fragment, a dropped seam, the wrong keys, a botched
@@ -396,7 +398,7 @@ func f16rne(x float32) float32 {
 //
 //	GOINFER_HEAVY_TESTS=1 GOINFER_CUDA_FAST_PREFILL=1 go test -tags 'cuda goinfer_testhooks' ./cuda/ -run TestAttnFused_vsF16Reference -v
 func TestAttnFused_vsF16Reference(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	path := os.Getenv("GOINFER_CUDA_MODEL")
 	if path == "" {
 		path = modelPath("qwen2.5-coder-1.5b-instruct-q4_k_m.gguf")

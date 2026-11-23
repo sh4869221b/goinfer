@@ -5,6 +5,8 @@ import (
 	"math"
 	"sort"
 	"strings"
+
+	"github.com/townsendmerino/aikit/embed"
 )
 
 // archAdapter resolves a parsed config.json into the family-agnostic
@@ -59,11 +61,12 @@ var registry = map[string]archAdapter{
 	"qwen3_next":       qwen3NextArchitecture,     // Qwen3-Next: same DeltaNet/softmax/MoE hybrid shape as qwen3_5_moe, but layer_types is COMPUTED (full_attention_interval) and partial_rotary_factor is a top-level field, not nested
 	"glm4_moe":         glm4moeArchitecture,       // GLM-4.5/4.6: DeepSeek-style MoE (sigmoid routing + bias) + dense prefix + QK-norm + partial RoPE
 	"laguna":           lagunaArchitecture,        // Laguna (poolside) XS-2.1 / XS.2 / M.1: sigmoid-routed MoE + shared expert + softplus attention output gating + per-layer query heads
+	"flint":            flintArchitecture,         // Flint (Cognichip): hybrid sliding-window + NoPE full attention with per-head attention sinks + dense prefix + sigmoid-routed MoE + ungated shared expert
 	"spark2_5":         spark25Architecture,       // Spark-X2.5 (XHToken): fused QKV, sigmoid head-wise attention output gate, 1:3 full/sliding (512) with layer-dependent partial RoPE, gated exact-GELU MLP, plain sequential (non-parallel) block
 	"granitemoehybrid": graniteArchitecture,       // Granite-4.0-H: Mamba-2 + attention hybrid + MoE-on-every-layer + Granite multipliers
 	"granite":          graniteDenseArchitecture,  // Granite 4.2 (3B/8B/30B) dense: llama skeleton + Granite's four scalar multipliers
 	"lfm2":             lfm2Architecture,          // LFM2 / LFM2.5: gated short-conv + GQA hybrid (layer_types), tied head, per-head RMSNorm QK-norm
-	"lfm2_vl":          lfm2Architecture,          // LFM2-VL / LFM2.5-VL (S10): the lfm2 decoder of an Lfm2VlForConditionalGeneration, text_config extracted; its SigLIP2 tower is multimodal/aikit's
+	"lfm2_vl":          lfm2Architecture,          // LFM2-VL / LFM2.5-VL: the lfm2 decoder of an Lfm2VlForConditionalGeneration, text_config extracted; its SigLIP2 tower is multimodal/aikit's
 	"nemotron_h":       nemotronhArchitecture,     // Nemotron-H: single-op-per-block hybrid (mamba | NoPE-attention | relu² MLP)
 	"deepseek_v2":      deepseekArchitecture,      // DeepSeek-V2 (MLA + DeepSeekMoE; softmax routing, V2-Lite has no q-LoRA)
 	"deepseek_v3":      deepseekArchitecture,      // DeepSeek-V3 (MLA + DeepSeekMoE; sigmoid + e_score_correction_bias group-limited routing)
@@ -82,7 +85,7 @@ var registry = map[string]archAdapter{
 func resolveArchitecture(cfg *Config) (*Architecture, *tensorSchema, error) {
 	adapter, ok := registry[cfg.ModelType]
 	if !ok {
-		return nil, nil, fmt.Errorf("decoder: unsupported model_type %q (have: %s)", cfg.ModelType, knownModelTypes())
+		return nil, nil, errorOfKind(ErrUnsupportedModel, "decoder: unsupported model_type %q (have: %s)", cfg.ModelType, knownModelTypes())
 	}
 	// Bound the config before the adapter runs: several adapters allocate NumLayers-sized slices with only a `> 0` check and loadConfig has no
 	// bound, so a hostile config (num_hidden_layers: 68719476736) is a fatal out-of-memory that no recover() catches, not the typed error
@@ -207,6 +210,46 @@ func validateConfigBounds(cfg *Config) error {
 func knownModelTypes() string {
 	keys := make([]string, 0, len(registry))
 	for k := range registry {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ", ")
+}
+
+// ggufConfigAdapter builds a *Config from a GGUF file's metadata for one general.architecture value.
+type ggufConfigAdapter func(*embed.GGUFFile) (*Config, error)
+
+// ggufRegistry maps GGUF general.architecture → its Config builder, keeping GGUF architecture registration in the same
+// table-driven file as safetensors registry above.
+var ggufRegistry = map[string]ggufConfigAdapter{
+	"llama":          ggufLlamaConfig,
+	"qwen2":          ggufQwen2Config,
+	"qwen3":          ggufQwen3Config,
+	"gemma":          func(g *embed.GGUFFile) (*Config, error) { return ggufGemma12Config(g, "gemma") },
+	"gemma2":         func(g *embed.GGUFFile) (*Config, error) { return ggufGemma12Config(g, "gemma2") },
+	"gemma3":         ggufGemmaConfig,
+	"gemma3_text":    ggufGemmaConfig,
+	"gemma4":         ggufGemma4Config,
+	"mellum":         ggufMellumConfig,
+	"qwen35moe":      ggufQwen35Config,
+	"qwen35":         ggufQwen35DenseConfig,
+	"qwen3moe":       ggufQwen3MoeConfig,
+	"laguna":         ggufLagunaConfig,
+	"flint":          ggufFlintConfig,
+	"glm4moe":        ggufGlm4MoeConfig,
+	"granitehybrid":  ggufGraniteConfig,
+	"granite":        ggufGraniteDenseConfig,
+	"nemotron_h":     ggufNemotronConfig,
+	"nemotron_h_moe": ggufNemotronConfig, // Nemotron 3 Nano — same HF model_type "nemotron_h", llama.cpp gives it its own GGUF arch string
+	"deepseek2":      ggufDeepseekConfig,
+	"phi3":           ggufPhi3Config,
+	"llama4":         ggufLlama4Config,
+	"gpt-oss":        ggufGptOssConfig,
+}
+
+func knownGGUFArchitectures() string {
+	keys := make([]string, 0, len(ggufRegistry))
+	for k := range ggufRegistry {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)

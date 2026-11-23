@@ -1,6 +1,6 @@
 //go:build realckpt
 
-// G-S10m-c of docs/tasks/task-multimodal-support-2026-10.md (S10, Ministral 3 (Pixtral)): Ministral 3 3B on an image
+// G-S10m-c: Ministral 3 3B on an image
 // prompt, goinfer's float32 CPU prefill against transformers' Mistral3ForConditionalGeneration in float32. Three steps, so the same ids reach both sides (nobara):
 //
 //  1. GOINFER_S10M_STEP=ids writes <out>/ids.json: the prompt serve builds for glm_ocr/table.png with an explicit system
@@ -34,6 +34,9 @@ import (
 	"github.com/townsendmerino/goinfer/internal/vision"
 	"github.com/townsendmerino/goinfer/multimodal"
 	"github.com/townsendmerino/goinfer/tokenizer"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 type s10mIDs struct {
@@ -43,7 +46,7 @@ type s10mIDs struct {
 }
 
 func TestPixtralFull(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	step, out := os.Getenv("GOINFER_S10M_STEP"), os.Getenv("GOINFER_S10M_OUT")
 	if step == "" || out == "" {
 		t.Skip("set GOINFER_S10M_STEP (ids | compare) and GOINFER_S10M_OUT")
@@ -196,15 +199,15 @@ func TestPixtralFull(t *testing.T) {
 		vocab := len(logits) / n
 		agree := 0
 		for i := range n {
-			if argmax(logits[i*vocab:(i+1)*vocab]) == g.C.Argmax[after+i] {
+			if sampling.Argmax(logits[i*vocab:(i+1)*vocab]) == g.C.Argmax[after+i] {
 				agree++
 			}
 		}
 		last := logits[(n-1)*vocab:]
 		cos = logitCosine(last, hfLast)
-		lastOK = argmax(last) == argmax(hfLast)
+		lastOK = sampling.Argmax(last) == sampling.Argmax(hfLast)
 		pct = 100 * float64(agree) / float64(n)
-		logf("%-46s last cosine %.6f, argmax %d (HF %d), agreement %d/%d = %.1f%% over the text after the image", label, cos, argmax(last), argmax(hfLast), agree, n, pct)
+		logf("%-46s last cosine %.6f, argmax %d (HF %d), agreement %d/%d = %.1f%% over the text after the image", label, cos, sampling.Argmax(last), sampling.Argmax(hfLast), agree, n, pct)
 		return cos, lastOK, pct
 	}
 	pass := func(cos float64, lastOK bool, pct float64) bool { return cos >= 0.999 && lastOK && pct >= 95 }

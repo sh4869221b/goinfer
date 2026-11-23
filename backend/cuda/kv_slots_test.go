@@ -4,9 +4,6 @@ package cuda
 
 import (
 	"context"
-	gpu "github.com/townsendmerino/goinfer/backend/cuda/internal/gpudev"
-	"github.com/townsendmerino/goinfer/internal/cost"
-	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 	"math"
 	"os"
 	"path/filepath"
@@ -16,16 +13,22 @@ import (
 	"testing"
 	"time"
 
+	gpu "github.com/townsendmerino/goinfer/backend/cuda/internal/gpudev"
+	"github.com/townsendmerino/goinfer/internal/cost"
+	"github.com/townsendmerino/goinfer/internal/runtime/mem"
+
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
-	gc "github.com/eitamring/gocudrv/cuda"
-	"github.com/townsendmerino/goinfer/decoder"
 	"sort"
 	"strings"
+
+	gc "github.com/eitamring/gocudrv/cuda"
+	"github.com/townsendmerino/goinfer/decoder"
+	"github.com/townsendmerino/goinfer/decoder/fit"
 )
 
 // kvSlotTurn is one generation of the MC1 identity scenario: its token ids and PrefillReused.
@@ -34,7 +37,7 @@ type kvSlotTurn struct {
 	reused int
 }
 
-// kvSlotsScenario is MC1's identity gate on CUDA (docs/tasks/task-concurrency-2026-09.md; the Metal twin is
+// kvSlotsScenario is MC1's identity gate on CUDA (the Metal twin is
 // TestMetalKVSlots_interleavedMatchesAlone): with two resident KV slots, two conversations that share only a lead,
 // interleaved turn by turn through the production Generate path, must each emit exactly the token ids they emit
 // when served alone, and reuse exactly as much of their own history on every turn. A control — the same interleaving
@@ -340,8 +343,7 @@ func TestCUDAKVSlots_pricedAgainstWhatIsLeft(t *testing.T) {
 	}
 }
 
-// TestResolveCtxCapFit_slotsShrinkTheContext pins the owner's decision (docs/tasks/task-concurrency-2026-09.md
-// MC1 on CUDA): an unpinned load that asks for N resident KV slots gives up context until all N fit, instead of taking
+// TestResolveCtxCapFit_slotsShrinkTheContext pins the owner's decision: an unpinned load that asks for N resident KV slots gives up context until all N fit, instead of taking
 // the one-slot context and clamping the slots. The free-VRAM budget is forced (ExtraResidentBytes, from a real probe,
 // the way TestResolveCtxCapFit_agreesWithCheckKVFits does it) so that one slot fits the full candidate while 4 fit only
 // at about 5000 positions. It checks the planning-time choice against the build-time one: at the chosen context
@@ -364,7 +366,7 @@ func TestResolveCtxCapFit_slotsShrinkTheContext(t *testing.T) {
 	for i := range layers {
 		layers[i].kvDim = nKV * hd
 	}
-	dense := probe.ResidentDenseWeightBytesFor("cuda") // what Plan prices for CUDA
+	dense := probe.ResidentDenseWeightBytesFor("cuda") + probe.PlanSlack("cuda") // what Plan prices for CUDA: the weights and the driver's charge over them
 	probe.Close()
 	free, ok := decoder.FreeBytesFor("cuda")
 	if !ok {
@@ -378,7 +380,7 @@ func TestResolveCtxCapFit_slotsShrinkTheContext(t *testing.T) {
 		wantSlots int // what checkKVFits grants at the chosen context
 	}{
 		{"interior: 4 slots fit at ~5000", 5000, func(got int) bool { return got > 4800 && got <= 5064 }, slots},
-		{"not even the floor holds 4: the floor, and the build clamps", 3000, func(got int) bool { return got == cudaCtxCapDefault }, 2},
+		{"not even the floor holds 4: the floor, and the build clamps", 2400, func(got int) bool { return got == cudaCtxCapDefault }, 2},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			// The budget holds exactly `slots` slots at the target as the pools charge them (kvChargedBytes): on this fixture the
@@ -393,7 +395,7 @@ func TestResolveCtxCapFit_slotsShrinkTheContext(t *testing.T) {
 				t.Fatalf("Load: %v", err)
 			}
 			defer m.Close()
-			// A GENUINE pin (item 28, docs/prompts/nobara-mc1-webgpu-2026-09.md §4): ResidentContext set
+			// A GENUINE pin: ResidentContext set
 			// in Options, not just a bare 8192 handed to resolveCtxCapFit with an otherwise-unpinned m —
 			// the latter is now a guard-pin scenario (m.ResidentContextPinned() false) and correctly runs
 			// fit-by-default clamped to it, which would shrink for these slots, not the "never shrinks"
@@ -410,7 +412,7 @@ func TestResolveCtxCapFit_slotsShrinkTheContext(t *testing.T) {
 			pinned, _ := resolveCtxCapFitSlack(mPinned, mPinned.ResidentContextRequest(), 1<<20, slots, fixedMargin(testCtxMargin), round)
 			t.Logf("one slot: ctx %d; %d slots: ctx %d (target %d); explicit 8192 with %d slots: %d", one, slots, got, c.target, slots, pinned)
 			// One slot gets the smaller of the candidate and what the forced budget holds (slots*target positions of KV beside the weights).
-			// With the candidate at 8192 that was always the candidate; at 16384 the 3000-position case holds only ~12000, which is the
+			// With the candidate at 8192 that was always the candidate; at 16384 the 2400-position case holds only ~9600, which is the
 			// budget talking, not a shrink the slots rule did.
 			room := slots * c.target
 			wantOne := min(room, fitDefaultCtx)
@@ -539,8 +541,7 @@ func TestResidentDenseBytes_matchesCUDADevice(t *testing.T) {
 			}
 			est, all := m.ResidentDenseWeightBytesFor("cuda"), m.ResidentDenseWeightBytes()
 			// Plan prices the requested bytes; the driver rounds each buffer of a quantum or more up (allocRoundSlack), which the build prices into the plan on its own
-			// (res.allocSlackBytes). The margin is for what neither knows, so the bound below is on Plan + that slack, not on Plan alone: the rounding alone can exceed the whole margin on the 7B
-			// (docs/tasks/task-multimodal-support-2026-10.md).
+			// (res.allocSlackBytes). The margin is for what neither knows, so the bound below is on Plan + that slack, not on Plan alone: the rounding alone can exceed the whole margin on the 7B.
 			t.Logf("device before KV %.0f MB; Plan's CUDA dense %.0f MB (all dense, host tables included, %.0f MB) + allocation slack %.0f MB; "+
 				"under by %.0f MB (margin %.0f MB)", mb(drop), mb(est), mb(all), mb(res.allocSlackBytes), mb(drop-est-res.allocSlackBytes), mb(res.ctxMargin()))
 			est += res.allocSlackBytes
@@ -624,7 +625,7 @@ func TestCUDAKVSlots_buildTrimsTheContext(t *testing.T) {
 	}
 }
 
-// TestCUDAKVSlots_oomKeepsTheSlotsThatFit is S18's CUDA gate (docs/tasks/task-multimodal-support-2026-10.md, "G-S18a"): when the device runs out of memory allocating a later KV slot (checkKVFits sizes the
+// TestCUDAKVSlots_oomKeepsTheSlotsThatFit is S18's CUDA gate: when the device runs out of memory allocating a later KV slot (checkKVFits sizes the
 // count against the free VRAM read before the build's own scratch, with the margin the only slack, so the last slot can miss by the scratch), the resident keeps the slots that fit instead of declining to the CPU.
 // Three slots requested, the seam fails slot 2: the model stays CUDA-resident with two, no device buffer leaks (the ledger equals a plain two-slot build's), and both granted slots decode the same tokens as a plain
 // two-slot build's. The control, no seam: all three slots. Without the recover the build declines and this goes red.
@@ -729,7 +730,7 @@ func TestPlanSlack_matchesTheBuild(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s: not resident: %s", p, m.ResidentDecline())
 		}
-		plan := m.Plan("cuda", 64<<30, decoder.PlanRequest{Ctx: 4096})
+		plan := m.Plan("cuda", 64<<30, fit.PlanRequest{Ctx: 4096})
 		t.Logf("%s: plan slack %d, build packedAllocSlack %d, build's slack %d", filepath.Base(p), planned, built, r.allocSlackBytes)
 		if planned != built || planned <= 0 || plan.AllocSlackBytes != built || r.allocSlackBytes != built {
 			t.Errorf("%s: the plan prices %d (Plan %d), the build's buffers round by %d", filepath.Base(p), planned, plan.AllocSlackBytes, built)
@@ -765,17 +766,17 @@ func TestPlanSlack_realSizeDiff(t *testing.T) {
 						if extra > 0 && (pinned || kv != "f32") {
 							continue
 						}
-						req := decoder.PlanRequest{Ctx: ctx, CtxPinned: pinned, KVF16: kv == "f16", KVI8: kv == "i8", ExtraBytes: extra}
+						req := fit.PlanRequest{Ctx: ctx, CtxPinned: pinned, KVF16: kv == "f16", KVI8: kv == "i8", ExtraBytes: extra}
 						g := fmt.Sprintf("D3 %s | cuda ctx=%d pinned=%v kv=%s extra=%d", name, ctx, pinned, kv, extra)
 						groups++
-						sum := func(pl decoder.Plan) string { return fmt.Sprintf("%s %d %d", pl.Placement, pl.Ctx, pl.Slots) }
+						sum := func(pl fit.Plan) string { return fmt.Sprintf("%s %d %d", pl.Placement, pl.Ctx, pl.Slots) }
 						edges := map[int64]bool{}
 						for _, f := range frees {
 							edges[f] = true
 						}
-						for _, side := range []func(int64) decoder.Plan{
-							func(f int64) decoder.Plan { return m.PlanWithoutSlackForTest("cuda", f, req) },
-							func(f int64) decoder.Plan { return m.Plan("cuda", f, req) },
+						for _, side := range []func(int64) fit.Plan{
+							func(f int64) fit.Plan { return m.PlanWithoutSlackForTest("cuda", f, req) },
+							func(f int64) fit.Plan { return m.Plan("cuda", f, req) },
 						} {
 							for _, e := range changePointsOf(0, 1<<36, 8, func(f int64) string { return sum(side(f)) }) {
 								edges[e], edges[e-1] = true, true
@@ -794,7 +795,7 @@ func TestPlanSlack_realSizeDiff(t *testing.T) {
 							if bl != al {
 								diff = true
 							}
-							if a.Placement == decoder.PlacementDecline && b.Placement != decoder.PlacementDecline {
+							if a.Placement == fit.PlacementDecline && b.Placement != fit.PlacementDecline {
 								toDecline++
 								summary = append(summary, fmt.Sprintf("TO DECLINE: %s at free %d: was %s ctx %d, now %s", g, f, b.Placement, b.Ctx, a.Reason))
 							}
@@ -871,7 +872,7 @@ func TestPlanSlack_realSizeDiff(t *testing.T) {
 	}
 }
 
-func planLineOf(p decoder.Plan) string {
+func planLineOf(p fit.Plan) string {
 	return fmt.Sprintf("%s ctx %d slots %d dense %d slack %d expertUsed %d kv %d extra %d free %d need %d | %s",
 		p.Placement, p.Ctx, p.Slots, p.DenseBytes, p.AllocSlackBytes, p.ExpertBytesUsed, p.KVBytes, p.ExtraBytes, p.FreeBytes, p.NeedBytes(), p.Reason)
 }
@@ -1425,5 +1426,49 @@ func TestCost_cudaGenerateOnTheWire(t *testing.T) {
 	cudaGenerate(t, m2, prompt, 3, c2) // the tokens and reuse are not read: only that nothing was counted
 	if r2 := c2.Report(); r2.Prefill != nil || r2.Decode != nil {
 		t.Errorf("under MC3 a generation was counted: %+v", r2)
+	}
+}
+
+// cardWeightMiB is the device's drop across a build's dense-line allocations (the weight arena and the final norm), MiB, from the
+// allocation sequence each build made (docs/measurements/memfix-e2-2026-11/seq-after-*.tsv.gz: free VRAM read after every
+// allocation). The scratch allocated before the weights is not in it. The plan prices this as the dense weights plus packedAllocSlack.
+var cardWeightMiB = map[string]float64{
+	"qwen2.5-coder-0.5b-instruct-q4_k_m.gguf":   324,
+	"qwen2.5-coder-1.5b-instruct-q4_k_m.gguf":   928,
+	"llama-3.2-1b-instruct-q4_k_m.gguf":         774,
+	"gemma3-1b-q4_k_m.gguf":                     664,
+	"qwen25vl-3b-instruct":                      1788,
+	"gemma-3-4b-it":                             2364,
+	"qwen2.5-7b-instruct-q4_k_m.gguf":           4024,
+	"gemma-4-e2b-gguf/gemma-4-E2B_q4_0-it.gguf": 1386,
+}
+
+// TestPlanSlack_pricesThePacking (KV3-S1-residual): on every real checkpoint whose weight upload was read against the card, the
+// plan's weight figure (dense bytes plus the planned slack) is within 2 MiB of the card's drop; the readings are in
+// docs/measurements/memfix-e2-2026-11/README.md.
+func TestPlanSlack_pricesThePacking(t *testing.T) {
+	ran := 0
+	for rel, want := range cardWeightMiB {
+		paths := realSizeModels(t, rel)
+		if len(paths) == 0 {
+			t.Logf("%s: not on this box", rel)
+			continue
+		}
+		t.Run(filepath.Base(rel), func(t *testing.T) {
+			m, err := decoder.Load(paths[0], decoder.Options{Backend: "cpu", Quant: "int4"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			got := float64(m.ResidentDenseWeightBytesFor("cuda")+m.PlanSlack("cuda")) / (1 << 20)
+			t.Logf("plan %.2f MiB against the card's %.2f MiB (%+.2f)", got, want, got-want)
+			if got < want-2 || got > want+2 {
+				t.Errorf("the plan prices %.2f MiB of weights, the card took %.2f: %+.2f MiB, bar 2", got, want, got-want)
+			}
+		})
+		ran++
+	}
+	if ran == 0 {
+		t.Skip("none of the checkpoints is on this box")
 	}
 }

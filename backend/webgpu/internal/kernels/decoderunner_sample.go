@@ -14,7 +14,7 @@ import (
 // gumbelDispatches is the dispatches a draw adds after the forward: the per-block maxima, then their reduction.
 const gumbelDispatches = 2
 
-// gumbelState is a DecodeRunner's device-sampling resources (R7b), built lazily on the first RunSample so a
+// gumbelState is a DecodeRunner's device-sampling resources, built lazily on the first RunSample so a
 // runner that only ever returns logits pays nothing.
 type gumbelState struct {
 	pl1, pl2   *wgpu.ComputePipeline
@@ -30,7 +30,7 @@ type gumbelState struct {
 // gumbelBlocks is the stage-1 dispatch size for a vocabulary of v entries (256 threads x 4 tokens each).
 func gumbelBlocks(v int) int { return (v + 1023) / 1024 }
 
-// newGumbelState builds the sampler's pipelines, buffers and bind groups over an existing logits buffer of `vocab`
+// NewGumbelState builds the sampler's pipelines, buffers and bind groups over an existing logits buffer of `vocab`
 // f32 values. Every object it creates is handed to `keep` for release. It is independent of DecodeRunner so the
 // kernel can be driven directly (gumbel_test.go) against arbitrary logits.
 func NewGumbelState(c *Context, logits *wgpu.Buffer, vocab int, keep func(release func())) (*gumbelState, error) {

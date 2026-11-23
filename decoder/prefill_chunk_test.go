@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// G40-1 (docs/tasks/task-cpu-prefill-memory-2026-10.md §4): a text prefill run in chunks equals the single pass bit for
+// G40-1: a text prefill run in chunks equals the single pass bit for
 // bit, in its last-row logits and in every K/V element of every layer (the ring contents of a sliding-window layer
 // included), cold and warm, under fast attention and under the exact path.
 
@@ -109,7 +109,7 @@ func prefillChunkCell(t *testing.T, m *Model, C int) {
 	}
 	t0, done, total := time.Now(), 0, 4*len(lengths)
 	for _, exact := range []bool{false, true} {
-		m.exactPrefill = exact
+		m.opts.ExactPrefill = exact
 		for _, warm := range []bool{false, true} {
 			var prefix []int
 			if warm {
@@ -140,7 +140,7 @@ func prefillChunkCell(t *testing.T, m *Model, C int) {
 			}
 		}
 	}
-	m.exactPrefill = false
+	m.opts.ExactPrefill = false
 }
 
 func TestPrefillChunked_bitIdentical(t *testing.T) {
@@ -161,8 +161,10 @@ func TestPrefillChunked_bitIdentical(t *testing.T) {
 }
 
 // TestPrefillChunked_bitIdenticalReal0p5B is G40-1's real-checkpoint cell: Qwen2.5-Coder-0.5B at int4 and the production
-// chunk size. Seconds per arm on the CPU; it needs the bench GGUF in ~/models.
+// chunk size. Ten minutes or more on the CPU, so slowTest skips it under -short (the day loop); CI, the gate runner and
+// the night queue run it. It needs the bench GGUF in ~/models.
 func TestPrefillChunked_bitIdenticalReal0p5B(t *testing.T) {
+	slowTest(t)
 	home, _ := os.UserHomeDir()
 	p := filepath.Join(home, "models", "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf")
 	if _, err := os.Stat(p); err != nil {

@@ -8,6 +8,8 @@ import (
 	"math"
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
 )
 
 // withBatchPlant runs f with plant p set, and clears it after.
@@ -22,7 +24,7 @@ func withBatchPlant(p walkBatchPlant, f func()) {
 func TestWalkBatchPlant_qwen35GateSkipped(t *testing.T) {
 	m, err := Load("testdata/qwen3_5-tiny-normw", Options{})
 	if err != nil {
-		t.Skipf("no qwen3_5-tiny-normw fixture: %v", err)
+		t.Fatalf("load testdata/qwen3_5-tiny-normw: %v", err)
 	}
 	defer m.Close()
 	const n, bar = 32, 1e-6
@@ -58,7 +60,7 @@ func TestWalkBatchPlant_qwen35GateSkipped(t *testing.T) {
 func TestWalkBatchPlant_qwen35ConvWindowDropped(t *testing.T) {
 	m, err := Load("../testdata/qwen35-tiny", Options{})
 	if err != nil {
-		t.Skipf("no qwen35-tiny fixture: %v", err)
+		t.Fatalf("load ../testdata/qwen35-tiny: %v", err)
 	}
 	defer m.Close()
 	const n, b = 40, 17
@@ -136,7 +138,7 @@ func TestWalkBatchPlant_gemma4BidirectionalDropped(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return argmax(lg), logitCosine(lg, g.LastLogits)
+		return sampling.Argmax(lg), logitCosine(lg, g.LastLogits)
 	}
 	ca, cc := run()
 	var pa int

@@ -11,6 +11,9 @@ type GIWLoad struct {
 	DeviceKV      bool    // the KV and the prefill scratch are on a device: only the pinned experts are host memory
 	Scratch       int64   // the prefill attention scratch cap
 	PinnedExperts int64   // the page-locked expert copy, 0 for none; the same at every context
+	// SnapshotBytes is the prefix-snapshot store's budget (-kv-host-bytes), 0 where the load keeps no store: host memory the server holds once it is
+	// serving, the same at every context.
+	SnapshotBytes int64
 }
 
 // GIWFit is SolveGIW's answer and the numbers behind it. Known is false when it could not price (proceed).
@@ -37,13 +40,22 @@ func SolveGIW(l GIWLoad, m Machine, p Policy) GIWFit {
 	if l.PinnedExperts > 0 {
 		what += " + the pinned MoE expert copy"
 	}
+	if l.SnapshotBytes > 0 {
+		what += " + the prefix-snapshot store (-kv-host-bytes)"
+	}
 	needAt := func(ctx int) int64 {
 		if l.DeviceKV {
-			return l.PinnedExperts
+			return l.PinnedExperts + l.SnapshotBytes
 		}
-		return l.KV(ctx) + l.Scratch + l.PinnedExperts
+		return l.KV(ctx) + l.Scratch + l.PinnedExperts + l.SnapshotBytes
 	}
-	margin := float64(p.GIWMargin) / gb
+	snapHint := func(need int64) string {
+		if l.SnapshotBytes <= 0 || need-l.SnapshotBytes > budget {
+			return ""
+		}
+		return "; or lower -kv-host-bytes (the snapshot store's budget; 0 turns snapshots off)"
+	}
+	margin := GiB(p.GIWMargin)
 	need := needAt(l.Ctx)
 	d := GIWFit{Known: true, Avail: avail, Budget: budget, Need: need, Ctx: l.Ctx, Pinned: l.Pinned, PinnedExperts: l.PinnedExperts}
 	if need <= budget {
@@ -51,20 +63,20 @@ func SolveGIW(l GIWLoad, m Machine, p Policy) GIWFit {
 	}
 	if l.Pinned {
 		d.Err = fmt.Errorf(
-			"decoder: pinned context %d needs ~%.2f GB (%s) but only %.2f GB of this "+
-				"machine's %.2f GB currently-available memory would be left as a %.0f GB safety "+
-				"margin — pass a smaller -ctx, or set GOINFER_NO_FIT_GUARD=1 to allow it anyway",
-			l.Ctx, float64(need)/gb, what, float64(budget)/gb, float64(avail)/gb, margin)
+			"decoder: pinned context %d needs ~%s (%s) but only %s of this "+
+				"machine's %s currently-available memory would be left as a %s safety "+
+				"margin — pass a smaller -ctx, or set GOINFER_NO_FIT_GUARD=1 to allow it anyway%s",
+			l.Ctx, GiB(need), what, GiB(budget), GiB(avail), margin, unpinnedHintIf(l.PinnedExperts, need, budget)+snapHint(need))
 		return d
 	}
 	floor := p.CtxFloor
 	if floorNeed := needAt(floor); floorNeed > budget {
 		d.Ctx, d.Need = floor, floorNeed
 		d.Err = fmt.Errorf(
-			"decoder: this model needs ~%.2f GB (%s) even at the %d-token floor, but only "+
-				"%.2f GB of this machine's %.2f GB currently-available memory would be left as a "+
-				"%.0f GB safety margin — set GOINFER_NO_FIT_GUARD=1 to allow it anyway",
-			float64(floorNeed)/gb, what, floor, float64(budget)/gb, float64(avail)/gb, margin)
+			"decoder: this model needs ~%s (%s) even at the %d-token floor, but only "+
+				"%s of this machine's %s currently-available memory would be left as a "+
+				"%s safety margin — set GOINFER_NO_FIT_GUARD=1 to allow it anyway%s",
+			GiB(floorNeed), what, floor, GiB(budget), GiB(avail), margin, unpinnedHintIf(l.PinnedExperts, floorNeed, budget)+snapHint(floorNeed))
 		return d
 	}
 	lo, hi := floor, l.Ctx
@@ -78,8 +90,24 @@ func SolveGIW(l GIWLoad, m Machine, p Policy) GIWFit {
 	}
 	d.PinCtx, d.Ctx, d.Need = lo, lo, needAt(lo)
 	d.Note = fmt.Sprintf(
-		"decoder: .giw context capped at %d (model allows %d) so that KV+scratch fits: needs ~%.2f GB "+
-			"of %.2f GB available (%.0f GB margin) — pass -ctx to choose, or free memory to lift\n",
-		lo, l.Ctx, float64(needAt(lo))/gb, float64(avail)/gb, margin)
+		"decoder: .giw context capped at %d (model allows %d) so that KV+scratch fits: needs ~%s "+
+			"of %s available (%s margin) — pass -ctx to choose, or free memory to lift\n",
+		lo, l.Ctx, GiB(needAt(lo)), GiB(avail), margin)
 	return d
+}
+
+// UnpinnedExpertsHint is what a refusal says when the pinned MoE expert copy (pinned bytes) is what does not fit: --moe-experts-unpinned drops it,
+// and the experts upload from the file's own pages at a measured decode cost (docs/measurements/mem10-2026-11/ab-registration.md, "Reading").
+func UnpinnedExpertsHint(pinned int64) string {
+	return fmt.Sprintf("--moe-experts-unpinned drops the %s pinned expert copy: the experts are packed into a file beside the model (written "+
+		"at load, unlinked while mapped) and upload from its pageable pages, measured at 0.82x decode at short context and 0.75x at long on "+
+		"Gemma 4 26B (docs/measurements/mem10-2026-11/)", GiB(pinned))
+}
+
+// unpinnedHintIf is "; or " and UnpinnedExpertsHint when a pinned expert copy is in need and dropping it would bring need within budget, else "".
+func unpinnedHintIf(pinned, need, budget int64) string {
+	if pinned <= 0 || need-pinned > budget {
+		return ""
+	}
+	return "; or " + UnpinnedExpertsHint(pinned)
 }

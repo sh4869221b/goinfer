@@ -12,7 +12,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// The prefix snapshot's gates on CUDA (docs/tasks/task-kv7-prefix-snapshot-2026-10.md): a restored prefix is the prefix computed, bit
+// The prefix snapshot's gates on CUDA: a restored prefix is the prefix computed, bit
 // for bit, in every K and V row the next position reads and in the logits that follow; a snapshot declines what its ring cannot serve
 // and nothing is written when it does.
 //
@@ -103,11 +103,12 @@ func TestKV7_restoreWindowed(t *testing.T) {
 	})
 }
 
-// TestKV7_restoreFull runs it on a whole-context fixture, f32 and f16 (the raw words of an f16 cache are copied as they are).
+// TestKV7_restoreFull runs it on a whole-context fixture, f32, f16 and int8 (the raw words of an f16 or int8 cache are copied as they are, and
+// an int8 cache's scales with them: kv2Rig compares them too).
 func TestKV7_restoreFull(t *testing.T) {
 	const dir = "../../testdata/llama-attnfa-tiny"
 	requireDeviceAndFixture(t, dir)
-	for _, kv := range []string{"f32", "f16"} {
+	for _, kv := range []string{"f32", "f16", "i8"} {
 		t.Run(kv, func(t *testing.T) {
 			g := kv2Load(t, dir, decoder.Options{ResidentKVSlots: 3, ResidentContext: 1024, KVPrecision: kv})
 			kv7Restore(t, g, 256)

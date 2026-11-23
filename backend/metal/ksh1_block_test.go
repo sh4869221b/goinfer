@@ -130,7 +130,7 @@ func ksh1WholeVsBlocked(t *testing.T, m *decoder.Model, a *metalResident, n, B i
 	}
 }
 
-// TestKSH1_exactAttentionBlocks is KH1-G1 and KH1-G3 (docs/tasks/task-kernel-survey-2026-10.md, "KS-H1 gates"): llama-tiny on
+// TestKSH1_exactAttentionBlocks is KH1-G1 and KH1-G3: llama-tiny on
 // Metal with the exact attention kernel forced and a 32-key tile, a 300-row prompt whole against 64-row blocks, byte-equal, each
 // pass inside its scratch figure; the resident now reports a block, and admission prices a 20,000-token prompt by it.
 func TestKSH1_exactAttentionBlocks(t *testing.T) {
@@ -160,7 +160,7 @@ func TestKSH1_exactAttentionBlocks(t *testing.T) {
 	price, ok := m.ResidentPrefillScratchForTest(20000)
 	fmt.Fprintf(os.Stderr, "[KH1] admission at 20,000 tokens: blocked price %d B (ok %v), block %d rows\n", price, ok, a.PrefillBlockRows())
 	rows := min(20000, a.PrefillBlockRows()+8-1) // the decoder's longest pass: a block plus the tail minimum (prefillTailMin, 8) less one
-	if want := a.PrefillScratchBytes(rows) + int64(rows)*4*int64(m.ResidentEmbedLen()); !ok || price != want {
+	if want := a.PrefillScratchBytes(rows) + int64(rows)*4*int64(m.BackendView().EmbedLen()); !ok || price != want {
 		t.Errorf("admission priced %d B (ok %v), want the blocked pass's %d B", price, ok, want)
 	}
 }

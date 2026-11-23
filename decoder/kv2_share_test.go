@@ -11,7 +11,7 @@ import (
 	"github.com/townsendmerino/goinfer/internal/runtime/kvmgr"
 )
 
-// copyFake is mc3Fake with a slot-to-slot copy (ResidentKVCopier). mc3Fake's rows are a hash of each position's input
+// copyFake is mc3Fake with a slot-to-slot copy (KVCopierAvailable). mc3Fake's rows are a hash of each position's input
 // and its logits a hash of the slot's whole history, so a copy that moves the wrong rows changes every later token.
 // plant makes the copy wrong in one way, to show the gate goes red: "short" copies a block less than it claims, "wrong"
 // writes another slot than dst (a slot index mixed up), "noop" reports success and copies nothing.
@@ -21,6 +21,9 @@ type copyFake struct {
 	copies         int
 	declinePrefill bool
 }
+
+func (f *copyFake) ResidentSubsystems() ResidentSubsystems { return selfSubsystems(f) }
+func (f *copyFake) KVCopierAvailable() bool                { return true }
 
 // PrefillLast declines while declinePrefill is set, as a backend whose batched pass refuses a prompt at call time.
 func (f *copyFake) PrefillLast(ctx context.Context, embs [][]float32, startPos int) ([]float32, error) {
@@ -322,7 +325,7 @@ func TestKV2_scopes(t *testing.T) {
 func TestKV2_optionOff(t *testing.T) {
 	const maxTok = 8
 	m, rf := loadWithCopyFake(t, 2, "")
-	m.kvShareOff = true // Options.KVShareOff
+	m.opts.KVShareOff = true // Options.KVShareOff
 	pre := kv2Preamble(m.w.arch.VocabSize)
 	a, b := newKV2Conv(pre, 0, m.w.arch.VocabSize), newKV2Conv(pre, 1, m.w.arch.VocabSize)
 	a.turn(t, context.Background(), m, 0, maxTok)

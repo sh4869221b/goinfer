@@ -10,9 +10,12 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/aikit/linalg"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// B27's tier 0 (docs/queue-engineering.md, B27, registered before any code): a quantized Nemotron-H load holds its Mamba
+// B27's tier 0: a quantized Nemotron-H load holds its Mamba
 // projections at int8, its .giw carries them so, the codes are the ones the GPU backends made before, and v17 refuses an
 // encoding it does not know by name.
 
@@ -50,7 +53,8 @@ func b27MambaLayers(t *testing.T, m *Model) []int {
 // b27Dims is the two projections' [rows, cols].
 func b27Dims(t *testing.T, m *Model) (d struct{ in, out [2]int }) {
 	t.Helper()
-	nh, hd, ds, ng, _, _, _, ok := m.NemotronResidentParams()
+	np, ok := m.BackendView().Nemotron()
+	nh, hd, ds, ng := np.NHeads, np.HeadDim, np.DState, np.NGroups
 	if !ok {
 		t.Fatal("not a Nemotron-H model")
 	}
@@ -231,13 +235,13 @@ func b27Lockstep(t *testing.T, ref, got *Model, seed []int, steps int) (minCos f
 		if i >= 2 {
 			minCos = min(minCos, float64(logitCosine(lg, lr)))
 		}
-		if argmax(lr) == argmax(lg) {
+		if sampling.Argmax(lr) == sampling.Argmax(lg) {
 			agree++
 		}
 		if i+1 < len(seed) {
 			tok = seed[i+1]
 		} else {
-			tok = argmax(lr)
+			tok = sampling.Argmax(lr)
 		}
 	}
 	return minCos, agree
@@ -257,12 +261,12 @@ func TestB27_cpuFidelityTiny(t *testing.T) {
 }
 
 // TestB27_cpuFidelitySlice is B27's CPU fidelity bar on the three-layer slice of NVIDIA-Nemotron-Nano-9B-v2 (layers 0, 1
-// and 14 of the Q8_0 GGUF; docs/tasks/task-forward-architecture-2026-10.md §4.7) at int4: the int8-Mamba CPU against the
+// and 14 of the Q8_0 GGUF) at int4: the int8-Mamba CPU against the
 // f32-Mamba CPU, 32 steps of greedy lockstep, min logit cosine >= 0.99 from position 2 and argmax agreement >= 28/32.
 //
 //	GOINFER_HEAVY_TESTS=1 go test -count=1 -run '^TestB27_cpuFidelitySlice$' -v ./decoder/
 func TestB27_cpuFidelitySlice(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	path := os.Getenv("GOINFER_NEMOTRON_SLICE_GGUF")
 	if path == "" {
 		home, _ := os.UserHomeDir()
@@ -283,7 +287,7 @@ func TestB27_cpuFidelitySlice(t *testing.T) {
 		return m
 	}
 	ref, got := load(true), load(false)
-	if in, _ := got.MambaProjInt8(0); in == nil {
+	if in, _ := got.BackendView().Layer(0).MambaProjInt8(); in == nil {
 		t.Fatal("the int8 arm's layer 0 holds no int8 projections")
 	}
 	minCos, agree := b27Lockstep(t, ref, got, []int{1, 17, 113, 29, 71, 5}, 32)

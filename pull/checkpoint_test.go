@@ -187,6 +187,17 @@ func configWithDifferentEOS(t *testing.T, original []byte) []byte {
 	return updated
 }
 
+// statCheckpointFixture captures the file ID before callers rename or remove its path.
+// On Windows os.Stat can defer reading the ID until os.SameFile.
+func statCheckpointFixture(path string) (os.FileInfo, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return f.Stat()
+}
+
 func withCacheRoot(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
@@ -549,7 +560,7 @@ func TestPublicCheckpointLoadsRecheckConfig(t *testing.T) {
 	})
 }
 
-// TestCheckpoint_shardedRoundTrip is P9's first gate (docs/tasks/task-checkpoint-fetch-2026-09.md): a safetensors
+// TestCheckpoint_shardedRoundTrip is P9's first gate: a safetensors
 // repo with a shard index goes plan -> fetch -> load -> one token. The plan takes config, index and both shards and
 // leaves the README and the legacy .bin out; the fetched directory is what decoder.Load opens; a second Resolve is
 // answered from the cache with no request.
@@ -1621,12 +1632,7 @@ func TestCheckpointResumeUsesPlannedIndex(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			f, err := os.Open(filepath.Join(staging, checkpointIndex))
-			if err != nil {
-				t.Fatal(err)
-			}
-			stagedIndex, err := f.Stat()
-			f.Close()
+			stagedIndex, err := statCheckpointFixture(filepath.Join(staging, checkpointIndex))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1634,7 +1640,7 @@ func TestCheckpointResumeUsesPlannedIndex(t *testing.T) {
 			if path, err := download(t.Context(), dest, func(_, _ int64, name string) {
 				if name == checkpointIndex {
 					var err error
-					readyIndex, err = os.Stat(filepath.Join(staging, checkpointIndex))
+					readyIndex, err = statCheckpointFixture(filepath.Join(staging, checkpointIndex))
 					if err != nil {
 						t.Fatal(err)
 					}

@@ -15,7 +15,7 @@ import (
 	"github.com/townsendmerino/goinfer/decoder"
 )
 
-// P29 (docs/queue-performance.md): a one-slot resident prefills its prompt on the batched step, verifies nothing on it, and
+// P29: a one-slot resident prefills its prompt on the batched step, verifies nothing on it, and
 // prices the step's scratch without ever refusing the load. Tier 0: the MC3 fixture on every darwin box, and the 0.5B on the
 // q4k lane where the file is present (the lane whose prefill is otherwise one token at a time).
 
@@ -116,8 +116,9 @@ func TestOneSlotStep_prefillBitIdentical(t *testing.T) {
 	}
 }
 
-// TestOneSlotStep_q4kLaneBitIdentical is the same check on the q4k lane, where PrefillLast takes the step for every prompt
-// of two or more tokens. It needs the Qwen2.5-Coder-0.5B q4_k_m file and skips without it.
+// TestOneSlotStep_q4kLaneBitIdentical is the same check on the q4k lane: prompts of 2 to 31 tokens through PrefillLast's step
+// route, and 32 to 64, which take the f16 pass there, through the step itself. It needs the Qwen2.5-Coder-0.5B q4_k_m file and
+// skips without it.
 func TestOneSlotStep_q4kLaneBitIdentical(t *testing.T) {
 	a := q4kStepResident(t, 1, 1024)
 	if len(a.r.kvSlotBufs) != 1 || a.VerifyCost() != nil {
@@ -125,7 +126,7 @@ func TestOneSlotStep_q4kLaneBitIdentical(t *testing.T) {
 	}
 	for _, n := range []int{2, 3, 8, 9, 17, 31, 32, 48, 64} {
 		embs, cont := oneSlotEmbs(a.r, uint32(2000+n), n)
-		lg, kv, cg := oneSlotStepDiff(t, a, embs, cont, true)
+		lg, kv, cg := oneSlotStepDiff(t, a, embs, cont, n < 32)
 		if lg != 0 || kv != 0 || cg != 0 {
 			t.Errorf("q4k, %d tokens: %d last-row logits, %d K/V elements, %d continuation logits differ from sequential", n, lg, kv, cg)
 		}
@@ -198,7 +199,7 @@ func TestOneSlotStep_scratchPricedNotTheLoad(t *testing.T) {
 
 	m := load()
 	t.Cleanup(func() { m.Close() })
-	need := residentNeedBytes(m)
+	need := residentNeedBytes(m, metalCtxPlan{})
 	tight := build(m, need)
 	if tight.r.batch != nil || tight.r.stepDecline == "" || tight.stepPrefill() {
 		t.Fatalf("need %d at a ceiling of %d: step built %v, decline %q; want the load admitted and the step declined",
@@ -216,7 +217,7 @@ func TestOneSlotStep_scratchPricedNotTheLoad(t *testing.T) {
 
 	m2 := load()
 	t.Cleanup(func() { m2.Close() })
-	roomy := build(m2, residentNeedBytes(m2)+scratch)
+	roomy := build(m2, residentNeedBytes(m2, metalCtxPlan{})+scratch)
 	if roomy.r.batch == nil || roomy.r.stepDecline != "" || !roomy.stepPrefill() {
 		t.Errorf("a ceiling of need + scratch: step built %v, decline %q; want the step", roomy.r.batch != nil, roomy.r.stepDecline)
 	}
@@ -254,10 +255,10 @@ func oneSlotPrefillAB(t *testing.T, path string, ctx int) {
 		t.Fatalf("load: %v", err)
 	}
 	t.Cleanup(func() { m.Close() })
-	if why := residentMemoryDecline(m); why != "" { // the guard the server applies; never bypassed here
+	if why := residentMemoryDecline(m, metalCtxPlan{}); why != "" { // the guard the server applies; never bypassed here
 		t.Skipf("Metal's memory guard declines this load now: %s", why)
 	}
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("build resident: %v", err)
 	}

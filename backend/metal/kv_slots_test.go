@@ -25,7 +25,7 @@ import (
 	"github.com/townsendmerino/goinfer/internal/runtime/mem"
 )
 
-// TestMetalKVSlots_interleavedMatchesAlone is MC1's gate (docs/tasks/task-concurrency-2026-09.md): with two resident KV
+// TestMetalKVSlots_interleavedMatchesAlone is MC1's gate: with two resident KV
 // slots, two conversations that share only a lead, interleaved turn by turn through the production Generate path,
 // must each emit exactly the token ids they emit when served alone, and reuse exactly as much of their own history
 // on every turn. A control — the same interleaving on one slot — must thrash, so this test can see the failure it
@@ -131,7 +131,7 @@ func reusedOf(ts []kvSlotTurn) []int {
 	return out
 }
 
-// TestKVSlotsWithin pins MC1's fit-guard clamp (docs/tasks/task-concurrency-2026-09.md MC1 gate 4) without allocating a
+// TestKVSlotsWithin pins MC1's fit-guard clamp without allocating a
 // real clamp's worth of KV on a 16 GB machine: the largest count up to the request that fits the budget, never below 1.
 func TestKVSlotsWithin(t *testing.T) {
 	const mb = int64(1 << 20)
@@ -173,7 +173,7 @@ func TestMetalKVSlots_pricedBeforeTheBuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	base, perSlot := residentNeedBytes(m), residentKVBytes(m)
+	base, perSlot := residentNeedBytes(m, metalCtxPlan{}), residentKVBytes(m, metalCtxPlan{})
 	if base <= 0 || perSlot <= 0 {
 		t.Skip("tiny fixture prices nothing")
 	}
@@ -182,7 +182,7 @@ func TestMetalKVSlots_pricedBeforeTheBuild(t *testing.T) {
 	orig := metalLiveAvailable
 	metalLiveAvailable = func() int64 { return live0 - (int64(dev.CurrentAllocatedSize()) - alloc0) }
 	t.Cleanup(func() { metalLiveAvailable = orig })
-	r, err := buildResident(m)
+	r, err := buildResident(m, metalCtxPlan{})
 	if err != nil {
 		t.Fatalf("build resident: %v", err)
 	}
@@ -243,7 +243,7 @@ func sb11Attributed(t *testing.T, what string, r cost.Report) {
 	}
 }
 
-// TestCost_metalDecodeExact is G-SB11-16 and G-SB11-17 (docs/tasks/task-subsystems-2026-10.md, SB11 "Step 4: Metal"):
+// TestCost_metalDecodeExact is G-SB11-16 and G-SB11-17:
 // llama-tiny resident on Metal at int4.
 //   - Every counted path attributes all the dispatches the device counts (no dispatch_other): the first token, whose buffer is
 //     encoded in line, tokens 1 to 3, a token without logits and the synchronous forward.
@@ -427,7 +427,7 @@ func sb11Median(xs []float64) float64 {
 	return (s[len(s)/2-1] + s[len(s)/2]) / 2
 }
 
-// TestCost_metalOffCost is G-SB11-18 (docs/tasks/task-subsystems-2026-10.md, SB11 "G-SB11-18's method"): the always-on
+// TestCost_metalOffCost is G-SB11-18: the always-on
 // counting, charged as three atomic adds and a hook nil check per dispatch, times the device's dispatches per decode token, as
 // a share of the median uncounted decode token, must be under 0.5%. It also reports the on cost (counted ÷ uncounted tokens,
 // the first token of each block dropped), which is not graded. A timed run: hold the timing lock exclusively, on AC.

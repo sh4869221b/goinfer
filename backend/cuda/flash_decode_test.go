@@ -176,11 +176,12 @@ func TestFlashDecodeEndToEnd(t *testing.T) {
 	}
 	t.Setenv("GOINFER_CUDA_FLASH_DECODE", "16")
 	t.Setenv("GOINFER_CUDA_FLASH_DECODE_MIN_KEYS", "0")
-	t.Setenv("GOINFER_SPLITKV_VSUM_SPLIT", "16") // the CONTROL arms: a known, accepted reduction-order change on the same input
+	setVsumSplit(t, 16) // the CONTROL arms: a known, accepted reduction-order change on the same input
 	for _, file := range []string{
 		"qwen2.5-coder-1.5b-instruct-q4_k_m.gguf", // hd128, GQA 6
 		"qwen2.5-coder-0.5b-instruct-q4_k_m.gguf", // hd64, GQA 7
 		"gemma3-1b-q4_k_m.gguf",                   // hd256, GQA 4, sliding-window layers (512) under a 2048-deep decode
+		"gemma-2-2b-it-Q8_0.gguf",                 // hd256, GQA 2, the attention softcap: the lane's capped variant (OP1-o2)
 	} {
 		t.Run(file, func(t *testing.T) { flashEndToEnd(t, file) })
 	}
@@ -191,7 +192,8 @@ func flashEndToEnd(t *testing.T, file string) {
 	if _, err := os.Stat(path); err != nil {
 		t.Skipf("no fixture at %s", path)
 	}
-	m, err := decoder.Load(path, decoder.Options{Backend: "cuda", Quant: "int4"})
+	// FlashDecodeSoftcap: a capped model (Gemma 2) takes the lane only when asked; it is no-op on the others.
+	m, err := decoder.Load(path, decoder.Options{Backend: "cuda", Quant: "int4", FlashDecodeSoftcap: true})
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}

@@ -15,7 +15,7 @@ import (
 	"github.com/townsendmerino/goinfer/internal/vision"
 )
 
-// LFM2-VL's image path (Lfm2VlForConditionalGeneration; S10 of docs/tasks/task-multimodal-support-2026-10.md): the
+// LFM2-VL's image path: the
 // preprocessing (HF's Lfm2VlImageProcessorFast: a large image becomes a grid of 512-pixel tiles plus a thumbnail, a small
 // one a single smart-resized tile), the prompt block and the multimodal projector (Lfm2VlMultiModalProjector). The tower
 // is aikit's vision.Siglip2NaFlexEncoder, one tile per call.
@@ -60,8 +60,11 @@ func Lfm2VLDefaultPreprocess() Lfm2VLPreprocessConfig {
 // when the file is absent), overlaying only the fields it sets.
 func LoadLfm2VLPreprocessConfig(dir string) (Lfm2VLPreprocessConfig, error) {
 	c := Lfm2VLDefaultPreprocess()
-	raw, err := os.ReadFile(filepath.Join(dir, "processor_config.json"))
+	raw, found, err := readOptionalConfig(dir, "processor_config.json")
 	if err != nil {
+		return c, fmt.Errorf("lfm2-vl: %w", err)
+	}
+	if !found {
 		return c, nil
 	}
 	var w struct {
@@ -131,7 +134,7 @@ func lfm2VLTargetRatios(minT, maxT int) [][2]int {
 	return r
 }
 
-// lfm2VLNoAreaRule, when set, keeps the first of equally close grids (HF's area test dropped): S10's planted defect for
+// lfm2VLNoAreaRule, when set, keeps the first of equally close grids (HF's area test dropped): a planted defect for
 // the tie-break.
 var lfm2VLNoAreaRule bool
 
@@ -295,7 +298,7 @@ type Lfm2VLProjector struct {
 func (p *Lfm2VLProjector) TextHidden() int { return p.textHidden }
 
 // lfm2VLUnshuffleChannelMajor, when set, lays each unit out channel-major (Pixtral's merger order) instead of HF's
-// position-major pixel unshuffle: S10's planted defect for this projector.
+// position-major pixel unshuffle: a planted defect for this projector.
 var lfm2VLUnshuffleChannelMajor bool
 
 // LoadLfm2VLProjector reads the projector from a checkpoint directory (config.json and the safetensors).

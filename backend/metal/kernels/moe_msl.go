@@ -239,7 +239,7 @@ kernel void gemv_w4a8_moe(device const uint4* wq[[buffer(0)]], device const half
     if (lane==0) out[row] = acc*asc[0];
 }
 
-// gemv_w8a8_moe / gemv_w8a8_moe_wacc (int8 slice 4, docs/tasks/task-metal-int8-2026-10.md): the expert GEMVs above on the
+// gemv_w8a8_moe / gemv_w8a8_moe_wacc: the expert GEMVs above on the
 // native int8 path's weights, in their argument order and launch shape. The stacked buffer holds every expert's int8
 // rows (K bytes each) with one f32 scale per row; the weight row is idx[slot]*rowsPerExpert + outRow. The body is
 // W8A8_SA_BODY's at that row: the activation staged as words, an exact int32 dot, and float(acc)·aScale·wScale through
@@ -392,7 +392,7 @@ template [[host_name("gemv_w4a8_moe_wacc_rows2")]] kernel decltype(gemv_w4a8_moe
 template [[host_name("gemv_w4a8_moe_wacc_rows4")]] kernel decltype(gemv_w4a8_moe_wacc_rows<4>) gemv_w4a8_moe_wacc_rows<4>;
 // gemv_w4a8_moe_wacc_bias: gpt-oss's down-projection combine. Its bias is added INSIDE the
 // expert, before the router weight scales the result (decoder's forward_gptoss.go's
-// gptOssExpertWith: dst = Down·h + downBias; then gptOssMoE combines out += w·dst) — so the bias
+// gptOssExpertDown: dst = Down·h + downBias; then gptOssMoE combines out += w·dst) — so the bias
 // is wgt[slot]*bias[row], NOT a plain += bias[row] the way GPT-2's o-proj/down-proj bias is
 // (those have no router weight to fold into). gemv_w4a8_moe_wacc has no bias epilogue at all,
 // so this is a genuinely new kernel, not a parameter added to an existing one.
@@ -434,7 +434,7 @@ kernel void shared_gate_combine(device float* x[[buffer(0)]], device const float
 }
 // gptoss_glu: clamp(gate,max=limit)·sigmoid(alpha·clamp(gate)) · (clamp(up,[-limit,limit])+1) —
 // gpt-oss's clamped interleaved-SwiGLU, verified against decoder's forward_gptoss.go's
-// gptOssExpertWith. THE ASYMMETRY IS REAL: gate clamps only from ABOVE, up clamps BOTH sides —
+// gptOssExpertDown. THE ASYMMETRY IS REAL: gate clamps only from ABOVE, up clamps BOTH sides —
 // clamping both symmetrically is the tidy-looking mistake, and it only differs from the
 // correct math where the activation saturates, which is exactly where a clamp exists to
 // matter (metal/gptoss_kernels_test.go's TestGptOssSwigluQuant_metal drives inputs well past

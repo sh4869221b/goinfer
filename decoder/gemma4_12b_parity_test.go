@@ -7,6 +7,9 @@ import (
 	"math"
 	"os"
 	"testing"
+
+	"github.com/townsendmerino/goinfer/internal/runtime/sampling"
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
 // TestGemma4_12B_logitParity gates the Gemma 4 12B forward — the dense, PLE-free
@@ -16,7 +19,7 @@ import (
 // argmax is the first answer token, so this also gates coherence) + sample-256
 // cosine over the quant floor. Skips without the golden or the GGUF asset.
 func TestGemma4_12B_logitParity(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	raw, err := os.ReadFile("../testdata/gemma4_12b_forward_golden.json")
 	if errors.Is(err, fs.ErrNotExist) {
 		t.Skip("no 12B golden; run scripts/pin_gemma4_12b.py")
@@ -51,7 +54,7 @@ func TestGemma4_12B_logitParity(t *testing.T) {
 		t.Fatalf("got %d logits, want vocab %d", len(logits), g.Vocab)
 	}
 
-	got := argmax(logits)
+	got := sampling.Argmax(logits)
 	t.Logf("argmax: got %d (logit %.4f) | want %d (golden logit %.4f)",
 		got, logits[got], g.Argmax, logits[g.Argmax])
 	if got != g.Argmax {

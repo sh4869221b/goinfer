@@ -10,9 +10,11 @@ import (
 	"github.com/townsendmerino/aikit/encoder"
 	"github.com/townsendmerino/goinfer/decoder"
 	"github.com/townsendmerino/goinfer/internal/runtime/modelload"
+
+	"github.com/townsendmerino/goinfer/internal/testgate"
 )
 
-// Decoder-as-embedder gates (docs/completed/task-decoder-as-embedder.md).
+// Decoder-as-embedder gates.
 //
 // These are the MECHANICAL properties — interface fit, instruction prefix, batch/sequential
 // agreement, concurrency safety, honest token counting — and they run against a base Qwen3 decoder,
@@ -27,7 +29,7 @@ var _ encoder.Encoder = (*decoderEmbedder)(nil)
 
 func newTestDecoderEmbedder(t *testing.T) *decoderEmbedder {
 	t.Helper()
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	p := os.ExpandEnv("$HOME/models/Qwen3-0.6B-Q8_0.gguf")
 	if _, err := os.Stat(p); err != nil {
 		t.Skipf("no checkpoint at %s", p)
@@ -268,7 +270,7 @@ func TestDecoderEmbedder_emptyInput(t *testing.T) {
 // decoder.NewBackend falls back to CPU for every non-cpu name, but RequestedBackend() records what
 // Options.Backend was at load time regardless.
 func TestLoadDecoderEmbedder_requestedBackendReachesTheLoad(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	p := os.ExpandEnv("$HOME/models/Qwen3-0.6B-Q8_0.gguf")
 	if _, err := os.Stat(p); err != nil {
 		t.Skipf("no checkpoint at %s", p)
@@ -291,7 +293,7 @@ func TestLoadDecoderEmbedder_requestedBackendReachesTheLoad(t *testing.T) {
 // TestLoadDecoderEmbedder_noBackendConfiguredStaysCPU: an unset -backend must still normalize to "cpu"
 // (decoder.NewBackend's "" → cpu rule), not request some other backend by accident.
 func TestLoadDecoderEmbedder_noBackendConfiguredStaysCPU(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	p := os.ExpandEnv("$HOME/models/Qwen3-0.6B-Q8_0.gguf")
 	if _, err := os.Stat(p); err != nil {
 		t.Skipf("no checkpoint at %s", p)
@@ -312,7 +314,7 @@ func TestLoadDecoderEmbedder_noBackendConfiguredStaysCPU(t *testing.T) {
 // decoder.Load's parseQuant as unknown, a hard load failure, so loadDecoderEmbedder must translate "q8" to
 // "int8". Audit M-17.
 func TestLoadDecoderEmbedder_embedQuantQ8MapsToInt8(t *testing.T) {
-	requireHeavyModel(t)
+	testgate.RequireHeavy(t)
 	p := os.ExpandEnv("$HOME/models/Qwen3-0.6B-Q8_0.gguf")
 	if _, err := os.Stat(p); err != nil {
 		t.Skipf("no checkpoint at %s", p)
@@ -340,4 +342,28 @@ func cosineF32(a, b []float32) float64 {
 		return 0
 	}
 	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+// The wiring itself: the embedder's bound is the model's context window, not 0. The arithmetic test in limits_test.go passes for any non-zero
+// bound, so this is what pins the source of it.
+func TestDecoderEmbedder_boundComesFromTheModelNotZero(t *testing.T) {
+	p := tinyChatCheckpoint(t)
+	tk, err := modelload.Tokenizer(p)
+	if err != nil {
+		t.Fatalf("tokenizer: %v", err)
+	}
+	m, err := decoder.Load(p, decoder.Options{Backend: "cpu", Quant: "int8int8"})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	defer m.Close()
+	want := m.Config().MaxPositions
+	if want <= 0 {
+		t.Fatalf("the fixture's MaxPositions is %d: this test proves nothing", want)
+	}
+	if got := newDecoderEmbedder(m, tk, "", "").maxTokens; got != want {
+		t.Errorf("maxTokens %d, want the model's max_position_embeddings %d: 0 leaves only the request's byte cap between a request "+
+			"and about 500k positions of sequential forward under the embed mutex (audit-2026-09-02 C-07), and Architecture.MaxPositions "+
+			"is the GPT-2 learned-position table, 0 for every RoPE family", got, want)
+	}
 }
