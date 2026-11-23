@@ -169,6 +169,13 @@ testdata/olmo_hybrid-tiny int4/kvprecision-i8
 testdata/olmo_hybrid-tiny int4/slots2
 testdata/olmo_hybrid-tiny int4/ssm
 testdata/olmo_hybrid-tiny int8int8
+testdata/plamo3-tiny f32
+testdata/plamo3-tiny int4
+testdata/plamo3-tiny int4/kv-f16
+testdata/plamo3-tiny int4/kvprecision-i8
+testdata/plamo3-tiny int4/slots2
+testdata/plamo3-tiny int4/ssm
+testdata/plamo3-tiny int8int8
 testdata/qwen25vl-tiny f32
 testdata/qwen25vl-tiny int4
 testdata/qwen25vl-tiny int4/kv-f16
