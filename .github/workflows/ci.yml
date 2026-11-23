@@ -224,7 +224,11 @@ jobs:
       # release" — several tags have shipped since (N-54, docs/audit-2026-09-10.md: this step's
       # own name used to claim otherwise).
       - name: apidiff (Hard tier vs the v0.13.0 API-freeze baseline)
-        run: scripts/apidiff_check.sh v0.13.0
+        run: |
+          if ! git show-ref --verify --quiet refs/tags/v0.13.0; then
+            git fetch --no-tags https://github.com/townsendmerino/goinfer.git refs/tags/v0.13.0:refs/tags/v0.13.0
+          fi
+          scripts/apidiff_check.sh v0.13.0
       - name: apidiff_check.sh's classification (the alias list's two licensed lines, and plants that stay fatal)
         run: python3 -B scripts/test_apidiff_check.py
 
